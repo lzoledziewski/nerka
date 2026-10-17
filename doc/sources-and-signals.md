@@ -1,7 +1,6 @@
-# Sources & Signals — design (parked)
+# Sources & Signals — design
 
-_Status: agreed direction, **not implemented**. Written 2026-10-17._
-_Current priority is klogg parity (`architecture-analysis.md` §8, Phase 1.5); pick this up after that._
+_Status: agreed direction. Written 2026-10-17. Updated 2026-10-18: **DLT from `.dlt` files is implemented** (source-supplied fields, DSL field predicates, own reader, table view); everything else here is still design. Current state and DLT decisions: `status.md`._
 
 ## Goal
 
@@ -20,6 +19,8 @@ Two new capabilities beyond plain-text logs:
 | Live monitoring (UDP/TCP capture) | **Not now.** Recorded files only, so stores may stay immutable for v1. Keep the traits append-friendly so this can be added later. |
 | Defining derived signals | **In the DSL.** The owner isn't fully convinced; keep the syntax small and revisit it once it's in use. |
 | Plugins | In-tree crates behind cargo features first. External plugins (WASM or a C ABI) later. |
+| DLT parser (2026-10-18) | **Own zero-copy reader, no crate** (not `dlt-core` / `dlt_parse`). Lives in `core/src/input/dlt/` for now; becomes `nerka-dlt` when the `Container` / `Decoder` traits exist. |
+| DLT display (2026-10-18) | A table with aligned, resizable columns in nerka's own view; no column sorting. |
 
 ## Layered model
 
@@ -89,7 +90,7 @@ All checked on crates.io on 2026-10-17. All MIT and/or Apache-2.0.
 
 | Purpose | Crate | Notes |
 |---|---|---|
-| DLT | `dlt-core` 0.20 (esrlabs, used by Chipmunk) | Full: verbose, non-verbose via FIBEX, writer. `dlt_parse` 0.10 is the zero-copy, headers-only alternative. |
+| DLT | ~~`dlt-core` 0.20~~, ~~`dlt_parse` 0.10~~ | **Not used**: own reader (owner, 2026-10-18). |
 | pcap/pcapng | `pcap-parser` 0.17 | |
 | Ethernet/IP/UDP | `etherparse` 0.21 | |
 | SOME/IP headers | `someip_parse` 0.7 | Doesn't interpret payloads: that is `SignalDb`'s job. |
@@ -106,10 +107,10 @@ Each one must be justified in its PR (spec §3.1).
 - Signal picker: search the `SignalDb` catalog by name, service or PDU and subscribe. A full tree browser is tentative.
 - Per tab, like the filter and bookmarks: subscriptions and derived-signal definitions belong to the tab.
 
-## Suggested order (after klogg parity)
+## Suggested order
 
-1. Time model and source-supplied fields in `Event`, with DSL field predicates. Use plain-text timestamps as the first user.
-2. `nerka-dlt` from `.dlt` files, with the header-only index fast path.
+1. Time model and source-supplied fields in `Event`, with DSL field predicates. Use plain-text timestamps as the first user. — **Fields and predicates done** (`LogSource::schema` / `field` / `supplied_level`, `Query::bind`); the `Timestamp` / clock model is **not** done (DLT exposes `tmsp` as a number, `time` is display-only).
+2. DLT from `.dlt` files, with the header-only index fast path. — **Done** in `core/src/input/dlt/` (index = message offsets; headers read in place).
 3. `nerka-pcap`: DLT over UDP.
 4. `SignalStore`, `egui_plot` panel, regex extractor in the DSL (the first signal producer, with no database needed).
 5. `SignalDb`: ARXML, then FIBEX. `nerka-someip` with subscriptions.

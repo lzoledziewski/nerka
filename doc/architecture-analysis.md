@@ -102,9 +102,14 @@ are flattened and sorted by estimated cost at compile time.
 `raw` is always the untouched line. Fields are computed lazily, only when a
 query references them. `level` comes from a hand-rolled scanner that looks
 for upper-case level tokens in the first 160 bytes. It replaced a regex and
-made level-only queries 5× faster. `timestamp`, `service` and `source` are
-reserved: the parser rejects them with "not supported yet" until a
-normalizer provides them.
+made level-only queries 5× faster.
+
+Since 2026-10-18 sources can supply **typed fields** and levels themselves
+(`LogSource::schema` / `field` / `supplied_level`; DLT supplies `ecu`,
+`apid`, `ctid`, … and the header level). The parser accepts any field name;
+`Query::bind` resolves it against the source's schema and reports unknown
+fields or wrong operators with their position. `Event` is lazy over
+`(source, line)`, so header-only filters never fetch or render the line.
 
 ## 5. Measured performance
 
@@ -127,7 +132,7 @@ below.
 
 | What | Where (now) | Later |
 |---|---|---|
-| Log data | Read-only memory map; never copied or modified | Decoders (PCAP/DLT) materialize text lines into a temp file or arena |
+| Log data | Read-only memory map; never copied or modified. DLT lines are rendered on demand from the mapped messages (no materialized text) | Revisit only if regex search over decoded formats proves too slow |
 | Line index | In memory | Optional on-disk index cache for multi-GB files |
 | Bookmarks + notes | Sidecar `<log>.nerka-marks`, plain text `line<TAB>note` | Same model synced via `nerka-server` for collaboration |
 | Saved filters, settings | — | `%APPDATA%\nerka` / XDG config dir (eframe persistence) |
@@ -141,7 +146,7 @@ annotations by sending it alongside the log.
 nerka/
   Cargo.toml            workspace, shared deps, lints, release profile
   core/                 nerka-core  — UI-free engine (library)
-    src/input/          LogSource trait, TextFile (mmap)
+    src/input/          LogSource trait, open() by content, TextFile (mmap), dlt/ (DLT reader + writer)
     src/engine/         LineIndex, search/Filter/Highlighter
     src/dsl/            NFD parser + evaluator
     src/event.rs        lazy field normalization (level)
@@ -158,7 +163,7 @@ nerka/
 **Phase 1 — MVP (spec §7), done in this scaffold:** open file, line
 indexing, regex and DSL filtering, highlighting, bookmarks with notes, CLI.
 
-**Phase 1.5 — klogg parity**
+**Phase 1.5 — klogg parity** (owner is happy with the base as of 2026-10-18; remaining items are on hold)
 - Follow/tail mode: remap on growth and extend the index incrementally.
 - Multiple highlight rules with colours (klogg's "highlighters"), saved filters.
 - Encoding detection (UTF-16, Latin-1).
@@ -167,7 +172,8 @@ indexing, regex and DSL filtering, highlighting, bookmarks with notes, CLI.
 - Rotated logs (`app.log`, `app.log.1`, …) presented as one source.
 
 **Phase 2 — formats, normalization & signals** (design: `sources-and-signals.md`)
-- DLT from `.dlt`, pcap and MF4 via container/decoder layers; SOME/IP signals from FIBEX/ARXML.
+- DLT from `.dlt` files: **done** (2026-10-18), shown as a table. Next: the owner's search manager / highlighters (`status.md`).
+- DLT from pcap and MF4 via container/decoder layers; SOME/IP signals from FIBEX/ARXML.
 - `timestamp` / `service` fields, with time-range filters (`timestamp >= 10:42:00`).
 - stdin source (`tail -f x | nerka-gui -`).
 
