@@ -1,0 +1,17 @@
+[package]
+name = "nerka-core"
+description = "Nerka log analysis engine: file access, line indexing, regex search"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+memchr.workspace = true
+memmap2.workspace = true
+rayon.workspace = true
+regex.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true

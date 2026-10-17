@@ -1,0 +1,42 @@
+[workspace]
+resolver = "3"
+members = ["core", "cli", "ui"]
+default-members = ["core", "cli"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/lzoledziewski/nerka"
+
+[workspace.dependencies]
+nerka-core = { path = "core" }
+memchr = "2.8"
+memmap2 = "0.9"
+rayon = "1.12"
+regex = "1.13"
+thiserror = "2"
+clap = { version = "4.6", features = ["derive"] }
+anyhow = "1"
+eframe = "0.37"
+rfd = "0.17"
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
+
+# Keep debug builds of the hot paths usable when testing on big logs.
+[profile.dev.package.nerka-core]
+opt-level = 2
+[profile.dev.package.regex-automata]
+opt-level = 3
+[profile.dev.package.memchr]
+opt-level = 3

@@ -1,0 +1,19 @@
+[package]
+name = "nerka-cli"
+description = "Nerka command line: index stats, regex search, line ranges"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "nerka"
+path = "src/main.rs"
+
+[dependencies]
+nerka-core.workspace = true
+clap.workspace = true
+anyhow.workspace = true
+
+[lints]
+workspace = true

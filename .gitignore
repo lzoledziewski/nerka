@@ -1,0 +1,6 @@
+/target
+**/*.rs.bk
+*.pdb
+# local test logs and bookmark sidecars
+*.log
+*.nerka-marks
