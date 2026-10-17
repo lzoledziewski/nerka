@@ -166,8 +166,8 @@ indexing, regex and DSL filtering, highlighting, bookmarks with notes, CLI.
 - Selection and copy of ranges; search history.
 - Rotated logs (`app.log`, `app.log.1`, …) presented as one source.
 
-**Phase 2 — formats & normalization**
-- `input::dlt`, `input::pcap` adapters implementing `LogSource`.
+**Phase 2 — formats, normalization & signals** (design: `sources-and-signals.md`)
+- DLT from `.dlt`, pcap and MF4 via container/decoder layers; SOME/IP signals from FIBEX/ARXML.
 - `timestamp` / `service` fields, with time-range filters (`timestamp >= 10:42:00`).
 - stdin source (`tail -f x | nerka-gui -`).
 

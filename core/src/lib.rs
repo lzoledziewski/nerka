@@ -11,11 +11,13 @@
 //! * [`dsl`] — NFD, the filter language (`level >= ERROR AND raw ~ /SSL/`).
 //! * [`event`] — lazily normalized fields (level, …) per line.
 //! * [`bookmarks`] — bookmarks/notes persisted in a sidecar file.
+//! * [`history`] — recently used filters.
 
 pub mod bookmarks;
 pub mod dsl;
 pub mod engine;
 pub mod event;
+pub mod history;
 pub mod input;
 
 pub use bookmarks::Bookmarks;
@@ -23,6 +25,7 @@ pub use dsl::{DslError, Query};
 pub use engine::index::LineIndex;
 pub use engine::search::{Filter, Highlighter, Matcher, MatcherOptions, SearchResult, search};
 pub use event::Level;
+pub use history::SearchHistory;
 pub use input::LogSource;
 pub use input::text::TextFile;
 

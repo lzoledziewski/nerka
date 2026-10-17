@@ -20,6 +20,10 @@ _Last update: 2026-10-17 (initial scaffold, generated in a claude.ai session)._
 4. Smoke test: `cargo run --release -p nerka-core --example gen_log -- big.log 1024`, then `target\release\nerka filter -c --stats "level >= ERROR" big.log` and `target\release\nerka-gui big.log`. Compare the numbers with `architecture-analysis.md` §5.
 5. Continue with Phase 1.5 of the roadmap (`architecture-analysis.md` §8). Follow/tail mode and highlight rules come first.
 
+## Current focus
+
+**klogg parity first** (owner, 2026-10-17). DLT, MF4, pcap and SOME/IP signals are designed but parked: see `sources-and-signals.md`. Don't implement them until the owner asks.
+
 ## Decisions pending with the owner
 
 Don't settle these silently: ask.
