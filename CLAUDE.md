@@ -18,7 +18,11 @@ cargo run -p nerka-cli -- filter 'level >= ERROR AND raw ~ /SSL/' app.log
 cargo run -p nerka-gui -- app.log --query 'level >= ERROR'
 cargo run --release -p nerka-core --example gen_log -- big.log 1024   # 1 GiB test log
 cargo run --release -p nerka-cli -- search -c --stats ERROR big.log  # benchmark
+powershell -ExecutionPolicy Bypass -File tools/screenshot.ps1 -Out shot.png -AppArgs app.log  # GUI screenshot (Windows)
 ```
+
+`doc/status.md` records the current state and the owner's GUI decisions; read it
+before changing the UI, and update it when the state changes.
 
 ## Rules
 - Line numbers are 0-based `LineNo` (u64) internally; add 1 only for display.
