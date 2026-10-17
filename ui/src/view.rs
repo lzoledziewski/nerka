@@ -22,6 +22,8 @@ const MAX_DISPLAY_BYTES: usize = 4096;
 const MAX_COPY_LINES: u64 = 100_000;
 const SCROLLBAR_W: f32 = 12.0;
 const TAB_COLS: usize = 4;
+/// Rows scrolled per mouse-wheel notch (klogg uses 3).
+const LINES_PER_NOTCH: u64 = 3;
 
 /// A position in the view: row and display column (tabs count as
 /// [`TAB_COLS`]). `col == usize::MAX` means "end of line".
@@ -44,6 +46,8 @@ pub struct ViewState {
     /// Text selection as (anchor, head); empty when both are equal.
     pub sel: Option<(TextPos, TextPos)>,
     dragging: bool,
+    /// Fraction of a row scrolled but not applied yet (trackpads).
+    scroll_acc: f32,
 }
 
 impl ViewState {
@@ -102,7 +106,10 @@ pub fn log_view(
     hl: &Highlight<'_>,
 ) -> ViewOutput {
     let font = FontId::monospace(13.0);
-    let row_h = ui.fonts_mut(|f| f.row_height(&font)) + 2.0;
+    // Whole physical pixels per row and per text origin keep glyphs crisp.
+    let ppp = ui.ctx().pixels_per_point();
+    let snap = |v: f32| (v * ppp).round() / ppp;
+    let row_h = snap(ui.fonts_mut(|f| f.row_height(&font)) + 2.0);
     let char_w = ui.fonts_mut(|f| f.glyph_width(&font, '0'));
     let total_lines = source.line_count();
     let gutter_w = (digits(total_lines) as f32 + 1.5) * char_w;
@@ -124,13 +131,41 @@ pub fn log_view(
     }
     let has_focus = response.has_focus();
     if response.hovered() {
-        let d = ui.input(|i| i.smooth_scroll_delta);
-        if d.y != 0.0 {
-            let lines = (-d.y / row_h).round() as i64;
-            let lines = if lines == 0 { -d.y.signum() as i64 } else { lines };
-            state.top = state.top.saturating_add_signed(lines * 3 / 2 + lines.signum()).min(max_top);
-        }
-        state.x_off = (state.x_off - d.x).max(0.0);
+        // Raw wheel events, not egui's smoothed delta: a notch moves a fixed
+        // number of whole rows at once, so text never sits between rows.
+        let (rows_delta, x_delta) = ui.input_mut(|i| {
+            i.smooth_scroll_delta = egui::Vec2::ZERO;
+            let (mut dy, mut dx) = (0.0f32, 0.0f32);
+            for e in &i.events {
+                let egui::Event::MouseWheel { unit, delta, modifiers, .. } = e else { continue };
+                if modifiers.command {
+                    continue; // Ctrl+wheel is zoom
+                }
+                // Shift+wheel scrolls sideways.
+                let d = if modifiers.shift && delta.x == 0.0 { egui::vec2(delta.y, 0.0) } else { *delta };
+                match unit {
+                    egui::MouseWheelUnit::Line => {
+                        dy -= d.y * LINES_PER_NOTCH as f32;
+                        dx -= d.x * char_w * 8.0;
+                    }
+                    egui::MouseWheelUnit::Point => {
+                        dy -= d.y / row_h;
+                        dx -= d.x;
+                    }
+                    egui::MouseWheelUnit::Page => {
+                        dy -= d.y * state.page as f32;
+                        dx -= d.x * text_clip.width();
+                    }
+                }
+            }
+            (dy, dx)
+        });
+        // Trackpads send small pixel deltas: keep the remainder for later.
+        state.scroll_acc += rows_delta;
+        let whole = state.scroll_acc.trunc();
+        state.scroll_acc -= whole;
+        state.top = state.top.saturating_add_signed(whole as i64).min(max_top);
+        state.x_off = (state.x_off + x_delta).max(0.0);
     }
 
     // Mouse → text position (row clamped to the rows that exist).
@@ -340,7 +375,7 @@ pub fn log_view(
     let mut max_w = 0.0f32;
     let last = (state.top + state.page + 1).min(rows);
     for (i, row) in (state.top..last).enumerate() {
-        let y = text_rect.top() + i as f32 * row_h;
+        let y = snap(text_rect.top()) + i as f32 * row_h;
         let line = line_of_row(row);
         let row_rect = Rect::from_min_size(pos2(text_rect.min.x, y), vec2(text_rect.width(), row_h));
         if state.selected == Some(row) {
@@ -354,7 +389,7 @@ pub fn log_view(
             );
         }
         painter.text(
-            pos2(text_rect.min.x + gutter_w - char_w * 0.75, y + 1.0),
+            pos2(text_rect.min.x + gutter_w - char_w * 0.75, snap(y + 1.0)),
             Align2::RIGHT_TOP,
             (line + 1).to_string(),
             font.clone(),
@@ -371,7 +406,7 @@ pub fn log_view(
             // Selected line breaks show as one extra column.
             let c1 = if row == e.row { e.col.min(width) } else { width + 1 };
             if c1 > c0 {
-                let x = text_x0 - state.x_off;
+                let x = snap(text_x0 - state.x_off);
                 let r = Rect::from_min_max(pos2(x + c0 as f32 * char_w, y), pos2(x + c1 as f32 * char_w, y + row_h));
                 painter.with_clip_rect(text_clip).rect_filled(r, 0.0, sel_bg);
             }
@@ -379,7 +414,7 @@ pub fn log_view(
         let job = line_job(shown, cut, hl.highlighter, &font, text_color, dim, match_bg);
         let galley = painter.layout_job(job);
         max_w = max_w.max(galley.size().x);
-        painter.with_clip_rect(text_clip).galley(pos2(text_x0 - state.x_off, y + 1.0), galley, text_color);
+        painter.with_clip_rect(text_clip).galley(pos2(snap(text_x0 - state.x_off), snap(y + 1.0)), galley, text_color);
     }
     state.x_off = state.x_off.min((max_w - text_clip.width() * 0.5).max(0.0));
 
@@ -529,6 +564,72 @@ mod tests {
         assert_eq!(col_to_byte(s, 7), 5);
         assert_eq!(col_to_byte(s, 9), s.len());
         assert_eq!(col_to_byte(s, usize::MAX), s.len());
+    }
+
+    /// One frame of the app's layout: filter view in a bottom panel under a
+    /// header row, main view in the centre. Returns the filter view's rect.
+    fn frame(
+        ctx: &egui::Context,
+        t: f64,
+        events: Vec<egui::Event>,
+        file: &nerka_core::TextFile,
+        main: &mut ViewState,
+        filter: &mut ViewState,
+    ) -> Rect {
+        let rows: Vec<u64> = (0..file.line_count()).step_by(2).collect();
+        let screen = Rect::from_min_size(pos2(0.0, 0.0), vec2(1000.0, 800.0));
+        let input = egui::RawInput { screen_rect: Some(screen), time: Some(t), events, ..Default::default() };
+        let hl = Highlight { highlighter: None, bookmarks: None };
+        let mut rect = Rect::NOTHING;
+        let mut out = ctx.run_ui(input, |ui| {
+            egui::Panel::bottom("filter").resizable(true).default_size(260.0).min_size(120.0).show(ui, |ui| {
+                ui.horizontal(|ui| ui.label("filter"));
+                rect = ui.available_rect_before_wrap();
+                log_view(ui, "filter", filter, rows.len() as u64, &|r| rows[r as usize], file, &hl);
+            });
+            egui::CentralPanel::default().show(ui, |ui| {
+                log_view(ui, "main", main, file.line_count(), &|r| r, file, &hl);
+            });
+        });
+        out.textures_delta.clear();
+        rect
+    }
+
+    fn wheel(notches: f32) -> egui::Event {
+        egui::Event::MouseWheel {
+            unit: egui::MouseWheelUnit::Line,
+            delta: vec2(0.0, -notches),
+            phase: egui::TouchPhase::Move,
+            source: egui::MouseWheelSource::Wheel,
+            modifiers: egui::Modifiers::NONE,
+        }
+    }
+
+    #[test]
+    fn wheel_scrolls_hovered_view_by_whole_lines() {
+        let text: String = (0..1000).map(|i| format!("line {i}\n")).collect();
+        let file = nerka_core::TextFile::from_bytes("t", text.into_bytes());
+        let ctx = egui::Context::default();
+        let (mut main, mut filter) = (ViewState::default(), ViewState::default());
+        let mut t = 0.0;
+        let mut step = |events: Vec<egui::Event>, main: &mut ViewState, filter: &mut ViewState| {
+            t += 1.0 / 60.0;
+            frame(&ctx, t, events, &file, main, filter)
+        };
+        let rect = step(vec![], &mut main, &mut filter);
+        step(vec![egui::Event::PointerMoved(rect.center())], &mut main, &mut filter);
+        // One wheel notch, then let any smoothing run out.
+        step(vec![wheel(1.0)], &mut main, &mut filter);
+        for _ in 0..60 {
+            step(vec![], &mut main, &mut filter);
+        }
+        assert_eq!(main.top, 0, "main view must not scroll");
+        assert_eq!(filter.top, LINES_PER_NOTCH, "one notch scrolls a few lines");
+        step(vec![wheel(-1.0)], &mut main, &mut filter);
+        for _ in 0..60 {
+            step(vec![], &mut main, &mut filter);
+        }
+        assert_eq!(filter.top, 0);
     }
 
     #[test]

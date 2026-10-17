@@ -5,6 +5,7 @@
 //! Open with Ctrl+O, drag & drop, or from a shell:
 //!     nerka-gui app.log other.log
 //!     nerka-gui app.log --query 'level >= ERROR AND raw ~ /SSL/'
+//!     nerka-gui app.log --text 'connection reset'
 //!     nerka-gui app.log --regex 'timeout|refused'
 //! Keys: Ctrl+F filter · Enter run · n/N next/prev match · Ctrl+G go to line
 //! · m toggle bookmark · b/B next/prev bookmark · Ctrl+C copy selection
@@ -33,14 +34,20 @@ use view::{Highlight, ViewOutput, ViewState, log_view};
 
 fn main() -> eframe::Result {
     let mut initial: Vec<PathBuf> = Vec::new();
-    let mut preset: Option<(Mode, String)> = None;
+    // (history tag, pattern): the same tags the search history uses.
+    let mut preset: Option<(&str, String)> = None;
     let mut args = std::env::args_os().skip(1);
     while let Some(a) = args.next() {
-        match a.to_str() {
-            Some("--query" | "-q") => preset = args.next().map(|v| (Mode::Query, v.to_string_lossy().into_owned())),
-            Some("--regex" | "-r") => preset = args.next().map(|v| (Mode::Regex, v.to_string_lossy().into_owned())),
-            _ => initial.push(PathBuf::from(a)),
-        }
+        let tag = match a.to_str() {
+            Some("--query" | "-q") => "query",
+            Some("--regex" | "-r") => "regex",
+            Some("--text" | "-t") => "text",
+            _ => {
+                initial.push(PathBuf::from(a));
+                continue;
+            }
+        };
+        preset = args.next().map(|v| (tag, v.to_string_lossy().into_owned()));
     }
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -58,9 +65,8 @@ fn main() -> eframe::Result {
             for p in initial {
                 app.open(&cc.egui_ctx, p);
                 // A filter given on the command line applies to every file it names.
-                if let (Some((mode, pattern)), Some(tab)) = (&preset, app.tabs.last_mut()) {
-                    tab.mode = *mode;
-                    tab.pattern = pattern.clone();
+                if let (Some((tag, pattern)), Some(tab)) = (&preset, app.tabs.last_mut()) {
+                    tab.set_filter(tag, pattern);
                 }
             }
             app.active = 0;
@@ -71,29 +77,16 @@ fn main() -> eframe::Result {
 
 #[derive(Default, PartialEq, Clone, Copy)]
 enum Mode {
-    /// klogg-style regex box.
+    /// klogg-style search box: plain text, or a regex when "Regex" is ticked.
     #[default]
-    Regex,
+    Text,
     /// NFD query: `level >= ERROR AND raw ~ /SSL/`.
     Query,
 }
 
-impl Mode {
-    /// Tag used in the search history file.
-    fn tag(self) -> &'static str {
-        match self {
-            Mode::Regex => "regex",
-            Mode::Query => "query",
-        }
-    }
-
-    fn from_tag(tag: &str) -> Option<Self> {
-        match tag {
-            "regex" => Some(Mode::Regex),
-            "query" => Some(Mode::Query),
-            _ => None,
-        }
-    }
+/// Text mode searches literally until "Regex" is ticked.
+fn default_matcher_options() -> MatcherOptions {
+    MatcherOptions { fixed_string: true, ..Default::default() }
 }
 
 /// One open file with its own filter, view positions and bookmarks.
@@ -126,7 +119,7 @@ impl Tab {
             filter_view: ViewState::default(),
             mode: Mode::default(),
             pattern: String::new(),
-            options: MatcherOptions::default(),
+            options: default_matcher_options(),
             highlighter: None,
             result: None,
             searching: None,
@@ -152,9 +145,32 @@ impl Tab {
         }
     }
 
+    /// History tag for the current filter: `text`, `regex` or `query`.
+    fn filter_tag(&self) -> &'static str {
+        match self.mode {
+            Mode::Text if self.options.fixed_string => "text",
+            Mode::Text => "regex",
+            Mode::Query => "query",
+        }
+    }
+
+    /// Set the filter from a history tag and pattern; unknown tags are ignored.
+    fn set_filter(&mut self, tag: &str, pattern: &str) -> bool {
+        match tag {
+            "text" | "regex" => {
+                self.mode = Mode::Text;
+                self.options.fixed_string = tag == "text";
+            }
+            "query" => self.mode = Mode::Query,
+            _ => return false,
+        }
+        self.pattern = pattern.to_owned();
+        true
+    }
+
     fn build_filter(&self) -> Result<Filter, String> {
         match self.mode {
-            Mode::Regex => Matcher::new(&self.pattern, self.options.clone()).map(Filter::Regex).map_err(|e| {
+            Mode::Text => Matcher::new(&self.pattern, self.options.clone()).map(Filter::Regex).map_err(|e| {
                 let detail = std::error::Error::source(&e).map(|s| s.to_string()).unwrap_or_default();
                 format!("Invalid regex: {}", detail.lines().last().unwrap_or(""))
             }),
@@ -367,7 +383,7 @@ impl Tab {
         file: &TextFile,
         focus_search: &mut bool,
         history: &SearchHistory,
-    ) -> Option<(Mode, String)> {
+    ) -> Option<(&'static str, String)> {
         let mut searched = None;
         ui.horizontal(|ui| {
             let mut go = false;
@@ -375,12 +391,9 @@ impl Tab {
                 ui.menu_button("🕘", |ui| {
                     egui::ScrollArea::vertical().max_height(400.0).show(ui, |ui| {
                         for (tag, pattern) in history.iter() {
-                            let Some(mode) = Mode::from_tag(tag) else { continue };
                             let label = egui::RichText::new(format!("{tag:<5}  {pattern}")).monospace();
                             if ui.add(egui::Button::new(label).wrap_mode(egui::TextWrapMode::Truncate)).clicked() {
-                                self.mode = mode;
-                                self.pattern = pattern.to_owned();
-                                go = true;
+                                go |= self.set_filter(tag, pattern);
                                 ui.close();
                             }
                         }
@@ -389,34 +402,39 @@ impl Tab {
                 .response
                 .on_hover_text("Recent filters");
             });
-            go |= ui.selectable_value(&mut self.mode, Mode::Regex, "Regex").changed();
+            go |= ui.selectable_value(&mut self.mode, Mode::Text, "Text").changed();
             go |= ui
                 .selectable_value(&mut self.mode, Mode::Query, "Query")
                 .on_hover_text("level >= ERROR AND raw ~ /SSL|CERT/i AND NOT /healthcheck/")
                 .changed();
             let hint = match self.mode {
-                Mode::Regex => "regex — Enter to search",
+                Mode::Text if self.options.fixed_string => "text — Enter to search",
+                Mode::Text => "regex — Enter to search",
                 Mode::Query => "level >= ERROR AND raw ~ /SSL/ — Enter to search",
             };
             let r = ui.add(
                 egui::TextEdit::singleline(&mut self.pattern)
                     .hint_text(hint)
                     .font(egui::TextStyle::Monospace)
-                    .desired_width(ui.available_width() - if self.mode == Mode::Regex { 260.0 } else { 70.0 }),
+                    .desired_width(ui.available_width() - if self.mode == Mode::Text { 260.0 } else { 70.0 }),
             );
             if *focus_search {
                 r.request_focus();
                 *focus_search = false;
             }
             go |= r.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
-            if self.mode == Mode::Regex {
+            if self.mode == Mode::Text {
+                let mut regex = !self.options.fixed_string;
+                if ui.checkbox(&mut regex, "Regex").changed() {
+                    self.options.fixed_string = !regex;
+                    go = true;
+                }
                 go |= ui.checkbox(&mut self.options.case_insensitive, "Ignore case").changed();
-                go |= ui.checkbox(&mut self.options.fixed_string, "Literal").changed();
                 go |= ui.checkbox(&mut self.options.invert, "Invert").changed();
             }
             go |= ui.button("Search").clicked();
             if go && self.start_search(ui.ctx()) {
-                searched = Some((self.mode, self.pattern.clone()));
+                searched = Some((self.filter_tag(), self.pattern.clone()));
             }
         });
         ui.add_space(2.0);
@@ -508,8 +526,8 @@ impl App {
         }
     }
 
-    fn record_search(&mut self, mode: Mode, pattern: &str) {
-        if self.history.push(mode.tag(), pattern)
+    fn record_search(&mut self, tag: &str, pattern: &str) {
+        if self.history.push(tag, pattern)
             && let Some(path) = history_path()
             && let Err(e) = self.history.save(&path)
             && let Some(t) = self.tabs.get_mut(self.active)
@@ -792,8 +810,8 @@ impl eframe::App for App {
             .show(ui, |ui| tab.filter_panel(ui, &file, &mut focus_search, &self.history))
             .inner;
         egui::CentralPanel::default().show(ui, |ui| tab.main_panel(ui, &file));
-        if let Some((mode, pattern)) = searched {
-            self.record_search(mode, &pattern);
+        if let Some((tag, pattern)) = searched {
+            self.record_search(tag, &pattern);
         }
     }
 }
