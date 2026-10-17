@@ -6,9 +6,13 @@
 //!     nerka-gui app.log other.log
 //!     nerka-gui app.log --query 'level >= ERROR AND raw ~ /SSL/'
 //!     nerka-gui app.log --regex 'timeout|refused'
-//! Keys: Ctrl+F filter · Enter run · n/N next/prev match · m toggle bookmark
-//! · b/B next/prev bookmark · Ctrl+C copy line · Ctrl+Home/End
+//! Keys: Ctrl+F filter · Enter run · n/N next/prev match · Ctrl+G go to line
+//! · m toggle bookmark · b/B next/prev bookmark · Ctrl+C copy selection
+//! (or line) · Ctrl+A select all · Ctrl+Home/End
 //! · Ctrl+Tab / Ctrl+Shift+Tab next/prev tab · Ctrl+W close tab.
+//!
+//! Recent filters are kept in `<config dir>/nerka/history` and offered by
+//! the 🕘 button next to the filter box.
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
@@ -18,12 +22,13 @@ mod view;
 use eframe::egui::{self, Key, KeyboardShortcut, Modifiers};
 use job::{Job, Poll};
 use nerka_core::{
-    Bookmarks, Filter, Highlighter, LineNo, LogSource, Matcher, MatcherOptions, Query, SearchResult, TextFile,
+    Bookmarks, Filter, Highlighter, LineNo, LogSource, Matcher, MatcherOptions, Query, SearchHistory, SearchResult,
+    TextFile,
 };
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
-use view::{Highlight, ViewState, log_view};
+use view::{Highlight, ViewOutput, ViewState, log_view};
 
 fn main() -> eframe::Result {
     let mut initial: Vec<PathBuf> = Vec::new();
@@ -45,6 +50,7 @@ fn main() -> eframe::Result {
         options,
         Box::new(move |cc| {
             let mut app = App::default();
+            app.load_history();
             for p in initial {
                 app.open(&cc.egui_ctx, p);
                 // A filter given on the command line applies to every file it names.
@@ -66,6 +72,24 @@ enum Mode {
     Regex,
     /// NFD query: `level >= ERROR AND raw ~ /SSL/`.
     Query,
+}
+
+impl Mode {
+    /// Tag used in the search history file.
+    fn tag(self) -> &'static str {
+        match self {
+            Mode::Regex => "regex",
+            Mode::Query => "query",
+        }
+    }
+
+    fn from_tag(tag: &str) -> Option<Self> {
+        match tag {
+            "regex" => Some(Mode::Regex),
+            "query" => Some(Mode::Query),
+            _ => None,
+        }
+    }
 }
 
 /// One open file with its own filter, view positions and bookmarks.
@@ -134,8 +158,10 @@ impl Tab {
         }
     }
 
-    fn start_search(&mut self, ctx: &egui::Context) {
-        let Some(file) = self.file.clone() else { return };
+    /// Start searching with the current filter; returns whether a search
+    /// was started (so the caller can record it in the history).
+    fn start_search(&mut self, ctx: &egui::Context) -> bool {
+        let Some(file) = self.file.clone() else { return false };
         if let Some((_, j)) = self.searching.take() {
             j.cancel();
         }
@@ -143,7 +169,7 @@ impl Tab {
             self.highlighter = None;
             self.result = None;
             self.status.clear();
-            return;
+            return false;
         }
         match self.build_filter() {
             Ok(f) => {
@@ -151,8 +177,12 @@ impl Tab {
                 let ff = f.clone();
                 let job = Job::spawn(ctx, move |prog| nerka_core::search(&*file, &ff, prog));
                 self.searching = Some((f, job));
+                true
             }
-            Err(e) => self.status = e,
+            Err(e) => {
+                self.status = e;
+                false
+            }
         }
     }
 
@@ -242,10 +272,13 @@ impl Tab {
     }
 
     fn toggle_bookmark(&mut self) {
+        self.toggle_bookmark_at(self.current_line());
+    }
+
+    fn toggle_bookmark_at(&mut self, line: LineNo) {
         if self.file.is_none() {
             return;
         }
-        let line = self.current_line();
         let on = self.bookmarks.toggle(line);
         self.status = format!("Bookmark {} line {}", if on { "added on" } else { "removed from" }, line + 1);
         self.save_bookmarks();
@@ -254,6 +287,20 @@ impl Tab {
     fn save_bookmarks(&mut self) {
         if let Err(e) = self.bookmarks.save_for(&self.path) {
             self.status = format!("Could not save bookmarks: {e}");
+        }
+    }
+
+    /// Status messages and context-menu actions from a log view.
+    fn view_output(&mut self, out: &ViewOutput, line_of_row: impl Fn(u64) -> LineNo) {
+        if let Some((n, cut)) = out.copied {
+            self.status = if cut {
+                format!("Copied the first {n} lines (copy is limited to {n} lines)")
+            } else {
+                format!("Copied {n} line{}", if n == 1 { "" } else { "s" })
+            };
+        }
+        if let Some(row) = out.toggle_bookmark {
+            self.toggle_bookmark_at(line_of_row(row));
         }
     }
 
@@ -309,9 +356,35 @@ impl Tab {
         }
     }
 
-    fn filter_panel(&mut self, ui: &mut egui::Ui, file: &TextFile, focus_search: &mut bool) {
+    /// Returns the filter that was searched for, if a search started.
+    fn filter_panel(
+        &mut self,
+        ui: &mut egui::Ui,
+        file: &TextFile,
+        focus_search: &mut bool,
+        history: &SearchHistory,
+    ) -> Option<(Mode, String)> {
+        let mut searched = None;
         ui.horizontal(|ui| {
             let mut go = false;
+            ui.add_enabled_ui(!history.is_empty(), |ui| {
+                ui.menu_button("🕘", |ui| {
+                    egui::ScrollArea::vertical().max_height(400.0).show(ui, |ui| {
+                        for (tag, pattern) in history.iter() {
+                            let Some(mode) = Mode::from_tag(tag) else { continue };
+                            let label = egui::RichText::new(format!("{tag:<5}  {pattern}")).monospace();
+                            if ui.add(egui::Button::new(label).wrap_mode(egui::TextWrapMode::Truncate)).clicked() {
+                                self.mode = mode;
+                                self.pattern = pattern.to_owned();
+                                go = true;
+                                ui.close();
+                            }
+                        }
+                    });
+                })
+                .response
+                .on_hover_text("Recent filters");
+            });
             go |= ui.selectable_value(&mut self.mode, Mode::Regex, "Regex").changed();
             go |= ui
                 .selectable_value(&mut self.mode, Mode::Query, "Query")
@@ -338,8 +411,8 @@ impl Tab {
                 go |= ui.checkbox(&mut self.options.invert, "Invert").changed();
             }
             go |= ui.button("Search").clicked();
-            if go {
-                self.start_search(ui.ctx());
+            if go && self.start_search(ui.ctx()) {
+                searched = Some((self.mode, self.pattern.clone()));
             }
         });
         ui.add_space(2.0);
@@ -351,8 +424,9 @@ impl Tab {
                 res.lines.len() as u64,
                 &|row| res.lines[row as usize],
                 file,
-                &Highlight { highlighter: self.highlighter.as_deref(), bookmarks: Some(&self.bookmarks), tint: None },
+                &Highlight { highlighter: self.highlighter.as_deref(), bookmarks: Some(&self.bookmarks) },
             );
+            self.view_output(&out, |row| res.lines[row as usize]);
             // Selecting in the filter view moves the main view.
             let picked = out.clicked.or(if out.has_focus { self.filter_view.selected } else { None });
             if let Some(row) = picked {
@@ -366,22 +440,20 @@ impl Tab {
             // Fill the pane: panels remember their content size.
             ui.allocate_space(ui.available_size());
         }
+        searched
     }
 
     fn main_panel(&mut self, ui: &mut egui::Ui, file: &TextFile) {
-        log_view(
+        let out = log_view(
             ui,
             "main",
             &mut self.main_view,
             file.line_count(),
             &|row| row,
             file,
-            &Highlight {
-                highlighter: self.highlighter.as_deref(),
-                bookmarks: Some(&self.bookmarks),
-                tint: self.result.as_deref(),
-            },
+            &Highlight { highlighter: self.highlighter.as_deref(), bookmarks: Some(&self.bookmarks) },
         );
+        self.view_output(&out, |row| row);
     }
 }
 
@@ -390,7 +462,9 @@ struct App {
     tabs: Vec<Tab>,
     active: usize,
     show_bookmarks: bool,
-    goto: String,
+    /// Text of the Ctrl+G dialog while it is open.
+    goto: Option<String>,
+    history: SearchHistory,
     /// Shown when no tab is open (e.g. why the last open failed).
     status: String,
     focus_search: bool,
@@ -405,7 +479,41 @@ fn same_file(a: &Path, b: &Path) -> bool {
     }
 }
 
+/// Per-user config directory for nerka, if one can be determined.
+fn config_dir() -> Option<PathBuf> {
+    let base = if cfg!(windows) {
+        std::env::var_os("APPDATA").map(PathBuf::from)
+    } else {
+        std::env::var_os("XDG_CONFIG_HOME")
+            .map(PathBuf::from)
+            .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))
+    };
+    base.map(|b| b.join("nerka"))
+}
+
+fn history_path() -> Option<PathBuf> {
+    config_dir().map(|d| d.join("history"))
+}
+
 impl App {
+    fn load_history(&mut self) {
+        let Some(path) = history_path() else { return };
+        match SearchHistory::load(&path) {
+            Ok(h) => self.history = h,
+            Err(e) => self.status = format!("Could not read search history: {e}"),
+        }
+    }
+
+    fn record_search(&mut self, mode: Mode, pattern: &str) {
+        if self.history.push(mode.tag(), pattern)
+            && let Some(path) = history_path()
+            && let Err(e) = self.history.save(&path)
+            && let Some(t) = self.tabs.get_mut(self.active)
+        {
+            t.status = format!("Could not save search history: {e}");
+        }
+    }
+
     fn tab(&mut self) -> Option<&mut Tab> {
         self.tabs.get_mut(self.active)
     }
@@ -478,6 +586,9 @@ impl App {
         if shortcut(Modifiers::COMMAND, Key::F) {
             self.focus_search = true;
         }
+        if (shortcut(Modifiers::COMMAND, Key::G) || shortcut(Modifiers::COMMAND, Key::L)) && !self.tabs.is_empty() {
+            self.goto = Some(String::new());
+        }
         if shortcut(Modifiers::COMMAND, Key::W) {
             self.close(self.active);
         }
@@ -490,6 +601,7 @@ impl App {
         }
         // Single-key commands (klogg style) only when not typing in a field.
         if !ctx.egui_wants_keyboard_input()
+            && self.goto.is_none()
             && let Some(tab) = self.tab()
         {
             let (shift, n, m, b) =
@@ -559,6 +671,31 @@ impl App {
         }
     }
 
+    /// Ctrl+G: modal "go to line" box for the active tab.
+    fn goto_dialog(&mut self, ctx: &egui::Context) {
+        let Some(text) = &mut self.goto else { return };
+        let lines = self.tabs.get(self.active).map_or(0, |t| t.total_lines());
+        let mut jump = None;
+        let modal = egui::Modal::new(egui::Id::unique("goto")).show(ctx, |ui| {
+            ui.label(format!("Go to line (1 – {lines}):"));
+            ui.add(egui::TextEdit::singleline(text).desired_width(160.0)).request_focus();
+            if ui.input(|i| i.key_pressed(Key::Enter)) {
+                jump = Some(text.trim().parse::<u64>().ok());
+            }
+        });
+        match jump {
+            Some(Some(n)) => {
+                if let Some(t) = self.tabs.get_mut(self.active) {
+                    t.goto_line(n.saturating_sub(1));
+                }
+                self.goto = None;
+            }
+            Some(None) => self.goto = None,
+            None if modal.should_close() => self.goto = None,
+            None => {}
+        }
+    }
+
     fn update_title(&mut self, ctx: &egui::Context) {
         let title = match self.tabs.get(self.active) {
             Some(t) => format!("nerka — {}", t.path.display()),
@@ -577,6 +714,7 @@ impl eframe::App for App {
         self.poll_jobs(&ctx);
         self.handle_input(&ctx);
         self.update_title(&ctx);
+        self.goto_dialog(&ctx);
 
         egui::Panel::top("toolbar").show(ui, |ui| {
             ui.horizontal(|ui| {
@@ -584,18 +722,11 @@ impl eframe::App for App {
                     self.pick_files(&ctx);
                 }
                 ui.separator();
-                ui.label("Go to line:");
-                let r = ui.add(egui::TextEdit::singleline(&mut self.goto).desired_width(90.0));
-                if r.lost_focus()
-                    && ui.input(|i| i.key_pressed(Key::Enter))
-                    && let Ok(n) = self.goto.trim().parse::<u64>()
-                    && let Some(tab) = self.tabs.get_mut(self.active)
-                {
-                    tab.goto_line(n.saturating_sub(1));
-                }
-                ui.separator();
                 let marks = self.tabs.get(self.active).map_or(0, |t| t.bookmarks.len());
-                ui.toggle_value(&mut self.show_bookmarks, format!("🔖 Bookmarks ({marks})"));
+                ui.toggle_value(&mut self.show_bookmarks, format!("🔖 Bookmarks ({marks})")).on_hover_text(
+                    "Mark lines to come back to: m (or right-click) toggles a bookmark on the current line, \
+                     b / Shift+B jump to the next / previous one. Saved next to the log as <file>.nerka-marks.",
+                );
                 if let Some(f) = self.tabs.get(self.active).and_then(|t| t.file.as_ref()) {
                     ui.separator();
                     ui.label(format!("{} lines · {:.1} MiB", f.line_count(), f.size_bytes() as f64 / 1048576.0));
@@ -650,9 +781,15 @@ impl eframe::App for App {
                 tab.bookmarks_panel(ui, &file);
             });
         }
-        egui::Panel::bottom("filter").resizable(true).default_size(260.0).min_size(120.0).show(ui, |ui| {
-            tab.filter_panel(ui, &file, &mut focus_search);
-        });
+        let searched = egui::Panel::bottom("filter")
+            .resizable(true)
+            .default_size(260.0)
+            .min_size(120.0)
+            .show(ui, |ui| tab.filter_panel(ui, &file, &mut focus_search, &self.history))
+            .inner;
         egui::CentralPanel::default().show(ui, |ui| tab.main_panel(ui, &file));
+        if let Some((mode, pattern)) = searched {
+            self.record_search(mode, &pattern);
+        }
     }
 }
