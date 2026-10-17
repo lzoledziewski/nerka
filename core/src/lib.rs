@@ -5,7 +5,8 @@
 //! `doc/nerka_architecture_implementation_spec_v_0.md` §10):
 //!
 //! * [`input`] — [`LogSource`]: random access to lines whatever the on-disk
-//!   format (plain text today; PCAP, DLT, stdin later).
+//!   format (plain text and DLT today; PCAP, stdin later); [`open`] picks
+//!   the reader from the file's content.
 //! * [`engine`] — [`LineIndex`] (parallel line indexing) and [`search`]:
 //!   filtering that yields the set of matching lines.
 //! * [`dsl`] — NFD, the filter language (`level >= ERROR AND raw ~ /SSL/`).
@@ -26,8 +27,9 @@ pub use engine::index::LineIndex;
 pub use engine::search::{Filter, Highlighter, Matcher, MatcherOptions, SearchResult, search};
 pub use event::{Event, FieldDef, FieldId, FieldKind, FieldValue, Level};
 pub use history::SearchHistory;
-pub use input::LogSource;
+pub use input::dlt::DltFile;
 pub use input::text::TextFile;
+pub use input::{LogSource, open};
 
 /// Line numbers are 0-based internally; UIs add 1 for display.
 pub type LineNo = u64;

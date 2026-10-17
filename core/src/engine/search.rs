@@ -240,7 +240,7 @@ fn scan_lines(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::input::mem::{MemSource, Row};
     use crate::{Level, TextFile};

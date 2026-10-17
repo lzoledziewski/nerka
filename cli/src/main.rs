@@ -1,6 +1,6 @@
 //! `nerka` — command line front end to the Nerka engine.
 //!
-//!     nerka open   app.log
+//!     nerka open   app.log          (plain text or DLT, picked by content)
 //!     nerka search -i 'error|timeout' app.log
 //!     nerka filter 'level >= ERROR AND raw ~ /SSL|CERT/' app.log
 //!     nerka lines  app.log 1000 1050
@@ -8,7 +8,7 @@
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use nerka_core::{Bookmarks, FieldDef, Filter, LogSource, Matcher, MatcherOptions, Progress, Query, TextFile, search};
+use nerka_core::{Bookmarks, FieldDef, Filter, LogSource, Matcher, MatcherOptions, Progress, Query, search};
 use std::io::{BufWriter, Write};
 use std::path::PathBuf;
 use std::time::Instant;
@@ -78,7 +78,7 @@ fn run_filter(
     let (f, t_index) = open(file)?;
     let filter = build(f.schema())?;
     let t = Instant::now();
-    let res = search(&f, &filter, &Progress::new())?;
+    let res = search(&*f, &filter, &Progress::new())?;
     let t_search = t.elapsed();
     if o.count {
         writeln!(out, "{}", res.lines.len())?;
@@ -103,9 +103,9 @@ fn run_filter(
     Ok(())
 }
 
-fn open(path: &PathBuf) -> Result<(TextFile, std::time::Duration)> {
+fn open(path: &PathBuf) -> Result<(Box<dyn LogSource>, std::time::Duration)> {
     let t = Instant::now();
-    let f = TextFile::open(path, &Progress::new()).with_context(|| format!("opening {}", path.display()))?;
+    let f = nerka_core::open(path, &Progress::new()).with_context(|| format!("opening {}", path.display()))?;
     Ok((f, t.elapsed()))
 }
 
@@ -138,7 +138,11 @@ fn run() -> Result<()> {
             writeln!(out, "file:        {}", f.name())?;
             writeln!(out, "size:        {} bytes", f.size_bytes())?;
             writeln!(out, "lines:       {}", f.line_count())?;
-            writeln!(out, "index mem:   {} KiB", f.index().memory_bytes() / 1024)?;
+            if !f.schema().is_empty() {
+                let names: Vec<&str> = f.schema().iter().map(|d| d.name).collect();
+                writeln!(out, "fields:      {}", names.join(", "))?;
+            }
+            writeln!(out, "index mem:   {} KiB", f.index_memory_bytes() / 1024)?;
             writeln!(out, "index time:  {took:.2?} ({:.0} MiB/s)", mib_per_s(f.size_bytes(), took))?;
         }
         Cmd::Search { pattern, file, ignore_case, fixed, invert, out: o } => {
@@ -160,7 +164,7 @@ fn run() -> Result<()> {
         }
         Cmd::Marks { file } => {
             let marks = Bookmarks::load_for(&file)?;
-            let f = TextFile::open(&file, &Progress::new())?;
+            let (f, _) = open(&file)?;
             for (l, note) in marks.iter() {
                 let text = f.line_text(l).unwrap_or_default();
                 if note.is_empty() {

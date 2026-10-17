@@ -26,7 +26,7 @@ pub enum Level {
 impl Level {
     pub fn parse(s: &str) -> Option<Level> {
         Some(match s.to_ascii_uppercase().as_str() {
-            "TRACE" | "T" => Level::Trace,
+            "TRACE" | "T" | "VERBOSE" | "V" => Level::Trace,
             "DEBUG" | "D" => Level::Debug,
             "INFO" | "I" => Level::Info,
             "NOTICE" | "N" => Level::Notice,

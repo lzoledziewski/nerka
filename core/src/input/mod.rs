@@ -4,9 +4,56 @@
 //! Binary formats decode records into displayable text lines; the search
 //! engine and UIs only ever see this trait.
 
-use crate::LineNo;
+pub mod dlt;
+
 use crate::event::{FieldDef, FieldId, FieldValue, Level};
+use crate::{LineNo, Progress, Result};
+use memmap2::Mmap;
 use std::borrow::Cow;
+use std::fs::File;
+use std::io::Read;
+use std::path::Path;
+
+/// Open `path` with the reader its content calls for: DLT if it starts
+/// with a DLT storage header, plain text otherwise.
+pub fn open(path: impl AsRef<Path>, progress: &Progress) -> Result<Box<dyn LogSource>> {
+    let path = path.as_ref();
+    let mut head = [0u8; 4];
+    let n = File::open(path)?.read(&mut head)?;
+    Ok(if dlt::is_dlt(&head[..n]) {
+        Box::new(dlt::DltFile::open(path, progress)?)
+    } else {
+        Box::new(text::TextFile::open(path, progress)?)
+    })
+}
+
+/// File contents: a read-only mapping, or owned bytes (tests, empty files).
+pub(crate) enum Bytes {
+    Mapped(Mmap),
+    Owned(Vec<u8>),
+}
+
+impl Bytes {
+    /// Map `path` read-only. If another process truncates the file while
+    /// it is mapped, reads may fault: the same trade-off klogg and ripgrep
+    /// make for speed. Follow/tail mode will remap on growth (see roadmap).
+    pub(crate) fn map(path: &Path) -> Result<Bytes> {
+        let file = File::open(path)?;
+        Ok(if file.metadata()?.len() == 0 {
+            Bytes::Owned(Vec::new())
+        } else {
+            // SAFETY: read-only mapping; see doc comment above.
+            Bytes::Mapped(unsafe { Mmap::map(&file)? })
+        })
+    }
+
+    pub(crate) fn bytes(&self) -> &[u8] {
+        match self {
+            Bytes::Mapped(m) => m,
+            Bytes::Owned(v) => v,
+        }
+    }
+}
 
 pub trait LogSource: Send + Sync {
     /// Human readable name (usually the file path).
@@ -24,6 +71,16 @@ pub trait LogSource: Send + Sync {
             Cow::Borrowed(b) => String::from_utf8_lossy(b),
             Cow::Owned(v) => Cow::Owned(String::from_utf8_lossy(&v).into_owned()),
         })
+    }
+
+    /// Size of the underlying file or buffer.
+    fn size_bytes(&self) -> u64 {
+        0
+    }
+
+    /// Memory used by the source's line or message index.
+    fn index_memory_bytes(&self) -> usize {
+        0
     }
 
     /// Fields this source supplies for every line (DLT: `ecu`, `apid`, …).

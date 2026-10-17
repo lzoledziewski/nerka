@@ -44,7 +44,16 @@ Decided for DLT: own zero-copy parser in `core/src/input/dlt/` (no crate, no dep
 
 Done (step 1): `LogSource::line_bytes` returns `Cow`; sources can supply a field schema, per-line field values and levels; `Event` is lazy over `(source, line)`, so header-only filters never render a line; the DSL accepts source fields (`apid == NAV`, `mcnt >= 0x10`), resolved by `Query::bind` / `compile_for`. Text-log benchmark unchanged (1 GiB: `search ERROR` ~30 ms, `level >= ERROR` ~31 ms).
 
-Next: DLT writer + parser with the columnar header index, then the table view.
+Done (step 2): own DLT reader in `core/src/input/dlt/` (no new dependencies). `nerka_core::open` picks DLT or text by content; the CLI uses it, the **GUI still opens everything as text** (switching it comes with the table view).
+- Index = one `u64` offset per message (~8 B/msg). Headers are read in place, so header-only filters never decode payloads.
+- Fields: `ecu apid ctid type mcnt tmsp seid mid`; `level` comes from the header (`VERBOSE` is accepted as an alias for `TRACE`).
+- Line = tab-separated columns `time tmsp ecu apid ctid type payload` (time is the storage time in **UTC**; `type` is the level for log messages, e.g. `error`).
+- Payload: verbose bool/int/float/string/raw/trace info, with VARI names and units; arrays, structs and fixed-point fall back to `<undecoded> hex`. Non-verbose: `[id] hex`. Control: service name, status, version string.
+- Corrupt data: resync on the next `DLT`, skipped bytes counted. Files without storage headers aren't supported.
+- `writer` module + `examples/gen_dlt.rs` produce synthetic files.
+- 1 GiB synthetic DLT (12.5M messages): index 280 ms (single-threaded), 95 MiB; `ecu == ECU1` 37 ms, `apid == NAV AND level >= WARN` 29 ms, `level >= ERROR` 32 ms, `raw ~ /timeout/` 288 ms (renders every line), `apid == NAV AND raw ~ /timeout/` 60 ms.
+
+Next: the table view in the GUI (aligned, resizable columns; GUI opens files via `nerka_core::open`).
 
 ## Decisions pending with the owner
 

@@ -3,4 +3,5 @@
 *.pdb
 # local test logs and bookmark sidecars
 *.log
+*.dlt
 *.nerka-marks

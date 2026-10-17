@@ -255,7 +255,7 @@ impl Parser<'_> {
                 };
                 let Some(level) = Level::parse(&name) else {
                     return err(
-                        format!("unknown level '{name}' (TRACE, DEBUG, INFO, NOTICE, WARN, ERROR, FATAL)"),
+                        format!("unknown level '{name}' (TRACE or VERBOSE, DEBUG, INFO, NOTICE, WARN, ERROR, FATAL)"),
                         val_pos,
                     );
                 };
