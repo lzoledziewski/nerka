@@ -8,7 +8,7 @@
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use nerka_core::{Bookmarks, Filter, LogSource, Matcher, MatcherOptions, Progress, Query, TextFile, search};
+use nerka_core::{Bookmarks, FieldDef, Filter, LogSource, Matcher, MatcherOptions, Progress, Query, TextFile, search};
 use std::io::{BufWriter, Write};
 use std::path::PathBuf;
 use std::time::Instant;
@@ -67,10 +67,18 @@ struct OutputArgs {
     stats: bool,
 }
 
-fn run_filter(file: &PathBuf, filter: &Filter, o: &OutputArgs, out: &mut impl Write) -> Result<()> {
+/// `build` gets the opened source's field schema, so query errors about
+/// unknown fields point into the query like syntax errors do.
+fn run_filter(
+    file: &PathBuf,
+    build: impl FnOnce(&[FieldDef]) -> Result<Filter>,
+    o: &OutputArgs,
+    out: &mut impl Write,
+) -> Result<()> {
     let (f, t_index) = open(file)?;
+    let filter = build(f.schema())?;
     let t = Instant::now();
-    let res = search(&f, filter, &Progress::new())?;
+    let res = search(&f, &filter, &Progress::new())?;
     let t_search = t.elapsed();
     if o.count {
         writeln!(out, "{}", res.lines.len())?;
@@ -79,7 +87,7 @@ fn run_filter(file: &PathBuf, filter: &Filter, o: &OutputArgs, out: &mut impl Wr
             if !o.no_line_numbers {
                 write!(out, "{}:", l + 1)?;
             }
-            out.write_all(f.line_bytes(l).unwrap_or_default())?;
+            out.write_all(&f.line_bytes(l).unwrap_or_default())?;
             out.write_all(b"\n")?;
         }
     }
@@ -136,13 +144,19 @@ fn run() -> Result<()> {
         Cmd::Search { pattern, file, ignore_case, fixed, invert, out: o } => {
             let m =
                 Matcher::new(&pattern, MatcherOptions { case_insensitive: ignore_case, fixed_string: fixed, invert })?;
-            run_filter(&file, &Filter::Regex(m), &o, &mut out)?;
+            run_filter(&file, |_| Ok(Filter::Regex(m)), &o, &mut out)?;
         }
         Cmd::Filter { query, file, out: o } => {
-            let q = Query::compile(&query).map_err(|e| {
-                anyhow::anyhow!("{e}\n  {query}\n  {}^", " ".repeat(query[..e.pos.min(query.len())].chars().count()))
-            })?;
-            run_filter(&file, &Filter::Query(q), &o, &mut out)?;
+            let build = |schema: &[FieldDef]| {
+                let q = Query::compile_for(&query, schema).map_err(|e| {
+                    anyhow::anyhow!(
+                        "{e}\n  {query}\n  {}^",
+                        " ".repeat(query[..e.pos.min(query.len())].chars().count())
+                    )
+                })?;
+                Ok(Filter::Query(q))
+            };
+            run_filter(&file, build, &o, &mut out)?;
         }
         Cmd::Marks { file } => {
             let marks = Bookmarks::load_for(&file)?;
@@ -160,7 +174,7 @@ fn run() -> Result<()> {
             let (f, _) = open(&file)?;
             let last = to.min(f.line_count());
             for l in from.max(1)..=last {
-                out.write_all(f.line_bytes(l - 1).unwrap_or_default())?;
+                out.write_all(&f.line_bytes(l - 1).unwrap_or_default())?;
                 out.write_all(b"\n")?;
             }
         }

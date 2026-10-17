@@ -2,7 +2,7 @@
 
 Snapshot of where the project stands. Update this file whenever the state changes.
 
-_Last update: 2026-10-17 (first Windows session: GUI feedback round from the owner)._
+_Last update: 2026-10-18 (DLT import started: source-supplied fields)._
 
 ## State
 
@@ -38,7 +38,13 @@ erka\prefs` (or `$XDG_CONFIG_HOME/nerka/prefs`) and becomes the default for new 
 
 ## Current focus
 
-**klogg parity first** (owner, 2026-10-17). DLT, MF4, pcap and SOME/IP signals are designed but parked: see `sources-and-signals.md`. Don't implement them until the owner asks.
+**DLT import** (owner, 2026-10-18), then a search manager / highlighters of the owner's own design (not a klogg clone; don't start it yet). Design: `sources-and-signals.md`.
+
+Decided for DLT: own zero-copy parser in `core/src/input/dlt/` (no crate, no dependency); synthetic test data only (a DLT writer + `gen_dlt` example); shown as a **table with aligned, resizable columns** in our own view (no column sorting; each row is still one tab-separated text line, so search, highlight and copy keep working).
+
+Done (step 1): `LogSource::line_bytes` returns `Cow`; sources can supply a field schema, per-line field values and levels; `Event` is lazy over `(source, line)`, so header-only filters never render a line; the DSL accepts source fields (`apid == NAV`, `mcnt >= 0x10`), resolved by `Query::bind` / `compile_for`. Text-log benchmark unchanged (1 GiB: `search ERROR` ~30 ms, `level >= ERROR` ~31 ms).
+
+Next: DLT writer + parser with the columnar header index, then the table view.
 
 ## Decisions pending with the owner
 

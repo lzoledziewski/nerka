@@ -176,7 +176,10 @@ impl Tab {
                 let detail = std::error::Error::source(&e).map(|s| s.to_string()).unwrap_or_default();
                 format!("Invalid regex: {}", detail.lines().last().unwrap_or(""))
             }),
-            Mode::Query => Query::compile(&self.pattern).map(Filter::Query).map_err(|e| format!("Query error: {e}")),
+            Mode::Query => {
+                let schema = self.file.as_ref().map(|f| f.schema()).unwrap_or_default();
+                Query::compile_for(&self.pattern, schema).map(Filter::Query).map_err(|e| format!("Query error: {e}"))
+            }
         }
     }
 

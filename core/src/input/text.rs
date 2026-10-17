@@ -2,6 +2,7 @@
 
 use crate::{LineIndex, LineNo, LogSource, Progress, Result};
 use memmap2::Mmap;
+use std::borrow::Cow;
 use std::fs::File;
 use std::path::{Path, PathBuf};
 
@@ -74,9 +75,9 @@ impl LogSource for TextFile {
         self.index.line_count()
     }
 
-    fn line_bytes(&self, line: LineNo) -> Option<&[u8]> {
+    fn line_bytes(&self, line: LineNo) -> Option<Cow<'_, [u8]>> {
         let buf = self.data.bytes();
-        self.index.line_range(buf, line).map(|r| &buf[r])
+        self.index.line_range(buf, line).map(|r| Cow::Borrowed(&buf[r]))
     }
 
     fn contiguous(&self) -> Option<&[u8]> {

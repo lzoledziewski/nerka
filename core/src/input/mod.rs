@@ -5,6 +5,7 @@
 //! engine and UIs only ever see this trait.
 
 use crate::LineNo;
+use crate::event::{FieldDef, FieldId, FieldValue, Level};
 use std::borrow::Cow;
 
 pub trait LogSource: Send + Sync {
@@ -13,12 +14,36 @@ pub trait LogSource: Send + Sync {
 
     fn line_count(&self) -> LineNo;
 
-    /// Raw bytes of a line without its terminator.
-    fn line_bytes(&self, line: LineNo) -> Option<&[u8]>;
+    /// Bytes of a line without its terminator. Text sources borrow them
+    /// from the file; decoded formats render them.
+    fn line_bytes(&self, line: LineNo) -> Option<Cow<'_, [u8]>>;
 
     /// Line as text; invalid UTF-8 is replaced with U+FFFD.
     fn line_text(&self, line: LineNo) -> Option<Cow<'_, str>> {
-        self.line_bytes(line).map(String::from_utf8_lossy)
+        self.line_bytes(line).map(|b| match b {
+            Cow::Borrowed(b) => String::from_utf8_lossy(b),
+            Cow::Owned(v) => Cow::Owned(String::from_utf8_lossy(&v).into_owned()),
+        })
+    }
+
+    /// Fields this source supplies for every line (DLT: `ecu`, `apid`, …).
+    /// Queries refer to them by name; plain text has none.
+    fn schema(&self) -> &[FieldDef] {
+        &[]
+    }
+
+    /// Value of field `id` (an index into [`Self::schema`]) for `line`.
+    /// `None` when the line has no value for it. Must not render the line:
+    /// header-only filters rely on this being cheap.
+    fn field(&self, _line: LineNo, _id: FieldId) -> Option<FieldValue<'_>> {
+        None
+    }
+
+    /// The level the format itself records for `line`. The outer `None`
+    /// means the source doesn't supply levels, so they're detected from
+    /// the text instead.
+    fn supplied_level(&self, _line: LineNo) -> Option<Option<Level>> {
+        None
     }
 
     /// Contiguous byte buffer holding all lines separated by `\n`, if the
@@ -40,3 +65,6 @@ pub trait LogSource: Send + Sync {
     }
 }
 pub mod text;
+
+#[cfg(test)]
+pub(crate) mod mem;

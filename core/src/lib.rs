@@ -24,7 +24,7 @@ pub use bookmarks::Bookmarks;
 pub use dsl::{DslError, Query};
 pub use engine::index::LineIndex;
 pub use engine::search::{Filter, Highlighter, Matcher, MatcherOptions, SearchResult, search};
-pub use event::Level;
+pub use event::{Event, FieldDef, FieldId, FieldKind, FieldValue, Level};
 pub use history::SearchHistory;
 pub use input::LogSource;
 pub use input::text::TextFile;

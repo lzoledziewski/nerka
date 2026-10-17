@@ -10,8 +10,11 @@
 //!
 //! Slow path — everything else (inverted regex, `level >= ERROR` alone,
 //! decoded formats): every line is tested individually, still in parallel.
+//! Lines are evaluated as lazy [`Event`]s, so conditions on source-supplied
+//! fields (`apid == "NAV"`) never fetch or render the line text.
 
-use crate::dsl::Query;
+use crate::dsl::{DslError, Query};
+use crate::event::{Event, FieldDef};
 use crate::{LineNo, LogSource, Progress, Result};
 use rayon::prelude::*;
 use regex::bytes::{Regex, RegexBuilder};
@@ -66,11 +69,20 @@ pub enum Filter {
 }
 
 impl Filter {
-    pub fn matches(&self, line: &[u8]) -> bool {
+    pub fn matches(&self, ev: &mut Event<'_>) -> bool {
         match self {
-            Filter::Regex(m) => m.is_line_match(line),
-            Filter::Query(q) => q.matches(line),
+            Filter::Regex(m) => m.is_line_match(ev.raw()),
+            Filter::Query(q) => q.matches_event(ev),
         }
+    }
+
+    /// Resolve query field names against a source's schema (see
+    /// [`Query::bind`]). Plain regex filters need no binding.
+    pub fn bind(&self, schema: &[FieldDef]) -> std::result::Result<Filter, DslError> {
+        Ok(match self {
+            Filter::Regex(m) => Filter::Regex(m.clone()),
+            Filter::Query(q) => Filter::Query(q.clone().bind(schema)?),
+        })
     }
 
     fn prefilter(&self) -> Option<&Regex> {
@@ -133,6 +145,7 @@ impl SearchResult {
 }
 
 pub fn search(source: &dyn LogSource, filter: &Filter, progress: &Progress) -> Result<SearchResult> {
+    let filter = &filter.bind(source.schema())?;
     let lines = match (source.contiguous(), filter.prefilter()) {
         (Some(buf), Some(pre)) => {
             // A plain regex only needs re-checking for hits that reach past
@@ -150,7 +163,7 @@ fn scan_buffer(
     buf: &[u8],
     pre: &Regex,
     always_verify: bool,
-    verify: &(dyn Fn(&[u8]) -> bool + Sync),
+    verify: &(dyn Fn(&mut Event<'_>) -> bool + Sync),
     progress: &Progress,
 ) -> Result<Vec<LineNo>> {
     let total_lines = source.line_count();
@@ -186,7 +199,8 @@ fn scan_buffer(
                 let content_end = source.line_start(line) as usize + content.len();
                 // `a\s+b` or `\n` can reach into the terminator or next line;
                 // such a hit only counts if the line matches on its own.
-                let ok = if always_verify || m.end() > content_end { verify(content) } else { true };
+                let need_verify = always_verify || m.end() > content_end;
+                let ok = !need_verify || verify(&mut Event::with_raw(source, line, &content));
                 if ok {
                     out.push(line);
                 }
@@ -202,7 +216,7 @@ fn scan_buffer(
 
 fn scan_lines(
     source: &dyn LogSource,
-    pred: &(dyn Fn(&[u8]) -> bool + Sync),
+    pred: &(dyn Fn(&mut Event<'_>) -> bool + Sync),
     progress: &Progress,
 ) -> Result<Vec<LineNo>> {
     let n = source.line_count();
@@ -217,7 +231,7 @@ fn scan_lines(
                 return Err(crate::Error::Cancelled);
             }
             let len = range.end - range.start;
-            let v = range.filter(|&l| source.line_bytes(l).is_some_and(pred)).collect();
+            let v = range.filter(|&l| pred(&mut Event::from_source(source, l))).collect();
             progress.add(len);
             Ok(v)
         })
@@ -228,19 +242,34 @@ fn scan_lines(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::TextFile;
+    use crate::input::mem::{MemSource, Row};
+    use crate::{Level, TextFile};
 
     fn regex_filter(pat: &str, opts: MatcherOptions) -> Filter {
         Filter::Regex(Matcher::new(pat, opts).unwrap())
     }
 
+    /// Naive reference: render every line and evaluate it on its own,
+    /// sequentially, with fields read straight from the source.
+    pub(crate) fn naive(source: &dyn LogSource, f: &Filter) -> Vec<LineNo> {
+        let f = f.bind(source.schema()).unwrap();
+        (0..source.line_count())
+            .filter(|&l| {
+                let raw = source.line_bytes(l).unwrap();
+                f.matches(&mut Event::with_raw(source, l, &raw))
+            })
+            .collect()
+    }
+
     /// Run through the engine and cross-check against naive per-line eval.
-    fn run_filter(text: &str, f: &Filter) -> Vec<LineNo> {
-        let src = TextFile::from_bytes("t", text.as_bytes().to_vec());
-        let fast = search(&src, f, &Progress::new()).unwrap().lines;
-        let slow = scan_lines(&src, &|l| f.matches(l), &Progress::new()).unwrap();
-        assert_eq!(fast, slow, "fast and slow paths disagree");
+    pub(crate) fn run_on(source: &dyn LogSource, f: &Filter) -> Vec<LineNo> {
+        let fast = search(source, f, &Progress::new()).unwrap().lines;
+        assert_eq!(fast, naive(source, f), "fast and naive paths disagree");
         fast
+    }
+
+    fn run_filter(text: &str, f: &Filter) -> Vec<LineNo> {
+        run_on(&TextFile::from_bytes("t", text.as_bytes().to_vec()), f)
     }
 
     fn run(text: &str, pat: &str, opts: MatcherOptions) -> Vec<LineNo> {
@@ -319,5 +348,70 @@ mod tests {
                 .spans(b"x")
                 .is_empty()
         );
+    }
+
+    fn mem() -> MemSource {
+        let row = |text, apid, mcnt, level| Row { text, apid, mcnt, level };
+        MemSource::new(vec![
+            row("nav start", Some("NAV"), Some(1), Some(Level::Info)),
+            row("[ERROR] text says error", Some("NAV"), Some(2), Some(Level::Debug)),
+            row("disk full", Some("STOR"), Some(3), Some(Level::Error)),
+            row("no header", None, None, None),
+            row("[WARN] nav slow", Some("NAV"), Some(0x10), Some(Level::Warn)),
+        ])
+    }
+
+    fn q(s: &str) -> Filter {
+        Filter::Query(Query::compile(s).unwrap())
+    }
+
+    #[test]
+    fn source_fields() {
+        let src = mem();
+        assert_eq!(run_on(&src, &q(r#"apid == "NAV""#)), [0, 1, 4]);
+        assert_eq!(run_on(&src, &q("apid == NAV")), [0, 1, 4]);
+        // Lines without a value only satisfy != and !~.
+        assert_eq!(run_on(&src, &q("apid != NAV")), [2, 3]);
+        assert_eq!(run_on(&src, &q("apid ~ /^ST/")), [2]);
+        assert_eq!(run_on(&src, &q("apid !~ /^ST/")), [0, 1, 3, 4]);
+        assert_eq!(run_on(&src, &q("mcnt >= 2 AND mcnt < 0x10")), [1, 2]);
+        assert_eq!(run_on(&src, &q("mcnt != 3")), [0, 1, 3, 4]);
+        assert_eq!(run_on(&src, &q("APID == NAV AND raw ~ /slow/")), [4]);
+        assert_eq!(run_on(&src, &q("apid == STOR OR /start/")), [0, 2]);
+    }
+
+    #[test]
+    fn supplied_level_wins_over_text() {
+        let src = mem();
+        // Line 1 says ERROR in its text but the source says DEBUG; line 3
+        // has no supplied level, so it gets none (no guessing from text).
+        assert_eq!(run_on(&src, &q("level >= ERROR")), [2]);
+        assert_eq!(run_on(&src, &q("level != INFO")), [1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn header_only_filter_renders_nothing() {
+        let src = mem();
+        let hits = search(&src, &q("apid == NAV AND level >= WARN AND mcnt > 1"), &Progress::new()).unwrap();
+        assert_eq!(hits.lines, [4]);
+        assert_eq!(src.renders.load(std::sync::atomic::Ordering::Relaxed), 0);
+        // A regex does need the text, but only for lines that pass the
+        // cheaper header conditions first.
+        search(&src, &q("raw ~ /nav/ AND apid == NAV AND level >= WARN"), &Progress::new()).unwrap();
+        assert_eq!(src.renders.load(std::sync::atomic::Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn regex_filter_on_rendered_source() {
+        assert_eq!(run_on(&mem(), &regex_filter("nav", Default::default())), [0, 4]);
+        let inv = MatcherOptions { invert: true, case_insensitive: true, ..Default::default() };
+        assert_eq!(run_on(&mem(), &regex_filter("nav", inv)), [1, 2, 3]);
+    }
+
+    #[test]
+    fn unknown_field_is_a_search_error() {
+        let text = TextFile::from_bytes("t", b"a\n".to_vec());
+        let e = search(&text, &q("apid == NAV"), &Progress::new()).unwrap_err();
+        assert!(matches!(e, crate::Error::Query(ref d) if d.msg.contains("unknown field 'apid'")), "{e:?}");
     }
 }

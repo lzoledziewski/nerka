@@ -4,6 +4,9 @@
 //! never lost. Fields are extracted lazily — only when a filter asks for
 //! them — so plain regex filtering pays nothing for normalization.
 
+use crate::{LineNo, LogSource};
+use std::borrow::Cow;
+
 /// How far into a line we look for a level token. Levels live in the
 /// prefix; scanning the whole message would mislabel lines that merely
 /// mention "ERROR".
@@ -87,19 +90,78 @@ pub fn detect_level(line: &[u8]) -> Option<Level> {
     None
 }
 
+/// Type of a source-supplied field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FieldKind {
+    /// Short byte string (DLT ECU / APID / CTID, …): `==`, `!=`, `~`, `!~`.
+    Str,
+    /// Unsigned number (counters, timestamps, ids): all comparisons.
+    U64,
+}
+
+/// One field a source supplies for every line, e.g. DLT's `apid`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FieldDef {
+    /// Lower-case name used in queries.
+    pub name: &'static str,
+    pub kind: FieldKind,
+}
+
+/// Index into [`crate::LogSource::schema`].
+pub type FieldId = usize;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FieldValue<'a> {
+    Str(&'a [u8]),
+    U64(u64),
+}
+
 /// Lazily-normalized view of one line, passed to filter evaluation.
+///
+/// Built over `(source, line)` so that conditions on source-supplied fields
+/// (and source-supplied levels) never fetch or render the line text.
 pub struct Event<'a> {
-    pub raw: &'a [u8],
+    source: Option<&'a dyn LogSource>,
+    line: LineNo,
+    raw: Option<Cow<'a, [u8]>>,
     level: Option<Option<Level>>,
 }
 
 impl<'a> Event<'a> {
+    /// A bare line without a source: no fields, level detected from text.
     pub fn new(raw: &'a [u8]) -> Self {
-        Self { raw, level: None }
+        Self { source: None, line: 0, raw: Some(Cow::Borrowed(raw)), level: None }
+    }
+
+    /// Line `line` of `source`; the text is fetched only when needed.
+    pub fn from_source(source: &'a dyn LogSource, line: LineNo) -> Self {
+        Self { source: Some(source), line, raw: None, level: None }
+    }
+
+    /// Like [`Self::from_source`] when the caller already holds the text.
+    pub fn with_raw(source: &'a dyn LogSource, line: LineNo, raw: &'a [u8]) -> Self {
+        Self { source: Some(source), line, raw: Some(Cow::Borrowed(raw)), level: None }
+    }
+
+    pub fn raw(&mut self) -> &[u8] {
+        let (source, line) = (self.source, self.line);
+        self.raw.get_or_insert_with(|| source.and_then(|s| s.line_bytes(line)).unwrap_or_default())
     }
 
     pub fn level(&mut self) -> Option<Level> {
-        *self.level.get_or_insert_with(|| detect_level(self.raw))
+        if let Some(l) = self.level {
+            return l;
+        }
+        let l = match self.source.and_then(|s| s.supplied_level(self.line)) {
+            Some(l) => l,
+            None => detect_level(self.raw()),
+        };
+        self.level = Some(l);
+        l
+    }
+
+    pub fn field(&self, id: FieldId) -> Option<FieldValue<'a>> {
+        self.source.and_then(|s| s.field(self.line, id))
     }
 }
 

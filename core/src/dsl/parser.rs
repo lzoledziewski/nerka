@@ -1,6 +1,6 @@
 //! Lexer + recursive-descent parser for NFD.
 
-use super::{CmpOp, Cond, DslError, Expr};
+use super::{CmpOp, Cond, DslError, Expr, FieldCond, FieldTest};
 use crate::event::Level;
 use regex::bytes::RegexBuilder;
 
@@ -261,10 +261,26 @@ impl Parser<'_> {
                 };
                 Ok(Expr::Cond(Cond::Level(c, level)))
             }
-            "timestamp" | "service" | "source" => {
-                err(format!("field '{field}' is not supported yet (v1 supports raw, level)"), field_pos)
+            _ => {
+                let test = match (op, val) {
+                    (OpTok::Match | OpTok::NotMatch, Tok::Regex { pat, ci }) => {
+                        FieldTest::Match(regex(&pat, ci, val_pos)?)
+                    }
+                    (OpTok::Match | OpTok::NotMatch, t) => {
+                        return err(format!("expected /regex/ but found {}", describe(&t)), val_pos);
+                    }
+                    (OpTok::Cmp(c), Tok::Word(w) | Tok::Str(w)) => FieldTest::Literal(c, w, val_pos),
+                    (OpTok::Cmp(_), t) => return err(format!("expected a value but found {}", describe(&t)), val_pos),
+                };
+                let e = Expr::Cond(Cond::Field(FieldCond {
+                    name: field.to_ascii_lowercase(),
+                    pos: field_pos,
+                    op_pos,
+                    id: None,
+                    test,
+                }));
+                Ok(if op == OpTok::NotMatch { Expr::Not(Box::new(e)) } else { e })
             }
-            _ => err(format!("unknown field '{field}' (v1 supports raw, level)"), field_pos),
         }
     }
 }

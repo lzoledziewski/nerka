@@ -16,19 +16,25 @@
 //!          | REGEX                      -- shorthand for  raw ~ REGEX
 //!          | STRING                     -- shorthand for  raw contains STRING
 //!          | FIELD OP VALUE
-//! FIELD   := raw | level
+//! FIELD   := raw | level | WORD         -- WORD: a field the source supplies
 //! OP      := == | != | >= | <= | > | < | ~ | !~
-//! VALUE   := REGEX | STRING | WORD
+//! VALUE   := REGEX | STRING | WORD      -- numbers are WORDs: 42, 0x2a
 //! REGEX   := /pattern/flags             -- flags: i (ignore case)
 //! STRING  := "text"                     -- \" and \\ escapes
 //! ```
 //!
-//! Keywords are case-insensitive. Evaluation reorders AND/OR operands so
+//! Source fields (DLT `ecu`, `apid`, …) are parsed generically and resolved
+//! by [`Query::bind`] against the source's schema, which also checks the
+//! operator and value against the field's kind: text fields take `==`,
+//! `!=`, `~`, `!~`; numeric fields take every comparison. A line without a
+//! value for a field only satisfies `!=` and `!~`.
+//!
+//! Keywords and field names are case-insensitive. Evaluation reorders AND/OR operands so
 //! cheap checks run before regexes (spec §3.5).
 
 mod parser;
 
-use crate::event::{Event, Level};
+use crate::event::{Event, FieldDef, FieldId, FieldKind, FieldValue, Level};
 use regex::bytes::Regex;
 
 pub use parser::parse;
@@ -64,6 +70,31 @@ pub enum Cond {
     RawEq(Vec<u8>),
     /// `level OP LEVEL`; lines without a detectable level only satisfy `!=`.
     Level(CmpOp, Level),
+    /// `FIELD OP VALUE` on a source-supplied field.
+    Field(FieldCond),
+}
+
+#[derive(Debug, Clone)]
+pub struct FieldCond {
+    /// Lower-case field name.
+    pub name: String,
+    /// Byte offsets of the field name and operator in the query.
+    pub pos: usize,
+    pub op_pos: usize,
+    /// Resolved by [`Query::bind`]; unbound conditions never match.
+    pub id: Option<FieldId>,
+    pub test: FieldTest,
+}
+
+#[derive(Debug, Clone)]
+pub enum FieldTest {
+    /// As parsed: operator, value text and its position. Typed by `bind`.
+    Literal(CmpOp, String, usize),
+    /// Text field, `==` or `!=`.
+    Str(CmpOp, Vec<u8>),
+    Num(CmpOp, u64),
+    /// `~` (`!~` is `NOT ~`).
+    Match(Regex),
 }
 
 #[derive(Debug, Clone)]
@@ -80,12 +111,29 @@ impl Expr {
             Expr::And(xs) => xs.iter().all(|x| x.eval(ev)),
             Expr::Or(xs) => xs.iter().any(|x| x.eval(ev)),
             Expr::Not(x) => !x.eval(ev),
-            Expr::Cond(Cond::RawMatch(re)) => re.is_match(ev.raw),
-            Expr::Cond(Cond::RawEq(s)) => ev.raw == s.as_slice(),
+            Expr::Cond(Cond::RawMatch(re)) => re.is_match(ev.raw()),
+            Expr::Cond(Cond::RawEq(s)) => ev.raw() == s.as_slice(),
             Expr::Cond(Cond::Level(op, want)) => match ev.level() {
                 Some(l) => op.test(l, *want),
                 None => *op == CmpOp::Ne,
             },
+            Expr::Cond(Cond::Field(f)) => match (f.id.and_then(|id| ev.field(id)), &f.test) {
+                (Some(FieldValue::Str(v)), FieldTest::Str(op, want)) => op.test(v, want.as_slice()),
+                (Some(FieldValue::U64(v)), FieldTest::Num(op, want)) => op.test(v, *want),
+                (Some(FieldValue::Str(v)), FieldTest::Match(re)) => re.is_match(v),
+                (None, FieldTest::Str(op, _) | FieldTest::Num(op, _)) => *op == CmpOp::Ne,
+                _ => false,
+            },
+        }
+    }
+
+    /// Resolve field names against `schema` and type their values.
+    fn bind(&mut self, schema: &[FieldDef]) -> Result<(), DslError> {
+        match self {
+            Expr::And(xs) | Expr::Or(xs) => xs.iter_mut().try_for_each(|x| x.bind(schema)),
+            Expr::Not(x) => x.bind(schema),
+            Expr::Cond(Cond::Field(f)) => f.bind(schema),
+            Expr::Cond(_) => Ok(()),
         }
     }
 
@@ -93,6 +141,7 @@ impl Expr {
     fn cost(&self) -> u32 {
         match self {
             Expr::Cond(Cond::RawEq(_)) => 1,
+            Expr::Cond(Cond::Field(_)) => 1,
             Expr::Cond(Cond::Level(..)) => 2,
             Expr::Cond(Cond::RawMatch(_)) => 10,
             Expr::Not(x) => x.cost(),
@@ -130,6 +179,49 @@ impl Expr {
     }
 }
 
+impl FieldCond {
+    fn bind(&mut self, schema: &[FieldDef]) -> Result<(), DslError> {
+        let Some(id) = schema.iter().position(|d| d.name == self.name) else {
+            let mut known: Vec<&str> = vec!["raw", "level"];
+            known.extend(schema.iter().map(|d| d.name));
+            return Err(DslError {
+                msg: format!("unknown field '{}' (this source has: {})", self.name, known.join(", ")),
+                pos: self.pos,
+            });
+        };
+        let name = &self.name;
+        let fail = |msg: String, pos| Err(DslError { msg, pos });
+        let test = std::mem::replace(&mut self.test, FieldTest::Num(CmpOp::Eq, 0));
+        self.test = match (test, schema[id].kind) {
+            (t @ (FieldTest::Match(_) | FieldTest::Str(..)), FieldKind::Str)
+            | (t @ FieldTest::Num(..), FieldKind::U64) => t,
+            (FieldTest::Literal(op @ (CmpOp::Eq | CmpOp::Ne), v, _), FieldKind::Str) => {
+                FieldTest::Str(op, v.into_bytes())
+            }
+            (FieldTest::Literal(..) | FieldTest::Num(..), FieldKind::Str) => {
+                return fail(format!("'{name}' is text: use ==, !=, ~ or !~"), self.op_pos);
+            }
+            (FieldTest::Literal(op, v, pos), FieldKind::U64) => match parse_u64(&v) {
+                Some(n) => FieldTest::Num(op, n),
+                None => return fail(format!("'{name}' is a number but '{v}' isn't"), pos),
+            },
+            (FieldTest::Match(_) | FieldTest::Str(..), FieldKind::U64) => {
+                return fail(format!("'{name}' is a number: use ==, !=, >=, <=, >, <"), self.op_pos);
+            }
+        };
+        self.id = Some(id);
+        Ok(())
+    }
+}
+
+/// Decimal or `0x` hexadecimal.
+fn parse_u64(s: &str) -> Option<u64> {
+    match s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
+        Some(hex) => u64::from_str_radix(hex, 16).ok(),
+        None => s.parse().ok(),
+    }
+}
+
 /// A compiled, optimized query.
 #[derive(Debug, Clone)]
 pub struct Query {
@@ -142,6 +234,20 @@ impl Query {
         Ok(Query { expr: parse(src)?.optimize(), source: src.to_owned() })
     }
 
+    /// Compile and [`bind`](Self::bind) in one step.
+    pub fn compile_for(src: &str, schema: &[FieldDef]) -> Result<Query, DslError> {
+        Query::compile(src)?.bind(schema)
+    }
+
+    /// Resolve source-supplied field names (`apid == "NAV"`) against the
+    /// schema of the source the query will run on. Unknown fields and
+    /// operators that don't fit the field's kind are errors. Binding a
+    /// bound query again is fine.
+    pub fn bind(mut self, schema: &[FieldDef]) -> Result<Query, DslError> {
+        self.expr.bind(schema)?;
+        Ok(self)
+    }
+
     pub fn source(&self) -> &str {
         &self.source
     }
@@ -150,8 +256,13 @@ impl Query {
         &self.expr
     }
 
+    /// Evaluate on a bare line (no source fields).
     pub fn matches(&self, raw: &[u8]) -> bool {
         self.expr.eval(&mut Event::new(raw))
+    }
+
+    pub fn matches_event(&self, ev: &mut Event<'_>) -> bool {
+        self.expr.eval(ev)
     }
 
     /// A regex every matching line must contain, if one exists. The engine
@@ -248,6 +359,40 @@ mod tests {
         assert_eq!(e.pos, 9);
         assert!(Query::compile("raw ~ /(/").is_err());
         assert!(Query::compile("level >= ERROR AND").is_err());
-        assert!(Query::compile("service == api").unwrap_err().msg.contains("not supported"));
+        let e = Query::compile_for("service == api", &[]).unwrap_err();
+        assert!(e.msg.contains("unknown field 'service'"), "{e}");
+        assert_eq!(e.pos, 0);
+        assert!(Query::compile(r#"apid ~ "x""#).unwrap_err().msg.contains("regex"));
+    }
+
+    #[test]
+    fn field_binding_errors_point_at_problem() {
+        use crate::input::mem::SCHEMA;
+        let bind = |s: &str| Query::compile_for(s, SCHEMA);
+        assert!(bind("Apid == NAV AND mcnt >= 0x2a").is_ok());
+
+        let e = bind("level >= INFO AND ctid == X").unwrap_err();
+        assert_eq!((e.pos, e.msg.as_str()), (18, "unknown field 'ctid' (this source has: raw, level, apid, mcnt)"));
+        let e = bind("apid >= NAV").unwrap_err();
+        assert_eq!(e.pos, 5);
+        assert!(e.msg.contains("is text"), "{e}");
+        let e = bind("mcnt == ten").unwrap_err();
+        assert_eq!(e.pos, 8);
+        assert!(e.msg.contains("'ten' isn't"), "{e}");
+        let e = bind("mcnt ~ /1/").unwrap_err();
+        assert_eq!(e.pos, 5);
+        assert!(e.msg.contains("is a number"), "{e}");
+        let e = Query::compile("apid == (").unwrap_err();
+        assert_eq!(e.pos, 8);
+        let e = Query::compile("apid ~ NAV").unwrap_err();
+        assert_eq!(e.pos, 7);
+    }
+
+    #[test]
+    fn unbound_fields_never_match() {
+        // Without binding (bare lines have no fields) only != holds.
+        assert!(!q("apid == NAV").matches(b"NAV"));
+        assert!(!q("apid != NAV").matches(b"NAV"));
+        assert!(Query::compile_for("apid != NAV", crate::input::mem::SCHEMA).unwrap().matches(b"NAV"));
     }
 }
