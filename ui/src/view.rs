@@ -8,13 +8,19 @@
 //! Text selection: drag, Shift+click, double-click (word), Shift+arrows
 //! (whole lines), Ctrl+A. Ctrl+C copies the selection, or the current line
 //! when nothing is selected.
+//!
+//! Sources with columns (DLT) are shown as a table: each line's
+//! tab-separated cells are aligned under a header row whose dividers can be
+//! dragged to resize columns. The line text stays the unit of selection,
+//! search highlighting and copy (copied cells keep their tabs, so they
+//! paste into a spreadsheet as columns).
 
 use eframe::egui::{
     self, Align2, Color32, CursorIcon, FontId, Key, Rect, Sense, Stroke, StrokeKind, Ui, pos2,
     text::{LayoutJob, TextFormat},
     vec2,
 };
-use nerka_core::{Bookmarks, Highlighter, LineNo, LogSource};
+use nerka_core::{Bookmarks, ColumnDef, Highlighter, LineNo, LogSource};
 
 /// Lines longer than this are cut for display (search still sees them).
 const MAX_DISPLAY_BYTES: usize = 4096;
@@ -25,8 +31,8 @@ const TAB_COLS: usize = 4;
 /// Rows scrolled per mouse-wheel notch (klogg uses 3).
 const LINES_PER_NOTCH: u64 = 3;
 
-/// A position in the view: row and display column (tabs count as
-/// [`TAB_COLS`]). `col == usize::MAX` means "end of line".
+/// A position in the view: row and display column (see [`Cells`]).
+/// `col == usize::MAX` means "end of line".
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub struct TextPos {
     pub row: u64,
@@ -48,6 +54,44 @@ pub struct ViewState {
     dragging: bool,
     /// Fraction of a row scrolled but not applied yet (trackpads).
     scroll_acc: f32,
+    /// Table column whose right divider is being dragged.
+    resizing: Option<usize>,
+}
+
+/// Column layout of a table view. A tab's views share one, so they stay
+/// aligned. Empty for plain text.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Columns {
+    pub names: Vec<&'static str>,
+    /// Cell widths in characters, including a one-character gap. The last
+    /// column is unbounded; its entry is unused.
+    pub widths: Vec<usize>,
+}
+
+impl Columns {
+    pub fn from_defs(defs: &[ColumnDef]) -> Self {
+        Columns {
+            names: defs.iter().map(|d| d.name).collect(),
+            widths: defs.iter().map(|d| (d.width as usize).max(d.name.len()) + 1).collect(),
+        }
+    }
+
+    fn cells(&self) -> Cells<'_> {
+        Cells { widths: &self.widths }
+    }
+
+    /// First display column of each cell.
+    fn starts(&self) -> Vec<usize> {
+        let mut at = 0;
+        self.widths
+            .iter()
+            .map(|w| {
+                let s = at;
+                at += w;
+                s
+            })
+            .collect()
+    }
 }
 
 impl ViewState {
@@ -96,6 +140,7 @@ pub struct ViewOutput {
 }
 
 /// Draw `rows` rows; `line_of_row` maps a view row to a file line.
+#[allow(clippy::too_many_arguments)]
 pub fn log_view(
     ui: &mut Ui,
     id: &str,
@@ -103,8 +148,10 @@ pub fn log_view(
     rows: u64,
     line_of_row: &dyn Fn(u64) -> LineNo,
     source: &dyn LogSource,
+    columns: &mut Columns,
     hl: &Highlight<'_>,
 ) -> ViewOutput {
+    let table = !columns.names.is_empty();
     let font = FontId::monospace(13.0);
     // Whole physical pixels per row and per text origin keep glyphs crisp.
     let ppp = ui.ctx().pixels_per_point();
@@ -118,10 +165,15 @@ pub fn log_view(
     let id = ui.scope_id().with(id);
     let text_rect = Rect::from_min_max(outer.min, pos2(outer.max.x - SCROLLBAR_W, outer.max.y));
     let bar_rect = Rect::from_min_max(pos2(text_rect.max.x, outer.min.y), outer.max);
-    let text_clip = Rect::from_min_max(pos2(text_rect.min.x + gutter_w, text_rect.min.y), text_rect.max);
+    // Rows go below the table header, if there is one.
+    let rows_rect =
+        Rect::from_min_max(pos2(text_rect.min.x, text_rect.min.y + if table { row_h } else { 0.0 }), text_rect.max);
+    let text_clip = Rect::from_min_max(pos2(text_rect.min.x + gutter_w, rows_rect.min.y), text_rect.max);
+    let header_rect =
+        Rect::from_min_max(pos2(text_clip.min.x, text_rect.min.y), pos2(text_rect.max.x, rows_rect.min.y));
     let text_x0 = text_clip.min.x + char_w * 0.5;
 
-    state.page = ((text_rect.height() / row_h).floor() as u64).max(1);
+    state.page = ((rows_rect.height() / row_h).floor() as u64).max(1);
     let max_top = rows.saturating_sub(state.page);
     let line_str = |row: u64| source.line_text(line_of_row(row)).unwrap_or_default();
 
@@ -170,7 +222,7 @@ pub fn log_view(
 
     // Mouse → text position (row clamped to the rows that exist).
     let hit = |state: &ViewState, p: egui::Pos2| -> TextPos {
-        let r = ((p.y - text_rect.top()) / row_h).floor();
+        let r = ((p.y - rows_rect.top()) / row_h).floor();
         let row = if r < 0.0 { state.top.saturating_sub(1) } else { state.top + r as u64 };
         let col = ((p.x - text_x0 + state.x_off) / char_w).round().max(0.0) as usize;
         TextPos { row: row.min(rows.saturating_sub(1)), col }
@@ -179,10 +231,38 @@ pub fn log_view(
     let (pressed, released, shift, pointer) = ui.input(|i| {
         (i.pointer.primary_pressed(), i.pointer.primary_released(), i.modifiers.shift, i.pointer.interact_pos())
     });
+    // ----- table header: drag a divider to resize its column -----
+    let x0 = snap(text_x0 - state.x_off);
+    let divider_x =
+        |starts: &[usize], widths: &[usize], k: usize| x0 + (starts[k] + widths[k]) as f32 * char_w - char_w * 0.5;
+    let mut over_divider = false;
+    if table {
+        let starts = columns.starts();
+        let n = columns.widths.len().saturating_sub(1);
+        let near = pointer
+            .filter(|p| header_rect.contains(*p) && response.contains_pointer())
+            .and_then(|p| (0..n).find(|&k| (p.x - divider_x(&starts, &columns.widths, k)).abs() <= 4.0));
+        over_divider = near.is_some();
+        if pressed && near.is_some() {
+            state.resizing = near;
+        }
+        if let Some(k) = state.resizing {
+            if !ui.input(|i| i.pointer.primary_down()) {
+                state.resizing = None;
+            } else if let Some(p) = pointer {
+                let cell_x = x0 + starts[k] as f32 * char_w;
+                columns.widths[k] = ((p.x - cell_x) / char_w + 0.5).round().max(2.0) as usize;
+            }
+        }
+    }
+
+    let columns = &*columns;
+    let cells = columns.cells();
+
     if rows > 0
         && pressed
         && let Some(p) = pointer
-        && text_rect.contains(p)
+        && rows_rect.contains(p)
         && response.contains_pointer()
     {
         let pos = hit(state, p);
@@ -201,10 +281,10 @@ pub fn log_view(
             state.dragging = false;
         } else if let Some(p) = pointer {
             // Auto-scroll while dragging past the edges.
-            if p.y < text_rect.top() {
+            if p.y < rows_rect.top() {
                 state.top = state.top.saturating_sub(1);
                 ui.ctx().request_repaint();
-            } else if p.y > text_rect.bottom() {
+            } else if p.y > rows_rect.bottom() {
                 state.top = (state.top + 1).min(max_top);
                 ui.ctx().request_repaint();
             }
@@ -217,16 +297,16 @@ pub fn log_view(
     }
     if response.double_clicked()
         && let Some(p) = response.interact_pointer_pos()
-        && text_rect.contains(p)
+        && rows_rect.contains(p)
         && rows > 0
     {
         let pos = hit(state, p);
-        let (a, b) = word_at(&line_str(pos.row), pos.col);
+        let (a, b) = word_at(cells, &line_str(pos.row), pos.col);
         state.sel = Some((TextPos { row: pos.row, col: a }, TextPos { row: pos.row, col: b }));
     }
     if response.secondary_clicked()
         && let Some(p) = response.interact_pointer_pos()
-        && text_rect.contains(p)
+        && rows_rect.contains(p)
         && rows > 0
     {
         // Right-click outside the selection moves the cursor there.
@@ -319,8 +399,8 @@ pub fn log_view(
         let mut out = String::new();
         for row in start.row..=last {
             let s = line_str(row);
-            let a = if row == start.row { col_to_byte(&s, start.col) } else { 0 };
-            let b = if row == end.row { col_to_byte(&s, end.col) } else { s.len() };
+            let a = if row == start.row { col_to_byte(cells, &s, start.col) } else { 0 };
+            let b = if row == end.row { col_to_byte(cells, &s, end.col) } else { s.len() };
             out.push_str(&s[a..b.max(a)]);
             if row < end.row {
                 out.push('\n');
@@ -347,7 +427,9 @@ pub fn log_view(
         state.top = (f * max_top as f64).round() as u64;
     }
     state.top = state.top.min(max_top);
-    if response.hovered() && !bar.hovered() {
+    if over_divider || state.resizing.is_some() {
+        ui.ctx().set_cursor_icon(CursorIcon::ResizeColumn);
+    } else if response.hovered() && !bar.hovered() {
         ui.ctx().set_cursor_icon(CursorIcon::Text);
     }
 
@@ -375,7 +457,7 @@ pub fn log_view(
     let mut max_w = 0.0f32;
     let last = (state.top + state.page + 1).min(rows);
     for (i, row) in (state.top..last).enumerate() {
-        let y = snap(text_rect.top()) + i as f32 * row_h;
+        let y = snap(rows_rect.top()) + i as f32 * row_h;
         let line = line_of_row(row);
         let row_rect = Rect::from_min_size(pos2(text_rect.min.x, y), vec2(text_rect.width(), row_h));
         if state.selected == Some(row) {
@@ -397,11 +479,11 @@ pub fn log_view(
         );
         let bytes = source.line_bytes(line).unwrap_or_default();
         let cut = bytes.len() > MAX_DISPLAY_BYTES;
-        let shown = &bytes[..bytes.len().min(MAX_DISPLAY_BYTES)];
+        let shown = String::from_utf8_lossy(&bytes[..bytes.len().min(MAX_DISPLAY_BYTES)]);
         if let Some((s, e)) = selection
             && (s.row..=e.row).contains(&row)
         {
-            let width = display_cols(&String::from_utf8_lossy(shown));
+            let width = cells.width(&shown);
             let c0 = if row == s.row { s.col.min(width) } else { 0 };
             // Selected line breaks show as one extra column.
             let c1 = if row == e.row { e.col.min(width) } else { width + 1 };
@@ -411,12 +493,40 @@ pub fn log_view(
                 painter.with_clip_rect(text_clip).rect_filled(r, 0.0, sel_bg);
             }
         }
-        let job = line_job(shown, cut, hl.highlighter, &font, text_color, dim, match_bg);
+        let job = line_job(&shown, cells, cut, hl.highlighter, &font, text_color, dim, match_bg);
         let galley = painter.layout_job(job);
         max_w = max_w.max(galley.size().x);
         painter.with_clip_rect(text_clip).galley(pos2(snap(text_x0 - state.x_off), snap(y + 1.0)), galley, text_color);
     }
     state.x_off = state.x_off.min((max_w - text_clip.width() * 0.5).max(0.0));
+
+    if table {
+        let full = Rect::from_min_max(text_rect.min, header_rect.max);
+        painter.rect_filled(full, 0.0, vis.faint_bg_color);
+        painter.hline(text_rect.x_range(), header_rect.bottom(), vis.widgets.noninteractive.bg_stroke);
+        let starts = columns.starts();
+        let head = painter.with_clip_rect(header_rect);
+        let header_font = FontId::proportional(12.5);
+        for (k, name) in columns.names.iter().enumerate() {
+            head.text(
+                pos2(x0 + starts[k] as f32 * char_w, header_rect.center().y),
+                Align2::LEFT_CENTER,
+                *name,
+                header_font.clone(),
+                vis.strong_text_color(),
+            );
+        }
+        let line = vis.widgets.noninteractive.bg_stroke.color.gamma_multiply(0.6);
+        for k in 0..columns.widths.len().saturating_sub(1) {
+            let x = snap(divider_x(&starts, &columns.widths, k));
+            let stroke = if state.resizing == Some(k) { vis.selection.stroke } else { Stroke::new(1.0, line) };
+            painter.with_clip_rect(Rect::from_min_max(pos2(text_clip.min.x, text_rect.min.y), text_clip.max)).vline(
+                x,
+                text_rect.y_range(),
+                stroke,
+            );
+        }
+    }
 
     // scrollbar paint
     painter.rect_filled(bar_rect, 0.0, vis.faint_bg_color);
@@ -436,46 +546,80 @@ pub fn log_view(
     ViewOutput { clicked, has_focus, copied, toggle_bookmark }
 }
 
-fn char_cols(c: char) -> usize {
-    if c == '\t' { TAB_COLS } else { 1 }
+/// How a line's characters map to display columns. In plain text a tab is
+/// [`TAB_COLS`] wide. In a table, a tab advances to the start of the next
+/// cell, and text that doesn't fit its cell is hidden (zero width) with a
+/// "…" drawn in the cell's gap.
+#[derive(Clone, Copy, Default)]
+struct Cells<'a> {
+    /// See [`Columns::widths`]; empty for plain text.
+    widths: &'a [usize],
 }
 
-/// Display width of `s` in columns (matches [`clean`]).
-fn display_cols(s: &str) -> usize {
-    s.chars().map(char_cols).sum()
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Glyph {
+    byte: usize,
+    ch: char,
+    col: usize,
+    /// Columns taken; 0 for text hidden by a narrow cell.
+    w: usize,
+    /// A tab ending a cell whose text was cut.
+    cut: bool,
+}
+
+impl Cells<'_> {
+    fn glyphs(&self, s: &str) -> Vec<Glyph> {
+        let mut out = Vec::with_capacity(s.len());
+        let (mut col, mut cell, mut cell_end, mut cut) = (0, 0, self.widths.first().copied().unwrap_or(0), false);
+        for (byte, ch) in s.char_indices() {
+            // The last cell (and plain text) is unbounded.
+            let bounded = cell + 1 < self.widths.len();
+            let mut g = Glyph { byte, ch, col, w: 1, cut: false };
+            if ch == '\t' && bounded {
+                g.w = cell_end - col;
+                g.cut = cut;
+                cell += 1;
+                cell_end += self.widths[cell];
+                cut = false;
+            } else if ch == '\t' {
+                g.w = TAB_COLS;
+            } else if bounded && col + 1 >= cell_end {
+                // Keep the last column of the cell free as a gap.
+                g.w = 0;
+                cut = true;
+            }
+            col += g.w;
+            out.push(g);
+        }
+        out
+    }
+
+    /// Display width of `s` in columns.
+    fn width(&self, s: &str) -> usize {
+        self.glyphs(s).last().map_or(0, |g| g.col + g.w)
+    }
 }
 
 /// Byte offset in `s` of display column `col` (clamped to the line end;
-/// a column inside a tab rounds to the nearer edge).
-fn col_to_byte(s: &str, col: usize) -> usize {
-    let mut c = 0;
-    for (b, ch) in s.char_indices() {
-        let w = char_cols(ch);
-        if col < c + w.div_ceil(2) {
-            return b;
+/// a column inside a tab rounds to the nearer edge). Hidden text belongs to
+/// the end of its cell.
+fn col_to_byte(cells: Cells<'_>, s: &str, col: usize) -> usize {
+    for g in cells.glyphs(s).into_iter().filter(|g| g.w > 0) {
+        if col < g.col + g.w.div_ceil(2) {
+            return g.byte;
         }
-        if col < c + w {
-            return b + ch.len_utf8();
+        if col < g.col + g.w {
+            return g.byte + g.ch.len_utf8();
         }
-        c += w;
     }
     s.len()
 }
 
 /// Display-column range of the word (or run of other non-space chars) at `col`.
-fn word_at(s: &str, col: usize) -> (usize, usize) {
+fn word_at(cells: Cells<'_>, s: &str, col: usize) -> (usize, usize) {
     let is_word = |c: char| c.is_alphanumeric() || c == '_';
-    let chars: Vec<(usize, char)> = {
-        let mut c = 0;
-        s.chars()
-            .map(|ch| {
-                let at = c;
-                c += char_cols(ch);
-                (at, ch)
-            })
-            .collect()
-    };
-    let Some(i) = chars.iter().rposition(|&(at, _)| at <= col) else { return (0, 0) };
+    let glyphs = cells.glyphs(s);
+    let Some(i) = glyphs.iter().rposition(|g| g.col <= col && g.w > 0) else { return (0, 0) };
     let class = |c: char| {
         if is_word(c) {
             0
@@ -485,21 +629,23 @@ fn word_at(s: &str, col: usize) -> (usize, usize) {
             2
         }
     };
-    let k = class(chars[i].1);
+    let k = class(glyphs[i].ch);
     let mut a = i;
-    while a > 0 && class(chars[a - 1].1) == k {
+    while a > 0 && class(glyphs[a - 1].ch) == k {
         a -= 1;
     }
     let mut b = i + 1;
-    while b < chars.len() && class(chars[b].1) == k {
+    while b < glyphs.len() && class(glyphs[b].ch) == k {
         b += 1;
     }
-    let end = chars.get(b).map_or_else(|| display_cols(s), |&(at, _)| at);
-    (chars[a].0, end)
+    let end = glyphs.get(b).map_or_else(|| cells.width(s), |g| g.col);
+    (glyphs[a].col, end)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn line_job(
-    bytes: &[u8],
+    text: &str,
+    cells: Cells<'_>,
     cut: bool,
     highlighter: Option<&Highlighter>,
     font: &FontId,
@@ -512,36 +658,34 @@ fn line_job(
     let plain = TextFormat { font_id: font.clone(), color, ..Default::default() };
     let hit = TextFormat { background: match_bg, ..plain.clone() };
 
-    let spans = highlighter.map(|h| h.spans(bytes)).unwrap_or_default();
-    let mut pos = 0;
-    for s in spans {
-        if s.start > pos {
-            job.append(&clean(&bytes[pos..s.start]), 0.0, plain.clone());
+    let spans = highlighter.map(|h| h.spans(text.as_bytes())).unwrap_or_default();
+    let (mut buf, mut in_hit, mut si) = (String::new(), false, 0);
+    for g in cells.glyphs(text) {
+        while si < spans.len() && spans[si].end <= g.byte {
+            si += 1;
         }
-        job.append(&clean(&bytes[s.clone()]), 0.0, hit.clone());
-        pos = s.end;
+        let h = spans.get(si).is_some_and(|s| s.start <= g.byte);
+        if h != in_hit && !buf.is_empty() {
+            job.append(&std::mem::take(&mut buf), 0.0, if in_hit { hit.clone() } else { plain.clone() });
+        }
+        in_hit = h;
+        match g.ch {
+            '\t' => {
+                buf.push(if g.cut { '…' } else { ' ' });
+                buf.extend(std::iter::repeat_n(' ', g.w - 1));
+            }
+            _ if g.w == 0 => {}
+            c if c.is_control() => buf.push('·'),
+            c => buf.push(c),
+        }
     }
-    if pos < bytes.len() {
-        job.append(&clean(&bytes[pos..]), 0.0, plain.clone());
+    if !buf.is_empty() {
+        job.append(&buf, 0.0, if in_hit { hit } else { plain.clone() });
     }
     if cut {
         job.append(" …[truncated]", 0.0, TextFormat { color: dim, ..plain });
     }
     job
-}
-
-/// Lossy UTF-8 with tabs expanded and control chars made visible.
-fn clean(b: &[u8]) -> String {
-    let s = String::from_utf8_lossy(b);
-    let mut out = String::with_capacity(s.len());
-    for c in s.chars() {
-        match c {
-            '\t' => out.push_str(&" ".repeat(TAB_COLS)),
-            c if c.is_control() => out.push('·'),
-            c => out.push(c),
-        }
-    }
-    out
 }
 
 fn digits(n: u64) -> u32 {
@@ -552,19 +696,69 @@ fn digits(n: u64) -> u32 {
 mod tests {
     use super::*;
 
+    const TEXT: Cells<'static> = Cells { widths: &[] };
+
     #[test]
     fn columns_map_to_bytes() {
         let s = "a\tbé c";
         // cols: a=0, tab=1..5, b=5, é=6, ' '=7, c=8
-        assert_eq!(display_cols(s), 9);
-        assert_eq!(col_to_byte(s, 0), 0);
-        assert_eq!(col_to_byte(s, 1), 1);
-        assert_eq!(col_to_byte(s, 2), 1);
-        assert_eq!(col_to_byte(s, 3), 2);
-        assert_eq!(col_to_byte(s, 5), 2);
-        assert_eq!(col_to_byte(s, 7), 5);
-        assert_eq!(col_to_byte(s, 9), s.len());
-        assert_eq!(col_to_byte(s, usize::MAX), s.len());
+        assert_eq!(TEXT.width(s), 9);
+        assert_eq!(col_to_byte(TEXT, s, 0), 0);
+        assert_eq!(col_to_byte(TEXT, s, 1), 1);
+        assert_eq!(col_to_byte(TEXT, s, 2), 1);
+        assert_eq!(col_to_byte(TEXT, s, 3), 2);
+        assert_eq!(col_to_byte(TEXT, s, 5), 2);
+        assert_eq!(col_to_byte(TEXT, s, 7), 5);
+        assert_eq!(col_to_byte(TEXT, s, 9), s.len());
+        assert_eq!(col_to_byte(TEXT, s, usize::MAX), s.len());
+    }
+
+    fn rendered(cells: Cells<'_>, s: &str) -> String {
+        let job =
+            line_job(s, cells, false, None, &FontId::monospace(13.0), Color32::WHITE, Color32::GRAY, Color32::YELLOW);
+        job.text
+    }
+
+    #[test]
+    fn table_cells_align_and_cut() {
+        // Cells 4 and 3 wide (gap included), last one unbounded.
+        let cells = Cells { widths: &[4, 3, 0] };
+        assert_eq!(rendered(cells, "ab\tc\tpayload"), "ab  c  payload");
+        // "abcdef" doesn't fit: shows "abc", hides "def", marks the gap.
+        assert_eq!(rendered(cells, "abcdef\tc\tp\tq"), "abc…c  p    q");
+        let s = "abcdef\tc\tp";
+        assert_eq!(cells.width(s), 8);
+        // Column 3 (the gap) maps to the tab, so selecting up to it copies
+        // the hidden text too; column 2 stops before "c".
+        assert_eq!(col_to_byte(cells, s, 3), 6);
+        assert_eq!(col_to_byte(cells, s, 2), 2);
+        assert_eq!(col_to_byte(cells, s, 4), 7);
+        assert_eq!(word_at(cells, s, 1), (0, 3));
+        assert_eq!(word_at(cells, "ab\tc\tpay load", 8), (7, 10));
+        // Missing cells are fine.
+        assert_eq!(rendered(cells, "x"), "x");
+    }
+
+    #[test]
+    fn highlight_spans_follow_cells() {
+        let h = nerka_core::Filter::Regex(nerka_core::Matcher::new("c\tp", Default::default()).unwrap()).highlighter();
+        let job = line_job(
+            "abcdef\tc\tpq",
+            Cells { widths: &[4, 3, 0] },
+            false,
+            Some(&h),
+            &FontId::monospace(13.0),
+            Color32::WHITE,
+            Color32::GRAY,
+            Color32::YELLOW,
+        );
+        let hits: Vec<&str> = job
+            .sections
+            .iter()
+            .filter(|s| s.format.background == Color32::YELLOW)
+            .map(|s| &job.text[s.byte_range.start.0..s.byte_range.end.0])
+            .collect();
+        assert_eq!(hits, ["c  p"]);
     }
 
     /// One frame of the app's layout: filter view in a bottom panel under a
@@ -586,10 +780,19 @@ mod tests {
             egui::Panel::bottom("filter").resizable(true).default_size(260.0).min_size(120.0).show(ui, |ui| {
                 ui.horizontal(|ui| ui.label("filter"));
                 rect = ui.available_rect_before_wrap();
-                log_view(ui, "filter", filter, rows.len() as u64, &|r| rows[r as usize], file, &hl);
+                log_view(
+                    ui,
+                    "filter",
+                    filter,
+                    rows.len() as u64,
+                    &|r| rows[r as usize],
+                    file,
+                    &mut Columns::default(),
+                    &hl,
+                );
             });
             egui::CentralPanel::default().show(ui, |ui| {
-                log_view(ui, "main", main, file.line_count(), &|r| r, file, &hl);
+                log_view(ui, "main", main, file.line_count(), &|r| r, file, &mut Columns::default(), &hl);
             });
         });
         out.textures_delta.clear();
@@ -634,13 +837,61 @@ mod tests {
     }
 
     #[test]
+    fn dragging_a_header_divider_resizes_its_column() {
+        let file = nerka_core::TextFile::from_bytes("t", b"ab\tc\tpayload\n".to_vec());
+        let ctx = egui::Context::default();
+        let (mut state, mut columns) =
+            (ViewState::default(), Columns { names: vec!["a", "b", "rest"], widths: vec![4, 3, 0] });
+        let hl = Highlight { highlighter: None, bookmarks: None };
+        let mut t = 0.0;
+        let mut step = |events: Vec<egui::Event>, state: &mut ViewState, columns: &mut Columns| {
+            t += 1.0 / 60.0;
+            let screen = Rect::from_min_size(pos2(0.0, 0.0), vec2(800.0, 400.0));
+            let input = egui::RawInput { screen_rect: Some(screen), time: Some(t), events, ..Default::default() };
+            let mut out = ctx.run_ui(input, |ui| {
+                egui::CentralPanel::default().show(ui, |ui| {
+                    log_view(ui, "v", state, 1, &|r| r, &file, columns, &hl);
+                });
+            });
+            out.textures_delta.clear();
+        };
+        let button = |pos, pressed| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        step(vec![], &mut state, &mut columns);
+        // Find the first divider by probing along the header row.
+        let y = 18.0;
+        let x = (0..400)
+            .map(|x| x as f32)
+            .find(|&x| {
+                step(vec![egui::Event::PointerMoved(pos2(x, y)), button(pos2(x, y), true)], &mut state, &mut columns);
+                let found = state.resizing.is_some();
+                step(vec![button(pos2(x, y), false)], &mut state, &mut columns);
+                found
+            })
+            .expect("a divider in the header");
+        assert_eq!(columns.widths, [4, 3, 0], "pressing alone must not resize");
+        // Drag it 60 px to the right: the first column gets wider.
+        step(vec![egui::Event::PointerMoved(pos2(x, y)), button(pos2(x, y), true)], &mut state, &mut columns);
+        step(vec![egui::Event::PointerMoved(pos2(x + 60.0, y))], &mut state, &mut columns);
+        step(vec![button(pos2(x + 60.0, y), false)], &mut state, &mut columns);
+        assert!(columns.widths[0] > 4, "{:?}", columns.widths);
+        assert_eq!(columns.widths[1], 3);
+        assert_eq!(state.resizing, None);
+        assert_eq!(state.selected, None, "header drags don't select rows");
+    }
+
+    #[test]
     fn words() {
         let s = "ERROR [db_pool] timeout=30s";
-        assert_eq!(word_at(s, 2), (0, 5));
-        assert_eq!(word_at(s, 8), (7, 14));
-        assert_eq!(word_at(s, 5), (5, 6));
-        assert_eq!(word_at(s, 24), (24, 27));
-        assert_eq!(word_at(s, 100), (24, 27));
-        assert_eq!(word_at("", 3), (0, 0));
+        assert_eq!(word_at(TEXT, s, 2), (0, 5));
+        assert_eq!(word_at(TEXT, s, 8), (7, 14));
+        assert_eq!(word_at(TEXT, s, 5), (5, 6));
+        assert_eq!(word_at(TEXT, s, 24), (24, 27));
+        assert_eq!(word_at(TEXT, s, 100), (24, 27));
+        assert_eq!(word_at(TEXT, "", 3), (0, 0));
     }
 }

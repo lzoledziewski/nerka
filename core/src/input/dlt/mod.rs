@@ -15,7 +15,7 @@ mod format;
 mod payload;
 pub mod writer;
 
-use super::Bytes;
+use super::{Bytes, ColumnDef};
 use crate::event::{FieldDef, FieldId, FieldKind, FieldValue, Level};
 use crate::{LineNo, LogSource, Progress, Result};
 use format::{MAGIC, MSTP_APP_TRACE, MSTP_CONTROL, MSTP_LOG, MSTP_NW_TRACE, Message};
@@ -24,7 +24,15 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 /// Columns of a rendered line, separated by tabs.
-pub const COLUMNS: [&str; 7] = ["time", "tmsp", "ecu", "apid", "ctid", "type", "payload"];
+pub const COLUMNS: [ColumnDef; 7] = [
+    ColumnDef { name: "time", width: 26 },
+    ColumnDef { name: "tmsp", width: 11 },
+    ColumnDef { name: "ecu", width: 4 },
+    ColumnDef { name: "apid", width: 4 },
+    ColumnDef { name: "ctid", width: 4 },
+    ColumnDef { name: "type", width: 9 },
+    ColumnDef { name: "payload", width: 0 },
+];
 
 const ECU: FieldId = 0;
 const APID: FieldId = 1;
@@ -34,6 +42,7 @@ const MCNT: FieldId = 4;
 const TMSP: FieldId = 5;
 const SEID: FieldId = 6;
 const MID: FieldId = 7;
+const MODE: FieldId = 8;
 
 const SCHEMA: &[FieldDef] = &[
     FieldDef { name: "ecu", kind: FieldKind::Str },
@@ -47,8 +56,10 @@ const SCHEMA: &[FieldDef] = &[
     FieldDef { name: "tmsp", kind: FieldKind::U64 },
     // session id
     FieldDef { name: "seid", kind: FieldKind::U64 },
-    // message id of non-verbose messages
+    // message id of non-verbose messages (none on verbose ones: 0 is a valid id)
     FieldDef { name: "mid", kind: FieldKind::U64 },
+    // verbose, non-verbose
+    FieldDef { name: "mode", kind: FieldKind::Str },
 ];
 
 /// Does `head` (the first bytes of a file) look like a DLT file?
@@ -234,6 +245,10 @@ impl LogSource for DltFile {
         self.offsets.capacity() * size_of::<u64>()
     }
 
+    fn columns(&self) -> &[ColumnDef] {
+        &COLUMNS
+    }
+
     fn schema(&self) -> &[FieldDef] {
         SCHEMA
     }
@@ -250,6 +265,8 @@ impl LogSource for DltFile {
             TMSP => m.timestamp().map(|t| FieldValue::U64(t.into())),
             SEID => m.session_id().map(|t| FieldValue::U64(t.into())),
             MID => non_verbose_id(&m).map(|t| FieldValue::U64(t.into())),
+            // Without an extended header a message is non-verbose.
+            MODE => Some(s(if m.verbose() { "verbose" } else { "non-verbose" })),
             _ => None,
         }
     }

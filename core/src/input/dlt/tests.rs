@@ -72,6 +72,7 @@ fn line_columns_and_fields() {
     assert_eq!(field("tmsp"), Some(FieldValue::U64(12_345_678)));
     assert_eq!(field("seid"), Some(FieldValue::U64(7)));
     assert_eq!(field("mid"), None);
+    assert_eq!(field("mode"), Some(FieldValue::Str(b"verbose")));
     assert_eq!(f.supplied_level(0), Some(Some(Level::Warn)));
 }
 
@@ -93,6 +94,7 @@ fn optional_headers_missing() {
     assert_eq!(f.field(0, TYPE), None);
     assert_eq!(f.field(0, TMSP), None);
     assert_eq!(f.field(0, MID), Some(FieldValue::U64(0x1234)));
+    assert_eq!(f.field(0, MODE), Some(FieldValue::Str(b"non-verbose")));
     assert_eq!(f.supplied_level(0), Some(None));
 }
 
@@ -232,6 +234,10 @@ fn engine_queries_match_naive_evaluation() {
     );
     assert!(count("level >= ERROR AND raw ~ /failed/") > 0);
     assert_eq!(count("type == control"), 60);
+    // Every 50th message from 10, 20 and 30 is non-verbose (control included).
+    assert_eq!(count("mode == non-verbose"), 180);
+    assert_eq!(count("mode == verbose"), 3000 - 180);
+    assert_eq!(count("mode == verbose AND mid != 0"), 3000 - 180);
     assert_eq!(count("mid == 7"), count("mid == 7 AND (type == log OR type != log)"));
     // Odd messages; the control and header-less ones are all even.
     assert_eq!(count("ctid ~ /^M/"), 1500);

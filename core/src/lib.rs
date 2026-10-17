@@ -29,7 +29,7 @@ pub use event::{Event, FieldDef, FieldId, FieldKind, FieldValue, Level};
 pub use history::SearchHistory;
 pub use input::dlt::DltFile;
 pub use input::text::TextFile;
-pub use input::{LogSource, open};
+pub use input::{ColumnDef, LogSource, open};
 
 /// Line numbers are 0-based internally; UIs add 1 for display.
 pub type LineNo = u64;

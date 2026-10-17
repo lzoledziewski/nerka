@@ -55,6 +55,15 @@ impl Bytes {
     }
 }
 
+/// A column of a source whose lines are tab-separated cells (DLT).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ColumnDef {
+    pub name: &'static str,
+    /// Typical content width in characters; 0 for the last column, which
+    /// takes the rest of the line.
+    pub width: u16,
+}
+
 pub trait LogSource: Send + Sync {
     /// Human readable name (usually the file path).
     fn name(&self) -> &str;
@@ -81,6 +90,12 @@ pub trait LogSource: Send + Sync {
     /// Memory used by the source's line or message index.
     fn index_memory_bytes(&self) -> usize {
         0
+    }
+
+    /// Columns of the rendered lines, if they are tab-separated cells. UIs
+    /// show such sources as a table; plain text has none.
+    fn columns(&self) -> &[ColumnDef] {
+        &[]
     }
 
     /// Fields this source supplies for every line (DLT: `ecu`, `apid`, …).

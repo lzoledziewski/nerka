@@ -1,6 +1,8 @@
 //! nerka-gui — klogg-style desktop viewer: one tab per open file, each with
 //! a main view on top, a filter view below and a bookmarks panel on the
-//! right. Filter, scroll position and bookmarks belong to the tab.
+//! right. Filter, scroll position, bookmarks and column widths belong to
+//! the tab. Plain text and DLT files are recognised by their content; DLT
+//! is shown as a table.
 //!
 //! Open with Ctrl+O, drag & drop, or from a shell:
 //!     nerka-gui app.log other.log
@@ -26,13 +28,12 @@ use eframe::egui::{self, Key, KeyboardShortcut, Modifiers};
 use job::{Job, Poll};
 use nerka_core::{
     Bookmarks, Filter, Highlighter, LineNo, LogSource, Matcher, MatcherOptions, Query, SearchHistory, SearchResult,
-    TextFile,
 };
 use prefs::SearchPrefs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
-use view::{Highlight, ViewOutput, ViewState, log_view};
+use view::{Columns, Highlight, ViewOutput, ViewState, log_view};
 
 fn main() -> eframe::Result {
     let mut initial: Vec<PathBuf> = Vec::new();
@@ -90,10 +91,11 @@ enum Mode {
 /// One open file with its own filter, view positions and bookmarks.
 struct Tab {
     path: PathBuf,
-    file: Option<Arc<TextFile>>,
-    loading: Option<Job<TextFile>>,
+    file: Option<Arc<dyn LogSource>>,
+    loading: Option<Job<Box<dyn LogSource>>>,
     main_view: ViewState,
     filter_view: ViewState,
+    columns: Columns,
 
     mode: Mode,
     pattern: String,
@@ -112,9 +114,10 @@ impl Tab {
         Self {
             path,
             file: None,
-            loading: Some(Job::spawn(ctx, move |prog| TextFile::open(&p, prog))),
+            loading: Some(Job::spawn(ctx, move |prog| nerka_core::open(&p, prog))),
             main_view: ViewState::default(),
             filter_view: ViewState::default(),
+            columns: Columns::default(),
             mode: prefs.mode,
             pattern: String::new(),
             options: prefs.options.clone(),
@@ -226,7 +229,8 @@ impl Tab {
                                 self.status = format!("Could not read bookmarks: {e}");
                                 Bookmarks::default()
                             });
-                            self.file = Some(Arc::new(f));
+                            self.columns = Columns::from_defs(f.columns());
+                            self.file = Some(Arc::from(f));
                             if !self.pattern.trim().is_empty() {
                                 self.start_search(ctx);
                             }
@@ -330,7 +334,7 @@ impl Tab {
     }
 
     /// Returns true when the panel's close button was clicked.
-    fn bookmarks_panel(&mut self, ui: &mut egui::Ui, file: &TextFile) -> bool {
+    fn bookmarks_panel(&mut self, ui: &mut egui::Ui, file: &dyn LogSource) -> bool {
         let mut close = false;
         ui.horizontal(|ui| {
             ui.heading("Bookmarks");
@@ -342,7 +346,7 @@ impl Tab {
         close
     }
 
-    fn bookmarks_list(&mut self, ui: &mut egui::Ui, file: &TextFile) {
+    fn bookmarks_list(&mut self, ui: &mut egui::Ui, file: &dyn LogSource) {
         ui.weak("m toggle · b / B next / prev");
         ui.separator();
         if self.bookmarks.is_empty() {
@@ -358,7 +362,13 @@ impl Tab {
                     if ui.link(format!("{}", line + 1)).clicked() {
                         jump = Some(line);
                     }
-                    let preview: String = file.line_text(line).unwrap_or_default().chars().take(48).collect();
+                    let preview: String = file
+                        .line_text(line)
+                        .unwrap_or_default()
+                        .chars()
+                        .map(|c| if c == '\t' { ' ' } else { c })
+                        .take(48)
+                        .collect();
                     ui.add(egui::Label::new(egui::RichText::new(preview).monospace().weak()).truncate());
                 });
                 // Right-to-left so the note field takes exactly the width left
@@ -400,7 +410,7 @@ impl Tab {
     fn filter_panel(
         &mut self,
         ui: &mut egui::Ui,
-        file: &TextFile,
+        file: &dyn LogSource,
         focus_search: &mut bool,
         history: &SearchHistory,
     ) -> Option<(&'static str, String)> {
@@ -471,6 +481,7 @@ impl Tab {
                 res.lines.len() as u64,
                 &|row| res.lines[row as usize],
                 file,
+                &mut self.columns,
                 &Highlight { highlighter: self.highlighter.as_deref(), bookmarks: Some(&self.bookmarks) },
             );
             self.view_output(&out, |row| res.lines[row as usize]);
@@ -490,7 +501,7 @@ impl Tab {
         searched
     }
 
-    fn main_panel(&mut self, ui: &mut egui::Ui, file: &TextFile) {
+    fn main_panel(&mut self, ui: &mut egui::Ui, file: &dyn LogSource) {
         let out = log_view(
             ui,
             "main",
@@ -498,6 +509,7 @@ impl Tab {
             file.line_count(),
             &|row| row,
             file,
+            &mut self.columns,
             &Highlight { highlighter: self.highlighter.as_deref(), bookmarks: Some(&self.bookmarks) },
         );
         self.view_output(&out, |row| row);
@@ -874,7 +886,7 @@ impl eframe::App for App {
             let close = egui::Panel::right("bookmarks")
                 .resizable(true)
                 .default_size(300.0)
-                .show(ui, |ui| tab.bookmarks_panel(ui, &file))
+                .show(ui, |ui| tab.bookmarks_panel(ui, &*file))
                 .inner;
             if close {
                 self.show_bookmarks = false;
@@ -885,10 +897,10 @@ impl eframe::App for App {
             .resizable(true)
             .default_size(260.0)
             .min_size(120.0)
-            .show(ui, |ui| tab.filter_panel(ui, &file, &mut focus_search, &self.history))
+            .show(ui, |ui| tab.filter_panel(ui, &*file, &mut focus_search, &self.history))
             .inner;
         let after = tab.search_prefs();
-        egui::CentralPanel::default().show(ui, |ui| tab.main_panel(ui, &file));
+        egui::CentralPanel::default().show(ui, |ui| tab.main_panel(ui, &*file));
         if after != before {
             self.save_prefs_from(after);
         }
