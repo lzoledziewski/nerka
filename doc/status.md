@@ -16,7 +16,9 @@ Owner feedback is driving this; these are deliberate choices, keep them:
 
 - **Tabs**, one per open file (klogg-style). Each tab has its own filter, view positions and bookmarks. Opening an already-open file switches to its tab. Ctrl+Tab / Ctrl+Shift+Tab (or Ctrl+PgDn/PgUp) switch tabs; Ctrl+W, ✖, middle-click or the context menu close them.
 - **Filter box:** modes **Text** (literal by default; a **Regex** checkbox switches to regex; also Ignore case and Invert) and **Query** (NFD). The row is laid out right to left so it never gets wider than the window. If it did, the result view's scrollbar would end up off-screen (that was a real bug).
-- **Search history:** the 🕘 button lists recent filters. They are stored in `%APPDATA%\nerka\history` (or `$XDG_CONFIG_HOME/nerka/history`) as `text|regex|query<TAB>pattern`, using `core::SearchHistory`.
+- **When a search runs (owner's decision):** only on Enter or the Search button. Ticking Regex / Ignore case / Invert, switching Text/Query or picking a history entry only changes the box's settings or contents; nothing runs until Enter. The last mode + checkbox combination is saved to `%APPDATA%
+erka\prefs` (or `$XDG_CONFIG_HOME/nerka/prefs`) and becomes the default for new tabs.
+- **Search history:** the 🕘 button lists recent filters; picking one fills the box. They are stored in `%APPDATA%\nerka\history` (or `$XDG_CONFIG_HOME/nerka/history`) as `text|regex|query<TAB>pattern`, using `core::SearchHistory`.
 - **Text selection:** drag, Shift+click, double-click (word), Shift+arrows (lines), Ctrl+A, Esc. Ctrl+C copies the selection, or the current line if nothing is selected (at most 100k lines). The right-click menu has Copy, Select all and Toggle bookmark.
 - **Go to line:** Ctrl+G / Ctrl+L opens a dialog. There is no toolbar field (the owner asked for it to be removed).
 - **Look:** no tint on matching lines in the main view (the owner disliked the blue); the cursor line is neutral grey. Scrollbar thumbs use the text colour at 50% and are 14 px wide.

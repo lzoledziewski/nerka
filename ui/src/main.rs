@@ -19,6 +19,7 @@
 
 mod icon;
 mod job;
+mod prefs;
 mod view;
 
 use eframe::egui::{self, Key, KeyboardShortcut, Modifiers};
@@ -27,6 +28,7 @@ use nerka_core::{
     Bookmarks, Filter, Highlighter, LineNo, LogSource, Matcher, MatcherOptions, Query, SearchHistory, SearchResult,
     TextFile,
 };
+use prefs::SearchPrefs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -62,6 +64,7 @@ fn main() -> eframe::Result {
         Box::new(move |cc| {
             let mut app = App::default();
             app.load_history();
+            app.load_prefs();
             for p in initial {
                 app.open(&cc.egui_ctx, p);
                 // A filter given on the command line applies to every file it names.
@@ -75,18 +78,13 @@ fn main() -> eframe::Result {
     )
 }
 
-#[derive(Default, PartialEq, Clone, Copy)]
+#[derive(Debug, Default, PartialEq, Clone, Copy)]
 enum Mode {
     /// klogg-style search box: plain text, or a regex when "Regex" is ticked.
     #[default]
     Text,
     /// NFD query: `level >= ERROR AND raw ~ /SSL/`.
     Query,
-}
-
-/// Text mode searches literally until "Regex" is ticked.
-fn default_matcher_options() -> MatcherOptions {
-    MatcherOptions { fixed_string: true, ..Default::default() }
 }
 
 /// One open file with its own filter, view positions and bookmarks.
@@ -109,7 +107,7 @@ struct Tab {
 }
 
 impl Tab {
-    fn open(ctx: &egui::Context, path: PathBuf) -> Self {
+    fn open(ctx: &egui::Context, path: PathBuf, prefs: &SearchPrefs) -> Self {
         let p = path.clone();
         Self {
             path,
@@ -117,9 +115,9 @@ impl Tab {
             loading: Some(Job::spawn(ctx, move |prog| TextFile::open(&p, prog))),
             main_view: ViewState::default(),
             filter_view: ViewState::default(),
-            mode: Mode::default(),
+            mode: prefs.mode,
             pattern: String::new(),
-            options: default_matcher_options(),
+            options: prefs.options.clone(),
             highlighter: None,
             result: None,
             searching: None,
@@ -143,6 +141,10 @@ impl Tab {
         if let Some((_, j)) = self.searching.take() {
             j.cancel();
         }
+    }
+
+    fn search_prefs(&self) -> SearchPrefs {
+        SearchPrefs { mode: self.mode, options: self.options.clone() }
     }
 
     /// History tag for the current filter: `text`, `regex` or `query`.
@@ -408,7 +410,9 @@ impl Tab {
                         for (tag, pattern) in history.iter() {
                             let label = egui::RichText::new(format!("{tag:<5}  {pattern}")).monospace();
                             if ui.add(egui::Button::new(label).wrap_mode(egui::TextWrapMode::Truncate)).clicked() {
-                                go |= self.set_filter(tag, pattern);
+                                // Fills the box only; Enter or Search runs it.
+                                self.set_filter(tag, pattern);
+                                *focus_search = true;
                                 ui.close();
                             }
                         }
@@ -417,11 +421,11 @@ impl Tab {
                 .response
                 .on_hover_text("Recent filters");
             });
-            go |= ui.selectable_value(&mut self.mode, Mode::Text, "Text").changed();
-            go |= ui
-                .selectable_value(&mut self.mode, Mode::Query, "Query")
-                .on_hover_text("level >= ERROR AND raw ~ /SSL|CERT/i AND NOT /healthcheck/")
-                .changed();
+            // Mode and checkboxes only change how the box is read; only
+            // Enter or Search runs it.
+            ui.selectable_value(&mut self.mode, Mode::Text, "Text");
+            ui.selectable_value(&mut self.mode, Mode::Query, "Query")
+                .on_hover_text("level >= ERROR AND raw ~ /SSL|CERT/i AND NOT /healthcheck/");
             let hint = match self.mode {
                 Mode::Text if self.options.fixed_string => "text — Enter to search",
                 Mode::Text => "regex — Enter to search",
@@ -432,12 +436,11 @@ impl Tab {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 go |= ui.button("Search").clicked();
                 if self.mode == Mode::Text {
-                    go |= ui.checkbox(&mut self.options.invert, "Invert").changed();
-                    go |= ui.checkbox(&mut self.options.case_insensitive, "Ignore case").changed();
+                    ui.checkbox(&mut self.options.invert, "Invert");
+                    ui.checkbox(&mut self.options.case_insensitive, "Ignore case");
                     let mut regex = !self.options.fixed_string;
                     if ui.checkbox(&mut regex, "Regex").changed() {
                         self.options.fixed_string = !regex;
-                        go = true;
                     }
                 }
                 let r = ui.add(
@@ -506,6 +509,8 @@ struct App {
     /// Text of the Ctrl+G dialog while it is open.
     goto: Option<String>,
     history: SearchHistory,
+    /// Search mode and options for new tabs: the last ones the user picked.
+    prefs: SearchPrefs,
     /// Shown when no tab is open (e.g. why the last open failed).
     status: String,
     focus_search: bool,
@@ -555,12 +560,38 @@ fn history_path() -> Option<PathBuf> {
     config_dir().map(|d| d.join("history"))
 }
 
+fn prefs_path() -> Option<PathBuf> {
+    config_dir().map(|d| d.join("prefs"))
+}
+
 impl App {
     fn load_history(&mut self) {
         let Some(path) = history_path() else { return };
         match SearchHistory::load(&path) {
             Ok(h) => self.history = h,
             Err(e) => self.status = format!("Could not read search history: {e}"),
+        }
+    }
+
+    fn load_prefs(&mut self) {
+        let Some(path) = prefs_path() else { return };
+        match SearchPrefs::load(&path) {
+            Ok(p) => self.prefs = p,
+            Err(e) => self.status = format!("Could not read preferences: {e}"),
+        }
+    }
+
+    /// Remember the active tab's mode and options if the user changed them.
+    fn save_prefs_from(&mut self, prefs: SearchPrefs) {
+        if prefs == self.prefs {
+            return;
+        }
+        self.prefs = prefs;
+        if let Some(path) = prefs_path()
+            && let Err(e) = self.prefs.save(&path)
+            && let Some(t) = self.tabs.get_mut(self.active)
+        {
+            t.status = format!("Could not save preferences: {e}");
         }
     }
 
@@ -584,7 +615,7 @@ impl App {
             self.active = i;
             return;
         }
-        self.tabs.push(Tab::open(ctx, path));
+        self.tabs.push(Tab::open(ctx, path, &self.prefs));
         self.active = self.tabs.len() - 1;
     }
 
@@ -846,13 +877,18 @@ impl eframe::App for App {
                 self.show_bookmarks = false;
             }
         }
+        let before = tab.search_prefs();
         let searched = egui::Panel::bottom("filter")
             .resizable(true)
             .default_size(260.0)
             .min_size(120.0)
             .show(ui, |ui| tab.filter_panel(ui, &file, &mut focus_search, &self.history))
             .inner;
+        let after = tab.search_prefs();
         egui::CentralPanel::default().show(ui, |ui| tab.main_panel(ui, &file));
+        if after != before {
+            self.save_prefs_from(after);
+        }
         if let Some((tag, pattern)) = searched {
             self.record_search(tag, &pattern);
         }
