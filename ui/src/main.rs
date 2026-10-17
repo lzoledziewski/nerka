@@ -330,7 +330,7 @@ impl Tab {
         ui.horizontal(|ui| {
             ui.heading("Bookmarks");
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                close = ui.small_button("✖").on_hover_text("Close panel").clicked();
+                close = close_button(ui).on_hover_text("Close panel").clicked();
             });
         });
         self.bookmarks_list(ui, file);
@@ -362,7 +362,7 @@ impl Tab {
                 // every frame until it fills the window.
                 let row = egui::vec2(ui.available_width(), ui.spacing().interact_size.y);
                 ui.allocate_ui_with_layout(row, egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.small_button("✖").on_hover_text("Remove").clicked() {
+                    if close_button(ui).on_hover_text("Remove").clicked() {
                         remove = Some(line);
                     }
                     let mut text = note.to_owned();
@@ -510,6 +510,25 @@ struct App {
     status: String,
     focus_search: bool,
     window_title: String,
+}
+
+/// A window-style close button: a thin painted "×" with a square hover
+/// background. The "✖" glyph isn't in egui's text font and falls back to the
+/// heavy emoji/icon font.
+fn close_button(ui: &mut egui::Ui) -> egui::Response {
+    let side = ui.spacing().interact_size.y;
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(side, side), egui::Sense::click());
+    if ui.is_rect_visible(rect) {
+        let visuals = ui.style().interact(&response);
+        if response.hovered() {
+            ui.painter().rect_filled(rect, 2.0, visuals.weak_bg_fill);
+        }
+        let r = egui::Rect::from_center_size(rect.center(), egui::vec2(side * 0.36, side * 0.36));
+        let stroke = egui::Stroke::new(1.2, visuals.fg_stroke.color);
+        ui.painter().line_segment([r.left_top(), r.right_bottom()], stroke);
+        ui.painter().line_segment([r.right_top(), r.left_bottom()], stroke);
+    }
+    response
 }
 
 /// Paths compare equal if they name the same file.
@@ -695,7 +714,7 @@ impl App {
                             ui.ctx().copy_text(t.path.display().to_string());
                         }
                     });
-                    if ui.small_button("✖").on_hover_text("Close (Ctrl+W)").clicked() {
+                    if close_button(ui).on_hover_text("Close (Ctrl+W)").clicked() {
                         close = Some(i);
                     }
                     ui.separator();
