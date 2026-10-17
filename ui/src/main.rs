@@ -324,8 +324,20 @@ impl Tab {
         }
     }
 
-    fn bookmarks_panel(&mut self, ui: &mut egui::Ui, file: &TextFile) {
-        ui.heading("Bookmarks");
+    /// Returns true when the panel's close button was clicked.
+    fn bookmarks_panel(&mut self, ui: &mut egui::Ui, file: &TextFile) -> bool {
+        let mut close = false;
+        ui.horizontal(|ui| {
+            ui.heading("Bookmarks");
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                close = ui.small_button("✖").on_hover_text("Close panel").clicked();
+            });
+        });
+        self.bookmarks_list(ui, file);
+        close
+    }
+
+    fn bookmarks_list(&mut self, ui: &mut egui::Ui, file: &TextFile) {
         ui.weak("m toggle · b / B next / prev");
         ui.separator();
         if self.bookmarks.is_empty() {
@@ -344,18 +356,21 @@ impl Tab {
                     let preview: String = file.line_text(line).unwrap_or_default().chars().take(48).collect();
                     ui.add(egui::Label::new(egui::RichText::new(preview).monospace().weak()).truncate());
                 });
-                ui.horizontal(|ui| {
+                // Right-to-left so the note field takes exactly the width left
+                // after the button. A guessed width overshoots by the item
+                // spacing, and a resizable panel grows to fit its content
+                // every frame until it fills the window.
+                let row = egui::vec2(ui.available_width(), ui.spacing().interact_size.y);
+                ui.allocate_ui_with_layout(row, egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.small_button("✖").on_hover_text("Remove").clicked() {
+                        remove = Some(line);
+                    }
                     let mut text = note.to_owned();
                     let r = ui.add(
-                        egui::TextEdit::singleline(&mut text)
-                            .hint_text("note…")
-                            .desired_width(ui.available_width() - 28.0),
+                        egui::TextEdit::singleline(&mut text).hint_text("note…").desired_width(ui.available_width()),
                     );
                     if r.changed() {
                         edits.push((line, text));
-                    }
-                    if ui.small_button("✖").on_hover_text("Remove").clicked() {
-                        remove = Some(line);
                     }
                 });
                 ui.add_space(4.0);
@@ -626,7 +641,7 @@ impl App {
             self.cycle_tab(true);
         }
         // Single-key commands (klogg style) only when not typing in a field.
-        if !ctx.egui_wants_keyboard_input()
+        if !ctx.text_edit_focused()
             && self.goto.is_none()
             && let Some(tab) = self.tab()
         {
@@ -803,9 +818,14 @@ impl eframe::App for App {
         };
 
         if show_bookmarks {
-            egui::Panel::right("bookmarks").resizable(true).default_size(300.0).show(ui, |ui| {
-                tab.bookmarks_panel(ui, &file);
-            });
+            let close = egui::Panel::right("bookmarks")
+                .resizable(true)
+                .default_size(300.0)
+                .show(ui, |ui| tab.bookmarks_panel(ui, &file))
+                .inner;
+            if close {
+                self.show_bookmarks = false;
+            }
         }
         let searched = egui::Panel::bottom("filter")
             .resizable(true)
