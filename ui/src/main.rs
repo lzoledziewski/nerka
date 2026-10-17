@@ -1,12 +1,14 @@
-//! nerka-gui — klogg-style desktop viewer: main view on top, filter view
-//! below, bookmarks panel on the right.
+//! nerka-gui — klogg-style desktop viewer: one tab per open file, each with
+//! a main view on top, a filter view below and a bookmarks panel on the
+//! right. Filter, scroll position and bookmarks belong to the tab.
 //!
 //! Open with Ctrl+O, drag & drop, or from a shell:
-//!     nerka-gui app.log
+//!     nerka-gui app.log other.log
 //!     nerka-gui app.log --query 'level >= ERROR AND raw ~ /SSL/'
 //!     nerka-gui app.log --regex 'timeout|refused'
 //! Keys: Ctrl+F filter · Enter run · n/N next/prev match · m toggle bookmark
-//! · b/B next/prev bookmark · Ctrl+C copy line · Ctrl+Home/End.
+//! · b/B next/prev bookmark · Ctrl+C copy line · Ctrl+Home/End
+//! · Ctrl+Tab / Ctrl+Shift+Tab next/prev tab · Ctrl+W close tab.
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
@@ -18,20 +20,20 @@ use job::{Job, Poll};
 use nerka_core::{
     Bookmarks, Filter, Highlighter, LineNo, LogSource, Matcher, MatcherOptions, Query, SearchResult, TextFile,
 };
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 use view::{Highlight, ViewState, log_view};
 
 fn main() -> eframe::Result {
-    let mut initial: Option<PathBuf> = None;
+    let mut initial: Vec<PathBuf> = Vec::new();
     let mut preset: Option<(Mode, String)> = None;
     let mut args = std::env::args_os().skip(1);
     while let Some(a) = args.next() {
         match a.to_str() {
             Some("--query" | "-q") => preset = args.next().map(|v| (Mode::Query, v.to_string_lossy().into_owned())),
             Some("--regex" | "-r") => preset = args.next().map(|v| (Mode::Regex, v.to_string_lossy().into_owned())),
-            _ => initial = Some(PathBuf::from(a)),
+            _ => initial.push(PathBuf::from(a)),
         }
     }
     let options = eframe::NativeOptions {
@@ -43,13 +45,15 @@ fn main() -> eframe::Result {
         options,
         Box::new(move |cc| {
             let mut app = App::default();
-            if let Some((mode, pattern)) = preset {
-                app.mode = mode;
-                app.pattern = pattern;
-            }
-            if let Some(p) = initial {
+            for p in initial {
                 app.open(&cc.egui_ctx, p);
+                // A filter given on the command line applies to every file it names.
+                if let (Some((mode, pattern)), Some(tab)) = (&preset, app.tabs.last_mut()) {
+                    tab.mode = *mode;
+                    tab.pattern = pattern.clone();
+                }
             }
+            app.active = 0;
             Ok(Box::new(app))
         }),
     )
@@ -64,10 +68,11 @@ enum Mode {
     Query,
 }
 
-#[derive(Default)]
-struct App {
+/// One open file with its own filter, view positions and bookmarks.
+struct Tab {
+    path: PathBuf,
     file: Option<Arc<TextFile>>,
-    loading: Option<(PathBuf, Job<TextFile>)>,
+    loading: Option<Job<TextFile>>,
     main_view: ViewState,
     filter_view: ViewState,
 
@@ -79,20 +84,44 @@ struct App {
     searching: Option<(Arc<Filter>, Job<SearchResult>)>,
 
     bookmarks: Bookmarks,
-    show_bookmarks: bool,
-
-    goto: String,
     status: String,
-    focus_search: bool,
 }
 
-impl App {
-    fn open(&mut self, ctx: &egui::Context, path: PathBuf) {
-        if let Some((_, j)) = self.loading.take() {
+impl Tab {
+    fn open(ctx: &egui::Context, path: PathBuf) -> Self {
+        let p = path.clone();
+        Self {
+            path,
+            file: None,
+            loading: Some(Job::spawn(ctx, move |prog| TextFile::open(&p, prog))),
+            main_view: ViewState::default(),
+            filter_view: ViewState::default(),
+            mode: Mode::default(),
+            pattern: String::new(),
+            options: MatcherOptions::default(),
+            highlighter: None,
+            result: None,
+            searching: None,
+            bookmarks: Bookmarks::default(),
+            status: String::new(),
+        }
+    }
+
+    fn title(&self) -> String {
+        self.path.file_name().map_or_else(|| self.path.display().to_string(), |n| n.to_string_lossy().into_owned())
+    }
+
+    fn is_busy(&self) -> bool {
+        self.loading.is_some() || self.searching.is_some()
+    }
+
+    fn cancel_jobs(&mut self) {
+        if let Some(j) = self.loading.take() {
             j.cancel();
         }
-        let p = path.clone();
-        self.loading = Some((path, Job::spawn(ctx, move |prog| TextFile::open(&p, prog))));
+        if let Some((_, j)) = self.searching.take() {
+            j.cancel();
+        }
     }
 
     fn build_filter(&self) -> Result<Filter, String> {
@@ -127,33 +156,32 @@ impl App {
         }
     }
 
-    fn poll_jobs(&mut self, ctx: &egui::Context) {
-        if let Some((path, job)) = &self.loading {
+    /// Advance background jobs. Returns `false` if the file failed to open
+    /// (the tab should then be closed; `status` holds the reason).
+    fn poll_jobs(&mut self, ctx: &egui::Context) -> bool {
+        if let Some(job) = &self.loading {
             match job.poll() {
                 Poll::Running => ctx.request_repaint_after(Duration::from_millis(50)),
                 Poll::Done(r, took) => {
+                    self.loading = None;
                     match r {
                         Ok(f) => {
                             self.status = format!("Indexed {} lines in {took:.2?}", f.line_count());
-                            self.bookmarks = Bookmarks::load_for(path).unwrap_or_else(|e| {
+                            self.bookmarks = Bookmarks::load_for(&self.path).unwrap_or_else(|e| {
                                 self.status = format!("Could not read bookmarks: {e}");
                                 Bookmarks::default()
                             });
                             self.file = Some(Arc::new(f));
-                            self.main_view = ViewState::default();
-                            self.filter_view = ViewState::default();
-                            self.result = None;
-                            ctx.send_viewport_cmd(egui::ViewportCommand::Title(format!("nerka — {}", path.display())));
+                            if !self.pattern.trim().is_empty() {
+                                self.start_search(ctx);
+                            }
                         }
-                        Err(nerka_core::Error::Cancelled) => {}
+                        Err(nerka_core::Error::Cancelled) => return false,
                         Err(e) => {
                             let src = std::error::Error::source(&e).map(|s| format!(" ({s})")).unwrap_or_default();
-                            self.status = format!("Cannot open {}: {e}{src}", path.display());
+                            self.status = format!("Cannot open {}: {e}{src}", self.path.display());
+                            return false;
                         }
-                    }
-                    self.loading = None;
-                    if self.file.is_some() && !self.pattern.trim().is_empty() {
-                        self.start_search(ctx);
                     }
                 }
             }
@@ -176,6 +204,7 @@ impl App {
                 }
             }
         }
+        true
     }
 
     fn total_lines(&self) -> LineNo {
@@ -223,49 +252,8 @@ impl App {
     }
 
     fn save_bookmarks(&mut self) {
-        if let Some(path) = self.file.as_ref().and_then(|f| f.path())
-            && let Err(e) = self.bookmarks.save_for(path)
-        {
+        if let Err(e) = self.bookmarks.save_for(&self.path) {
             self.status = format!("Could not save bookmarks: {e}");
-        }
-    }
-
-    fn handle_input(&mut self, ctx: &egui::Context) {
-        let dropped = ctx.input(|i| i.raw.dropped_files.first().map(|f| f.path().to_path_buf()));
-        if let Some(p) = dropped.filter(|p| !p.as_os_str().is_empty()) {
-            self.open(ctx, p);
-        }
-        let open = KeyboardShortcut::new(Modifiers::COMMAND, Key::O);
-        let find = KeyboardShortcut::new(Modifiers::COMMAND, Key::F);
-        if ctx.input_mut(|i| i.consume_shortcut(&open)) {
-            self.pick_file(ctx);
-        }
-        if ctx.input_mut(|i| i.consume_shortcut(&find)) {
-            self.focus_search = true;
-        }
-        // Single-key commands (klogg style) only when not typing in a field.
-        if !ctx.egui_wants_keyboard_input() {
-            let (shift, n, m, b) =
-                ctx.input(|i| (i.modifiers.shift, i.key_pressed(Key::N), i.key_pressed(Key::M), i.key_pressed(Key::B)));
-            if n {
-                self.jump_match(!shift);
-            }
-            if m {
-                self.toggle_bookmark();
-            }
-            if b {
-                self.jump_bookmark(!shift);
-            }
-        }
-    }
-
-    fn pick_file(&mut self, ctx: &egui::Context) {
-        if let Some(p) = rfd::FileDialog::new()
-            .add_filter("Logs", &["log", "txt", "out"])
-            .add_filter("All files", &["*"])
-            .pick_file()
-        {
-            self.open(ctx, p);
         }
     }
 
@@ -320,6 +308,267 @@ impl App {
             self.goto_line(l);
         }
     }
+
+    fn filter_panel(&mut self, ui: &mut egui::Ui, file: &TextFile, focus_search: &mut bool) {
+        ui.horizontal(|ui| {
+            let mut go = false;
+            go |= ui.selectable_value(&mut self.mode, Mode::Regex, "Regex").changed();
+            go |= ui
+                .selectable_value(&mut self.mode, Mode::Query, "Query")
+                .on_hover_text("level >= ERROR AND raw ~ /SSL|CERT/i AND NOT /healthcheck/")
+                .changed();
+            let hint = match self.mode {
+                Mode::Regex => "regex — Enter to search",
+                Mode::Query => "level >= ERROR AND raw ~ /SSL/ — Enter to search",
+            };
+            let r = ui.add(
+                egui::TextEdit::singleline(&mut self.pattern)
+                    .hint_text(hint)
+                    .font(egui::TextStyle::Monospace)
+                    .desired_width(ui.available_width() - if self.mode == Mode::Regex { 260.0 } else { 70.0 }),
+            );
+            if *focus_search {
+                r.request_focus();
+                *focus_search = false;
+            }
+            go |= r.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
+            if self.mode == Mode::Regex {
+                go |= ui.checkbox(&mut self.options.case_insensitive, "Ignore case").changed();
+                go |= ui.checkbox(&mut self.options.fixed_string, "Literal").changed();
+                go |= ui.checkbox(&mut self.options.invert, "Invert").changed();
+            }
+            go |= ui.button("Search").clicked();
+            if go {
+                self.start_search(ui.ctx());
+            }
+        });
+        ui.add_space(2.0);
+        if let Some(res) = self.result.clone() {
+            let out = log_view(
+                ui,
+                "filter",
+                &mut self.filter_view,
+                res.lines.len() as u64,
+                &|row| res.lines[row as usize],
+                file,
+                &Highlight { highlighter: self.highlighter.as_deref(), bookmarks: Some(&self.bookmarks), tint: None },
+            );
+            // Selecting in the filter view moves the main view.
+            let picked = out.clicked.or(if out.has_focus { self.filter_view.selected } else { None });
+            if let Some(row) = picked {
+                let line = res.lines[row as usize];
+                if self.main_view.selected != Some(line) {
+                    self.goto_line(line);
+                }
+            }
+        } else {
+            ui.weak("No filter applied.");
+            // Fill the pane: panels remember their content size.
+            ui.allocate_space(ui.available_size());
+        }
+    }
+
+    fn main_panel(&mut self, ui: &mut egui::Ui, file: &TextFile) {
+        log_view(
+            ui,
+            "main",
+            &mut self.main_view,
+            file.line_count(),
+            &|row| row,
+            file,
+            &Highlight {
+                highlighter: self.highlighter.as_deref(),
+                bookmarks: Some(&self.bookmarks),
+                tint: self.result.as_deref(),
+            },
+        );
+    }
+}
+
+#[derive(Default)]
+struct App {
+    tabs: Vec<Tab>,
+    active: usize,
+    show_bookmarks: bool,
+    goto: String,
+    /// Shown when no tab is open (e.g. why the last open failed).
+    status: String,
+    focus_search: bool,
+    window_title: String,
+}
+
+/// Paths compare equal if they name the same file.
+fn same_file(a: &Path, b: &Path) -> bool {
+    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => a == b,
+    }
+}
+
+impl App {
+    fn tab(&mut self) -> Option<&mut Tab> {
+        self.tabs.get_mut(self.active)
+    }
+
+    /// Open `path` in a new tab, or switch to it if it is already open.
+    fn open(&mut self, ctx: &egui::Context, path: PathBuf) {
+        if let Some(i) = self.tabs.iter().position(|t| same_file(&t.path, &path)) {
+            self.active = i;
+            return;
+        }
+        self.tabs.push(Tab::open(ctx, path));
+        self.active = self.tabs.len() - 1;
+    }
+
+    fn close(&mut self, i: usize) {
+        if i >= self.tabs.len() {
+            return;
+        }
+        self.tabs.remove(i).cancel_jobs();
+        if self.active > i || self.active >= self.tabs.len() {
+            self.active = self.active.saturating_sub(1);
+        }
+    }
+
+    fn close_others(&mut self, keep: usize) {
+        for (i, mut t) in std::mem::take(&mut self.tabs).into_iter().enumerate() {
+            if i == keep {
+                self.tabs.push(t);
+            } else {
+                t.cancel_jobs();
+            }
+        }
+        self.active = 0;
+    }
+
+    fn cycle_tab(&mut self, forward: bool) {
+        let n = self.tabs.len();
+        if n > 1 {
+            self.active = if forward { (self.active + 1) % n } else { (self.active + n - 1) % n };
+        }
+    }
+
+    fn poll_jobs(&mut self, ctx: &egui::Context) {
+        let mut i = 0;
+        while i < self.tabs.len() {
+            if self.tabs[i].poll_jobs(ctx) {
+                i += 1;
+                continue;
+            }
+            let msg = std::mem::take(&mut self.tabs[i].status);
+            self.close(i);
+            match self.tab() {
+                Some(t) => t.status = msg,
+                None => self.status = msg,
+            }
+        }
+    }
+
+    fn handle_input(&mut self, ctx: &egui::Context) {
+        let dropped: Vec<PathBuf> = ctx.input(|i| {
+            i.raw.dropped_files.iter().map(|f| f.path().to_path_buf()).filter(|p| !p.as_os_str().is_empty()).collect()
+        });
+        for p in dropped {
+            self.open(ctx, p);
+        }
+        let shortcut = |m, k| ctx.input_mut(|i| i.consume_shortcut(&KeyboardShortcut::new(m, k)));
+        if shortcut(Modifiers::COMMAND, Key::O) {
+            self.pick_files(ctx);
+        }
+        if shortcut(Modifiers::COMMAND, Key::F) {
+            self.focus_search = true;
+        }
+        if shortcut(Modifiers::COMMAND, Key::W) {
+            self.close(self.active);
+        }
+        // Shift variants first: matching ignores an unrequested Shift.
+        if shortcut(Modifiers::COMMAND | Modifiers::SHIFT, Key::Tab) || shortcut(Modifiers::COMMAND, Key::PageUp) {
+            self.cycle_tab(false);
+        }
+        if shortcut(Modifiers::COMMAND, Key::Tab) || shortcut(Modifiers::COMMAND, Key::PageDown) {
+            self.cycle_tab(true);
+        }
+        // Single-key commands (klogg style) only when not typing in a field.
+        if !ctx.egui_wants_keyboard_input()
+            && let Some(tab) = self.tab()
+        {
+            let (shift, n, m, b) =
+                ctx.input(|i| (i.modifiers.shift, i.key_pressed(Key::N), i.key_pressed(Key::M), i.key_pressed(Key::B)));
+            if n {
+                tab.jump_match(!shift);
+            }
+            if m {
+                tab.toggle_bookmark();
+            }
+            if b {
+                tab.jump_bookmark(!shift);
+            }
+        }
+    }
+
+    fn pick_files(&mut self, ctx: &egui::Context) {
+        if let Some(paths) = rfd::FileDialog::new()
+            .add_filter("Logs", &["log", "txt", "out"])
+            .add_filter("All files", &["*"])
+            .pick_files()
+        {
+            for p in paths {
+                self.open(ctx, p);
+            }
+        }
+    }
+
+    fn tab_bar(&mut self, ui: &mut egui::Ui) {
+        let (mut select, mut close, mut close_others) = (None, None, None);
+        egui::ScrollArea::horizontal().show(ui, |ui| {
+            ui.horizontal(|ui| {
+                for (i, t) in self.tabs.iter().enumerate() {
+                    let label = if t.is_busy() { format!("⏳ {}", t.title()) } else { t.title() };
+                    let r = ui.selectable_label(i == self.active, label).on_hover_text(t.path.display().to_string());
+                    if r.clicked() {
+                        select = Some(i);
+                    }
+                    if r.middle_clicked() {
+                        close = Some(i);
+                    }
+                    r.context_menu(|ui| {
+                        if ui.button("Close").clicked() {
+                            close = Some(i);
+                        }
+                        if ui.button("Close other tabs").clicked() {
+                            close_others = Some(i);
+                        }
+                        if ui.button("Copy full path").clicked() {
+                            ui.ctx().copy_text(t.path.display().to_string());
+                        }
+                    });
+                    if ui.small_button("✖").on_hover_text("Close (Ctrl+W)").clicked() {
+                        close = Some(i);
+                    }
+                    ui.separator();
+                }
+            });
+        });
+        if let Some(i) = select {
+            self.active = i;
+        }
+        if let Some(i) = close {
+            self.close(i);
+        } else if let Some(i) = close_others {
+            self.close_others(i);
+        }
+    }
+
+    fn update_title(&mut self, ctx: &egui::Context) {
+        let title = match self.tabs.get(self.active) {
+            Some(t) => format!("nerka — {}", t.path.display()),
+            None => "nerka".to_owned(),
+        };
+        if title != self.window_title {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Title(title.clone()));
+            self.window_title = title;
+        }
+    }
 }
 
 impl eframe::App for App {
@@ -327,11 +576,12 @@ impl eframe::App for App {
         let ctx = ui.ctx().clone();
         self.poll_jobs(&ctx);
         self.handle_input(&ctx);
+        self.update_title(&ctx);
 
         egui::Panel::top("toolbar").show(ui, |ui| {
             ui.horizontal(|ui| {
                 if ui.button("📂 Open…").on_hover_text("Ctrl+O").clicked() {
-                    self.pick_file(&ctx);
+                    self.pick_files(&ctx);
                 }
                 ui.separator();
                 ui.label("Go to line:");
@@ -339,130 +589,70 @@ impl eframe::App for App {
                 if r.lost_focus()
                     && ui.input(|i| i.key_pressed(Key::Enter))
                     && let Ok(n) = self.goto.trim().parse::<u64>()
+                    && let Some(tab) = self.tabs.get_mut(self.active)
                 {
-                    self.goto_line(n.saturating_sub(1));
+                    tab.goto_line(n.saturating_sub(1));
                 }
                 ui.separator();
-                ui.toggle_value(&mut self.show_bookmarks, format!("🔖 Bookmarks ({})", self.bookmarks.len()));
-                if let Some(f) = &self.file {
+                let marks = self.tabs.get(self.active).map_or(0, |t| t.bookmarks.len());
+                ui.toggle_value(&mut self.show_bookmarks, format!("🔖 Bookmarks ({marks})"));
+                if let Some(f) = self.tabs.get(self.active).and_then(|t| t.file.as_ref()) {
                     ui.separator();
                     ui.label(format!("{} lines · {:.1} MiB", f.line_count(), f.size_bytes() as f64 / 1048576.0));
                 }
             });
         });
 
+        if !self.tabs.is_empty() {
+            egui::Panel::top("tabs").show(ui, |ui| self.tab_bar(ui));
+        }
+
         egui::Panel::bottom("status").show(ui, |ui| {
-            ui.horizontal(|ui| {
-                if let Some((p, j)) = &self.loading {
-                    ui.add(egui::ProgressBar::new(j.progress.fraction()).desired_width(200.0).show_percentage());
-                    ui.label(format!("Indexing {}", p.display()));
-                } else if let Some((_, j)) = &self.searching {
-                    ui.add(egui::ProgressBar::new(j.progress.fraction()).desired_width(200.0).show_percentage());
-                    if ui.button("Cancel").clicked() {
-                        j.cancel();
+            ui.horizontal(|ui| match self.tabs.get(self.active) {
+                Some(t) => {
+                    if let Some(j) = &t.loading {
+                        ui.add(egui::ProgressBar::new(j.progress.fraction()).desired_width(200.0).show_percentage());
+                        ui.label(format!("Indexing {}", t.path.display()));
+                    } else if let Some((_, j)) = &t.searching {
+                        ui.add(egui::ProgressBar::new(j.progress.fraction()).desired_width(200.0).show_percentage());
+                        if ui.button("Cancel").clicked() {
+                            j.cancel();
+                        }
+                    } else {
+                        ui.label(&t.status);
                     }
-                } else {
+                }
+                None => {
                     ui.label(&self.status);
                 }
             });
         });
 
-        let Some(file) = self.file.clone() else {
+        let show_bookmarks = self.show_bookmarks;
+        let mut focus_search = std::mem::take(&mut self.focus_search);
+        let Some(tab) = self.tabs.get_mut(self.active) else {
             egui::CentralPanel::default().show(ui, |ui| {
-                ui.centered_and_justified(|ui| {
-                    ui.label(if self.loading.is_some() {
-                        "Indexing…"
-                    } else {
-                        "Open a log file (Ctrl+O) or drop it here"
-                    });
-                });
+                ui.centered_and_justified(|ui| ui.label("Open log files (Ctrl+O) or drop them here"));
             });
             return;
         };
+        let Some(file) = tab.file.clone() else {
+            egui::CentralPanel::default().show(ui, |ui| {
+                ui.centered_and_justified(|ui| ui.label("Indexing…"));
+            });
+            // Keep a pending Ctrl+F for when the file is ready.
+            self.focus_search = focus_search;
+            return;
+        };
 
-        if self.show_bookmarks {
+        if show_bookmarks {
             egui::Panel::right("bookmarks").resizable(true).default_size(300.0).show(ui, |ui| {
-                self.bookmarks_panel(ui, &file);
+                tab.bookmarks_panel(ui, &file);
             });
         }
-
         egui::Panel::bottom("filter").resizable(true).default_size(260.0).min_size(120.0).show(ui, |ui| {
-            ui.horizontal(|ui| {
-                let mut go = false;
-                go |= ui.selectable_value(&mut self.mode, Mode::Regex, "Regex").changed();
-                go |= ui
-                    .selectable_value(&mut self.mode, Mode::Query, "Query")
-                    .on_hover_text("level >= ERROR AND raw ~ /SSL|CERT/i AND NOT /healthcheck/")
-                    .changed();
-                let hint = match self.mode {
-                    Mode::Regex => "regex — Enter to search",
-                    Mode::Query => "level >= ERROR AND raw ~ /SSL/ — Enter to search",
-                };
-                let r = ui.add(
-                    egui::TextEdit::singleline(&mut self.pattern)
-                        .hint_text(hint)
-                        .font(egui::TextStyle::Monospace)
-                        .desired_width(ui.available_width() - if self.mode == Mode::Regex { 260.0 } else { 70.0 }),
-                );
-                if self.focus_search {
-                    r.request_focus();
-                    self.focus_search = false;
-                }
-                go |= r.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
-                if self.mode == Mode::Regex {
-                    go |= ui.checkbox(&mut self.options.case_insensitive, "Ignore case").changed();
-                    go |= ui.checkbox(&mut self.options.fixed_string, "Literal").changed();
-                    go |= ui.checkbox(&mut self.options.invert, "Invert").changed();
-                }
-                go |= ui.button("Search").clicked();
-                if go {
-                    self.start_search(&ctx);
-                }
-            });
-            ui.add_space(2.0);
-            if let Some(res) = self.result.clone() {
-                let out = log_view(
-                    ui,
-                    "filter",
-                    &mut self.filter_view,
-                    res.lines.len() as u64,
-                    &|row| res.lines[row as usize],
-                    &*file,
-                    &Highlight {
-                        highlighter: self.highlighter.as_deref(),
-                        bookmarks: Some(&self.bookmarks),
-                        tint: None,
-                    },
-                );
-                // Selecting in the filter view moves the main view.
-                let picked = out.clicked.or(if out.has_focus { self.filter_view.selected } else { None });
-                if let Some(row) = picked {
-                    let line = res.lines[row as usize];
-                    if self.main_view.selected != Some(line) {
-                        self.goto_line(line);
-                    }
-                }
-            } else {
-                ui.weak("No filter applied.");
-                // Fill the pane: panels remember their content size.
-                ui.allocate_space(ui.available_size());
-            }
+            tab.filter_panel(ui, &file, &mut focus_search);
         });
-
-        egui::CentralPanel::default().show(ui, |ui| {
-            log_view(
-                ui,
-                "main",
-                &mut self.main_view,
-                file.line_count(),
-                &|row| row,
-                &*file,
-                &Highlight {
-                    highlighter: self.highlighter.as_deref(),
-                    bookmarks: Some(&self.bookmarks),
-                    tint: self.result.as_deref(),
-                },
-            );
-        });
+        egui::CentralPanel::default().show(ui, |ui| tab.main_panel(ui, &file));
     }
 }
