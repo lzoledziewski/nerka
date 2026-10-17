@@ -412,27 +412,31 @@ impl Tab {
                 Mode::Text => "regex — Enter to search",
                 Mode::Query => "level >= ERROR AND raw ~ /SSL/ — Enter to search",
             };
-            let r = ui.add(
-                egui::TextEdit::singleline(&mut self.pattern)
-                    .hint_text(hint)
-                    .font(egui::TextStyle::Monospace)
-                    .desired_width(ui.available_width() - if self.mode == Mode::Text { 260.0 } else { 70.0 }),
-            );
-            if *focus_search {
-                r.request_focus();
-                *focus_search = false;
-            }
-            go |= r.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
-            if self.mode == Mode::Text {
-                let mut regex = !self.options.fixed_string;
-                if ui.checkbox(&mut regex, "Regex").changed() {
-                    self.options.fixed_string = !regex;
-                    go = true;
+            // Right to left: buttons first, the text box takes what is left,
+            // so the row never grows wider than the panel.
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                go |= ui.button("Search").clicked();
+                if self.mode == Mode::Text {
+                    go |= ui.checkbox(&mut self.options.invert, "Invert").changed();
+                    go |= ui.checkbox(&mut self.options.case_insensitive, "Ignore case").changed();
+                    let mut regex = !self.options.fixed_string;
+                    if ui.checkbox(&mut regex, "Regex").changed() {
+                        self.options.fixed_string = !regex;
+                        go = true;
+                    }
                 }
-                go |= ui.checkbox(&mut self.options.case_insensitive, "Ignore case").changed();
-                go |= ui.checkbox(&mut self.options.invert, "Invert").changed();
-            }
-            go |= ui.button("Search").clicked();
+                let r = ui.add(
+                    egui::TextEdit::singleline(&mut self.pattern)
+                        .hint_text(hint)
+                        .font(egui::TextStyle::Monospace)
+                        .desired_width(ui.available_width()),
+                );
+                if *focus_search {
+                    r.request_focus();
+                    *focus_search = false;
+                }
+                go |= r.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
+            });
             if go && self.start_search(ui.ctx()) {
                 searched = Some((self.filter_tag(), self.pattern.clone()));
             }

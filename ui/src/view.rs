@@ -20,7 +20,7 @@ use nerka_core::{Bookmarks, Highlighter, LineNo, LogSource};
 const MAX_DISPLAY_BYTES: usize = 4096;
 /// Copying more lines than this is cut short (the clipboard is not a file).
 const MAX_COPY_LINES: u64 = 100_000;
-const SCROLLBAR_W: f32 = 12.0;
+const SCROLLBAR_W: f32 = 14.0;
 const TAB_COLS: usize = 4;
 /// Rows scrolled per mouse-wheel notch (klogg uses 3).
 const LINES_PER_NOTCH: u64 = 3;
@@ -337,7 +337,7 @@ pub fn log_view(
         bar_h
     } else {
         // min ≤ max even when the panel is shorter than the minimum thumb.
-        (bar_h * state.page as f32 / rows as f32).clamp(24.0_f32.min(bar_h), bar_h)
+        (bar_h * state.page as f32 / rows as f32).clamp(32.0_f32.min(bar_h), bar_h)
     };
     let track = (bar_rect.height() - thumb_h).max(1.0);
     if (bar.dragged() || bar.clicked())
@@ -422,8 +422,9 @@ pub fn log_view(
     painter.rect_filled(bar_rect, 0.0, vis.faint_bg_color);
     let thumb_y = bar_rect.top() + if max_top == 0 { 0.0 } else { track * (state.top as f64 / max_top as f64) as f32 };
     let thumb = Rect::from_min_size(pos2(bar_rect.left() + 2.0, thumb_y), vec2(SCROLLBAR_W - 4.0, thumb_h));
-    let thumb_col =
-        if bar.dragged() || bar.hovered() { vis.widgets.hovered.bg_fill } else { vis.widgets.inactive.bg_fill };
+    painter.vline(bar_rect.left(), bar_rect.y_range(), vis.widgets.noninteractive.bg_stroke);
+    // Derived from the text colour so the thumb stands out in both themes.
+    let thumb_col = text_color.gamma_multiply(if bar.dragged() || bar.hovered() { 0.7 } else { 0.5 });
     painter.rect_filled(thumb, 4.0, thumb_col);
     if bar.hovered() {
         ui.ctx().set_cursor_icon(CursorIcon::Default);
