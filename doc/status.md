@@ -80,7 +80,7 @@ Open with the owner: save column widths? Sorting stays out (decided). Next after
 - Considered: **MPL-2.0** (core changes must stay open, closed plugins still allowed), LGPL (awkward with Rust's static linking), GPL + plugin exception, AGPL + commercial dual licence (needs a CLA). Revisit before the first public release or before accepting outside contributions: relicensing later needs every contributor's consent, so decide on a CLA first.
 - Code already published under `MIT OR Apache-2.0` stays available under it.
 - The plugin interface is also the licensing boundary: keep it stable and documented.
-- **Missing:** `LICENSE-MIT` and `LICENSE-APACHE` files in the repo root (a dual licence normally ships both).
+- **Licence files** (owner, 2026-10-18): `LICENSE-MIT` (copyright line "Copyright (c) 2026 Łukasz Żołędziewski", as in the About dialog) and `LICENSE-APACHE` (the canonical Apache 2.0 text from apache.org) are in the repo root and ship in the release archives.
 
 ## Search manager (POC built: core, CLI, GUI)
 
@@ -107,9 +107,8 @@ Don't settle these silently: ask.
 2. **Level detection:** only upper-case tokens (`ERROR`, `[WARN]`, `level=INFO`) in the first 160 bytes are recognised. This needs real log samples from the owner.
 3. **Bookmark storage:** currently a sidecar `<log>.nerka-marks` next to the log. The alternative is a central app-data folder when the log's directory is read-only.
 4. **DLT column widths:** resizable per tab but not saved. Save them (globally or per file)?
-5. **Releases / downloads:** `release.yml` (Linux + Windows pre-releases on `v*` tags) is in place; open: macOS builds (unsigned binaries warn; 10x runner minutes), the `.exe` icon (needs an unapproved build dependency), and licence files in the archives.
+5. **Releases / downloads:** `release.yml` (Linux + Windows pre-releases on `v*` tags, archives with the README and both licence files) is in place; open: macOS builds (unsigned binaries warn; 10x runner minutes) and the `.exe` icon (needs an unapproved build dependency).
 6. **Linux builds from this Windows PC:** no WSL, Docker or zig installed. Options: cross-compile with `cargo zigbuild --target x86_64-unknown-linux-gnu.2.17` (user-level installs; build only, untested), WSL (can also run the GUI), or GitHub Actions. `Cargo.lock` has no GTK (the file dialog uses D-Bus via `zbus`), so a cross build is expected to link; not verified.
-7. **Licence files:** add `LICENSE-MIT` and `LICENSE-APACHE`, and with which copyright line?
 
 ## Known limitations
 

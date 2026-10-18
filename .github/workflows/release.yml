@@ -46,7 +46,7 @@ jobs:
           ref="${GITHUB_REF_NAME//\//-}"
           dir="nerka-${ref}-${{ matrix.name }}"
           mkdir "$dir"
-          cp target/release/nerka target/release/nerka-gui README.md "$dir/"
+          cp target/release/nerka target/release/nerka-gui README.md LICENSE-MIT LICENSE-APACHE "$dir/"
           tar czf "$dir.tar.gz" "$dir"
           echo "ASSET=$dir.tar.gz" >> "$GITHUB_ENV"
       - name: Package (Windows)
@@ -56,7 +56,7 @@ jobs:
           $ref = $env:GITHUB_REF_NAME -replace '/', '-'
           $dir = "nerka-$ref-${{ matrix.name }}"
           New-Item -ItemType Directory $dir | Out-Null
-          Copy-Item target/release/nerka.exe, target/release/nerka-gui.exe, README.md $dir
+          Copy-Item target/release/nerka.exe, target/release/nerka-gui.exe, README.md, LICENSE-MIT, LICENSE-APACHE $dir
           Compress-Archive -Path $dir -DestinationPath "$dir.zip"
           "ASSET=$dir.zip" | Out-File -FilePath $env:GITHUB_ENV -Append
       - uses: actions/upload-artifact@v4
