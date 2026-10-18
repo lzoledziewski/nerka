@@ -533,7 +533,7 @@ pub fn library_panel(
         ui.separator();
     }
 
-    ui.weak("+ adds to the selection (or drag it) · 🔍 searches · ✎ edits");
+    ui.weak("+ adds to the selection (or drag it) · 🔍 searches · ⋮ edit, refine");
     let lib_ro: &Library = lib;
     let mut edit_request: Option<EditRequest> = None;
     egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
@@ -575,7 +575,7 @@ pub fn library_panel(
                     .show(ui, |ui| group_ui(ui, lib_ro, &unlabelled, picks, &mut action, &mut edit_request));
             }
             ui.add_space(4.0);
-            ui.weak("New queries: ↳ on a query refines it; or group by Pack, then + New query.");
+            ui.weak("New queries: ⋮ → refine on a query, or group by Pack, then + New query.");
         }
     });
     if let Some(EditRequest { pack, old, parent }) = edit_request {
@@ -607,7 +607,8 @@ pub fn parent_choices(lib: &Library, own: Option<&str>) -> Vec<String> {
         .collect()
 }
 
-/// A label's or pack's queries. "+ all" adds them now: a query labelled
+/// A label's or pack's queries as a tree: a query refining another one of
+/// the group is nested under it. "+ all" adds them now: a query labelled
 /// later doesn't join.
 fn group_ui(
     ui: &mut egui::Ui,
@@ -622,50 +623,147 @@ fn group_ui(
             picks.add(lib, id, Use::Include, None);
         }
     }
-    for id in ids {
-        let Some((pack, q)) = lib.get(id) else { continue };
-        ui.horizontal(|ui| {
-            ui.spacing_mut().item_spacing.x = 4.0;
-            if ui.small_button("+").on_hover_text("Add to the selection (include in the filter)").clicked() {
-                picks.add(lib, id, Use::Include, None);
-            }
-            search_menu(ui, Target::Library(id.clone()), action);
-            let color = q.color.as_deref().and_then(parse_color);
-            let (rect, _) = ui.allocate_exact_size(egui::vec2(8.0, 12.0), egui::Sense::hover());
-            if let Some(c) = color {
-                ui.painter().rect_filled(rect, 2.0, c);
-            }
-            let mut name = q.id.clone();
-            if !q.params.is_empty() {
-                name += &format!("({})", q.params.join(", "));
-            }
-            let mut tip = format!("{id}\n\n{}", q.text);
-            if let Some(parent) = pack.parent_of(q) {
-                tip += &format!("\n\nrefines {parent}");
-            }
-            if !q.labels.is_empty() {
-                tip += &format!("\nlabels: {}", q.labels.join(", "));
-            }
-            ui.dnd_drag_source(ui.scope_id().with(("lib-drag", id)), Drag::Library(id.clone()), |ui| {
-                ui.label(name);
-            })
-            .response
-            .on_hover_text(tip);
-            ui.weak(&pack.name);
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.small_button("✎").on_hover_text("Edit this query in its pack").clicked() {
-                    *edit = Some(EditRequest { pack: pack.name.clone(), old: Some(q.id.clone()), parent: None });
-                }
-                if ui
-                    .small_button("↳")
-                    .on_hover_text("New query that refines this one (its parent): its meaning is this AND the new text")
-                    .clicked()
-                {
-                    *edit = Some(EditRequest { pack: pack.name.clone(), old: None, parent: Some(id.clone()) });
-                }
-            });
-        });
+    let tree = Tree::of(lib, ids);
+    for &root in &tree.roots {
+        tree_ui(ui, lib, &tree, root, picks, action, edit);
     }
+}
+
+/// Queries of a group arranged by refinement.
+struct Tree<'a> {
+    ids: &'a [String],
+    /// Parent (qualified) of each query, if it has one.
+    parents: Vec<Option<String>>,
+    /// Indices into `ids` of the queries whose parent isn't in the group.
+    roots: Vec<usize>,
+    /// Children of each query, in group order.
+    children: Vec<Vec<usize>>,
+}
+
+impl<'a> Tree<'a> {
+    fn of(lib: &Library, ids: &'a [String]) -> Tree<'a> {
+        let parents: Vec<Option<String>> = ids.iter().map(|id| lib.get(id).and_then(|(p, q)| p.parent_of(q))).collect();
+        let mut roots = Vec::new();
+        let mut children = vec![Vec::new(); ids.len()];
+        for (i, parent) in parents.iter().enumerate() {
+            match parent.as_ref().and_then(|p| ids.iter().position(|id| id == p)) {
+                // A broken loop (a refines b refines a) still shows: as roots.
+                Some(j) if j != i && !lib.chain(&ids[j]).is_empty() => children[j].push(i),
+                _ => roots.push(i),
+            }
+        }
+        Tree { ids, parents, roots, children }
+    }
+}
+
+fn tree_ui(
+    ui: &mut egui::Ui,
+    lib: &Library,
+    tree: &Tree<'_>,
+    i: usize,
+    picks: &mut Picks,
+    action: &mut Action,
+    edit: &mut Option<EditRequest>,
+) {
+    let id = &tree.ids[i];
+    // A parent outside this group is named, so the chain stays visible.
+    let outside = tree.parents[i].as_ref().filter(|p| !tree.ids.contains(p));
+    if tree.children[i].is_empty() {
+        ui.horizontal(|ui| {
+            // Line up with the rows that have a fold arrow.
+            ui.add_space(ui.spacing().icon_width + ui.spacing().item_spacing.x);
+            query_row(ui, lib, id, outside, picks, action, edit);
+        });
+        return;
+    }
+    egui::collapsing_header::CollapsingState::load_with_default_open(
+        ui.ctx(),
+        ui.make_persistent_id(("tree", id)),
+        true,
+    )
+    .show_header(ui, |ui| query_row(ui, lib, id, outside, picks, action, edit))
+    .body(|ui| {
+        for &c in &tree.children[i] {
+            tree_ui(ui, lib, tree, c, picks, action, edit);
+        }
+    });
+}
+
+/// One library query: `+`, `🔍`, `⋮` (edit, refine, exclude), colour, name
+/// (drag it into the selection), pack.
+fn query_row(
+    ui: &mut egui::Ui,
+    lib: &Library,
+    id: &str,
+    outside_parent: Option<&String>,
+    picks: &mut Picks,
+    action: &mut Action,
+    edit: &mut Option<EditRequest>,
+) {
+    let Some((pack, q)) = lib.get(id) else { return };
+    ui.spacing_mut().item_spacing.x = 4.0;
+    if ui.small_button("+").on_hover_text("Add to the selection (include in the filter)").clicked() {
+        picks.add(lib, id, Use::Include, None);
+    }
+    search_menu(ui, Target::Library(id.to_owned()), action);
+    ui.menu_button("⋮", |ui| {
+        if ui.button("Edit…").on_hover_text("Edit this query in its pack").clicked() {
+            *edit = Some(EditRequest { pack: pack.name.clone(), old: Some(q.id.clone()), parent: None });
+            ui.close();
+        }
+        if ui
+            .button("New query refining this…")
+            .on_hover_text("Its meaning will be this query AND the new text")
+            .clicked()
+        {
+            *edit = Some(EditRequest { pack: pack.name.clone(), old: None, parent: Some(id.to_owned()) });
+            ui.close();
+        }
+        ui.separator();
+        if ui.button("Exclude from the filter").on_hover_text("Add to the selection as − (AND NOT)").clicked() {
+            picks.add(lib, id, Use::Exclude, None);
+            ui.close();
+        }
+    })
+    .response
+    .on_hover_text("Edit, refine, exclude");
+    let color = q.color.as_deref().and_then(parse_color);
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(8.0, 12.0), egui::Sense::hover());
+    if let Some(c) = color {
+        ui.painter().rect_filled(rect, 2.0, c);
+    }
+    let mut name = q.id.clone();
+    if !q.params.is_empty() {
+        name += &format!("({})", q.params.join(", "));
+    }
+    let mut tip = format!("{id}\n\n{}", q.text);
+    if let Some(parent) = pack.parent_of(q) {
+        tip += &format!("\n\nrefines {parent}");
+    }
+    if !q.labels.is_empty() {
+        tip += &format!("\nlabels: {}", q.labels.join(", "));
+    }
+    tip += "\n\nDrag it into the selection; ⋮ for more";
+    // Drag the name into the selection.
+    let r = ui.add(egui::Label::new(&name).sense(egui::Sense::drag()));
+    r.dnd_set_drag_payload(Drag::Library(id.to_owned()));
+    if r.dragged()
+        && let Some(p) = ui.ctx().pointer_interact_pos()
+    {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+        egui::Area::new(ui.make_persistent_id(("lib-drag-preview", id)))
+            .order(egui::Order::Tooltip)
+            .fixed_pos(p + egui::vec2(12.0, 4.0))
+            .show(ui.ctx(), |ui| {
+                egui::Frame::popup(ui.style()).show(ui, |ui| ui.label(&name));
+            });
+    }
+    r.on_hover_text(tip);
+    if let Some(p) = outside_parent {
+        ui.weak(format!("↑ {}", p.split_once('.').map_or(p.as_str(), |(_, q)| q)))
+            .on_hover_text(format!("refines {p} (not in this group)"));
+    }
+    ui.weak(&pack.name);
 }
 
 enum EditOutcome {
@@ -1158,7 +1256,7 @@ mod tests {
         // Find a library query's name by probing down the library pane: a
         // press and a small move there starts a drag.
         let mut found = None;
-        'probe: for x in [770, 790, 810] {
+        'probe: for x in (720..960).step_by(8) {
             for y in (40..400).step_by(3) {
                 let p = egui::pos2(x as f32, y as f32);
                 step(vec![egui::Event::PointerMoved(p), button(p, true)], &mut lib, &mut picks);
@@ -1311,6 +1409,35 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
+    fn all_text(shapes: &[egui::epaint::ClippedShape]) -> Vec<String> {
+        fn walk(shape: &egui::Shape, out: &mut Vec<String>) {
+            match shape {
+                egui::Shape::Text(t) => out.push(t.galley.text().to_owned()),
+                egui::Shape::Vec(v) => v.iter().for_each(|s| walk(s, out)),
+                _ => {}
+            }
+        }
+        let mut out = Vec::new();
+        shapes.iter().for_each(|c| walk(&c.shape, &mut out));
+        out
+    }
+
+    /// Centre of the text shape reading `label` on the row at `y`.
+    fn find_text_at_y(shapes: &[egui::epaint::ClippedShape], label: &str, y: f32) -> Option<egui::Pos2> {
+        fn walk(shape: &egui::Shape, label: &str, y: f32) -> Option<egui::Pos2> {
+            match shape {
+                egui::Shape::Text(t)
+                    if t.galley.text() == label && (t.visual_bounding_rect().center().y - y).abs() < 6.0 =>
+                {
+                    Some(t.visual_bounding_rect().center())
+                }
+                egui::Shape::Vec(v) => v.iter().find_map(|s| walk(s, label, y)),
+                _ => None,
+            }
+        }
+        shapes.iter().find_map(|c| walk(&c.shape, label, y))
+    }
+
     /// Centre of the first text shape that reads `label`.
     fn find_text(shapes: &[egui::epaint::ClippedShape], label: &str) -> Option<egui::Pos2> {
         fn walk(shape: &egui::Shape, label: &str) -> Option<egui::Pos2> {
@@ -1373,6 +1500,68 @@ mod tests {
         p.add(&lib, "v.very slow", Use::Include, None);
         assert_eq!(p.expand(&lib).unwrap().exp.nfd, "(/slow/) AND (level >= WARN)");
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn the_dots_menu_of_a_library_query_edits_or_refines_it() {
+        let ctx = egui::Context::default();
+        let (mut lib, mut picks, mut view) = (lib(), Picks::default(), LibraryView { by_pack: true, editing: None });
+        let mut frame = |events: Vec<egui::Event>, view: &mut LibraryView| {
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(500.0, 600.0))),
+                events,
+                ..Default::default()
+            };
+            let mut full = ctx.run_ui(input, |ui| {
+                egui::CentralPanel::default().show(ui, |ui| {
+                    library_panel(ui, &mut lib, &[], &mut picks, view);
+                });
+            });
+            full.textures_delta.clear();
+            full.shapes
+        };
+        let click = |p: egui::Pos2, b: egui::PointerButton| {
+            let ev =
+                |pressed| egui::Event::PointerButton { pos: p, button: b, pressed, modifiers: egui::Modifiers::NONE };
+            [vec![egui::Event::PointerMoved(p), ev(true)], vec![ev(false)], vec![]]
+        };
+        // Edit opens drops itself (whose parent is v.scope); refine opens a
+        // new query whose parent is drops.
+        for (item, want_old, want_parent) in
+            [("Edit…", Some("drops"), Some("v.scope")), ("New query refining this…", None, Some("v.drops"))]
+        {
+            view.editing = None;
+            let shapes = frame(vec![], &mut view);
+            let name = find_text(&shapes, "drops").expect("the drops row");
+            let dots = find_text_at_y(&shapes, "⋮", name.y).expect("the row's ⋮ button");
+            let mut shapes = Vec::new();
+            for ev in click(dots, egui::PointerButton::Primary) {
+                shapes = frame(ev, &mut view);
+            }
+            let p =
+                find_text(&shapes, item).unwrap_or_else(|| panic!("menu item {item}; drawn: {:?}", all_text(&shapes)));
+            for ev in click(p, egui::PointerButton::Primary) {
+                frame(ev, &mut view);
+            }
+            let e = view.editing.as_ref().unwrap_or_else(|| panic!("{item} opens the editor"));
+            assert_eq!((e.old.as_deref(), e.node.parent.as_deref()), (want_old, want_parent));
+        }
+    }
+
+    #[test]
+    fn library_tree_nests_children_under_parents() {
+        let mut lib = lib();
+        lib.add(parse_pack("o.nerka-pack", "pack o\nquery far  parent: v.drops\n  /far/\n").unwrap()).unwrap();
+        let ids: Vec<String> = ["v.scope", "v.drops", "v.slow", "o.far"].iter().map(|s| s.to_string()).collect();
+        let t = Tree::of(&lib, &ids);
+        assert_eq!(t.roots, [0, 2]);
+        assert_eq!(t.children[0], [1]);
+        assert_eq!(t.children[1], [3]);
+        // Without its parent in the group a child is a root.
+        let ids: Vec<String> = ["v.drops", "o.far"].iter().map(|s| s.to_string()).collect();
+        let t = Tree::of(&lib, &ids);
+        assert_eq!((t.roots.as_slice(), t.children[0].as_slice()), ([0usize].as_slice(), [1usize].as_slice()));
+        assert_eq!(t.parents[0].as_deref(), Some("v.scope"));
     }
 
     #[test]
