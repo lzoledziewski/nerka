@@ -42,6 +42,14 @@ Nerka is a **log viewer first**. The search manager helps you build good queries
 
 The UI only shows the selection and sends the expanded NFD (spec §4).
 
+As built (`core/src/pack/expand.rs`):
+
+- Shape: `(root) AND (…) AND (query)` per picked query (every query's own text in parentheses); several includes are joined with `OR` (AND binds tighter, so a chain needs no extra parentheses) and grouped in parentheses only when excludes follow; each exclude is `AND NOT …`. Only excludes means "every other line". The result is **one line** (whitespace outside regexes and strings collapsed), so it fits the history file.
+- Parameter values depend on where they stand: inside `/…/` regex-escaped (`/` and `\` as `/` / `\`, so a value can't end the regex); inside `"…"` string-escaped; as a bare value (`ecu == $ecu`) they become a string (`ecu == "SOCB"`), so a value like `A OR x` can't change the query. Raw (`ParamValue::raw`, CLI `--raw-param`) only matters inside a regex: the value is inserted as regex syntax (only `/` is still escaped). A parameter can't stand for a field name.
+- Parameter names are shared by every picked query (no mapping between packs).
+- Labels resolve when `expand` runs. `Selection::snapshot` replaces labels by their current queries, for a UI that keeps a selection around.
+- Errors: nothing selected, unknown query id, a label no query has, a missing parameter (naming the query that needs it), an orphaned child (its parent isn't loaded), a parent cycle, and a raw value that makes a query invalid NFD. Each part is checked to parse.
+
 ### Display of long expansions
 
 The expanded NFD can get long (a label with ten queries). The filter and search boxes show it **on several lines, grouped** (by label, by query or by parent), with **name chips** for the picked queries. The full text stays available and is what actually runs.

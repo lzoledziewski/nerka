@@ -4,7 +4,7 @@
 //! are identified as `pack.query`. A query has NFD text, an optional parent
 //! (its full meaning is `parent AND own text`), labels, parameters and an
 //! optional colour. NFD itself knows nothing about packs: picking from a
-//! [`Library`] expands into plain NFD (`expand`, step 2 of the POC).
+//! [`Library`] expands into plain NFD ([`expand`]), with provenance.
 //!
 //! File format (`*.nerka-pack`, UTF-8):
 //!
@@ -39,11 +39,13 @@
 //! checks the syntax (field names can only be checked against a source).
 //! Every error carries the file, line and column.
 
+mod expand;
 mod parser;
 
 use std::fmt;
 use std::path::{Path, PathBuf};
 
+pub use expand::{ExpandError, Expansion, ParamValue, Params, Part, Pick, Role, Selection, expand};
 pub use parser::parse_pack;
 
 /// File extension of pack files when a directory is loaded.
@@ -269,5 +271,7 @@ pub(crate) fn is_name(s: &str) -> bool {
     cs.next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_') && cs.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
+#[cfg(test)]
+mod expand_tests;
 #[cfg(test)]
 mod tests;
