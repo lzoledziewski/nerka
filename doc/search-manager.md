@@ -110,8 +110,8 @@ Steps 1–4 are built (core + CLI, no new dependency); step 5 (GUI) is not start
 
 Choices made while building (not in the decisions above). Owner's answers, 2026-10-18, in italics:
 
-1. A parameter used as a bare value becomes a string (`ecu == "SOCB"`), so it can't stand for a field name or inject operators. _Open: should a parameter be able to carry an operator?_
-2. Raw parameter values only differ from escaped ones inside regexes. _Open: owner asked for an explanation._
+1. A parameter used as a bare value becomes a string (`ecu == "SOCB"`), so it can't stand for a field name or inject operators. _Confirmed; no operator parameters until a real query needs one (then a typed parameter such as `op: ==|!=`, not a raw bare value)._
+2. Raw parameter values only differ from escaped ones inside regexes. _Confirmed._
 3. Picking only excludes means "every line except these". _Confirmed._
 4. Picking a label includes the labels below it (`system` → `system/vision`). _OK for now._
 5. A child's parent may live in another pack (`parent: vision.cam_scope`); a missing parent is an expansion error, not a load error. _Doubts, but try it._
