@@ -24,11 +24,12 @@ Owner feedback is driving this; these are deliberate choices, keep them:
 - **Look:** no tint on matching lines in the main view (the owner disliked the blue); the cursor line is neutral grey. Scrollbar thumbs use the text colour at 50% and are 14 px wide.
 - **Scrolling:** the views read raw mouse-wheel events (3 rows per notch), not egui's smoothed delta; the smoothing made text look smeared. Rows and text origins snap to physical pixels. A headless test (`view::tests::wheel_scrolls_hovered_view_by_whole_lines`) runs the app's panel layout and injects wheel events. Use that pattern for other GUI input tests.
 - **Icon:** a kidney ("nerka") with messy log lines going in and clean lines coming out, drawn in code (`ui/src/icon.rs`). It shows on the window and taskbar only; the `.exe` file icon is still the default, because embedding it needs a build dependency the owner hasn't approved.
+- **About:** an "ℹ About" button at the right of the toolbar (or F1) opens a modal with the icon, version, author (© 2026 Łukasz Żołędziewski, email as a mailto link), licence and repository link. All of these come from `Cargo.toml` (`env!`), so keep `authors` / `repository` `.workspace = true` in each crate.
 - **Bookmarks:** these work (`m`, `b` / `B`, notes in the side panel, `<log>.nerka-marks` sidecar), but the owner wasn't sure about them yet. Hovering the 🔖 button explains them. Ask before investing more in them.
 
 ## Checking the GUI visually
 
-`tools/screenshot.ps1` launches the debug build, captures its window to a PNG and closes it again. Read the PNG to check layout and rendering. This is how the off-screen scrollbar was found. Don't close or kill nerka-gui windows the owner has open; if the exe is locked by one of them, build with `--target-dir target/<name>` and pass `-Exe`.
+`tools/screenshot.ps1` launches the debug build, captures its window to a PNG and closes it again. Read the PNG to check layout and rendering. This is how the off-screen scrollbar was found. `-Keys` sends keystrokes before the capture (SendKeys syntax), e.g. `-Keys '{F1}'` for the About dialog. Don't close or kill nerka-gui windows the owner has open; if the exe is locked by one of them, build with `--target-dir target/<name>` and pass `-Exe`.
 
 ## Next steps
 
@@ -69,6 +70,15 @@ Open with the owner: save column widths? Sorting stays out (decided). Next after
 - **Non-verbose messages:** shown as `[message id] hex` until FIBEX support exists. `mid` is that message id: the key into the FIBEX database that will later decode the payload.
 - **Time:** `time` is the logger's storage time rendered in UTC, `tmsp` the ECU uptime (0.1 ms). The full `Timestamp { ns, clock }` model of `sources-and-signals.md` waits until sources are merged or signals arrive.
 
+## Licensing (owner, 2026-10-18)
+
+- **Stays `MIT OR Apache-2.0`** for the core and the apps.
+- Goal: the core stays OSS; extensions (plugins / DLLs, planned WASM or C ABI) can be sold as closed source. A permissive licence allows that; it also allows others to sell closed forks, which the owner accepts for now.
+- Considered: **MPL-2.0** (core changes must stay open, closed plugins still allowed), LGPL (awkward with Rust's static linking), GPL + plugin exception, AGPL + commercial dual licence (needs a CLA). Revisit before the first public release or before accepting outside contributions: relicensing later needs every contributor's consent, so decide on a CLA first.
+- Code already published under `MIT OR Apache-2.0` stays available under it.
+- The plugin interface is also the licensing boundary: keep it stable and documented.
+- **Missing:** `LICENSE-MIT` and `LICENSE-APACHE` files in the repo root (a dual licence normally ships both).
+
 ## Search manager: owner's idea (next, not started)
 
 Recorded 2026-10-18, before any design work. The owner has no clear picture of the UI yet.
@@ -96,6 +106,7 @@ Don't settle these silently: ask.
 4. **DLT column widths:** resizable per tab but not saved. Save them (globally or per file)?
 5. **Releases / downloads:** not set up. Options discussed: `gh release create` by hand, or a `.github/workflows/release.yml` that builds Windows/Linux/macOS on a `v*` tag and attaches zips (`softprops/action-gh-release`). Needs pushing, and adds the first CI file (ask first). Unsigned macOS binaries will warn; the `.exe` icon needs an unapproved build dependency.
 6. **Linux builds from this Windows PC:** no WSL, Docker or zig installed. Options: cross-compile with `cargo zigbuild --target x86_64-unknown-linux-gnu.2.17` (user-level installs; build only, untested), WSL (can also run the GUI), or GitHub Actions. `Cargo.lock` has no GTK (the file dialog uses D-Bus via `zbus`), so a cross build is expected to link; not verified.
+7. **Licence files:** add `LICENSE-MIT` and `LICENSE-APACHE`, and with which copyright line?
 
 ## Known limitations
 

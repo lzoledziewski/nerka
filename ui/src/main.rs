@@ -12,7 +12,7 @@
 //! Keys: Ctrl+F filter · Enter run · n/N next/prev match · Ctrl+G go to line
 //! · m toggle bookmark · b/B next/prev bookmark · Ctrl+C copy selection
 //! (or line) · Ctrl+A select all · Ctrl+Home/End
-//! · Ctrl+Tab / Ctrl+Shift+Tab next/prev tab · Ctrl+W close tab.
+//! · Ctrl+Tab / Ctrl+Shift+Tab next/prev tab · Ctrl+W close tab · F1 about.
 //!
 //! Recent filters are kept in `<config dir>/nerka/history` and offered by
 //! the 🕘 button next to the filter box.
@@ -523,6 +523,10 @@ struct App {
     show_bookmarks: bool,
     /// Text of the Ctrl+G dialog while it is open.
     goto: Option<String>,
+    /// The About dialog is open.
+    about: bool,
+    /// The app icon as a texture for the About dialog, made on first use.
+    about_icon: Option<egui::TextureHandle>,
     history: SearchHistory,
     /// Search mode and options for new tabs: the last ones the user picked.
     prefs: SearchPrefs,
@@ -698,6 +702,9 @@ impl App {
         if shortcut(Modifiers::COMMAND, Key::W) {
             self.close(self.active);
         }
+        if shortcut(Modifiers::NONE, Key::F1) {
+            self.about = true;
+        }
         // Shift variants first: matching ignores an unrequested Shift.
         if shortcut(Modifiers::COMMAND | Modifiers::SHIFT, Key::Tab) || shortcut(Modifiers::COMMAND, Key::PageUp) {
             self.cycle_tab(false);
@@ -802,6 +809,56 @@ impl App {
         }
     }
 
+    /// F1 / the About button: name, version, licence and where to find it.
+    fn about_dialog(&mut self, ctx: &egui::Context) {
+        if !self.about {
+            return;
+        }
+        let icon = self
+            .about_icon
+            .get_or_insert_with(|| {
+                let i = icon::icon();
+                let image = egui::ColorImage::from_rgba_unmultiplied([i.width as usize, i.height as usize], &i.rgba);
+                ctx.load_texture("about-icon", image, egui::TextureOptions::LINEAR)
+            })
+            .clone();
+        let mut close = false;
+        let modal = egui::Modal::new(egui::Id::unique("about")).show(ctx, |ui| {
+            ui.set_width(340.0);
+            ui.horizontal(|ui| {
+                ui.add(egui::Image::new(&icon).fit_to_exact_size(egui::vec2(72.0, 72.0)));
+                ui.vertical(|ui| {
+                    ui.heading("nerka");
+                    ui.label(format!("Version {}", env!("CARGO_PKG_VERSION")));
+                    ui.weak("Fast log viewer for plain text and DLT");
+                });
+            });
+            ui.add_space(8.0);
+            // `authors` in Cargo.toml: "Name <email>".
+            let (name, email) = env!("CARGO_PKG_AUTHORS")
+                .split(':')
+                .next()
+                .and_then(|a| a.split_once(" <"))
+                .map_or((env!("CARGO_PKG_AUTHORS"), ""), |(n, e)| (n, e.trim_end_matches('>')));
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 6.0;
+                ui.label(format!("© 2026 {name}"));
+                if !email.is_empty() {
+                    ui.hyperlink_to(email, format!("mailto:{email}"));
+                }
+            });
+            ui.label(format!("Licensed under {}.", env!("CARGO_PKG_LICENSE").replace(" OR ", " or ")));
+            ui.hyperlink(env!("CARGO_PKG_REPOSITORY"));
+            ui.add_space(4.0);
+            ui.weak("“Nerka” is Polish for kidney: it filters what flows through it.");
+            ui.add_space(8.0);
+            ui.vertical_centered(|ui| close = ui.button("Close").clicked());
+        });
+        if close || modal.should_close() {
+            self.about = false;
+        }
+    }
+
     fn update_title(&mut self, ctx: &egui::Context) {
         let title = match self.tabs.get(self.active) {
             Some(t) => format!("nerka — {}", t.path.display()),
@@ -821,6 +878,7 @@ impl eframe::App for App {
         self.handle_input(&ctx);
         self.update_title(&ctx);
         self.goto_dialog(&ctx);
+        self.about_dialog(&ctx);
 
         egui::Panel::top("toolbar").show(ui, |ui| {
             ui.horizontal(|ui| {
@@ -837,6 +895,11 @@ impl eframe::App for App {
                     ui.separator();
                     ui.label(format!("{} lines · {:.1} MiB", f.line_count(), f.size_bytes() as f64 / 1048576.0));
                 }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.button("ℹ About").on_hover_text("F1").clicked() {
+                        self.about = true;
+                    }
+                });
             });
         });
 

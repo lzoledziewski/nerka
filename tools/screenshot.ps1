@@ -10,16 +10,25 @@ alone. Build first: cargo build -p nerka-gui
 
 .EXAMPLE
 powershell -ExecutionPolicy Bypass -File tools/screenshot.ps1 -Out shot.png -AppArgs big.log,--text,ERROR
+
+.EXAMPLE
+# Open the About dialog (F1) before capturing; -Keys uses SendKeys syntax.
+powershell -ExecutionPolicy Bypass -File tools/screenshot.ps1 -Out about.png -Keys '{F1}'
 #>
 param(
     [Parameter(Mandatory)] [string]$Out,
     [string[]]$AppArgs = @(),
-    [string]$Exe = (Join-Path $PSScriptRoot '..\target\debug\nerka-gui.exe'),
+    # Defaults to the debug build next to this script (set below: Windows
+    # PowerShell 5 leaves $PSScriptRoot empty in parameter defaults).
+    [string]$Exe = '',
     # Seconds to wait after the window appears (indexing, first search).
     [int]$Wait = 3,
-    [switch]$KeepOpen
+    [switch]$KeepOpen,
+    # Keystrokes sent to the window before capturing (SendKeys syntax, e.g. '{F1}', '^g').
+    [string]$Keys = ''
 )
 $ErrorActionPreference = 'Stop'
+if (-not $Exe) { $Exe = Join-Path (Split-Path -Parent $MyInvocation.MyCommand.Path) '..\target\debug\nerka-gui.exe' }
 Add-Type -AssemblyName System.Drawing
 Add-Type @"
 using System;
@@ -34,7 +43,10 @@ public class NerkaShotWin32 {
 # Physical pixels, so the capture matches the window at any display scaling.
 [NerkaShotWin32]::SetProcessDPIAware() | Out-Null
 
-$p = Start-Process -FilePath (Resolve-Path $Exe) -ArgumentList $AppArgs -PassThru
+# Start-Process rejects an empty -ArgumentList, so pass it only when set.
+$start = @{ FilePath = (Resolve-Path $Exe); PassThru = $true }
+if ($AppArgs) { $start.ArgumentList = $AppArgs }
+$p = Start-Process @start
 try {
     # winit creates a tiny helper window first; wait for the real one.
     $r = New-Object NerkaShotWin32+RECT
@@ -49,6 +61,10 @@ try {
 
     [NerkaShotWin32]::SetForegroundWindow($p.MainWindowHandle) | Out-Null
     Start-Sleep -Seconds $Wait
+    if ($Keys) {
+        (New-Object -ComObject WScript.Shell).SendKeys($Keys)
+        Start-Sleep -Milliseconds 700
+    }
     [NerkaShotWin32]::GetWindowRect($p.MainWindowHandle, [ref]$r) | Out-Null
     $w = $r.R - $r.L; $h = $r.B - $r.T
     $bmp = New-Object System.Drawing.Bitmap $w, $h
