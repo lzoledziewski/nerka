@@ -37,11 +37,11 @@ mod view;
 
 use eframe::egui::{self, Color32, Key, KeyboardShortcut, Modifiers, RichText};
 use job::{Job, Poll};
-use library::{Applied, LibraryView, Picks, Use};
+use library::{Applied, LibraryView, Picks, Target, Term, Use};
 use nerka_core::pack::{self, Library, Role};
 use nerka_core::{
     Bookmarks, Filter, Highlighter, LineNo, LogSource, Matcher, MatcherOptions, Query, SearchHistory, SearchHits,
-    SearchResult, SearchSet,
+    SearchResult, SearchSet, text_to_nfd,
 };
 use prefs::SearchPrefs;
 use std::path::{Path, PathBuf};
@@ -57,6 +57,7 @@ fn main() -> eframe::Result {
     // every file.
     let (mut packs, mut show_library) = (Vec::new(), false);
     let mut startup: Vec<(Use, String)> = Vec::new();
+    let mut searches: Vec<String> = Vec::new();
     let mut highlight: Vec<String> = Vec::new();
     let mut params = std::collections::BTreeMap::new();
     let mut args = std::env::args_os().skip(1);
@@ -83,7 +84,7 @@ fn main() -> eframe::Result {
                 continue;
             }
             Some("--search-pick") => {
-                startup.push((Use::Search, value()));
+                searches.push(value());
                 continue;
             }
             Some("--param") => {
@@ -136,6 +137,9 @@ fn main() -> eframe::Result {
                     tab.picks = picks.clone();
                     if !picks.nodes.is_empty() {
                         tab.apply_selection(&cc.egui_ctx, &app.library);
+                    }
+                    for id in &searches {
+                        tab.search_for(&cc.egui_ctx, &app.library, &Target::Library(id.clone()), true);
                     }
                 }
             }
@@ -193,8 +197,9 @@ struct SearchBox {
     pattern: String,
     regex: bool,
     ignore_case: bool,
-    /// The library expansion the box holds, while its text is unchanged.
-    exp: Option<Arc<Applied>>,
+    /// The queries the box holds (from 🔍 Search / Add to search), while
+    /// its text is unchanged: each is searched and coloured on its own.
+    terms: Vec<Term>,
     /// The search that ran last. It runs again when the filter result changes.
     active: Option<Arc<ActiveSearch>>,
     hits: Option<(Arc<ActiveSearch>, Arc<SearchHits>)>,
@@ -210,9 +215,33 @@ struct ActiveSearch {
 }
 
 impl SearchBox {
-    /// The expansion, if the box still holds its text.
-    fn expansion(&self) -> Option<&Arc<Applied>> {
-        self.exp.as_ref().filter(|a| a.exp.nfd == self.pattern)
+    /// The box's text for `terms`: OR'ed (AND binds tighter, and each term
+    /// is a parenthesized chain, a string, a regex or `NOT` one of them).
+    fn text_of(terms: &[Term]) -> String {
+        terms.iter().map(|t| t.nfd.as_str()).collect::<Vec<_>>().join(" OR ")
+    }
+
+    /// The terms, if the box still holds their text.
+    fn current_terms(&self) -> Option<&[Term]> {
+        (!self.terms.is_empty() && Self::text_of(&self.terms) == self.pattern).then_some(self.terms.as_slice())
+    }
+
+    /// What the box holds as one term: typed text becomes the query that
+    /// finds the same lines.
+    fn typed_term(&self) -> Option<Term> {
+        let text = self.pattern.trim();
+        if text.is_empty() {
+            return None;
+        }
+        let nfd = match self.mode {
+            Mode::Text => text_to_nfd(
+                text,
+                &MatcherOptions { fixed_string: !self.regex, case_insensitive: self.ignore_case, invert: false },
+            ),
+            Mode::Query => format!("({text})"),
+        };
+        let name: String = text.chars().take(24).collect();
+        Some(Term { name, nfd, color: library::palette(0) })
     }
 }
 
@@ -435,27 +464,16 @@ impl Tab {
         true
     }
 
-    /// Apply the Selection pane: its filter queries go into the Filter bar,
-    /// its search queries into the Search box, and both run. A box without
-    /// queries in the selection is left as it is. Returns the filter text to
-    /// record in the history.
+    /// Apply the Selection pane: its queries, expanded, go into the Filter
+    /// bar and the filter runs. Returns the text to record in the history.
     fn apply_selection(&mut self, ctx: &egui::Context, lib: &Library) -> Option<String> {
-        self.picks.error = None;
-        let recorded = if self.picks.has(Use::Include) || self.picks.has(Use::Exclude) {
-            self.apply_filter_picks(ctx, lib)
-        } else {
-            None
-        };
-        if self.picks.has(Use::Search) {
-            self.apply_search_picks(ctx, lib);
-        }
-        recorded
+        self.apply_filter_picks(ctx, lib)
     }
 
     /// Put the selection's filter queries, expanded, into the Filter bar
     /// and run it. Returns the text to record in the history.
     fn apply_filter_picks(&mut self, ctx: &egui::Context, lib: &Library) -> Option<String> {
-        match self.picks.expand(lib, false) {
+        match self.picks.expand(lib) {
             Ok(a) => {
                 self.picks.error = None;
                 self.mode = Mode::Query;
@@ -470,14 +488,25 @@ impl Tab {
         }
     }
 
-    /// Put the selection's search queries, expanded, into the Search box
-    /// and run it.
-    fn apply_search_picks(&mut self, ctx: &egui::Context, lib: &Library) {
-        match self.picks.expand(lib, true) {
-            Ok(a) => {
+    /// 🔍 on a query: replace the Search box with it, or add it (OR). When
+    /// adding to typed text, the text becomes a query first, so nothing in
+    /// the box is lost.
+    fn search_for(&mut self, ctx: &egui::Context, lib: &Library, target: &Target, add: bool) {
+        let mut terms: Vec<Term> = if add {
+            match self.search.current_terms() {
+                Some(t) => t.to_vec(),
+                None => self.search.typed_term().into_iter().collect(),
+            }
+        } else {
+            Vec::new()
+        };
+        match self.picks.search_term(lib, target, terms.len()) {
+            Ok(t) => {
+                terms.push(t);
+                self.picks.error = None;
                 self.search.mode = Mode::Query;
-                self.search.pattern = a.exp.nfd.clone();
-                self.search.exp = Some(Arc::new(a));
+                self.search.pattern = SearchBox::text_of(&terms);
+                self.search.terms = terms;
                 self.run_search_box(ctx);
             }
             Err(e) => self.picks.error = Some(format!("Search: {e}")),
@@ -487,10 +516,23 @@ impl Tab {
     /// What the Search box asks for: one query per picked library query, or
     /// the box's text as one query.
     fn build_search(&self) -> Result<ActiveSearch, String> {
-        if let Some(a) = self.search.expansion() {
-            let set = a.exp.search_set().map_err(|e| format!("Search: {e}"))?;
-            let highlighters = set.include.iter().map(Filter::highlighter).collect();
-            return Ok(ActiveSearch { set, names: a.names.clone(), colors: a.colors.clone(), highlighters });
+        if let Some(terms) = self.search.current_terms() {
+            let schema = self.file.as_ref().map(|f| f.schema()).unwrap_or_default();
+            let include = terms
+                .iter()
+                .map(|t| {
+                    Query::compile_for(&t.nfd, schema)
+                        .map(Filter::Query)
+                        .map_err(|e| format!("Search: {}: {e}", t.name))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let highlighters = include.iter().map(Filter::highlighter).collect();
+            return Ok(ActiveSearch {
+                set: SearchSet { include, exclude: vec![] },
+                names: terms.iter().map(|t| t.name.clone()).collect(),
+                colors: terms.iter().map(|t| t.color).collect(),
+                highlighters,
+            });
         }
         let f = match self.search.mode {
             Mode::Text => {
@@ -535,7 +577,7 @@ impl Tab {
         }
         self.search.active = None;
         self.search.hits = None;
-        self.search.exp = None;
+        self.search.terms.clear();
         self.search.pattern.clear();
     }
 
@@ -905,8 +947,8 @@ impl Tab {
         } else if go {
             self.run_search_box(ui.ctx());
         }
-        if let Some(e) = self.search.expansion().cloned() {
-            expansion_view(ui, &e, None);
+        if let Some(terms) = self.search.current_terms() {
+            terms_view(ui, terms);
         }
     }
 
@@ -994,6 +1036,17 @@ fn expansion_view(ui: &mut egui::Ui, a: &Applied, lit: Option<&dyn Fn(u64) -> bo
         ui.weak(format!("… {} more (the full text is in the box above)", e.parts.len() - MAX_LINES));
     }
     clicked
+}
+
+/// The Search box's queries, one per line: OR, a chip, the NFD.
+fn terms_view(ui: &mut egui::Ui, terms: &[Term]) {
+    for (i, t) in terms.iter().enumerate() {
+        ui.horizontal(|ui| {
+            ui.add_sized([52.0, 14.0], egui::Label::new(RichText::new(if i == 0 { "" } else { "OR" }).small().weak()));
+            library::chip(ui, &t.name, t.color, false);
+            ui.add(egui::Label::new(RichText::new(&t.nfd).monospace().small()).truncate());
+        });
+    }
 }
 
 #[derive(Default)]
@@ -1085,6 +1138,21 @@ impl App {
                 self.library = lib;
                 if let Some(nfd) = recorded {
                     self.record_search("query", &nfd);
+                }
+            }
+            library::Action::Search { target, add } => {
+                let lib = std::mem::take(&mut self.library);
+                if let Some(t) = self.tab() {
+                    t.search_for(ctx, &lib, &target, add);
+                }
+                self.library = lib;
+            }
+            library::Action::Edited { renamed } => {
+                for t in &mut self.tabs {
+                    if let Some((old, new)) = &renamed {
+                        t.picks.renamed(old, new);
+                    }
+                    t.picks.refresh(&self.library);
                 }
             }
         }
@@ -1480,7 +1548,7 @@ impl eframe::App for App {
                 .show(ui, |ui| {
                     library::library_panel(
                         ui,
-                        &self.library,
+                        &mut self.library,
                         &self.library_errors,
                         &mut tab.picks,
                         &mut self.library_view,
@@ -1596,9 +1664,8 @@ query timeouts  labels: vision
 
         // Search inside the filter result only; then widen the filter and
         // the search follows it.
-        tab.picks.add(&lib, "vision.drops", Use::Search, None);
-        tab.picks.add(&lib, "vision.timeouts", Use::Search, None);
-        tab.apply_selection(&ctx, &lib);
+        tab.search_for(&ctx, &lib, &Target::Library("vision.drops".into()), false);
+        tab.search_for(&ctx, &lib, &Target::Library("vision.timeouts".into()), true);
         settle(&mut tab, &ctx);
         assert_eq!(hits(&tab), [(1, vec!["drops"])]);
         let colors = &tab.search.hits.as_ref().unwrap().0.colors;
@@ -1637,7 +1704,7 @@ query timeouts  labels: vision
 
         // Editing the box drops the chips; the text is a plain query.
         tab.search.pattern.push_str(" OR /disk/");
-        assert!(tab.search.expansion().is_none());
+        assert!(tab.search.current_terms().is_none());
         tab.run_search_box(&ctx);
         settle(&mut tab, &ctx);
         assert_eq!(tab.search.hits.as_ref().unwrap().1.lines, [1, 5]);
@@ -1668,6 +1735,19 @@ query timeouts  labels: vision
         tab.run_search_box(&ctx);
         settle(&mut tab, &ctx);
         assert_eq!(tab.search.hits.as_ref().unwrap().1.lines, [2]);
+
+        // Add to search: the typed regex becomes a query, OR'ed with the
+        // library query, each with its own hits and colour.
+        tab.search_for(&ctx, &lib, &Target::Library("vision.timeouts".into()), true);
+        assert_eq!(tab.search.pattern, "/cam[2]/i OR (/timeout/)");
+        assert_eq!(tab.search.mode, Mode::Query);
+        settle(&mut tab, &ctx);
+        assert_eq!(hits(&tab), [(2, vec!["cam[2]"]), (3, vec!["timeouts"]), (5, vec!["timeouts"])]);
+        // Search for it (replace): only the new query is left.
+        tab.search_for(&ctx, &lib, &Target::Library("vision.drops".into()), false);
+        settle(&mut tab, &ctx);
+        assert_eq!(tab.search.pattern, "(/frame drop/)");
+        assert_eq!(hits(&tab), [(0, vec!["drops"]), (1, vec!["drops"]), (2, vec!["drops"])]);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }
