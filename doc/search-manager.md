@@ -99,6 +99,24 @@ erka\packs\` (Linux: `~/.config/nerka/packs/`), plus `--pack <dir|file>` on the 
 4. **CLI:** `--pack`, `nerka expand` (prints the NFD), and `search --in <filter>`. Thin, as always.
 5. **GUI:** a library panel (grouped by label or by pack; include / exclude for Filter, a tick for Search; parameter fields), a Search box next to the Filter box, multi-line grouped display with chips, search hits coloured per query. Packs are **edited as text files** in the POC; the GUI only reads and reloads them.
 
+### POC status (2026-10-18)
+
+Steps 1–4 are built (core + CLI, no new dependency); step 5 (GUI) is not started.
+
+- `core/src/pack/`: parser (`parse_pack`, `Library`), `expand` → `Expansion { nfd, parts }`, `Expansion::search_set`.
+- `core/src/engine/within.rs`: `search_within(source, filter_lines, SearchSet)` → `SearchHits` (lines plus, per hit, which include queries matched; any number of queries). A hit matches any include query and no exclude query. Two paths: per-line over the filter's lines, or (every include query has a prefilter and the filter keeps ≥ 1/16 of the lines) the buffer scan per query intersected with the filter's lines. Tests run both against a naive per-line evaluation.
+- CLI: `--pack <dir|file>` (global, repeatable; the per-user directory is loaded too), `nerka packs`, `nerka expand -q ID -l LABEL -x ID -X LABEL -p NAME=VALUE --raw-param NAME=VALUE [--parts]`, `nerka search --in FILTER PATTERN FILE` and `nerka search [--in FILTER] -q/-l … FILE` (prints `line:[queries] text`; `-c` adds hits per query). Filtering by picks goes through `nerka filter "$(nerka expand …)"`.
+- 1 GiB text log: `search ERROR`, `level >= ERROR` and `level >= WARN AND raw ~ /timeout/` unchanged (~32 ms); `search --in 'level >= WARN' timeout` 36 ms filter + 57 ms search.
+
+Choices made while building (not in the decisions above; confirm or change):
+
+1. A parameter used as a bare value becomes a string (`ecu == "SOCB"`), so it can't stand for a field name or inject operators.
+2. Raw parameter values only differ from escaped ones inside regexes.
+3. Picking only excludes means "every line except these".
+4. Picking a label includes the labels below it (`system` → `system/vision`).
+5. A child's parent may live in another pack (`parent: vision.cam_scope`); a missing parent is an expansion error, not a load error.
+6. The CLI puts `-q` picks before `-l` picks (clap loses the order between the two options); without `--in`, a pick search runs over every line.
+
 ## Open questions
 
 - Packs stored with a project (next to the logs or in a repo), besides the app-data folder?

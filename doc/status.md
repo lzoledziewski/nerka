@@ -2,11 +2,11 @@
 
 Snapshot of where the project stands. Update this file whenever the state changes.
 
-_Last update: 2026-10-18 (search manager designed with the owner, see `search-manager.md`)._
+_Last update: 2026-10-18 (search manager POC steps 1–4 built on branch `claude/search-manager-poc-d451e1`: core + CLI; GUI step next)._
 
 ## State
 
-- Builds and runs on **Windows** (MSVC, debug and release). Clippy `-D warnings`, fmt and all tests pass (44 core, 11 GUI). The 1 GiB benchmarks have been run on Windows (numbers below and in the commit messages).
+- Builds and runs on **Windows** (MSVC, debug and release). Clippy `-D warnings`, fmt and all tests pass (62 core, 11 GUI). The 1 GiB benchmarks have been run on Windows (numbers below and in the commit messages).
 - Committed on `main`, **not pushed** since `5b632c3` (don't push until the owner says so).
 - Only built for Windows so far. Linux/macOS builds and releases are open questions (see "Decisions pending").
 - `.github/workflows/ci.yml` and `.vscode/extensions.json` are still **not on disk**; their contents are in the appendix below.
@@ -34,7 +34,7 @@ Owner feedback is driving this; these are deliberate choices, keep them:
 ## Next steps
 
 1. Owner tries the DLT table on real use; settle the open DLT questions below.
-2. Then the **search manager** POC: design agreed, scope in `search-manager.md`.
+2. **Search manager** POC: steps 1–4 (core packs, expansion, search within the filter, CLI) are built; step 5 (GUI) is next. See `search-manager.md` → "POC status".
 3. Recreate the two config files from the appendix (ask before adding CI).
 
 Text-log benchmark on Windows (1 GiB, 12M lines, release): index ~90 ms, `search ERROR` ~30 ms, `level >= ERROR` ~31 ms, `level >= WARN AND raw ~ /timeout/` ~30 ms, `search -v ERROR` ~100 ms.
@@ -79,7 +79,7 @@ Open with the owner: save column widths? Sorting stays out (decided). Next after
 - The plugin interface is also the licensing boundary: keep it stable and documented.
 - **Missing:** `LICENSE-MIT` and `LICENSE-APACHE` files in the repo root (a dual licence normally ships both).
 
-## Search manager (designed, POC not started)
+## Search manager (POC: core and CLI built, GUI next)
 
 Design agreed with the owner on 2026-10-18 after mockups: **`search-manager.md`** (decisions, model, POC scope, open questions). In short:
 
