@@ -1,6 +1,7 @@
-//! nerka-gui — klogg-style desktop viewer: one tab per open file, each with
-//! a main view on top, a filter view below and a bookmarks panel on the
-//! right. Filter, scroll position, bookmarks and column widths belong to
+//! nerka-gui — desktop log viewer: one tab per open file. The main view
+//! shows the lines the Filter keeps (every line without a filter); the
+//! Search looks inside them and lists its hits in the pane below; bookmarks
+//! and the library are panels on the right. Filter, scroll position, bookmarks and column widths belong to
 //! the tab. Plain text and DLT files are recognised by their content; DLT
 //! is shown as a table.
 //!
@@ -10,8 +11,8 @@
 //!     nerka-gui app.log --text 'connection reset'
 //!     nerka-gui app.log --regex 'timeout|refused'
 //!     nerka-gui app.log --pack packs/ --pick vision.cam_scope --search-pick vision.frame_drops --param cam=CAM1
-//! Keys: Ctrl+F filter · Enter run · n/N next/prev search hit (or filter match
-//! when nothing is searched) · Ctrl+G go to line · Ctrl+Shift+L library
+//! Keys: Ctrl+F filter · Enter run · n/N next/prev search hit · Ctrl+G go to
+//! line (the nearest kept line when filtered) · Ctrl+Shift+L library
 //! · m toggle bookmark · b/B next/prev bookmark · Ctrl+C copy selection
 //! (or line) · Ctrl+A select all · Ctrl+Home/End
 //! · Ctrl+Tab / Ctrl+Shift+Tab next/prev tab · Ctrl+W close tab · F1 about.
@@ -144,14 +145,15 @@ struct Tab {
     path: PathBuf,
     file: Option<Arc<dyn LogSource>>,
     loading: Option<Job<Box<dyn LogSource>>>,
+    /// The lines the filter keeps (all lines without a filter).
     main_view: ViewState,
-    filter_view: ViewState,
+    /// The search hits.
+    hits_view: ViewState,
     columns: Columns,
 
     mode: Mode,
     pattern: String,
     options: MatcherOptions,
-    highlighter: Option<Arc<Highlighter>>,
     result: Option<Arc<SearchResult>>,
     searching: Option<(Arc<Filter>, Job<SearchResult>)>,
 
@@ -204,12 +206,11 @@ impl Tab {
             file: None,
             loading: Some(Job::spawn(ctx, move |prog| nerka_core::open(&p, prog))),
             main_view: ViewState::default(),
-            filter_view: ViewState::default(),
+            hits_view: ViewState::default(),
             columns: Columns::default(),
             mode: prefs.mode,
             pattern: String::new(),
             options: prefs.options.clone(),
-            highlighter: None,
             result: None,
             searching: None,
             filter_exp: None,
@@ -291,8 +292,9 @@ impl Tab {
             self.filter_exp = None;
         }
         if self.pattern.trim().is_empty() {
-            self.highlighter = None;
+            let cur = self.current_line();
             self.result = None;
+            self.goto_line(cur);
             self.status.clear();
             self.rerun_search(ctx);
             return false;
@@ -345,16 +347,16 @@ impl Tab {
                 }
             }
         }
-        if let Some((f, job)) = &self.searching {
+        if let Some((_, job)) = &self.searching {
             match job.poll() {
                 Poll::Running => ctx.request_repaint_after(Duration::from_millis(50)),
                 Poll::Done(r, took) => {
                     match r {
                         Ok(res) => {
-                            self.status = format!("{} matching lines in {took:.2?}", res.lines.len());
-                            self.highlighter = Some(Arc::new(f.highlighter()));
+                            self.status = format!("Filter keeps {} lines ({took:.2?})", res.lines.len());
+                            let cur = self.current_line();
                             self.result = Some(Arc::new(res));
-                            self.filter_view = ViewState::default();
+                            self.goto_line(cur);
                             self.searching = None;
                             // The search looks inside the filter result.
                             self.rerun_search(ctx);
@@ -383,6 +385,7 @@ impl Tab {
                             }
                             self.status = msg;
                             self.search.hits = Some((a.clone(), Arc::new(hits)));
+                            self.hits_view = ViewState::default();
                         }
                         Err(nerka_core::Error::Cancelled) => {}
                         Err(e) => self.status = format!("Search failed: {e}"),
@@ -505,35 +508,48 @@ impl Tab {
         self.file.as_ref().map_or(0, |f| f.line_count())
     }
 
+    /// Rows of the main view: the lines the filter keeps, or all lines.
+    fn main_rows(&self) -> u64 {
+        self.result.as_ref().map_or(self.total_lines(), |r| r.lines.len() as u64)
+    }
+
+    fn line_of_row(&self, row: u64) -> LineNo {
+        match &self.result {
+            Some(r) => r.lines.get(row as usize).copied().unwrap_or(0),
+            None => row,
+        }
+    }
+
+    /// The main-view row of `line`, or of the next kept line after it (the
+    /// last one if there is none).
+    fn row_of_line(&self, line: LineNo) -> u64 {
+        match &self.result {
+            Some(r) => (r.position_at_or_after(line) as u64).min((r.lines.len() as u64).saturating_sub(1)),
+            None => line.min(self.total_lines().saturating_sub(1)),
+        }
+    }
+
     fn current_line(&self) -> LineNo {
-        self.main_view.selected.unwrap_or(self.main_view.top)
+        self.line_of_row(self.main_view.selected.unwrap_or(self.main_view.top))
     }
 
+    /// Centre the main view on `line`, or the nearest kept line after it.
     fn goto_line(&mut self, line: LineNo) {
-        let n = self.total_lines();
-        self.main_view.center_on(line.min(n.saturating_sub(1)), n);
+        let row = self.row_of_line(line);
+        self.main_view.center_on(row, self.main_rows());
     }
 
-    /// Jump the main view to the next/previous search hit after the
-    /// selection, or filter match when nothing is searched.
+    /// Jump to the next/previous search hit after the main view's cursor.
     fn jump_match(&mut self, forward: bool) {
-        let hits = self.search.hits.as_ref().map(|(_, h)| h.clone()).filter(|h| !h.is_empty());
-        let lines: &[LineNo] = match (&hits, &self.result) {
-            (Some(h), _) => &h.lines,
-            (None, Some(r)) => &r.lines,
-            (None, None) => return,
-        };
-        if lines.is_empty() {
+        let Some((_, hits)) = self.search.hits.clone() else { return };
+        if hits.is_empty() {
             return;
         }
         let cur = self.current_line();
-        let i = lines.partition_point(|&l| l < if forward { cur + 1 } else { cur });
-        let i = if forward { i.min(lines.len() - 1) } else { i.saturating_sub(1) };
-        let line = lines[i];
-        self.goto_line(line);
-        if let Some(res) = self.result.clone() {
-            self.filter_view.select(res.position_at_or_after(line) as u64, res.lines.len() as u64);
-        }
+        let i = hits.position_at_or_after(if forward { cur + 1 } else { cur });
+        let i = if forward { i.min(hits.len() - 1) } else { i.saturating_sub(1) };
+        self.goto_line(hits.lines[i]);
+        self.hits_view.select(i as u64, hits.len() as u64);
     }
 
     fn jump_bookmark(&mut self, forward: bool) {
@@ -685,14 +701,14 @@ impl Tab {
             ui.selectable_value(&mut self.mode, Mode::Query, "Query")
                 .on_hover_text("level >= ERROR AND raw ~ /SSL|CERT/i AND NOT /healthcheck/");
             let hint = match self.mode {
-                Mode::Text if self.options.fixed_string => "text — Enter to search",
-                Mode::Text => "regex — Enter to search",
-                Mode::Query => "level >= ERROR AND raw ~ /SSL/ — Enter to search",
+                Mode::Text if self.options.fixed_string => "filter: lines to keep (text) — Enter to apply",
+                Mode::Text => "filter: lines to keep (regex) — Enter to apply",
+                Mode::Query => "filter: level >= ERROR AND raw ~ /SSL/ — Enter to apply",
             };
             // Right to left: buttons first, the text box takes what is left,
             // so the row never grows wider than the panel.
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                go |= ui.button("Search").clicked();
+                go |= ui.button("Filter").on_hover_text("Show only the matching lines in the main view").clicked();
                 if self.mode == Mode::Text {
                     ui.checkbox(&mut self.options.invert, "Invert");
                     ui.checkbox(&mut self.options.case_insensitive, "Ignore case");
@@ -727,32 +743,32 @@ impl Tab {
             colors: &a.colors,
             highlighters: &a.highlighters,
         });
-        if let Some(res) = self.result.clone() {
+        if let Some((_, hits)) = self.search.hits.clone() {
             let out = log_view(
                 ui,
-                "filter",
-                &mut self.filter_view,
-                res.lines.len() as u64,
-                &|row| res.lines[row as usize],
+                "hits",
+                &mut self.hits_view,
+                hits.len() as u64,
+                &|row| hits.lines[row as usize],
                 file,
                 &mut self.columns,
-                &Highlight {
-                    highlighter: self.highlighter.as_deref(),
-                    bookmarks: Some(&self.bookmarks),
-                    search: marks.as_ref(),
-                },
+                &Highlight { highlighter: None, bookmarks: Some(&self.bookmarks), search: marks.as_ref() },
             );
-            self.view_output(&out, |row| res.lines[row as usize]);
-            // Selecting in the filter view moves the main view.
-            let picked = out.clicked.or(if out.has_focus { self.filter_view.selected } else { None });
+            self.view_output(&out, |row| hits.lines[row as usize]);
+            // Selecting a hit moves the main view to it.
+            let picked = out.clicked.or(if out.has_focus { self.hits_view.selected } else { None });
             if let Some(row) = picked {
-                let line = res.lines[row as usize];
-                if self.main_view.selected != Some(line) {
+                let line = hits.lines[row as usize];
+                if self.current_line() != line {
                     self.goto_line(line);
                 }
             }
         } else {
-            ui.weak("No filter applied.");
+            ui.weak(if self.result.is_some() {
+                "No search. Type in the Search box to find lines among the filtered ones."
+            } else {
+                "No search. Type in the Search box to find lines."
+            });
             // Fill the pane: panels remember their content size.
             ui.allocate_space(ui.available_size());
         }
@@ -764,7 +780,9 @@ impl Tab {
         let mut go = false;
         let mut clear = false;
         ui.horizontal(|ui| {
-            ui.label("🔍").on_hover_text("Search inside the filter result; n / N jump between hits");
+            ui.label("🔍").on_hover_text(
+                "Search the lines in the main view; hits are listed below and coloured, n / N jump between them",
+            );
             ui.selectable_value(&mut self.search.mode, Mode::Text, "Text");
             ui.selectable_value(&mut self.search.mode, Mode::Query, "Query");
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -775,7 +793,7 @@ impl Tab {
                     ui.checkbox(&mut self.search.regex, "Regex");
                 }
                 let hint = match self.search.mode {
-                    Mode::Text => "search inside the filter result — Enter to find",
+                    Mode::Text => "search: lines to find among the filtered ones — Enter to find",
                     Mode::Query => "NFD query, or tick queries in the library — Enter to find",
                 };
                 let r = ui.add(
@@ -803,21 +821,28 @@ impl Tab {
             colors: &a.colors,
             highlighters: &a.highlighters,
         });
+        let result = self.result.clone();
+        let line_of_row = |row: u64| match &result {
+            Some(r) => r.lines[row as usize],
+            None => row,
+        };
+        let rows = self.main_rows();
         let out = log_view(
             ui,
             "main",
             &mut self.main_view,
-            file.line_count(),
-            &|row| row,
+            rows,
+            &line_of_row,
             file,
             &mut self.columns,
             &Highlight {
-                highlighter: self.highlighter.as_deref(),
+                // Every row matches the filter: only search hits are coloured.
+                highlighter: None,
                 bookmarks: Some(&self.bookmarks),
                 search: marks.as_ref(),
             },
         );
-        self.view_output(&out, |row| row);
+        self.view_output(&out, line_of_row);
     }
 }
 
@@ -1166,7 +1191,7 @@ impl App {
         let lines = self.tabs.get(self.active).map_or(0, |t| t.total_lines());
         let mut jump = None;
         let modal = egui::Modal::new(egui::Id::unique("goto")).show(ctx, |ui| {
-            ui.label(format!("Go to line (1 – {lines}):"));
+            ui.label(format!("Go to line (1 – {lines}; filtered: the nearest kept line):"));
             ui.add(egui::TextEdit::singleline(text).desired_width(160.0)).request_focus();
             if ui.input(|i| i.key_pressed(Key::Enter)) {
                 jump = Some(text.trim().parse::<u64>().ok());
@@ -1457,14 +1482,18 @@ query timeouts  labels: vision
         assert_eq!(tab.result.as_ref().unwrap().lines, [1, 5]);
         assert_eq!(hits(&tab), [(1, vec!["drops"]), (5, vec!["timeouts"])]);
 
-        // n / N jump between search hits.
+        // The main view shows only the kept lines; going to a hidden line
+        // lands on the next kept one. n / N jump between search hits.
+        assert_eq!(tab.main_rows(), 2);
         tab.goto_line(0);
-        tab.jump_match(true);
         assert_eq!(tab.current_line(), 1);
-        tab.jump_match(true);
+        tab.goto_line(3);
         assert_eq!(tab.current_line(), 5);
         tab.jump_match(false);
         assert_eq!(tab.current_line(), 1);
+        tab.jump_match(true);
+        assert_eq!(tab.current_line(), 5);
+        assert_eq!(tab.hits_view.selected, Some(1));
 
         // Editing the box drops the chips; the text is a plain query.
         tab.search.pattern.push_str(" OR /disk/");
@@ -1473,13 +1502,32 @@ query timeouts  labels: vision
         settle(&mut tab, &ctx);
         assert_eq!(tab.search.hits.as_ref().unwrap().1.lines, [1, 5]);
 
-        // Without a filter the search covers the whole file.
+        // Without a filter the main view and the search cover the whole
+        // file; the cursor stays on its line.
         tab.pattern.clear();
         tab.start_search(&ctx);
         settle(&mut tab, &ctx);
+        assert_eq!(tab.main_rows(), 6);
+        assert_eq!(tab.current_line(), 5);
         assert_eq!(tab.search.hits.as_ref().unwrap().1.lines, [0, 1, 2, 3, 4, 5]);
         tab.clear_search();
         assert!(tab.search.hits.is_none());
+
+        // Typed text, as a user would: literal by default, then a regex.
+        tab.search.mode = Mode::Text;
+        tab.search.pattern = "Frame drop".into();
+        tab.search.ignore_case = true;
+        tab.run_search_box(&ctx, &lib);
+        settle(&mut tab, &ctx);
+        assert_eq!(tab.search.hits.as_ref().unwrap().1.lines, [0, 1, 2]);
+        tab.search.pattern = "cam[2]".into();
+        tab.run_search_box(&ctx, &lib);
+        settle(&mut tab, &ctx);
+        assert!(tab.search.hits.as_ref().unwrap().1.is_empty(), "literal by default");
+        tab.search.regex = true;
+        tab.run_search_box(&ctx, &lib);
+        settle(&mut tab, &ctx);
+        assert_eq!(tab.search.hits.as_ref().unwrap().1.lines, [2]);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }
