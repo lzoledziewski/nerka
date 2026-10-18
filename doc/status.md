@@ -2,7 +2,7 @@
 
 Snapshot of where the project stands. Update this file whenever the state changes.
 
-_Last update: 2026-10-18 (DLT import steps 1–3 done; design decisions synced from the agent's notes)._
+_Last update: 2026-10-18 (search manager designed with the owner, see `search-manager.md`)._
 
 ## State
 
@@ -34,7 +34,7 @@ Owner feedback is driving this; these are deliberate choices, keep them:
 ## Next steps
 
 1. Owner tries the DLT table on real use; settle the open DLT questions below.
-2. Then the **search manager / highlighters** (see "Search manager: owner's idea" below). Explore the UI with the owner (mockups) before building.
+2. Then the **search manager** POC: design agreed, scope in `search-manager.md`.
 3. Recreate the two config files from the appendix (ask before adding CI).
 
 Text-log benchmark on Windows (1 GiB, 12M lines, release): index ~90 ms, `search ERROR` ~30 ms, `level >= ERROR` ~31 ms, `level >= WARN AND raw ~ /timeout/` ~30 ms, `search -v ERROR` ~100 ms.
@@ -79,15 +79,15 @@ Open with the owner: save column widths? Sorting stays out (decided). Next after
 - The plugin interface is also the licensing boundary: keep it stable and documented.
 - **Missing:** `LICENSE-MIT` and `LICENSE-APACHE` files in the repo root (a dual licence normally ships both).
 
-## Search manager: owner's idea (next, not started)
+## Search manager (designed, POC not started)
 
-Recorded 2026-10-18, before any design work. The owner has no clear picture of the UI yet.
+Design agreed with the owner on 2026-10-18 after mockups: **`search-manager.md`** (decisions, model, POC scope, open questions). In short:
 
-- Manage **saved queries**; combine them easily (by clicking, a tree, checkboxes).
-- Enable entries as **highlighters**.
-- Possibly a **2nd..nth layer of result tabs**, one per query.
-- Must extend to **DLT and signals** (field predicates, later signal conditions).
-- **Not a copy of klogg's** saved filters / highlighters lists. Explore with the owner (mockups) instead of proposing klogg-style lists.
+- **No result tabs.** Two functions with the same inputs: **Filter** and **Search**. Search only looks inside the filter result.
+- Queries live in shareable **packs** (files). Child queries refine a component's parent query. **Labels** group queries across packs and components. **Parameters** are substituted regex-escaped.
+- **NFD is unchanged:** picking from the library expands (in core) into plain NFD, with provenance for search colours.
+- Parked: scenarios / skill export, pack collaboration (dirty / clean, push / pull), the details view with replace / extract.
+- Still not a copy of klogg's saved filters / highlighters lists.
 
 ## Where state lives
 
