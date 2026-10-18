@@ -7,6 +7,7 @@
 
 use super::{Ctx, Library, render};
 use crate::dsl::DslError;
+use crate::event::FieldDef;
 use crate::{Filter, Query, SearchSet};
 use std::collections::BTreeMap;
 use std::ops::Range;
@@ -199,6 +200,31 @@ impl Library {
     /// empty if the query is unknown or its chain is broken.
     pub fn chain(&self, id: &str) -> Vec<String> {
         chain_of(self, id).unwrap_or_default()
+    }
+
+    /// Source fields that query `id` (with its parent chain) uses but
+    /// `schema` doesn't have, in order. Such a query can't run on that
+    /// source ("unknown field"). Unknown or broken queries give none (they
+    /// fail elsewhere with their own error).
+    pub fn missing_fields(&self, id: &str, schema: &[FieldDef]) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        for qid in self.chain(id) {
+            let Some((_, q)) = self.get(&qid) else { continue };
+            // Parameters as placeholder values: only the fields matter.
+            let text = render(
+                &q.text,
+                false,
+                |_, ctx, _| Ok::<_, ()>(if ctx == Ctx::Bare { "\"x\"".into() } else { "x".into() }),
+                |_| (),
+            );
+            let Some(expr) = text.ok().and_then(|t| crate::dsl::parse(&t).ok()) else { continue };
+            for f in expr.field_names() {
+                if !schema.iter().any(|d| d.name == f) && !out.contains(&f) {
+                    out.push(f);
+                }
+            }
+        }
+        out
     }
 
     /// Parameter names the queries need, their parent chains included, in

@@ -1592,6 +1592,7 @@ impl eframe::App for App {
                         &self.library_errors,
                         &mut tab.picks,
                         &mut self.library_view,
+                        Some(file.schema()),
                     )
                 })
                 .inner;

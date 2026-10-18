@@ -242,6 +242,20 @@ fn expansion_as_a_search_inside_a_filter() {
 }
 
 #[test]
+fn missing_fields_follow_the_parent_chain() {
+    use crate::input::mem::SCHEMA;
+    let mut lib = lib();
+    lib.add(pack(VISION)).unwrap();
+    // nav.* use apid and mcnt, which the test schema has; text has none.
+    assert!(lib.missing_fields("nav.big", SCHEMA).is_empty());
+    assert_eq!(lib.missing_fields("nav.big", &[]), ["apid", "mcnt"]);
+    assert!(lib.missing_fields("txt.cam", &[]).is_empty());
+    // A child inherits its parent's fields; parameters don't matter.
+    assert_eq!(lib.missing_fields("vision.cam_scope", SCHEMA), ["ecu", "ctid"]);
+    assert!(lib.missing_fields("nope.x", &[]).is_empty());
+}
+
+#[test]
 fn chains() {
     let lib = lib();
     assert_eq!(lib.chain("nav.big"), ["nav.all", "nav.slow", "nav.big"]);

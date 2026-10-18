@@ -142,6 +142,22 @@ impl Expr {
         }
     }
 
+    /// Source fields the expression uses (lower-case, each once, in order;
+    /// `raw` and `level` aren't source fields).
+    pub fn field_names(&self) -> Vec<String> {
+        fn walk(e: &Expr, out: &mut Vec<String>) {
+            match e {
+                Expr::And(xs) | Expr::Or(xs) => xs.iter().for_each(|x| walk(x, out)),
+                Expr::Not(x) => walk(x, out),
+                Expr::Cond(Cond::Field(f)) if !out.contains(&f.name) => out.push(f.name.clone()),
+                Expr::Cond(_) => {}
+            }
+        }
+        let mut out = Vec::new();
+        walk(self, &mut out);
+        out
+    }
+
     /// Rough relative cost used to order operands.
     fn cost(&self) -> u32 {
         match self {
@@ -408,6 +424,13 @@ mod tests {
         assert!(!q("apid == NAV").matches(b"NAV"));
         assert!(!q("apid != NAV").matches(b"NAV"));
         assert!(Query::compile_for("apid != NAV", crate::input::mem::SCHEMA).unwrap().matches(b"NAV"));
+    }
+
+    #[test]
+    fn field_names_in_order_without_repeats() {
+        let e = parse("APID == NAV AND (level >= WARN OR NOT ctid ~ /x/) AND raw ~ /y/ AND apid != X").unwrap();
+        assert_eq!(e.field_names(), ["apid", "ctid"]);
+        assert!(parse("level >= ERROR AND /x/").unwrap().field_names().is_empty());
     }
 
     #[test]

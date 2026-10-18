@@ -21,6 +21,7 @@
 //! temporary pack so they expand exactly like library queries.
 
 use eframe::egui::{self, Color32, RichText};
+use nerka_core::FieldDef;
 use nerka_core::pack::{
     self, Expansion, Library, Pack, PackQuery, ParamValue, Params, Pick, Role, Selection, format_query, is_query_name,
     params_in, parse_pack, upsert_query,
@@ -462,6 +463,17 @@ pub fn chip(ui: &mut egui::Ui, text: &str, color: Color32, strong: bool) -> egui
         .response
 }
 
+/// Why a query can't run on this file: the fields it needs that the file
+/// doesn't have.
+fn incompatible_text(missing: &[String], schema: &[FieldDef]) -> String {
+    let has: Vec<&str> = ["raw", "level"].into_iter().chain(schema.iter().map(|d| d.name)).collect();
+    format!(
+        "Can't run on this file: it has no field {} (it has: {})",
+        missing.iter().map(|m| format!("'{m}'")).collect::<Vec<_>>().join(", "),
+        has.join(", ")
+    )
+}
+
 /// The 🔍 menu of a query: replace the search, or add to it.
 fn search_menu(ui: &mut egui::Ui, target: Target, action: &mut Action) {
     ui.menu_button("🔍", |ui| {
@@ -490,6 +502,7 @@ pub fn library_panel(
     load_errors: &[String],
     picks: &mut Picks,
     view: &mut LibraryView,
+    schema: Option<&[FieldDef]>,
 ) -> Action {
     let mut action = Action::None;
     ui.horizontal(|ui| {
@@ -551,7 +564,7 @@ pub fn library_panel(
                         {
                             edit_request = Some(EditRequest { pack: p.name.clone(), old: None, parent: None });
                         }
-                        group_ui(ui, lib_ro, &ids, picks, &mut action, &mut edit_request);
+                        group_ui(ui, lib_ro, &ids, picks, &mut action, &mut edit_request, schema);
                     });
                 header.header_response.on_hover_text(&p.file);
             }
@@ -561,7 +574,7 @@ pub fn library_panel(
                 egui::CollapsingHeader::new(RichText::new(label).strong())
                     .id_salt(("label", label))
                     .default_open(true)
-                    .show(ui, |ui| group_ui(ui, lib_ro, &ids, picks, &mut action, &mut edit_request));
+                    .show(ui, |ui| group_ui(ui, lib_ro, &ids, picks, &mut action, &mut edit_request, schema));
             }
             let unlabelled: Vec<String> = lib_ro
                 .packs()
@@ -572,7 +585,7 @@ pub fn library_panel(
                 egui::CollapsingHeader::new(RichText::new("(no label)").weak())
                     .id_salt("unlabelled")
                     .default_open(true)
-                    .show(ui, |ui| group_ui(ui, lib_ro, &unlabelled, picks, &mut action, &mut edit_request));
+                    .show(ui, |ui| group_ui(ui, lib_ro, &unlabelled, picks, &mut action, &mut edit_request, schema));
             }
             ui.add_space(4.0);
             ui.weak("New queries: ⋮ → refine on a query, or group by Pack, then + New query.");
@@ -617,6 +630,7 @@ fn group_ui(
     picks: &mut Picks,
     action: &mut Action,
     edit: &mut Option<EditRequest>,
+    schema: Option<&[FieldDef]>,
 ) {
     if ui.small_button("+ all").on_hover_text("Add all of them to the selection").clicked() {
         for id in ids {
@@ -625,7 +639,7 @@ fn group_ui(
     }
     let tree = Tree::of(lib, ids);
     for &root in &tree.roots {
-        tree_ui(ui, lib, &tree, root, picks, action, edit);
+        tree_ui(ui, lib, &tree, root, picks, action, edit, schema);
     }
 }
 
@@ -656,6 +670,7 @@ impl<'a> Tree<'a> {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn tree_ui(
     ui: &mut egui::Ui,
     lib: &Library,
@@ -664,6 +679,7 @@ fn tree_ui(
     picks: &mut Picks,
     action: &mut Action,
     edit: &mut Option<EditRequest>,
+    schema: Option<&[FieldDef]>,
 ) {
     let id = &tree.ids[i];
     // A parent outside this group is named, so the chain stays visible.
@@ -672,7 +688,7 @@ fn tree_ui(
         ui.horizontal(|ui| {
             // Line up with the rows that have a fold arrow.
             ui.add_space(ui.spacing().icon_width + ui.spacing().item_spacing.x);
-            query_row(ui, lib, id, outside, picks, action, edit);
+            query_row(ui, lib, id, outside, picks, action, edit, schema);
         });
         return;
     }
@@ -681,16 +697,17 @@ fn tree_ui(
         ui.make_persistent_id(("tree", id)),
         true,
     )
-    .show_header(ui, |ui| query_row(ui, lib, id, outside, picks, action, edit))
+    .show_header(ui, |ui| query_row(ui, lib, id, outside, picks, action, edit, schema))
     .body(|ui| {
         for &c in &tree.children[i] {
-            tree_ui(ui, lib, tree, c, picks, action, edit);
+            tree_ui(ui, lib, tree, c, picks, action, edit, schema);
         }
     });
 }
 
 /// One library query: `+`, `🔍`, colour, name (drag it into the
 /// selection), pack, and `⋮` (edit, refine, exclude) at the right.
+#[allow(clippy::too_many_arguments)]
 fn query_row(
     ui: &mut egui::Ui,
     lib: &Library,
@@ -699,13 +716,21 @@ fn query_row(
     picks: &mut Picks,
     action: &mut Action,
     edit: &mut Option<EditRequest>,
+    schema: Option<&[FieldDef]>,
 ) {
     let Some((pack, q)) = lib.get(id) else { return };
     ui.spacing_mut().item_spacing.x = 4.0;
-    if ui.small_button("+").on_hover_text("Add to the selection (include in the filter)").clicked() {
+    // Fields this file doesn't have: the query can't run on it.
+    let missing = schema.map(|s| lib.missing_fields(id, s)).unwrap_or_default();
+    let why = incompatible_text(&missing, schema.unwrap_or_default());
+    let usable = missing.is_empty();
+    let plus = ui.add_enabled(usable, egui::Button::new("+").small());
+    if plus.on_hover_text("Add to the selection (include in the filter)").on_disabled_hover_text(&why).clicked() {
         picks.add(lib, id, Use::Include, None);
     }
-    search_menu(ui, Target::Library(id.to_owned()), action);
+    ui.add_enabled_ui(usable, |ui| search_menu(ui, Target::Library(id.to_owned()), action))
+        .response
+        .on_disabled_hover_text(&why);
     let color = q.color.as_deref().and_then(parse_color);
     let (rect, _) = ui.allocate_exact_size(egui::vec2(8.0, 12.0), egui::Sense::hover());
     if let Some(c) = color {
@@ -723,10 +748,16 @@ fn query_row(
         tip += &format!("\nlabels: {}", q.labels.join(", "));
     }
     tip += "\n\nDrag it into the selection; ⋮ for more";
-    // Drag the name into the selection.
-    let r = ui.add(egui::Label::new(&name).sense(egui::Sense::drag()));
-    r.dnd_set_drag_payload(Drag::Library(id.to_owned()));
+    // Drag the name into the selection (not a query this file can't run).
+    let shown = if usable { RichText::new(&name) } else { RichText::new(&name).weak() };
+    let r = ui.add(egui::Label::new(shown).sense(egui::Sense::drag()));
+    if usable {
+        r.dnd_set_drag_payload(Drag::Library(id.to_owned()));
+    } else {
+        tip = format!("{why}\n\n{tip}");
+    }
     if r.dragged()
+        && usable
         && let Some(p) = ui.ctx().pointer_interact_pos()
     {
         ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
@@ -1218,7 +1249,7 @@ mod tests {
         let input = egui::RawInput { screen_rect: Some(screen), time: Some(t), events, ..Default::default() };
         let mut out = ctx.run_ui(input, |ui| {
             egui::Panel::right("library").exact_size(300.0).show(ui, |ui| {
-                library_panel(ui, &mut lib.clone(), &[], picks, &mut LibraryView::default());
+                library_panel(ui, &mut lib.clone(), &[], picks, &mut LibraryView::default(), None);
             });
             egui::CentralPanel::default().show(ui, |ui| {
                 selection_panel(ui, lib, picks);
@@ -1517,7 +1548,7 @@ mod tests {
             };
             let mut full = ctx.run_ui(input, |ui| {
                 egui::CentralPanel::default().show(ui, |ui| {
-                    library_panel(ui, &mut lib, &[], &mut picks, view);
+                    library_panel(ui, &mut lib, &[], &mut picks, view, None);
                 });
             });
             full.textures_delta.clear();
@@ -1549,6 +1580,47 @@ mod tests {
             let e = view.editing.as_ref().unwrap_or_else(|| panic!("{item} opens the editor"));
             assert_eq!((e.old.as_deref(), e.node.parent.as_deref()), (want_old, want_parent));
         }
+    }
+
+    #[test]
+    fn queries_a_file_cant_run_are_greyed_out() {
+        let mut lib = Library::new();
+        lib.add(parse_pack("d.nerka-pack", "pack d\nquery nav\n  apid == NAV\nquery any\n  /x/\n").unwrap()).unwrap();
+        let (mut picks, mut view) = (Picks::default(), LibraryView { by_pack: true, editing: None });
+        let ctx = egui::Context::default();
+        // On a text file (no fields): + of `nav` is disabled, of `any` not.
+        let mut frame = |events: Vec<egui::Event>, picks: &mut Picks| {
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(500.0, 400.0))),
+                events,
+                ..Default::default()
+            };
+            let mut full = ctx.run_ui(input, |ui| {
+                egui::CentralPanel::default().show(ui, |ui| {
+                    library_panel(ui, &mut lib, &[], picks, &mut view, Some(&[]));
+                });
+            });
+            full.textures_delta.clear();
+            full.shapes
+        };
+        let shapes = frame(vec![], &mut picks);
+        for (name, adds) in [("nav", false), ("any", true)] {
+            let row = find_text(&shapes, name).unwrap();
+            let plus = find_text_at_y(&shapes, "+", row.y).unwrap();
+            let ev = |pressed| egui::Event::PointerButton {
+                pos: plus,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            };
+            frame(vec![egui::Event::PointerMoved(plus), ev(true)], &mut picks);
+            frame(vec![ev(false)], &mut picks);
+            frame(vec![], &mut picks);
+            let added = picks.nodes.iter().any(|n| n.name == name);
+            assert_eq!(added, adds, "clicking + of {name}");
+        }
+        let why = incompatible_text(&["apid".into()], &[]);
+        assert_eq!(why, "Can't run on this file: it has no field 'apid' (it has: raw, level)");
     }
 
     #[test]
