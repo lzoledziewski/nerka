@@ -10,7 +10,7 @@
 //!     nerka-gui app.log --query 'level >= ERROR AND raw ~ /SSL/'
 //!     nerka-gui app.log --text 'connection reset'
 //!     nerka-gui app.log --regex 'timeout|refused'
-//!     nerka-gui app.log --pack packs/ --pick vision.cam_scope --search-pick vision.frame_drops --param cam=CAM1
+//!     nerka-gui app.log --pack packs/ --pick vision.cam_scope --search-pick vision.frame_drops --param cam=CAM1 --highlight vision.cam_scope
 //! Keys: Ctrl+F filter · Enter run · n/N next/prev search hit · Ctrl+G go to
 //! line (the nearest kept line when filtered) · Ctrl+Shift+L library
 //! · m toggle bookmark · b/B next/prev bookmark · Ctrl+C copy selection
@@ -71,6 +71,10 @@ fn main() -> eframe::Result {
             }
             Some("--exclude") => {
                 picks.set_filter(&value(), Some(Use::Exclude));
+                continue;
+            }
+            Some("--highlight") => {
+                picks.toggle_highlight(&value());
                 continue;
             }
             Some("--search-pick") => {
@@ -161,6 +165,11 @@ struct Tab {
     /// unchanged: shown grouped, with chips.
     filter_exp: Option<Arc<Expansion>>,
     picks: Picks,
+    /// Colour of each included filter query, in expansion order.
+    filter_colors: Vec<Color32>,
+    /// Whole-line colours of the filter queries switched on in `picks`.
+    line_colors: Option<(Arc<ActiveSearch>, Arc<SearchHits>)>,
+    colors_job: Option<(Arc<ActiveSearch>, Job<SearchHits>)>,
     search: SearchBox,
 
     bookmarks: Bookmarks,
@@ -215,6 +224,9 @@ impl Tab {
             searching: None,
             filter_exp: None,
             picks: Picks::default(),
+            filter_colors: Vec::new(),
+            line_colors: None,
+            colors_job: None,
             search: SearchBox::default(),
             bookmarks: Bookmarks::default(),
             status: String::new(),
@@ -226,7 +238,7 @@ impl Tab {
     }
 
     fn is_busy(&self) -> bool {
-        self.loading.is_some() || self.searching.is_some() || self.search.job.is_some()
+        self.loading.is_some() || self.searching.is_some() || self.search.job.is_some() || self.colors_job.is_some()
     }
 
     fn cancel_jobs(&mut self) {
@@ -237,6 +249,9 @@ impl Tab {
             j.cancel();
         }
         if let Some((_, j)) = self.search.job.take() {
+            j.cancel();
+        }
+        if let Some((_, j)) = self.colors_job.take() {
             j.cancel();
         }
     }
@@ -296,6 +311,7 @@ impl Tab {
             self.result = None;
             self.goto_line(cur);
             self.status.clear();
+            self.recolor(ctx);
             self.rerun_search(ctx);
             return false;
         }
@@ -358,7 +374,8 @@ impl Tab {
                             self.result = Some(Arc::new(res));
                             self.goto_line(cur);
                             self.searching = None;
-                            // The search looks inside the filter result.
+                            // Colours and the search follow the filter result.
+                            self.recolor(ctx);
                             self.rerun_search(ctx);
                         }
                         Err(nerka_core::Error::Cancelled) => self.searching = None,
@@ -367,6 +384,19 @@ impl Tab {
                             self.searching = None;
                         }
                     }
+                }
+            }
+        }
+        if let Some((a, job)) = &self.colors_job {
+            match job.poll() {
+                Poll::Running => ctx.request_repaint_after(Duration::from_millis(50)),
+                Poll::Done(r, _) => {
+                    match r {
+                        Ok(hits) => self.line_colors = Some((a.clone(), Arc::new(hits))),
+                        Err(nerka_core::Error::Cancelled) => {}
+                        Err(e) => self.status = format!("Colouring failed: {e}"),
+                    }
+                    self.colors_job = None;
                 }
             }
         }
@@ -405,6 +435,11 @@ impl Tab {
                 self.picks.error = None;
                 self.mode = Mode::Query;
                 self.pattern = e.nfd.clone();
+                self.filter_colors = e
+                    .parts_with(Role::Include)
+                    .enumerate()
+                    .map(|(i, p)| library::query_color(lib, &p.query, i))
+                    .collect();
                 self.filter_exp = Some(Arc::new(e));
                 self.start_search(ctx).then(|| self.pattern.clone())
             }
@@ -484,6 +519,39 @@ impl Tab {
         self.search.hits = None;
         self.search.exp = None;
         self.search.pattern.clear();
+    }
+
+    /// Work out (again) the whole-line colours: for the filter queries
+    /// switched on, which kept lines each one matches. Runs after the
+    /// filter result is in, and when a colour is switched on or off.
+    fn recolor(&mut self, ctx: &egui::Context) {
+        if let Some((_, j)) = self.colors_job.take() {
+            j.cancel();
+        }
+        self.line_colors = None;
+        let e = self.filter_exp.clone().filter(|e| e.nfd == self.pattern);
+        let (Some(e), Some(res), Some(file)) = (e, self.result.clone(), self.file.clone()) else { return };
+        if self.searching.is_some() {
+            return;
+        }
+        let (mut include, mut names, mut colors) = (Vec::new(), Vec::new(), Vec::new());
+        for (i, p) in e.parts_with(Role::Include).enumerate() {
+            if !self.picks.is_highlighted(&p.query) {
+                continue;
+            }
+            let Ok(q) = Query::compile(e.part_nfd(p)) else { continue };
+            include.push(Filter::Query(q));
+            names.push(p.query.clone());
+            colors.push(self.filter_colors.get(i).copied().unwrap_or(library::palette(i)));
+        }
+        if include.is_empty() {
+            return;
+        }
+        let a =
+            Arc::new(ActiveSearch { set: SearchSet { include, exclude: vec![] }, names, colors, highlighters: vec![] });
+        let aa = a.clone();
+        let job = Job::spawn(ctx, move |prog| nerka_core::search_within(&*file, Some(&res.lines), &aa.set, prog));
+        self.colors_job = Some((a, job));
     }
 
     /// Start (again) the active search over the current filter result.
@@ -666,11 +734,11 @@ impl Tab {
         }
     }
 
-    /// Returns the filter that was searched for, if a search started.
-    fn filter_panel(
+    /// The Filter bar at the top. Returns the filter that was applied, if
+    /// one started.
+    fn filter_bar(
         &mut self,
         ui: &mut egui::Ui,
-        file: &dyn LogSource,
         focus_search: &mut bool,
         history: &SearchHistory,
         lib: &Library,
@@ -695,8 +763,10 @@ impl Tab {
                 .response
                 .on_hover_text("Recent filters");
             });
+            ui.label(RichText::new("Filter").strong())
+                .on_hover_text("Decides which lines the main view shows; Enter applies it");
             // Mode and checkboxes only change how the box is read; only
-            // Enter or Search runs it.
+            // Enter or the Filter button runs it.
             ui.selectable_value(&mut self.mode, Mode::Text, "Text");
             ui.selectable_value(&mut self.mode, Mode::Query, "Query")
                 .on_hover_text("level >= ERROR AND raw ~ /SSL|CERT/i AND NOT /healthcheck/");
@@ -734,8 +804,18 @@ impl Tab {
             }
         });
         if let Some(e) = self.filter_exp.clone().filter(|e| e.nfd == self.pattern) {
-            expansion_view(ui, &e, lib);
+            let picks = &self.picks;
+            let clicked = expansion_view(ui, &e, lib, Some(&|id: &str| picks.is_highlighted(id)));
+            if let Some(id) = clicked {
+                self.picks.toggle_highlight(&id);
+                self.recolor(ui.ctx());
+            }
         }
+        searched
+    }
+
+    /// The Search box and the list of its hits (bottom panel).
+    fn search_panel(&mut self, ui: &mut egui::Ui, file: &dyn LogSource, lib: &Library) {
         self.search_row(ui, lib);
         ui.add_space(2.0);
         let marks = self.search.hits.as_ref().map(|(a, h)| SearchMarks {
@@ -752,7 +832,7 @@ impl Tab {
                 &|row| hits.lines[row as usize],
                 file,
                 &mut self.columns,
-                &Highlight { highlighter: None, bookmarks: Some(&self.bookmarks), search: marks.as_ref() },
+                &Highlight { highlighter: None, bookmarks: Some(&self.bookmarks), search: marks.as_ref(), lines: None },
             );
             self.view_output(&out, |row| hits.lines[row as usize]);
             // Selecting a hit moves the main view to it.
@@ -772,7 +852,6 @@ impl Tab {
             // Fill the pane: panels remember their content size.
             ui.allocate_space(ui.available_size());
         }
-        searched
     }
 
     /// The Search box, under the Filter box: same modes, Enter runs it.
@@ -811,7 +890,7 @@ impl Tab {
             self.run_search_box(ui.ctx(), lib);
         }
         if let Some(e) = self.search.expansion().cloned() {
-            expansion_view(ui, &e, lib);
+            expansion_view(ui, &e, lib, None);
         }
     }
 
@@ -821,6 +900,8 @@ impl Tab {
             colors: &a.colors,
             highlighters: &a.highlighters,
         });
+        let lines =
+            self.line_colors.as_ref().map(|(a, h)| SearchMarks { hits: h, colors: &a.colors, highlighters: &[] });
         let result = self.result.clone();
         let line_of_row = |row: u64| match &result {
             Some(r) => r.lines[row as usize],
@@ -840,6 +921,7 @@ impl Tab {
                 highlighter: None,
                 bookmarks: Some(&self.bookmarks),
                 search: marks.as_ref(),
+                lines: lines.as_ref(),
             },
         );
         self.view_output(&out, line_of_row);
@@ -852,8 +934,16 @@ fn short(id: &str) -> &str {
 }
 
 /// An expansion on several lines, one per picked query: how it joins the
-/// others, a name chip in the query's colour, and its NFD.
-fn expansion_view(ui: &mut egui::Ui, e: &Expansion, lib: &Library) {
+/// others, a name chip in the query's colour, and its NFD. With `lit`, the
+/// included queries' chips switch their line colour: filled when on.
+/// Returns the query whose chip was clicked.
+fn expansion_view(
+    ui: &mut egui::Ui,
+    e: &Expansion,
+    lib: &Library,
+    lit: Option<&dyn Fn(&str) -> bool>,
+) -> Option<String> {
+    let mut clicked = None;
     const MAX_LINES: usize = 8;
     let shorts: Vec<&str> = e.parts.iter().map(|p| short(&p.query)).collect();
     let mut includes = 0;
@@ -874,13 +964,26 @@ fn expansion_view(ui: &mut egui::Ui, e: &Expansion, lib: &Library) {
         let name = if shorts.iter().filter(|s| **s == shorts[i]).count() > 1 { &p.query } else { shorts[i] };
         ui.horizontal(|ui| {
             ui.add_sized([52.0, 14.0], egui::Label::new(RichText::new(joiner).small().weak()));
-            library::chip(ui, name, color).on_hover_text(&p.query);
+            match (lit, p.role) {
+                (Some(lit), Role::Include) => {
+                    let on = lit(&p.query);
+                    let tip = if on { "Lines coloured: click to stop" } else { "Click to colour its lines" };
+                    let r = library::chip(ui, name, color, on).interact(egui::Sense::click());
+                    if r.on_hover_text(format!("{}\n{tip}", p.query)).clicked() {
+                        clicked = Some(p.query.clone());
+                    }
+                }
+                _ => {
+                    library::chip(ui, name, color, false).on_hover_text(&p.query);
+                }
+            }
             ui.add(egui::Label::new(RichText::new(e.part_nfd(p)).monospace().small()).truncate());
         });
     }
     if e.parts.len() > MAX_LINES {
         ui.weak(format!("… {} more (the full text is in the box above)", e.parts.len() - MAX_LINES));
     }
+    clicked
 }
 
 #[derive(Default)]
@@ -1357,7 +1460,13 @@ impl eframe::App for App {
             return;
         };
 
+        let before = tab.search_prefs();
+        let searched = egui::Panel::top("filter")
+            .show(ui, |ui| tab.filter_bar(ui, &mut focus_search, &self.history, &self.library))
+            .inner;
+        let after = tab.search_prefs();
         if self.show_library {
+            let highlight = tab.picks.highlight.clone();
             let action = egui::Panel::right("library")
                 .resizable(true)
                 .default_size(320.0)
@@ -1365,6 +1474,9 @@ impl eframe::App for App {
                     library::panel(ui, &self.library, &self.library_errors, &mut tab.picks, &mut self.library_view)
                 })
                 .inner;
+            if tab.picks.highlight != highlight {
+                tab.recolor(&ctx);
+            }
             if action != library::Action::None {
                 self.library_action(&ctx, action);
             }
@@ -1380,14 +1492,11 @@ impl eframe::App for App {
                 self.show_bookmarks = false;
             }
         }
-        let before = tab.search_prefs();
-        let searched = egui::Panel::bottom("filter")
+        egui::Panel::bottom("search")
             .resizable(true)
             .default_size(260.0)
             .min_size(120.0)
-            .show(ui, |ui| tab.filter_panel(ui, &*file, &mut focus_search, &self.history, &self.library))
-            .inner;
-        let after = tab.search_prefs();
+            .show(ui, |ui| tab.search_panel(ui, &*file, &self.library));
         egui::CentralPanel::default().show(ui, |ui| tab.main_panel(ui, &*file));
         if after != before {
             self.save_prefs_from(after);
@@ -1481,6 +1590,16 @@ query timeouts  labels: vision
         settle(&mut tab, &ctx);
         assert_eq!(tab.result.as_ref().unwrap().lines, [1, 5]);
         assert_eq!(hits(&tab), [(1, vec!["drops"]), (5, vec!["timeouts"])]);
+
+        // Line colours are off by default; switched on, the later pick wins
+        // where a line matches several.
+        assert!(tab.line_colors.is_none());
+        tab.picks.toggle_highlight("vision.cam");
+        tab.recolor(&ctx);
+        settle(&mut tab, &ctx);
+        let (a, h) = tab.line_colors.clone().expect("line colours");
+        assert_eq!(h.lines, [1, 5]);
+        assert_eq!(a.names, ["vision.cam"]);
 
         // The main view shows only the kept lines; going to a hidden line
         // lands on the next kept one. n / N jump between search hits.

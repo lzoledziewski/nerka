@@ -130,6 +130,8 @@ pub struct Highlight<'a> {
     pub highlighter: Option<&'a Highlighter>,
     pub bookmarks: Option<&'a Bookmarks>,
     pub search: Option<&'a SearchMarks<'a>>,
+    /// Whole-line colours: the last matching query (in pick order) wins.
+    pub lines: Option<&'a SearchMarks<'a>>,
 }
 
 /// Search hits to mark, coloured per search query.
@@ -483,6 +485,13 @@ pub fn log_view(
         let y = snap(rows_rect.top()) + i as f32 * row_h;
         let line = line_of_row(row);
         let row_rect = Rect::from_min_size(pos2(text_rect.min.x, y), vec2(text_rect.width(), row_h));
+        if let Some(lc) = hl.lines
+            && let Some(&q) = lc.matched(line).as_deref().and_then(<[usize]>::last)
+            && let Some(&c) = lc.colors.get(q)
+        {
+            let bg = Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), if vis.dark_mode { 70 } else { 90 });
+            painter.rect_filled(row_rect, 0.0, bg);
+        }
         if state.selected == Some(row) {
             painter.rect_filled(row_rect, 0.0, cursor_bg);
         }
@@ -837,7 +846,7 @@ mod tests {
         let rows: Vec<u64> = (0..file.line_count()).step_by(2).collect();
         let screen = Rect::from_min_size(pos2(0.0, 0.0), vec2(1000.0, 800.0));
         let input = egui::RawInput { screen_rect: Some(screen), time: Some(t), events, ..Default::default() };
-        let hl = Highlight { highlighter: None, bookmarks: None, search: None };
+        let hl = Highlight { highlighter: None, bookmarks: None, search: None, lines: None };
         let mut rect = Rect::NOTHING;
         let mut out = ctx.run_ui(input, |ui| {
             egui::Panel::bottom("filter").resizable(true).default_size(260.0).min_size(120.0).show(ui, |ui| {
@@ -905,7 +914,7 @@ mod tests {
         let ctx = egui::Context::default();
         let (mut state, mut columns) =
             (ViewState::default(), Columns { names: vec!["a", "b", "rest"], widths: vec![4, 3, 0] });
-        let hl = Highlight { highlighter: None, bookmarks: None, search: None };
+        let hl = Highlight { highlighter: None, bookmarks: None, search: None, lines: None };
         let mut t = 0.0;
         let mut step = |events: Vec<egui::Event>, state: &mut ViewState, columns: &mut Columns| {
             t += 1.0 / 60.0;

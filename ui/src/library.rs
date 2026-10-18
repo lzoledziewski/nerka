@@ -23,6 +23,9 @@ pub struct Picks {
     /// Qualified ids in the order they were picked.
     pub filter: Vec<(String, Use)>,
     pub search: Vec<String>,
+    /// Filter queries whose kept lines get a whole-line colour (off unless
+    /// switched on).
+    pub highlight: Vec<String>,
     /// Parameter values by name, with "insert as regex" (raw).
     pub params: BTreeMap<String, (String, bool)>,
     /// The last expansion error, shown in the panel.
@@ -54,6 +57,25 @@ impl Picks {
             }
             _ => {}
         }
+    }
+
+    pub fn toggle_highlight(&mut self, id: &str) {
+        match self.highlight.iter().position(|q| q == id) {
+            Some(i) => {
+                self.highlight.remove(i);
+            }
+            None => self.highlight.push(id.to_owned()),
+        }
+    }
+
+    pub fn is_highlighted(&self, id: &str) -> bool {
+        self.highlight.iter().any(|q| q == id)
+    }
+
+    /// Position of `id` among the included filter queries (its palette
+    /// slot, the same as in the expansion).
+    pub fn include_index(&self, id: &str) -> Option<usize> {
+        self.filter.iter().filter(|(_, u)| *u == Use::Include).position(|(q, _)| q == id)
     }
 
     pub fn filter_selection(&self) -> Selection {
@@ -130,10 +152,10 @@ pub fn palette(index: usize) -> Color32 {
     PALETTE[index % PALETTE.len()]
 }
 
-/// A small coloured name tag.
-pub fn chip(ui: &mut egui::Ui, text: &str, color: Color32) -> egui::Response {
+/// A small coloured name tag; `strong` fills it with the colour.
+pub fn chip(ui: &mut egui::Ui, text: &str, color: Color32, strong: bool) -> egui::Response {
     egui::Frame::new()
-        .fill(color.gamma_multiply(0.25))
+        .fill(color.gamma_multiply(if strong { 0.8 } else { 0.25 }))
         .stroke(egui::Stroke::new(1.0, color))
         .corner_radius(6.0)
         .inner_margin(egui::Margin::symmetric(5, 0))
@@ -206,7 +228,7 @@ pub fn panel(
                 picks.error = None;
             }
         });
-        ui.weak("+ include · − exclude (Filter) · ☑ Search");
+        ui.weak("+ include · − exclude (Filter) · ☑ Search · ■ colour lines");
     });
 
     egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
@@ -294,10 +316,23 @@ fn query_row(ui: &mut egui::Ui, lib: &Library, id: &str, picks: &mut Picks) {
         if ui.checkbox(&mut on, "").on_hover_text("Search for it").changed() {
             picks.set_search(id, on);
         }
-        let color = q.color.as_deref().and_then(parse_color);
-        let (rect, _) = ui.allocate_exact_size(egui::vec2(8.0, 12.0), egui::Sense::hover());
-        if let Some(c) = color {
-            ui.painter().rect_filled(rect, 2.0, c);
+        // The swatch switches the line colour of this query's filter lines.
+        let color = query_color(lib, id, picks.include_index(id).unwrap_or(0));
+        let lit = picks.is_highlighted(id);
+        let (rect, r) = ui.allocate_exact_size(egui::vec2(12.0, 14.0), egui::Sense::click());
+        let sw = egui::Rect::from_center_size(rect.center(), egui::vec2(10.0, 12.0));
+        if lit {
+            ui.painter().rect_filled(sw, 2.0, color);
+        } else {
+            ui.painter().rect_stroke(sw, 2.0, egui::Stroke::new(1.5, color), egui::StrokeKind::Inside);
+        }
+        let tip = if lit {
+            "Its filter lines are coloured: click to stop"
+        } else {
+            "Colour the lines this query keeps in the filter (later picks win where lines overlap)"
+        };
+        if r.on_hover_text(tip).clicked() {
+            picks.toggle_highlight(id);
         }
         let mut name = q.id.clone();
         if !q.params.is_empty() {
@@ -367,5 +402,11 @@ mod tests {
         assert_eq!(p.search_selection().include.len(), 1);
         p.params.insert("cam".into(), ("c(1)".into(), false));
         assert_eq!(p.params()["cam"], ParamValue::literal("c(1)"));
+        assert_eq!(p.include_index("a.z"), Some(0));
+        assert_eq!(p.include_index("a.x"), None);
+        p.toggle_highlight("a.z");
+        assert!(p.is_highlighted("a.z"));
+        p.toggle_highlight("a.z");
+        assert!(!p.is_highlighted("a.z"));
     }
 }
