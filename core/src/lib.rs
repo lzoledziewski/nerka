@@ -8,7 +8,8 @@
 //!   format (plain text and DLT today; PCAP, stdin later); [`open`] picks
 //!   the reader from the file's content.
 //! * [`engine`] — [`LineIndex`] (parallel line indexing) and [`search`]:
-//!   filtering that yields the set of matching lines.
+//!   filtering that yields the set of matching lines; [`search_within`]:
+//!   search inside a filter result, per query.
 //! * [`dsl`] — NFD, the filter language (`level >= ERROR AND raw ~ /SSL/`).
 //! * [`event`] — lazily normalized fields (level, …) per line.
 //! * [`bookmarks`] — bookmarks/notes persisted in a sidecar file.
@@ -28,6 +29,7 @@ pub use bookmarks::Bookmarks;
 pub use dsl::{DslError, Query};
 pub use engine::index::LineIndex;
 pub use engine::search::{Filter, Highlighter, Matcher, MatcherOptions, SearchResult, search};
+pub use engine::within::{SearchHits, SearchSet, search_within};
 pub use event::{Event, FieldDef, FieldId, FieldKind, FieldValue, Level};
 pub use history::SearchHistory;
 pub use input::dlt::DltFile;

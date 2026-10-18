@@ -7,6 +7,7 @@
 
 use super::{Ctx, Library, render};
 use crate::dsl::DslError;
+use crate::{Filter, Query, SearchSet};
 use std::collections::BTreeMap;
 use std::ops::Range;
 
@@ -100,6 +101,15 @@ impl Expansion {
 
     pub fn parts_with(&self, role: Role) -> impl Iterator<Item = &Part> {
         self.parts.iter().filter(move |p| p.role == role)
+    }
+
+    /// The parts as search queries: hits are reported per included part,
+    /// in the order of [`parts_with`](Self::parts_with)`(Role::Include)`.
+    pub fn search_set(&self) -> Result<SearchSet, DslError> {
+        let compile = |role| {
+            self.parts_with(role).map(|p| Query::compile(self.part_nfd(p)).map(Filter::Query)).collect::<Result<_, _>>()
+        };
+        Ok(SearchSet { include: compile(Role::Include)?, exclude: compile(Role::Exclude)? })
     }
 }
 

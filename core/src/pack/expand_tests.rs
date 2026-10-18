@@ -226,3 +226,17 @@ fn multi_line_bodies_become_one_line() {
     lib.add(pack("pack w\nquery a\n  raw ~ /a  b/\n     AND\n\n   \"x   y\"\n")).unwrap();
     assert_eq!(expand(&sel(&["w.a"], &[]), &lib, &Params::new()).unwrap().nfd, r#"(raw ~ /a  b/ AND "x   y")"#);
 }
+
+#[test]
+fn expansion_as_a_search_inside_a_filter() {
+    let src = mem();
+    let filter = expand(&sel(&["nav.all"], &[]), &lib(), &params(&[("app", "NAV")])).unwrap();
+    let within = same_lines(&src, &filter.nfd, "apid == NAV");
+    let search = expand(&sel(&["nav.slow", "nav.errs"], &["nav.big"]), &lib(), &params(&[("app", "NAV")])).unwrap();
+    let set = search.search_set().unwrap();
+    let hits = crate::search_within(&src, &within, &set, &crate::Progress::new()).unwrap();
+    let got: Vec<(crate::LineNo, Vec<usize>)> =
+        (0..hits.len()).map(|i| (hits.lines[i], hits.matched(i).collect())).collect();
+    // Line 5 is slow, an error and big: excluded.
+    assert_eq!(got, [(1, vec![0]), (2, vec![1])]);
+}
