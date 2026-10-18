@@ -3,17 +3,26 @@
 //! queries, their order) stays as it was.
 
 use super::{Ctx, PACK_EXTENSION, PackError, PackQuery, is_name, parse_pack, render};
+
+/// A query name as written in a file: quoted unless it is a NAME.
+fn quoted(name: &str) -> String {
+    if is_name(name) { name.to_owned() } else { format!("\"{name}\"") }
+}
 use std::path::{Path, PathBuf};
 
 /// A query as pack text: the header line and the body indented by four
 /// spaces, without a trailing newline.
 pub fn format_query(q: &PackQuery) -> String {
-    let mut out = format!("query {}", q.id);
+    let mut out = format!("query {}", quoted(&q.id));
     if !q.params.is_empty() {
         out += &format!("({})", q.params.join(", "));
     }
     if let Some(p) = &q.parent {
-        out += &format!("  parent: {p}");
+        let plain = match p.split_once('.') {
+            Some((pack, name)) => is_name(pack) && is_name(name),
+            None => is_name(p),
+        };
+        out += &if plain { format!("  parent: {p}") } else { format!("  parent: \"{p}\"") };
     }
     if !q.labels.is_empty() {
         out += &format!("  labels: {}", q.labels.join(", "));
@@ -37,13 +46,46 @@ pub fn format_query(q: &PackQuery) -> String {
 /// The result is parsed before it is returned, so an invalid query (or
 /// one that clashes with the file) is an error and nothing changes.
 pub fn upsert_query(file: &str, text: &str, q: &PackQuery) -> Result<String, PackError> {
+    put(file, text, &q.id, Some(q))
+}
+
+/// `text` with query `old` replaced by `q` in place (`q` may have another
+/// name). Errors if `old` doesn't exist or another query has `q`'s name.
+pub fn rename_query(file: &str, text: &str, old: &str, q: &PackQuery) -> Result<String, PackError> {
+    let pack = parse_pack(file, text)?;
+    let err = |msg: String| PackError { file: file.to_owned(), pos: None, msg };
+    if pack.query(old).is_none() {
+        return Err(err(format!("no query '{old}' in pack '{}'", pack.name)));
+    }
+    if q.id != old && pack.query(&q.id).is_some() {
+        return Err(err(format!("pack '{}' already has a query '{}'", pack.name, q.id)));
+    }
+    put(file, text, old, Some(q))
+}
+
+/// `text` without query `id` (and the blank line before it, if any).
+pub fn remove_query(file: &str, text: &str, id: &str) -> Result<String, PackError> {
+    if parse_pack(file, text)?.query(id).is_none() {
+        return Err(PackError { file: file.to_owned(), pos: None, msg: format!("no query '{id}'") });
+    }
+    put(file, text, id, None)
+}
+
+/// Replace the block of query `at` with `q` (or remove it when `q` is
+/// `None`); append `q` if there is no such query. Keeps every other line
+/// and the line ending, and checks the result parses.
+fn put(file: &str, text: &str, at: &str, q: Option<&PackQuery>) -> Result<String, PackError> {
     let pack = parse_pack(file, text)?;
     let nl = if text.contains("\r\n") { "\r\n" } else { "\n" };
-    let block: Vec<String> = format_query(q).lines().map(str::to_owned).collect();
+    let block: Vec<String> = q.map(|q| format_query(q).lines().map(str::to_owned).collect()).unwrap_or_default();
     let mut lines: Vec<String> = text.lines().map(str::to_owned).collect();
-    match pack.query(&q.id) {
+    match pack.query(at) {
         Some(old) => {
-            lines.splice(old.line..=old.end_line, block);
+            let mut start = old.line;
+            if q.is_none() && start > 0 && lines[start - 1].trim().is_empty() {
+                start -= 1;
+            }
+            lines.splice(start..=old.end_line, block);
         }
         None => {
             while lines.last().is_some_and(|l| l.trim().is_empty()) {
@@ -155,6 +197,29 @@ query b
         let mut bad = q("c", "/$y/");
         bad.params.clear();
         assert!(upsert_query("t", FILE, &bad).unwrap_err().msg.contains("not declared"));
+    }
+
+    #[test]
+    fn quoted_names_rename_and_remove() {
+        let mut spaced = q("xyz logs", "apid == XYZ");
+        spaced.parent = Some("other.cam scope".into());
+        let out = upsert_query("t", FILE, &spaced).unwrap();
+        assert!(out.ends_with("query \"xyz logs\"  parent: \"other.cam scope\"\n    apid == XYZ\n"), "{out}");
+        let p = parse_pack("t", &out).unwrap();
+        let x = p.query("xyz logs").unwrap();
+        assert_eq!(x.parent.as_deref(), Some("other.cam scope"));
+
+        // Rename in place; a clash is refused.
+        let renamed = rename_query("t", &out, "a", &q("a2", "/$x/")).unwrap();
+        let ids: Vec<String> = parse_pack("t", &renamed).unwrap().queries.into_iter().map(|q| q.id).collect();
+        assert_eq!(ids, ["a2", "b", "xyz logs"]);
+        assert!(rename_query("t", &out, "a", &q("b", "/x/")).unwrap_err().msg.contains("already has"));
+        assert!(rename_query("t", &out, "nope", &q("c", "/x/")).is_err());
+
+        // Remove takes the blank line before the block too.
+        let removed = remove_query("t", &out, "xyz logs").unwrap();
+        assert_eq!(removed, FILE);
+        assert!(remove_query("t", FILE, "nope").is_err());
     }
 
     #[test]

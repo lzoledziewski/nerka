@@ -17,12 +17,18 @@
 //!
 //! query frame_drops(cam)  parent: cam_scope  labels: system/vision, perf  color: violet
 //!     payload ~ /$cam frame drop/
+//!
+//! query "xyz logs"  parent: "vision.cam scope"
+//!     apid == XYZ
 //! ```
 //!
 //! ```text
 //! file    := comment* "pack" NAME query*
-//! query   := "query" NAME [ "(" PARAM ("," PARAM)* ")" ] attr*  NEWLINE  body
-//! attr    := "parent:" (NAME | NAME "." NAME)      -- same pack, or pack.query
+//! query   := "query" QNAME [ "(" PARAM ("," PARAM)* ")" ] attr*  NEWLINE  body
+//! QNAME   := NAME | '"' text '"'                   -- quoted: spaces allowed,
+//!                                                     no . " # : at all
+//! attr    := "parent:" (NAME | NAME "." NAME       -- same pack, or pack.query
+//!                      | '"' [NAME "."] text '"')  -- quoted, for QNAMEs
 //!          | "labels:" LABEL ("," LABEL)*          -- LABEL: seg ("/" seg)*
 //!          | "color:" (lowercase name | "#" 6 hex digits)
 //! body    := indented lines (the NFD text, kept verbatim), up to the next
@@ -48,7 +54,7 @@ use std::path::{Path, PathBuf};
 
 pub use expand::{ExpandError, Expansion, ParamValue, Params, Part, Pick, Role, Selection, expand};
 pub use parser::parse_pack;
-pub use write::{create_pack_file, format_query, params_in, upsert_query};
+pub use write::{create_pack_file, format_query, params_in, remove_query, rename_query, upsert_query};
 
 /// File extension of pack files when a directory is loaded.
 pub const PACK_EXTENSION: &str = "nerka-pack";
@@ -186,13 +192,34 @@ impl Library {
     /// if its id exists, appended otherwise) and reload that pack. Nothing
     /// is written if the result wouldn't parse.
     pub fn save_query(&mut self, pack: &str, q: &PackQuery) -> Result<(), PackError> {
+        self.rewrite(pack, |file, text| upsert_query(file, text, q))
+    }
+
+    /// Replace query `old` of pack `pack` with `q`, which may have a new
+    /// name (in place, so the file keeps its order). Fails if another query
+    /// already has `q`'s name.
+    pub fn rename_query(&mut self, pack: &str, old: &str, q: &PackQuery) -> Result<(), PackError> {
+        self.rewrite(pack, |file, text| rename_query(file, text, old, q))
+    }
+
+    /// Delete query `id` from pack `pack`'s file.
+    pub fn remove_query(&mut self, pack: &str, id: &str) -> Result<(), PackError> {
+        self.rewrite(pack, |file, text| remove_query(file, text, id))
+    }
+
+    /// Read a pack's file, change its text, write it back and reload it.
+    fn rewrite(
+        &mut self,
+        pack: &str,
+        change: impl FnOnce(&str, &str) -> Result<String, PackError>,
+    ) -> Result<(), PackError> {
         let Some(i) = self.packs.iter().position(|p| p.name == pack) else {
             return Err(PackError { file: pack.to_owned(), pos: None, msg: format!("pack '{pack}' isn't loaded") });
         };
         let file = self.packs[i].file.clone();
         let io_err = |e: std::io::Error| PackError { file: file.clone(), pos: None, msg: e.to_string() };
         let text = std::fs::read_to_string(&file).map_err(io_err)?;
-        let new = upsert_query(&file, &text, q)?;
+        let new = change(&file, &text)?;
         std::fs::write(&file, &new).map_err(io_err)?;
         self.packs[i] = parse_pack(&file, &new)?;
         Ok(())
@@ -309,6 +336,13 @@ pub(crate) fn render<E>(
         out.pop();
     }
     Ok(out)
+}
+
+/// Can `s` name a query? A NAME, or any text without `.`, `"`, `#`, `:`
+/// or control characters that doesn't start or end with a space. Names
+/// that aren't a NAME are quoted in pack files: `query "xyz logs"`.
+pub fn is_query_name(s: &str) -> bool {
+    !s.is_empty() && s.trim() == s && !s.chars().any(|c| matches!(c, '.' | '"' | '#' | ':') || c.is_control())
 }
 
 /// Is `s` a valid pack, query or parameter name (`[A-Za-z_][A-Za-z0-9_]*`)?

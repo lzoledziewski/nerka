@@ -61,6 +61,33 @@ impl Matcher {
     }
 }
 
+/// The NFD query that matches the same lines as a plain text / regex
+/// search with `options`, so typed text can be combined with queries:
+/// `"text"` for a literal, `/regex/` (with `i` for ignore case), wrapped in
+/// `NOT (…)` when inverted.
+pub fn text_to_nfd(pattern: &str, options: &MatcherOptions) -> String {
+    let q = if options.fixed_string && !options.case_insensitive {
+        let mut s = String::from('"');
+        for c in pattern.chars() {
+            if c == '"' || c == '\\' {
+                s.push('\\');
+            }
+            s.push(c);
+        }
+        s.push('"');
+        s
+    } else {
+        let re = if options.fixed_string { regex::escape(pattern) } else { pattern.to_owned() };
+        // `/` would end the NFD regex; a final `\` would escape that end.
+        let mut body = re.replace('/', r"\x2f");
+        if body.ends_with('\\') {
+            body.push_str("(?:)");
+        }
+        format!("/{body}/{}", if options.case_insensitive { "i" } else { "" })
+    };
+    if options.invert { format!("NOT {q}") } else { q }
+}
+
 /// Anything the engine can filter by.
 #[derive(Debug, Clone)]
 pub enum Filter {
@@ -342,6 +369,28 @@ pub(crate) mod tests {
         // per-line path
         assert_eq!(run_filter(log, &q("level >= ERROR")), [1, 2, 3, 4]);
         assert_eq!(run_filter(log, &q("level == INFO OR /disk/")), [0, 2]);
+    }
+
+    #[test]
+    fn text_searches_as_nfd_find_the_same_lines() {
+        let log = "a/b \"q\" x\nA.B\nback\\slash\nplain\nfoo bar\nFoo  Bar\n";
+        let cases = [
+            ("a/b", false, false, false),
+            ("\"q\"", true, false, false),
+            ("back\\", true, false, false),
+            ("a.b", true, true, false),
+            ("a.b", false, true, false),
+            (r"back\\", false, false, false),
+            (r"foo\s+bar", false, true, true),
+            ("plain", true, false, true),
+        ];
+        for (pat, fixed, ci, invert) in cases {
+            let o = MatcherOptions { fixed_string: fixed, case_insensitive: ci, invert };
+            let nfd = text_to_nfd(pat, &o);
+            let q = Filter::Query(Query::compile(&nfd).unwrap_or_else(|e| panic!("{nfd}: {e}")));
+            assert_eq!(run_filter(log, &q), run(log, pat, o.clone()), "{pat} {o:?} -> {nfd}");
+        }
+        assert_eq!(text_to_nfd("a\"b", &MatcherOptions { fixed_string: true, ..Default::default() }), r#""a\"b""#);
     }
 
     #[test]

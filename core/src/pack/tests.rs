@@ -96,6 +96,16 @@ fn header_errors() {
     let q = |h: &str| format!("pack p\n{h}\n  /x/\n");
     assert_error(&q("query"), 2, 6, "expected a query name");
     assert_error(&q("query a-b"), 2, 7, "invalid query name 'a-b'");
+    assert_error(&q("query \"a b"), 2, 7, "missing closing '\"'");
+    assert_error(&q("query \"a.b\""), 2, 8, "invalid query name 'a.b'");
+    assert_error(&q("query \" a\""), 2, 8, "invalid query name ' a'");
+    assert_error(&q("query \"\""), 2, 8, "invalid query name ''");
+    assert_error(&q("query a  parent: \"x.y.z\""), 2, 18, "invalid parent");
+    assert_error(&q("query \"a b\"  parent: \"a b\""), 2, 22, "its own parent");
+    let p = pack(&q("query \"xyz logs\"(cam)  parent: \"other.cam scope\"  labels: x"));
+    assert_eq!(p.queries[0].id, "xyz logs");
+    assert_eq!(p.queries[0].params, ["cam"]);
+    assert_eq!(p.queries[0].parent.as_deref(), Some("other.cam scope"));
     assert_error(&q("query a(x, y"), 2, 8, "missing ')'");
     assert_error(&q("query a(x, 1y)"), 2, 12, "invalid parameter name '1y'");
     assert_error(&q("query a(x,)"), 2, 11, "invalid parameter name ''");

@@ -1,6 +1,6 @@
 //! Pack file parser (format in `pack/mod.rs`).
 
-use super::{Ctx, Pack, PackError, PackQuery, is_name, render};
+use super::{Ctx, Pack, PackError, PackQuery, is_name, is_query_name, render};
 use std::ops::Range;
 
 /// Parse the text of a pack file. `file` is used in error messages.
@@ -101,14 +101,27 @@ fn header(line: &str, content: &str, ln: usize) -> Result<PackQuery, (usize, Str
     let mut pos = "query".len();
     let skip_ws = |p: usize| p + content[p..].len() - content[p..].trim_start().len();
     pos = skip_ws(pos);
-    let name_end = content[pos..].find(|c: char| c == '(' || c.is_whitespace()).map_or(content.len(), |e| pos + e);
-    let id = &content[pos..name_end];
-    if id.is_empty() {
-        return at(pos, "expected a query name after 'query'".into());
-    }
-    if !is_name(id) {
-        return at(pos, format!("invalid query name '{id}' (letters, digits and _)"));
-    }
+    let (id, name_end) = if content[pos..].starts_with('"') {
+        // A quoted name may hold spaces: query "xyz logs"
+        let Some(close) = content[pos + 1..].find('"').map(|c| pos + 1 + c) else {
+            return at(pos, "missing closing '\"' after the query name".into());
+        };
+        let id = &content[pos + 1..close];
+        if !is_query_name(id) {
+            return at(pos + 1, format!("invalid query name '{id}' (no . \" # : and no spaces at the ends)"));
+        }
+        (id, close + 1)
+    } else {
+        let end = content[pos..].find(|c: char| c == '(' || c.is_whitespace()).map_or(content.len(), |e| pos + e);
+        let id = &content[pos..end];
+        if id.is_empty() {
+            return at(pos, "expected a query name after 'query'".into());
+        }
+        if !is_name(id) {
+            return at(pos, format!("invalid query name '{id}' (letters, digits and _, or a \"quoted name\")"));
+        }
+        (id, end)
+    };
     pos = skip_ws(name_end);
 
     let mut params: Vec<String> = Vec::new();
@@ -159,17 +172,21 @@ fn header(line: &str, content: &str, ln: usize) -> Result<PackQuery, (usize, Str
         }
         match key {
             "parent" => {
-                let ok = match v.split_once('.') {
-                    Some((p, n)) => is_name(p) && is_name(n),
-                    None => is_name(v),
+                // `name`, `pack.name`, or quoted: "xyz logs", "pack.xyz logs".
+                let quoted = v.len() >= 2 && v.starts_with('"') && v.ends_with('"');
+                let inner = if quoted { &v[1..v.len() - 1] } else { v };
+                let name_ok = |n: &str| if quoted { is_query_name(n) } else { is_name(n) };
+                let ok = match inner.split_once('.') {
+                    Some((p, n)) => is_name(p) && name_ok(n),
+                    None => name_ok(inner),
                 };
                 if !ok {
                     return at(v_at, format!("invalid parent '{v}' (a query name, or pack.query)"));
                 }
-                if v == q.id {
+                if inner == q.id {
                     return at(v_at, "a query can't be its own parent".into());
                 }
-                q.parent = Some(v.to_owned());
+                q.parent = Some(inner.to_owned());
             }
             "labels" => {
                 let mut p = val.start;

@@ -28,7 +28,7 @@ pub mod pack;
 pub use bookmarks::Bookmarks;
 pub use dsl::{DslError, Query};
 pub use engine::index::LineIndex;
-pub use engine::search::{Filter, Highlighter, Matcher, MatcherOptions, SearchResult, search};
+pub use engine::search::{Filter, Highlighter, Matcher, MatcherOptions, SearchResult, search, text_to_nfd};
 pub use engine::within::{SearchHits, SearchSet, search_within};
 pub use event::{Event, FieldDef, FieldId, FieldKind, FieldValue, Level};
 pub use history::SearchHistory;
