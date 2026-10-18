@@ -20,7 +20,8 @@ use eframe::egui::{
     text::{LayoutJob, TextFormat},
     vec2,
 };
-use nerka_core::{Bookmarks, ColumnDef, Highlighter, LineNo, LogSource};
+use nerka_core::{Bookmarks, ColumnDef, Highlighter, LineNo, LogSource, SearchHits};
+use std::ops::Range;
 
 /// Lines longer than this are cut for display (search still sees them).
 const MAX_DISPLAY_BYTES: usize = 4096;
@@ -128,6 +129,30 @@ impl ViewState {
 pub struct Highlight<'a> {
     pub highlighter: Option<&'a Highlighter>,
     pub bookmarks: Option<&'a Bookmarks>,
+    pub search: Option<&'a SearchMarks<'a>>,
+    /// Whole-line colours: the last matching query (in pick order) wins.
+    pub lines: Option<&'a SearchMarks<'a>>,
+}
+
+/// Search hits to mark, coloured per search query.
+pub struct SearchMarks<'a> {
+    pub hits: &'a SearchHits,
+    /// Per include query of the search: its colour and what to highlight.
+    pub colors: &'a [Color32],
+    pub highlighters: &'a [Highlighter],
+}
+
+impl SearchMarks<'_> {
+    /// Include queries that matched `line`, if it is a hit.
+    fn matched(&self, line: LineNo) -> Option<Vec<usize>> {
+        let i = self.hits.lines.binary_search(&line).ok()?;
+        Some(self.hits.matched(i).collect())
+    }
+}
+
+/// Background for search hits of a query colour.
+fn hit_bg(c: Color32, dark: bool) -> Color32 {
+    Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), if dark { 110 } else { 150 })
 }
 
 pub struct ViewOutput {
@@ -460,8 +485,25 @@ pub fn log_view(
         let y = snap(rows_rect.top()) + i as f32 * row_h;
         let line = line_of_row(row);
         let row_rect = Rect::from_min_size(pos2(text_rect.min.x, y), vec2(text_rect.width(), row_h));
+        if let Some(lc) = hl.lines
+            && let Some(&q) = lc.matched(line).as_deref().and_then(<[usize]>::last)
+            && let Some(&c) = lc.colors.get(q)
+        {
+            let bg = Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), if vis.dark_mode { 70 } else { 90 });
+            painter.rect_filled(row_rect, 0.0, bg);
+        }
         if state.selected == Some(row) {
             painter.rect_filled(row_rect, 0.0, cursor_bg);
+        }
+        let matched = hl.search.and_then(|s| s.matched(line));
+        if let (Some(qs), Some(s)) = (&matched, hl.search) {
+            // One thin stripe per matched search query, right of the
+            // bookmark stripe, so queries without text spans show too.
+            for (k, &q) in qs.iter().take(4).enumerate() {
+                let x = row_rect.min.x + char_w * (0.8 + 0.45 * k as f32);
+                let r = Rect::from_min_size(pos2(x, row_rect.min.y + 1.0), vec2(char_w * 0.35, row_h - 2.0));
+                painter.rect_filled(r, 1.0, s.colors[q % s.colors.len().max(1)]);
+            }
         }
         if hl.bookmarks.is_some_and(|b| b.contains(line)) {
             painter.rect_filled(
@@ -493,7 +535,17 @@ pub fn log_view(
                 painter.with_clip_rect(text_clip).rect_filled(r, 0.0, sel_bg);
             }
         }
-        let job = line_job(&shown, cells, cut, hl.highlighter, &font, text_color, dim, match_bg);
+        let mut spans: Vec<(Range<usize>, Color32)> = Vec::new();
+        if let Some(h) = hl.highlighter {
+            spans.extend(h.spans(shown.as_bytes()).into_iter().map(|r| (r, match_bg)));
+        }
+        if let (Some(qs), Some(s)) = (&matched, hl.search) {
+            for &q in qs {
+                let (Some(h), Some(&c)) = (s.highlighters.get(q), s.colors.get(q)) else { continue };
+                spans.extend(h.spans(shown.as_bytes()).into_iter().map(|r| (r, hit_bg(c, vis.dark_mode))));
+            }
+        }
+        let job = line_job(&shown, cells, cut, &spans, &font, text_color, dim);
         let galley = painter.layout_job(job);
         max_w = max_w.max(galley.size().x);
         painter.with_clip_rect(text_clip).galley(pos2(snap(text_x0 - state.x_off), snap(y + 1.0)), galley, text_color);
@@ -642,33 +694,39 @@ fn word_at(cells: Cells<'_>, s: &str, col: usize) -> (usize, usize) {
     (glyphs[a].col, end)
 }
 
-#[allow(clippy::too_many_arguments)]
+/// Lay out a line. `spans` are byte ranges with a background colour; a
+/// later span wins where they overlap (search colours over the filter's).
 fn line_job(
     text: &str,
     cells: Cells<'_>,
     cut: bool,
-    highlighter: Option<&Highlighter>,
+    spans: &[(Range<usize>, Color32)],
     font: &FontId,
     color: Color32,
     dim: Color32,
-    match_bg: Color32,
 ) -> LayoutJob {
     let mut job = LayoutJob::default();
     job.wrap.max_width = f32::INFINITY;
     let plain = TextFormat { font_id: font.clone(), color, ..Default::default() };
-    let hit = TextFormat { background: match_bg, ..plain.clone() };
+    let format = |bg: Option<Color32>| match bg {
+        Some(background) => TextFormat { background, ..plain.clone() },
+        None => plain.clone(),
+    };
+    let mut bg_of: Vec<Option<Color32>> = Vec::new();
+    if !spans.is_empty() {
+        bg_of = vec![None; text.len()];
+        for (r, c) in spans {
+            bg_of[r.start.min(text.len())..r.end.min(text.len())].fill(Some(*c));
+        }
+    }
 
-    let spans = highlighter.map(|h| h.spans(text.as_bytes())).unwrap_or_default();
-    let (mut buf, mut in_hit, mut si) = (String::new(), false, 0);
+    let (mut buf, mut in_bg) = (String::new(), None);
     for g in cells.glyphs(text) {
-        while si < spans.len() && spans[si].end <= g.byte {
-            si += 1;
+        let bg = bg_of.get(g.byte).copied().flatten();
+        if bg != in_bg && !buf.is_empty() {
+            job.append(&std::mem::take(&mut buf), 0.0, format(in_bg));
         }
-        let h = spans.get(si).is_some_and(|s| s.start <= g.byte);
-        if h != in_hit && !buf.is_empty() {
-            job.append(&std::mem::take(&mut buf), 0.0, if in_hit { hit.clone() } else { plain.clone() });
-        }
-        in_hit = h;
+        in_bg = bg;
         match g.ch {
             '\t' => {
                 buf.push(if g.cut { '…' } else { ' ' });
@@ -680,7 +738,7 @@ fn line_job(
         }
     }
     if !buf.is_empty() {
-        job.append(&buf, 0.0, if in_hit { hit } else { plain.clone() });
+        job.append(&buf, 0.0, format(in_bg));
     }
     if cut {
         job.append(" …[truncated]", 0.0, TextFormat { color: dim, ..plain });
@@ -714,8 +772,7 @@ mod tests {
     }
 
     fn rendered(cells: Cells<'_>, s: &str) -> String {
-        let job =
-            line_job(s, cells, false, None, &FontId::monospace(13.0), Color32::WHITE, Color32::GRAY, Color32::YELLOW);
+        let job = line_job(s, cells, false, &[], &FontId::monospace(13.0), Color32::WHITE, Color32::GRAY);
         job.text
     }
 
@@ -742,23 +799,38 @@ mod tests {
     #[test]
     fn highlight_spans_follow_cells() {
         let h = nerka_core::Filter::Regex(nerka_core::Matcher::new("c\tp", Default::default()).unwrap()).highlighter();
+        let text = "abcdef\tc\tpq";
+        let spans: Vec<_> = h.spans(text.as_bytes()).into_iter().map(|r| (r, Color32::YELLOW)).collect();
         let job = line_job(
-            "abcdef\tc\tpq",
+            text,
             Cells { widths: &[4, 3, 0] },
             false,
-            Some(&h),
+            &spans,
             &FontId::monospace(13.0),
             Color32::WHITE,
             Color32::GRAY,
-            Color32::YELLOW,
         );
-        let hits: Vec<&str> = job
-            .sections
+        assert_eq!(backgrounds(&job), [("c  p", Color32::YELLOW)]);
+    }
+
+    /// Text and background of every highlighted section.
+    fn backgrounds(job: &LayoutJob) -> Vec<(&str, Color32)> {
+        job.sections
             .iter()
-            .filter(|s| s.format.background == Color32::YELLOW)
-            .map(|s| &job.text[s.byte_range.start.0..s.byte_range.end.0])
-            .collect();
-        assert_eq!(hits, ["c  p"]);
+            .filter(|s| s.format.background != Color32::TRANSPARENT)
+            .map(|s| (&job.text[s.byte_range.start.0..s.byte_range.end.0], s.format.background))
+            .collect()
+    }
+
+    #[test]
+    fn later_spans_win_where_they_overlap() {
+        // Filter highlight on "frame drop", search query colours on "cam1"
+        // and "drop": each keeps its own colour.
+        let (y, r, b) = (Color32::YELLOW, Color32::RED, Color32::BLUE);
+        let spans = [(5..15, y), (0..4, r), (11..15, b)];
+        let job =
+            line_job("cam1 frame drop!", TEXT, false, &spans, &FontId::monospace(13.0), Color32::WHITE, Color32::GRAY);
+        assert_eq!(backgrounds(&job), [("cam1", r), ("frame ", y), ("drop", b)]);
     }
 
     /// One frame of the app's layout: filter view in a bottom panel under a
@@ -774,7 +846,7 @@ mod tests {
         let rows: Vec<u64> = (0..file.line_count()).step_by(2).collect();
         let screen = Rect::from_min_size(pos2(0.0, 0.0), vec2(1000.0, 800.0));
         let input = egui::RawInput { screen_rect: Some(screen), time: Some(t), events, ..Default::default() };
-        let hl = Highlight { highlighter: None, bookmarks: None };
+        let hl = Highlight { highlighter: None, bookmarks: None, search: None, lines: None };
         let mut rect = Rect::NOTHING;
         let mut out = ctx.run_ui(input, |ui| {
             egui::Panel::bottom("filter").resizable(true).default_size(260.0).min_size(120.0).show(ui, |ui| {
@@ -842,7 +914,7 @@ mod tests {
         let ctx = egui::Context::default();
         let (mut state, mut columns) =
             (ViewState::default(), Columns { names: vec!["a", "b", "rest"], widths: vec![4, 3, 0] });
-        let hl = Highlight { highlighter: None, bookmarks: None };
+        let hl = Highlight { highlighter: None, bookmarks: None, search: None, lines: None };
         let mut t = 0.0;
         let mut step = |events: Vec<egui::Event>, state: &mut ViewState, columns: &mut Columns| {
             t += 1.0 / 60.0;

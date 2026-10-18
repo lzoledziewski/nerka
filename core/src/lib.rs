@@ -8,11 +8,14 @@
 //!   format (plain text and DLT today; PCAP, stdin later); [`open`] picks
 //!   the reader from the file's content.
 //! * [`engine`] — [`LineIndex`] (parallel line indexing) and [`search`]:
-//!   filtering that yields the set of matching lines.
+//!   filtering that yields the set of matching lines; [`search_within`]:
+//!   search inside a filter result, per query.
 //! * [`dsl`] — NFD, the filter language (`level >= ERROR AND raw ~ /SSL/`).
 //! * [`event`] — lazily normalized fields (level, …) per line.
 //! * [`bookmarks`] — bookmarks/notes persisted in a sidecar file.
 //! * [`history`] — recently used filters.
+//! * [`pack`] — query packs (the search manager's library) and their
+//!   expansion into plain NFD.
 
 pub mod bookmarks;
 pub mod dsl;
@@ -20,16 +23,19 @@ pub mod engine;
 pub mod event;
 pub mod history;
 pub mod input;
+pub mod pack;
 
 pub use bookmarks::Bookmarks;
 pub use dsl::{DslError, Query};
 pub use engine::index::LineIndex;
-pub use engine::search::{Filter, Highlighter, Matcher, MatcherOptions, SearchResult, search};
+pub use engine::search::{Filter, Highlighter, Matcher, MatcherOptions, SearchResult, search, text_to_nfd};
+pub use engine::within::{SearchHits, SearchSet, search_within};
 pub use event::{Event, FieldDef, FieldId, FieldKind, FieldValue, Level};
 pub use history::SearchHistory;
 pub use input::dlt::DltFile;
 pub use input::text::TextFile;
 pub use input::{ColumnDef, LogSource, open};
+pub use pack::{Library, Pack, PackError, PackQuery};
 
 /// Line numbers are 0-based internally; UIs add 1 for display.
 pub type LineNo = u64;
@@ -47,6 +53,20 @@ pub enum Error {
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
+
+/// Per-user config directory for nerka (`%APPDATA%\nerka`, or
+/// `$XDG_CONFIG_HOME/nerka`, `~/.config/nerka`), if one can be determined.
+pub fn config_dir() -> Option<std::path::PathBuf> {
+    use std::path::PathBuf;
+    let base = if cfg!(windows) {
+        std::env::var_os("APPDATA").map(PathBuf::from)
+    } else {
+        std::env::var_os("XDG_CONFIG_HOME")
+            .map(PathBuf::from)
+            .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))
+    };
+    base.map(|b| b.join("nerka"))
+}
 
 /// Shared progress / cancellation handle for long operations
 /// (indexing, searching). Cheap to clone, safe to poll from a UI thread.

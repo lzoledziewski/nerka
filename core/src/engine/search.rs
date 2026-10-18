@@ -21,7 +21,7 @@ use regex::bytes::{Regex, RegexBuilder};
 use std::ops::Range;
 
 const CHUNK_BYTES: u64 = 4 * 1024 * 1024;
-const LINES_PER_TASK: u64 = 64 * 1024;
+pub(crate) const LINES_PER_TASK: u64 = 64 * 1024;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct MatcherOptions {
@@ -59,6 +59,33 @@ impl Matcher {
     pub fn is_line_match(&self, line: &[u8]) -> bool {
         self.regex.is_match(line) != self.options.invert
     }
+}
+
+/// The NFD query that matches the same lines as a plain text / regex
+/// search with `options`, so typed text can be combined with queries:
+/// `"text"` for a literal, `/regex/` (with `i` for ignore case), wrapped in
+/// `NOT (…)` when inverted.
+pub fn text_to_nfd(pattern: &str, options: &MatcherOptions) -> String {
+    let q = if options.fixed_string && !options.case_insensitive {
+        let mut s = String::from('"');
+        for c in pattern.chars() {
+            if c == '"' || c == '\\' {
+                s.push('\\');
+            }
+            s.push(c);
+        }
+        s.push('"');
+        s
+    } else {
+        let re = if options.fixed_string { regex::escape(pattern) } else { pattern.to_owned() };
+        // `/` would end the NFD regex; a final `\` would escape that end.
+        let mut body = re.replace('/', r"\x2f");
+        if body.ends_with('\\') {
+            body.push_str("(?:)");
+        }
+        format!("/{body}/{}", if options.case_insensitive { "i" } else { "" })
+    };
+    if options.invert { format!("NOT {q}") } else { q }
 }
 
 /// Anything the engine can filter by.
@@ -146,16 +173,35 @@ impl SearchResult {
 
 pub fn search(source: &dyn LogSource, filter: &Filter, progress: &Progress) -> Result<SearchResult> {
     let filter = &filter.bind(source.schema())?;
-    let lines = match (source.contiguous(), filter.prefilter()) {
+    progress.set_total(work(source, filter));
+    Ok(SearchResult { lines: scan(source, filter, progress)? })
+}
+
+/// Can `filter` (bound) take the buffer-scan fast path on `source`?
+pub(crate) fn has_fast_path(source: &dyn LogSource, filter: &Filter) -> bool {
+    source.contiguous().is_some() && filter.prefilter().is_some()
+}
+
+/// Progress units [`scan`] reports: bytes on the fast path, else lines.
+pub(crate) fn work(source: &dyn LogSource, filter: &Filter) -> u64 {
+    match source.contiguous() {
+        Some(buf) if filter.prefilter().is_some() => buf.len() as u64,
+        _ => source.line_count(),
+    }
+}
+
+/// All lines matching a bound filter. Adds to `progress` but leaves its
+/// total to the caller.
+pub(crate) fn scan(source: &dyn LogSource, filter: &Filter, progress: &Progress) -> Result<Vec<LineNo>> {
+    match (source.contiguous(), filter.prefilter()) {
         (Some(buf), Some(pre)) => {
             // A plain regex only needs re-checking for hits that reach past
             // the line content; a query is always fully evaluated.
             let always_verify = matches!(filter, Filter::Query(_));
-            scan_buffer(source, buf, pre, always_verify, &|l| filter.matches(l), progress)?
+            scan_buffer(source, buf, pre, always_verify, &|l| filter.matches(l), progress)
         }
-        _ => scan_lines(source, &|l| filter.matches(l), progress)?,
-    };
-    Ok(SearchResult { lines })
+        _ => scan_lines(source, &|l| filter.matches(l), progress),
+    }
 }
 
 fn scan_buffer(
@@ -167,7 +213,6 @@ fn scan_buffer(
     progress: &Progress,
 ) -> Result<Vec<LineNo>> {
     let total_lines = source.line_count();
-    progress.set_total(buf.len() as u64);
 
     let mut chunks: Vec<Range<LineNo>> = Vec::new();
     let mut first = 0;
@@ -220,7 +265,6 @@ fn scan_lines(
     progress: &Progress,
 ) -> Result<Vec<LineNo>> {
     let n = source.line_count();
-    progress.set_total(n);
     let tasks: Vec<Range<LineNo>> =
         (0..n.div_ceil(LINES_PER_TASK)).map(|t| t * LINES_PER_TASK..((t + 1) * LINES_PER_TASK).min(n)).collect();
 
@@ -325,6 +369,28 @@ pub(crate) mod tests {
         // per-line path
         assert_eq!(run_filter(log, &q("level >= ERROR")), [1, 2, 3, 4]);
         assert_eq!(run_filter(log, &q("level == INFO OR /disk/")), [0, 2]);
+    }
+
+    #[test]
+    fn text_searches_as_nfd_find_the_same_lines() {
+        let log = "a/b \"q\" x\nA.B\nback\\slash\nplain\nfoo bar\nFoo  Bar\n";
+        let cases = [
+            ("a/b", false, false, false),
+            ("\"q\"", true, false, false),
+            ("back\\", true, false, false),
+            ("a.b", true, true, false),
+            ("a.b", false, true, false),
+            (r"back\\", false, false, false),
+            (r"foo\s+bar", false, true, true),
+            ("plain", true, false, true),
+        ];
+        for (pat, fixed, ci, invert) in cases {
+            let o = MatcherOptions { fixed_string: fixed, case_insensitive: ci, invert };
+            let nfd = text_to_nfd(pat, &o);
+            let q = Filter::Query(Query::compile(&nfd).unwrap_or_else(|e| panic!("{nfd}: {e}")));
+            assert_eq!(run_filter(log, &q), run(log, pat, o.clone()), "{pat} {o:?} -> {nfd}");
+        }
+        assert_eq!(text_to_nfd("a\"b", &MatcherOptions { fixed_string: true, ..Default::default() }), r#""a\"b""#);
     }
 
     #[test]

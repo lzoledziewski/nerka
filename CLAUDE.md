@@ -16,12 +16,17 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all
 cargo run -p nerka-cli -- filter 'level >= ERROR AND raw ~ /SSL/' app.log
 cargo run -p nerka-gui -- app.log --query 'level >= ERROR'
+cargo run -p nerka-cli -- --pack packs/ expand -l ota -p cam=CAM1 --parts   # pack picks -> NFD
+cargo run -p nerka-cli -- --pack packs/ search --in 'level >= WARN' -l ota app.log
 cargo run --release -p nerka-core --example gen_log -- big.log 1024   # 1 GiB test log
 cargo run --release -p nerka-cli -- search -c --stats ERROR big.log  # benchmark
 cargo run --release -p nerka-core --example gen_dlt -- big.dlt 1024   # 1 GiB DLT test file
 cargo run --release -p nerka-cli -- filter -c --stats 'apid == NAV AND level >= WARN' big.dlt
 powershell -ExecutionPolicy Bypass -File tools/screenshot.ps1 -Out shot.png -AppArgs app.log  # GUI screenshot (Windows)
 ```
+
+CI (`.github/workflows/ci.yml`) runs fmt, clippy and tests on Linux and Windows; `release.yml`
+builds Linux/Windows archives and publishes a pre-release on a `v*` tag.
 
 `doc/status.md` records the current state and the owner's GUI decisions; read it
 before changing the UI, and update it when the state changes.

@@ -5,10 +5,17 @@
 //!     nerka filter 'level >= ERROR AND raw ~ /SSL|CERT/' app.log
 //!     nerka lines  app.log 1000 1050
 //!     nerka marks  app.log
+//!     nerka packs                                       (list loaded query packs)
+//!     nerka expand -q vision.frame_drops -p cam=CAM1    (pack picks -> plain NFD)
+//!     nerka search --in 'level >= WARN' timeout app.log (search inside a filter)
+//!     nerka search --in 'ecu == SOCB' -l ota app.log     (per pack query)
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use nerka_core::{Bookmarks, FieldDef, Filter, LogSource, Matcher, MatcherOptions, Progress, Query, search};
+use nerka_core::pack::{self, Expansion, Library, ParamValue, Params, Pick, Role, Selection};
+use nerka_core::{
+    Bookmarks, FieldDef, Filter, LogSource, Matcher, MatcherOptions, Progress, Query, SearchSet, search, search_within,
+};
 use std::io::{BufWriter, Write};
 use std::path::PathBuf;
 use std::time::Instant;
@@ -16,6 +23,10 @@ use std::time::Instant;
 #[derive(Parser)]
 #[command(name = "nerka", version, about = "Fast regex log analysis")]
 struct Cli {
+    /// Load query packs from a .nerka-pack file or a directory of them
+    /// (repeatable), besides the per-user pack directory.
+    #[arg(long, global = true, value_name = "DIR|FILE")]
+    pack: Vec<PathBuf>,
     #[command(subcommand)]
     cmd: Cmd,
 }
@@ -25,10 +36,17 @@ enum Cmd {
     /// Index a file and print statistics (lines, size, throughput).
     #[command(alias = "info")]
     Open { file: PathBuf },
-    /// Print lines matching a regex (like grep -n).
+    /// Print lines matching a regex (like grep -n). With --in, search only
+    /// the lines of a filter. With pack picks (-q, -l, -x, -X) instead of a
+    /// pattern, print which query matched each line.
     Search {
-        pattern: String,
-        file: PathBuf,
+        #[arg(required = true, num_args = 1..=2, value_names = ["PATTERN", "FILE"])]
+        args: Vec<String>,
+        /// Only search the lines matching this NFD filter.
+        #[arg(long = "in", value_name = "FILTER")]
+        within: Option<String>,
+        #[command(flatten)]
+        picks: PickArgs,
         /// Case-insensitive.
         #[arg(short = 'i', long)]
         ignore_case: bool,
@@ -48,6 +66,16 @@ enum Cmd {
         #[command(flatten)]
         out: OutputArgs,
     },
+    /// Expand pack picks into plain NFD and print it.
+    Expand {
+        #[command(flatten)]
+        picks: PickArgs,
+        /// Also print each picked query's part of the expansion.
+        #[arg(long)]
+        parts: bool,
+    },
+    /// List the loaded packs and their queries.
+    Packs,
     /// List bookmarks saved for a file (by the UI).
     Marks { file: PathBuf },
     /// Print a 1-based inclusive range of lines.
@@ -56,7 +84,8 @@ enum Cmd {
 
 #[derive(clap::Args)]
 struct OutputArgs {
-    /// Only print the number of matching lines.
+    /// Only print the number of matching lines (and, for pack picks, the
+    /// hits per query).
     #[arg(short = 'c', long)]
     count: bool,
     /// Do not prefix lines with their number.
@@ -65,6 +94,70 @@ struct OutputArgs {
     /// Print timing to stderr.
     #[arg(long)]
     stats: bool,
+}
+
+/// Queries picked from the packs.
+#[derive(clap::Args)]
+struct PickArgs {
+    /// Include a query (pack.query); repeatable.
+    #[arg(short = 'q', long = "query", value_name = "ID")]
+    queries: Vec<String>,
+    /// Include every query with this label (or one below it).
+    #[arg(short = 'l', long = "label")]
+    labels: Vec<String>,
+    /// Exclude a query (AND NOT).
+    #[arg(short = 'x', long = "exclude", value_name = "ID")]
+    exclude: Vec<String>,
+    /// Exclude every query with this label.
+    #[arg(short = 'X', long = "exclude-label", value_name = "LABEL")]
+    exclude_labels: Vec<String>,
+    /// Parameter value, escaped where it is used: NAME=VALUE.
+    #[arg(short = 'p', long = "param", value_name = "NAME=VALUE")]
+    params: Vec<String>,
+    /// Parameter value inserted as regex syntax inside regexes: NAME=VALUE.
+    #[arg(long = "raw-param", value_name = "NAME=VALUE")]
+    raw_params: Vec<String>,
+}
+
+impl PickArgs {
+    fn is_empty(&self) -> bool {
+        self.queries.is_empty() && self.labels.is_empty() && self.exclude.is_empty() && self.exclude_labels.is_empty()
+    }
+
+    /// Queries come before labels, each in command-line order.
+    fn expand(&self, lib: &Library) -> Result<Expansion> {
+        let picks = |ids: &[String], labels: &[String]| -> Vec<Pick> {
+            ids.iter().map(|q| Pick::Query(q.clone())).chain(labels.iter().map(|l| Pick::Label(l.clone()))).collect()
+        };
+        let sel = Selection {
+            include: picks(&self.queries, &self.labels),
+            exclude: picks(&self.exclude, &self.exclude_labels),
+        };
+        let mut params = Params::new();
+        for (list, raw) in [(&self.params, false), (&self.raw_params, true)] {
+            for kv in list {
+                let (k, v) = kv.split_once('=').with_context(|| format!("expected NAME=VALUE, got '{kv}'"))?;
+                params.insert(k.to_owned(), ParamValue { value: v.to_owned(), raw });
+            }
+        }
+        Ok(pack::expand(&sel, lib, &params)?)
+    }
+}
+
+/// The per-user pack directory (if it exists) plus every `--pack`.
+fn library(extra: &[PathBuf]) -> Result<Library> {
+    let mut lib = Library::new();
+    for p in pack::default_dir().filter(|d| d.is_dir()).iter().chain(extra) {
+        lib.load(p)?;
+    }
+    Ok(lib)
+}
+
+/// Compile an NFD query for a source, with a caret under the error.
+fn compile(query: &str, schema: &[FieldDef]) -> Result<Query> {
+    Query::compile_for(query, schema).map_err(|e| {
+        anyhow::anyhow!("{e}\n  {query}\n  {}^", " ".repeat(query[..e.pos.min(query.len())].chars().count()))
+    })
 }
 
 /// `build` gets the opened source's field schema, so query errors about
@@ -98,6 +191,59 @@ fn run_filter(
             res.lines.len(),
             f.line_count(),
             mib_per_s(f.size_bytes(), t_search)
+        );
+    }
+    Ok(())
+}
+
+/// Search inside the lines of `within` (every line without it). `names`
+/// are the include queries' names, printed per hit; empty for a pattern.
+fn run_search_within(
+    file: &PathBuf,
+    within: Option<&str>,
+    set: SearchSet,
+    names: &[String],
+    o: &OutputArgs,
+    out: &mut impl Write,
+) -> Result<()> {
+    let (f, t_index) = open(file)?;
+    let filter = within.map(|q| compile(q, f.schema())).transpose()?;
+    let t = Instant::now();
+    let lines = match filter {
+        Some(q) => Some(search(&*f, &Filter::Query(q), &Progress::new())?.lines),
+        None => None,
+    };
+    let t_filter = t.elapsed();
+    let t = Instant::now();
+    let hits = search_within(&*f, lines.as_deref(), &set, &Progress::new())?;
+    let t_search = t.elapsed();
+    if o.count {
+        writeln!(out, "{}", hits.len())?;
+        if !names.is_empty() {
+            for (name, n) in names.iter().zip(hits.counts(names.len())) {
+                writeln!(out, "{name}\t{n}")?;
+            }
+        }
+    } else {
+        for (i, &l) in hits.lines.iter().enumerate() {
+            if !o.no_line_numbers {
+                write!(out, "{}:", l + 1)?;
+            }
+            if !names.is_empty() {
+                let ids: Vec<&str> = hits.matched(i).map(|q| names[q].as_str()).collect();
+                write!(out, "[{}] ", ids.join(","))?;
+            }
+            out.write_all(&f.line_bytes(l).unwrap_or_default())?;
+            out.write_all(b"\n")?;
+        }
+    }
+    if o.stats {
+        out.flush()?;
+        eprintln!(
+            "{} hits in {} filtered of {} lines | index {t_index:.2?} | filter {t_filter:.2?} | search {t_search:.2?}",
+            hits.len(),
+            lines.as_ref().map_or(f.line_count() as usize, Vec::len),
+            f.line_count()
         );
     }
     Ok(())
@@ -145,22 +291,65 @@ fn run() -> Result<()> {
             writeln!(out, "index mem:   {} KiB", f.index_memory_bytes() / 1024)?;
             writeln!(out, "index time:  {took:.2?} ({:.0} MiB/s)", mib_per_s(f.size_bytes(), took))?;
         }
-        Cmd::Search { pattern, file, ignore_case, fixed, invert, out: o } => {
-            let m =
-                Matcher::new(&pattern, MatcherOptions { case_insensitive: ignore_case, fixed_string: fixed, invert })?;
-            run_filter(&file, |_| Ok(Filter::Regex(m)), &o, &mut out)?;
+        Cmd::Search { mut args, within, picks, ignore_case, fixed, invert, out: o } => {
+            let file = PathBuf::from(args.pop().expect("clap requires FILE"));
+            let options = MatcherOptions { case_insensitive: ignore_case, fixed_string: fixed, invert };
+            match (args.pop(), picks.is_empty()) {
+                (Some(_), false) => anyhow::bail!("give either a PATTERN or pack picks (-q, -l, -x, -X), not both"),
+                (None, true) => anyhow::bail!("missing PATTERN (or pack picks: -q, -l, -x, -X)"),
+                (Some(pattern), true) => {
+                    let m = Matcher::new(&pattern, options)?;
+                    match within {
+                        None => run_filter(&file, |_| Ok(Filter::Regex(m)), &o, &mut out)?,
+                        Some(w) => {
+                            let set = SearchSet { include: vec![Filter::Regex(m)], exclude: vec![] };
+                            run_search_within(&file, Some(&w), set, &[], &o, &mut out)?;
+                        }
+                    }
+                }
+                (None, false) => {
+                    if ignore_case || fixed || invert {
+                        anyhow::bail!("-i, -F and -v apply to a PATTERN, not to pack picks");
+                    }
+                    let e = picks.expand(&library(&cli.pack)?)?;
+                    let names: Vec<String> = e.parts_with(Role::Include).map(|p| p.query.clone()).collect();
+                    run_search_within(&file, within.as_deref(), e.search_set()?, &names, &o, &mut out)?;
+                }
+            }
         }
         Cmd::Filter { query, file, out: o } => {
-            let build = |schema: &[FieldDef]| {
-                let q = Query::compile_for(&query, schema).map_err(|e| {
-                    anyhow::anyhow!(
-                        "{e}\n  {query}\n  {}^",
-                        " ".repeat(query[..e.pos.min(query.len())].chars().count())
-                    )
-                })?;
-                Ok(Filter::Query(q))
-            };
-            run_filter(&file, build, &o, &mut out)?;
+            run_filter(&file, |schema| Ok(Filter::Query(compile(&query, schema)?)), &o, &mut out)?;
+        }
+        Cmd::Expand { picks, parts } => {
+            if picks.is_empty() {
+                anyhow::bail!("nothing picked: use -q ID, -l LABEL, -x ID or -X LABEL");
+            }
+            let e = picks.expand(&library(&cli.pack)?)?;
+            writeln!(out, "{}", e.nfd)?;
+            if parts {
+                for p in &e.parts {
+                    let role = if p.role == Role::Include { "include" } else { "exclude" };
+                    writeln!(out, "{role} {}: {}", p.query, e.part_nfd(p))?;
+                }
+            }
+        }
+        Cmd::Packs => {
+            for p in library(&cli.pack)?.packs() {
+                writeln!(out, "{}  ({})", p.name, p.file)?;
+                for q in &p.queries {
+                    let mut line = format!("  {}.{}", p.name, q.id);
+                    if !q.params.is_empty() {
+                        line += &format!("({})", q.params.join(", "));
+                    }
+                    if let Some(parent) = p.parent_of(q) {
+                        line += &format!("  parent: {parent}");
+                    }
+                    if !q.labels.is_empty() {
+                        line += &format!("  labels: {}", q.labels.join(", "));
+                    }
+                    writeln!(out, "{line}")?;
+                }
+            }
         }
         Cmd::Marks { file } => {
             let marks = Bookmarks::load_for(&file)?;

@@ -2,21 +2,23 @@
 
 Snapshot of where the project stands. Update this file whenever the state changes.
 
-_Last update: 2026-10-18 (search manager designed with the owner, see `search-manager.md`)._
+_Last update: 2026-10-18 (search manager POC built on branch `claude/search-manager-poc-d451e1`: core, CLI and GUI; owner to try it)._
 
 ## State
 
-- Builds and runs on **Windows** (MSVC, debug and release). Clippy `-D warnings`, fmt and all tests pass (44 core, 11 GUI). The 1 GiB benchmarks have been run on Windows (numbers below and in the commit messages).
+- Builds and runs on **Windows** (MSVC, debug and release). Clippy `-D warnings`, fmt and all tests pass (63 core, 15 GUI). The 1 GiB benchmarks have been run on Windows (numbers below and in the commit messages).
 - Committed on `main`, **not pushed** since `5b632c3` (don't push until the owner says so).
 - Only built for Windows so far. Linux/macOS builds and releases are open questions (see "Decisions pending").
-- `.github/workflows/ci.yml` and `.vscode/extensions.json` are still **not on disk**; their contents are in the appendix below.
+- **CI and releases (owner, 2026-10-18):** `.github/workflows/ci.yml` runs fmt, clippy and the tests on Linux and Windows for pushes to `main` and every PR (macOS left out: its runner minutes count 10x on a private repo). `release.yml` builds `nerka` + `nerka-gui` for Linux (Ubuntu 22.04, glibc 2.35+, `.tar.gz`) and Windows (`.zip`) on a `v*` tag and publishes them as a GitHub pre-release (tags with `-`, e.g. `v0.1.0-alpha.1`); run by hand it only builds artifacts. Version is `0.1.0-alpha.1`. `.vscode/extensions.json` is still not on disk (appendix).
 
 ## GUI as of now (`ui/`)
 
 Owner feedback is driving this; these are deliberate choices, keep them:
 
+- **Filter and Search (owner, 2026-10-18):** the **Filter** decides what the **main view** shows (only the kept lines; every line without a filter). The **Search** looks only among those lines; its hits are listed in the **bottom pane** (clicking one moves the main view there) and coloured per query in both views; n / N jump between hits. This replaces the klogg layout (whole file on top, filter result below). Going to a line that the filter hides lands on the next kept line. The filter's matches are no longer tinted: every row in the main view matches it. The **Filter bar sits at the top**, under the tab bar and across the whole window; the Search box and its hits pane are at the bottom.
+- **Line colours (owner, 2026-10-18):** each included library filter query can colour the whole lines it keeps in the main view. Off by default; switched on per query by clicking its swatch in the selection or its chip under the Filter box (filled = on). Where a line matches several, the later query in the selection wins. The cursor and selection are drawn over the colour.
 - **Tabs**, one per open file (klogg-style). Each tab has its own filter, view positions and bookmarks. Opening an already-open file switches to its tab. Ctrl+Tab / Ctrl+Shift+Tab (or Ctrl+PgDn/PgUp) switch tabs; Ctrl+W, ✖, middle-click or the context menu close them.
-- **Filter box:** modes **Text** (literal by default; a **Regex** checkbox switches to regex; also Ignore case and Invert) and **Query** (NFD). The row is laid out right to left so it never gets wider than the window. If it did, the result view's scrollbar would end up off-screen (that was a real bug).
+- **Filter box:** modes **Text** (literal by default; a **Regex** checkbox switches to regex; also Ignore case and Invert) and **Query** (NFD). Its button is **Filter** (it was labelled Search, which was confusing). The row is laid out right to left so it never gets wider than the window. If it did, the result view's scrollbar would end up off-screen (that was a real bug).
 - **When a search runs (owner's decision):** only on Enter or the Search button. Ticking Regex / Ignore case / Invert, switching Text/Query or picking a history entry only changes the box's settings or contents; nothing runs until Enter. The last mode + checkbox combination is saved to `%APPDATA%\nerka\prefs` (or `$XDG_CONFIG_HOME/nerka/prefs`) and becomes the default for new tabs.
 - **Search history:** the 🕘 button lists recent filters; picking one fills the box. They are stored in `%APPDATA%\nerka\history` (or `$XDG_CONFIG_HOME/nerka/history`) as `text|regex|query<TAB>pattern`, using `core::SearchHistory`.
 - **Text selection:** drag, Shift+click, double-click (word), Shift+arrows (lines), Ctrl+A, Esc. Ctrl+C copies the selection, or the current line if nothing is selected (at most 100k lines). The right-click menu has Copy, Select all and Toggle bookmark.
@@ -25,7 +27,8 @@ Owner feedback is driving this; these are deliberate choices, keep them:
 - **Scrolling:** the views read raw mouse-wheel events (3 rows per notch), not egui's smoothed delta; the smoothing made text look smeared. Rows and text origins snap to physical pixels. A headless test (`view::tests::wheel_scrolls_hovered_view_by_whole_lines`) runs the app's panel layout and injects wheel events. Use that pattern for other GUI input tests.
 - **Icon:** a kidney ("nerka") with messy log lines going in and clean lines coming out, drawn in code (`ui/src/icon.rs`). It shows on the window and taskbar only; the `.exe` file icon is still the default, because embedding it needs a build dependency the owner hasn't approved.
 - **About:** an "ℹ About" button at the right of the toolbar (or F1) opens a modal with the icon, version, author (© 2026 Łukasz Żołędziewski, email as a mailto link), licence and repository link. All of these come from `Cargo.toml` (`env!`), so keep `authors` / `repository` `.workspace = true` in each crate.
-- **Bookmarks:** these work (`m`, `b` / `B`, notes in the side panel, `<log>.nerka-marks` sidecar), but the owner wasn't sure about them yet. Hovering the 🔖 button explains them. Ask before investing more in them.
+- **Search manager (POC):** 📚 (Ctrl+Shift+L) opens two panes: the **Library** (a tree: refining queries under their parent; `+` or drag adds to the selection, `🔍` searches, `⋮` edit / refine / exclude, `+ New query`) and the **Selection** (ordered filter queries; drag to reorder, `+` / `−` role, `✎` edit, save to a pack; owner, 2026-10-18: no checkboxes). **Apply** puts the selection into the Filter bar. Searching is an action: `🔍` → **Search for it** (replace) or **Add to search (OR)** (typed text becomes a query first). The Search box looks only inside the filter result and colours hits per query (n / N jump between search hits). Query names may contain spaces (quoted in pack files).
+- **Bookmarks:** these work (`m`, `b` / `B`, notes in the side panel, `<log>.nerka-marks` sidecar; the panel shows each line wrapped to two rows, ▸ / ▾ or a click unfolds the whole line), but the owner wasn't sure about them yet. Hovering the 🔖 button explains them. Ask before investing more in them.
 
 ## Checking the GUI visually
 
@@ -34,8 +37,8 @@ Owner feedback is driving this; these are deliberate choices, keep them:
 ## Next steps
 
 1. Owner tries the DLT table on real use; settle the open DLT questions below.
-2. Then the **search manager** POC: design agreed, scope in `search-manager.md`.
-3. Recreate the two config files from the appendix (ask before adding CI).
+2. **Search manager** POC: all five steps are built; the owner tries it and answers the GUI choices 7–12 in `search-manager.md` → "POC status".
+3. First alpha: after the search-manager PR is merged, tag `v0.1.0-alpha.1` on `main` and push the tag (owner's go-ahead) — `release.yml` publishes the pre-release.
 
 Text-log benchmark on Windows (1 GiB, 12M lines, release): index ~90 ms, `search ERROR` ~30 ms, `level >= ERROR` ~31 ms, `level >= WARN AND raw ~ /timeout/` ~30 ms, `search -v ERROR` ~100 ms.
 
@@ -77,9 +80,9 @@ Open with the owner: save column widths? Sorting stays out (decided). Next after
 - Considered: **MPL-2.0** (core changes must stay open, closed plugins still allowed), LGPL (awkward with Rust's static linking), GPL + plugin exception, AGPL + commercial dual licence (needs a CLA). Revisit before the first public release or before accepting outside contributions: relicensing later needs every contributor's consent, so decide on a CLA first.
 - Code already published under `MIT OR Apache-2.0` stays available under it.
 - The plugin interface is also the licensing boundary: keep it stable and documented.
-- **Missing:** `LICENSE-MIT` and `LICENSE-APACHE` files in the repo root (a dual licence normally ships both).
+- **Licence files** (owner, 2026-10-18): `LICENSE-MIT` (copyright line "Copyright (c) 2026 Łukasz Żołędziewski", as in the About dialog) and `LICENSE-APACHE` (the canonical Apache 2.0 text from apache.org) are in the repo root and ship in the release archives.
 
-## Search manager (designed, POC not started)
+## Search manager (POC built: core, CLI, GUI)
 
 Design agreed with the owner on 2026-10-18 after mockups: **`search-manager.md`** (decisions, model, POC scope, open questions). In short:
 
@@ -104,9 +107,8 @@ Don't settle these silently: ask.
 2. **Level detection:** only upper-case tokens (`ERROR`, `[WARN]`, `level=INFO`) in the first 160 bytes are recognised. This needs real log samples from the owner.
 3. **Bookmark storage:** currently a sidecar `<log>.nerka-marks` next to the log. The alternative is a central app-data folder when the log's directory is read-only.
 4. **DLT column widths:** resizable per tab but not saved. Save them (globally or per file)?
-5. **Releases / downloads:** not set up. Options discussed: `gh release create` by hand, or a `.github/workflows/release.yml` that builds Windows/Linux/macOS on a `v*` tag and attaches zips (`softprops/action-gh-release`). Needs pushing, and adds the first CI file (ask first). Unsigned macOS binaries will warn; the `.exe` icon needs an unapproved build dependency.
+5. **Releases / downloads:** `release.yml` (Linux + Windows pre-releases on `v*` tags, archives with the README and both licence files) is in place; open: macOS builds (unsigned binaries warn; 10x runner minutes) and the `.exe` icon (needs an unapproved build dependency).
 6. **Linux builds from this Windows PC:** no WSL, Docker or zig installed. Options: cross-compile with `cargo zigbuild --target x86_64-unknown-linux-gnu.2.17` (user-level installs; build only, untested), WSL (can also run the GUI), or GitHub Actions. `Cargo.lock` has no GTK (the file dialog uses D-Bus via `zbus`), so a cross build is expected to link; not verified.
-7. **Licence files:** add `LICENSE-MIT` and `LICENSE-APACHE`, and with which copyright line?
 
 ## Known limitations
 
@@ -117,53 +119,6 @@ Don't settle these silently: ask.
 - DLT: only files with storage headers; no FIBEX (non-verbose payloads stay hex); arrays/structs/fixed-point arguments shown as hex; time in UTC only; the message index is built single-threaded (~280 ms per GiB).
 
 ## Appendix: files to recreate
-
-### `.github/workflows/ci.yml`
-
-```yaml
-name: CI
-
-on:
-  push:
-    branches: [main]
-  pull_request:
-
-env:
-  CARGO_TERM_COLOR: always
-
-jobs:
-  check:
-    name: ${{ matrix.os }}
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [windows-latest, ubuntu-latest, macos-latest]
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
-      - name: Format
-        run: cargo fmt --all --check
-      - name: Clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
-      - name: Test
-        run: cargo test --workspace
-      - name: Build release
-        run: cargo build --release --workspace
-      - name: Upload binaries
-        uses: actions/upload-artifact@v4
-        with:
-          name: nerka-${{ matrix.os }}
-          path: |
-            target/release/nerka
-            target/release/nerka-gui
-            target/release/nerka.exe
-            target/release/nerka-gui.exe
-          if-no-files-found: ignore
-```
 
 ### `.vscode/extensions.json`
 
