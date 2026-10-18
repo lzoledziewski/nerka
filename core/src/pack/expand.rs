@@ -195,6 +195,12 @@ pub fn expand(sel: &Selection, lib: &Library, params: &Params) -> Result<Expansi
 }
 
 impl Library {
+    /// Qualified ids from the root of `id`'s parent chain down to `id`;
+    /// empty if the query is unknown or its chain is broken.
+    pub fn chain(&self, id: &str) -> Vec<String> {
+        chain_of(self, id).unwrap_or_default()
+    }
+
     /// Parameter names the queries need, their parent chains included, in
     /// first-use order. Unknown ids and broken chains are skipped (expanding
     /// reports them).

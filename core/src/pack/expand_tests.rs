@@ -242,6 +242,14 @@ fn expansion_as_a_search_inside_a_filter() {
 }
 
 #[test]
+fn chains() {
+    let lib = lib();
+    assert_eq!(lib.chain("nav.big"), ["nav.all", "nav.slow", "nav.big"]);
+    assert_eq!(lib.chain("nav.all"), ["nav.all"]);
+    assert!(lib.chain("nav.nope").is_empty());
+}
+
+#[test]
 fn params_needed_follow_parent_chains() {
     let mut lib = lib();
     lib.add(pack(VISION)).unwrap();

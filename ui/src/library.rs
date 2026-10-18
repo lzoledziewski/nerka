@@ -535,7 +535,7 @@ pub fn library_panel(
 
     ui.weak("+ adds to the selection (or drag it) · 🔍 searches · ✎ edits");
     let lib_ro: &Library = lib;
-    let mut edit_request: Option<(String, Option<String>)> = None;
+    let mut edit_request: Option<EditRequest> = None;
     egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
         if view.by_pack {
             for p in lib_ro.packs() {
@@ -549,7 +549,7 @@ pub fn library_panel(
                             .on_hover_text(format!("Write a new query in {}", p.name))
                             .clicked()
                         {
-                            edit_request = Some((p.name.clone(), None));
+                            edit_request = Some(EditRequest { pack: p.name.clone(), old: None, parent: None });
                         }
                         group_ui(ui, lib_ro, &ids, picks, &mut action, &mut edit_request);
                     });
@@ -575,18 +575,36 @@ pub fn library_panel(
                     .show(ui, |ui| group_ui(ui, lib_ro, &unlabelled, picks, &mut action, &mut edit_request));
             }
             ui.add_space(4.0);
-            ui.weak("New queries: group by Pack, then + New query.");
+            ui.weak("New queries: ↳ on a query refines it; or group by Pack, then + New query.");
         }
     });
-    if let Some((pack, old)) = edit_request {
+    if let Some(EditRequest { pack, old, parent }) = edit_request {
         let mut node = match &old {
             Some(id) => Node::of_library(0, lib_ro, &format!("{pack}.{id}"), Use::Include).expect("listed query"),
-            None => Node { name: String::new(), ..Node::blank(0, Use::Include) },
+            None => Node { name: String::new(), parent, ..Node::blank(0, Use::Include) },
         };
         node.open = true;
         view.editing = Some(LibEdit { pack, old, node, confirm_delete: false });
     }
     action
+}
+
+/// Open the library editor: on query `old` of `pack`, or on a new query
+/// (refining `parent`, if given).
+struct EditRequest {
+    pack: String,
+    old: Option<String>,
+    parent: Option<String>,
+}
+
+/// Queries a query may refine: every library query except `own` (the
+/// query being edited) and the queries that refine it, so no chain loops.
+pub fn parent_choices(lib: &Library, own: Option<&str>) -> Vec<String> {
+    lib.packs()
+        .iter()
+        .flat_map(|p| p.queries.iter().map(move |q| format!("{}.{}", p.name, q.id)))
+        .filter(|id| own.is_none_or(|own| !lib.chain(id).iter().any(|c| c == own)))
+        .collect()
 }
 
 /// A label's or pack's queries. "+ all" adds them now: a query labelled
@@ -597,7 +615,7 @@ fn group_ui(
     ids: &[String],
     picks: &mut Picks,
     action: &mut Action,
-    edit: &mut Option<(String, Option<String>)>,
+    edit: &mut Option<EditRequest>,
 ) {
     if ui.small_button("+ all").on_hover_text("Add all of them to the selection").clicked() {
         for id in ids {
@@ -636,7 +654,14 @@ fn group_ui(
             ui.weak(&pack.name);
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui.small_button("✎").on_hover_text("Edit this query in its pack").clicked() {
-                    *edit = Some((pack.name.clone(), Some(q.id.clone())));
+                    *edit = Some(EditRequest { pack: pack.name.clone(), old: Some(q.id.clone()), parent: None });
+                }
+                if ui
+                    .small_button("↳")
+                    .on_hover_text("New query that refines this one (its parent): its meaning is this AND the new text")
+                    .clicked()
+                {
+                    *edit = Some(EditRequest { pack: pack.name.clone(), old: None, parent: Some(id.clone()) });
                 }
             });
         });
@@ -658,7 +683,9 @@ fn library_editor(ui: &mut egui::Ui, lib: &mut Library, e: &mut LibEdit) -> Edit
         None => format!("New query in {}", e.pack),
     };
     ui.label(RichText::new(title).strong());
-    let valid = fields_ui(ui, &mut e.node);
+    let own = e.old.as_ref().map(|o| format!("{}.{o}", e.pack));
+    let parents = parent_choices(lib, own.as_deref());
+    let valid = fields_ui(ui, &mut e.node, &parents);
     ui.horizontal(|ui| {
         if ui
             .add_enabled(valid.is_ok(), egui::Button::new("Save"))
@@ -709,8 +736,9 @@ fn library_editor(ui: &mut egui::Ui, lib: &mut Library, e: &mut LibEdit) -> Edit
     outcome
 }
 
-/// Name, labels, colour, NFD text and parent of a query, with validation.
-fn fields_ui(ui: &mut egui::Ui, n: &mut Node) -> Result<(), String> {
+/// Name, labels, colour, parent and NFD text of a query, with validation.
+/// `parents` are the queries it may refine.
+fn fields_ui(ui: &mut egui::Ui, n: &mut Node, parents: &[String]) -> Result<(), String> {
     egui::Grid::new(("fields", n.key)).num_columns(2).show(ui, |ui| {
         ui.label("Name");
         if ui.add(egui::TextEdit::singleline(&mut n.name).desired_width(f32::INFINITY)).changed() {
@@ -737,6 +765,21 @@ fn fields_ui(ui: &mut egui::Ui, n: &mut Node) -> Result<(), String> {
             n.edited = true;
         }
         ui.end_row();
+        ui.label("Refines").on_hover_text("Its parent: the query means the parent AND its own text");
+        let before = n.parent.clone();
+        egui::ComboBox::from_id_salt(("parent", n.key))
+            .width(ui.available_width().max(120.0))
+            .selected_text(n.parent.as_deref().unwrap_or("(nothing)"))
+            .show_ui(ui, |ui| {
+                ui.selectable_value(&mut n.parent, None, "(nothing)");
+                for p in parents {
+                    ui.selectable_value(&mut n.parent, Some(p.clone()), p);
+                }
+            });
+        if n.parent != before {
+            n.edited = true;
+        }
+        ui.end_row();
     });
     let r = ui.add(
         egui::TextEdit::multiline(&mut n.text)
@@ -748,15 +791,6 @@ fn fields_ui(ui: &mut egui::Ui, n: &mut Node) -> Result<(), String> {
     if r.changed() {
         n.edited = true;
         n.error = None;
-    }
-    if let Some(p) = n.parent.clone() {
-        ui.horizontal(|ui| {
-            ui.weak(format!("refines {p}"));
-            if ui.small_button("×").on_hover_text("Don't refine it (no parent)").clicked() {
-                n.parent = None;
-                n.edited = true;
-            }
-        });
     }
     let valid = n.validate();
     match (&n.error, &valid) {
@@ -826,7 +860,8 @@ pub fn selection_panel(ui: &mut egui::Ui, lib: &mut Library, picks: &mut Picks) 
                 for n in picks.nodes.iter_mut() {
                     row_rects.push(node_row(ui, n, &mut remove, &mut action));
                     if n.open {
-                        match node_editor(ui, n, &packs, save_pack, new_pack) {
+                        let parents = parent_choices(lib, n.source.as_deref());
+                        match node_editor(ui, n, &packs, &parents, save_pack, new_pack) {
                             Some(EditorAction::Save) => save = Some(n.key),
                             Some(EditorAction::CreatePack) => create_pack = true,
                             None => {}
@@ -958,12 +993,13 @@ fn node_editor(
     ui: &mut egui::Ui,
     n: &mut Node,
     packs: &[String],
+    parents: &[String],
     save_pack: &mut String,
     new_pack: &mut String,
 ) -> Option<EditorAction> {
     let mut action = None;
     egui::Frame::group(ui.style()).show(ui, |ui| {
-        let valid = fields_ui(ui, n);
+        let valid = fields_ui(ui, n, parents);
         if save_pack.is_empty()
             && let Some((p, _)) = n.source.as_deref().and_then(|s| s.split_once('.'))
         {
@@ -1285,6 +1321,58 @@ mod tests {
             }
         }
         shapes.iter().find_map(|c| walk(&c.shape, label))
+    }
+
+    #[test]
+    fn refining_a_query_from_the_library() {
+        let lib = lib();
+        // No loops: a query can't refine itself or a query refining it.
+        let all = parent_choices(&lib, None);
+        assert_eq!(all, ["v.scope", "v.drops", "v.slow"]);
+        assert_eq!(parent_choices(&lib, Some("v.scope")), ["v.slow"]);
+        assert_eq!(parent_choices(&lib, Some("v.drops")), ["v.scope", "v.slow"]);
+
+        // A new child of v.slow, saved from the library editor: the parent
+        // is written short (same pack), and expanding it ANDs the chain.
+        let dir = std::env::temp_dir().join(format!("nerka-gui-refine-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("v.nerka-pack");
+        std::fs::write(&file, "pack v\nquery slow\n  /slow/\n").unwrap();
+        let mut lib = Library::new();
+        lib.load(&file).unwrap();
+        let ctx = egui::Context::default();
+        let mut e = LibEdit {
+            pack: "v".into(),
+            old: None,
+            node: Node { name: "very slow".into(), parent: Some("v.slow".into()), ..Node::blank(0, Use::Include) },
+            confirm_delete: false,
+        };
+        e.node.text = "level >= WARN".into();
+        let frame = |events: Vec<egui::Event>, e: &mut LibEdit, lib: &mut Library| {
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(400.0, 400.0))),
+                events,
+                ..Default::default()
+            };
+            let mut out = EditOutcome::Open;
+            let mut full = ctx.run_ui(input, |ui| {
+                egui::CentralPanel::default().show(ui, |ui| out = library_editor(ui, lib, e));
+            });
+            full.textures_delta.clear();
+            (out, full.shapes)
+        };
+        let (_, shapes) = frame(vec![], &mut e, &mut lib);
+        let p = find_text(&shapes, "Save").unwrap();
+        frame(vec![egui::Event::PointerMoved(p), button(p, true)], &mut e, &mut lib);
+        assert!(matches!(frame(vec![button(p, false)], &mut e, &mut lib).0, EditOutcome::Saved(None)));
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap(),
+            "pack v\nquery slow\n  /slow/\n\nquery \"very slow\"  parent: slow\n    level >= WARN\n"
+        );
+        let mut p = Picks::default();
+        p.add(&lib, "v.very slow", Use::Include, None);
+        assert_eq!(p.expand(&lib).unwrap().exp.nfd, "(/slow/) AND (level >= WARN)");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
