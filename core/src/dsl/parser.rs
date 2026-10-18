@@ -266,8 +266,11 @@ impl Parser<'_> {
                     (OpTok::Match | OpTok::NotMatch, Tok::Regex { pat, ci }) => {
                         FieldTest::Match(regex(&pat, ci, val_pos)?)
                     }
+                    (OpTok::Match | OpTok::NotMatch, Tok::Str(s)) => {
+                        FieldTest::Match(regex(&regex::escape(&s), false, val_pos)?)
+                    }
                     (OpTok::Match | OpTok::NotMatch, t) => {
-                        return err(format!("expected /regex/ but found {}", describe(&t)), val_pos);
+                        return err(format!("expected /regex/ or \"text\" but found {}", describe(&t)), val_pos);
                     }
                     (OpTok::Cmp(c), Tok::Word(w) | Tok::Str(w)) => FieldTest::Literal(c, w, val_pos),
                     (OpTok::Cmp(_), t) => return err(format!("expected a value but found {}", describe(&t)), val_pos),
@@ -278,6 +281,7 @@ impl Parser<'_> {
                     op_pos,
                     id: None,
                     test,
+                    costly: false,
                 }));
                 Ok(if op == OpTok::NotMatch { Expr::Not(Box::new(e)) } else { e })
             }

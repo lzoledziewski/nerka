@@ -49,14 +49,14 @@ Done (step 1): `LogSource::line_bytes` returns `Cow`; sources can supply a field
 
 Done (step 2): own DLT reader in `core/src/input/dlt/` (no new dependencies). `nerka_core::open` picks DLT or text by content; the CLI uses it, the **GUI still opens everything as text** (switching it comes with the table view).
 - Index = one `u64` offset per message (~8 B/msg). Headers are read in place, so header-only filters never decode payloads.
-- Fields: `ecu apid ctid type mcnt tmsp seid mid mode`; `mode` is `verbose` / `non-verbose` (`mid` stays empty on verbose messages, since 0 is a valid message id); `level` comes from the header (`VERBOSE` is accepted as an alias for `TRACE`).
+- Fields: `ecu apid ctid type mcnt tmsp seid mid mode payload`; `payload` is the decoded payload column only (unlike `raw`, which spans every column), e.g. `payload ~ "timeout"`, and is checked after the header conditions; `mode` is `verbose` / `non-verbose` (`mid` stays empty on verbose messages, since 0 is a valid message id); `level` comes from the header (`VERBOSE` is accepted as an alias for `TRACE`).
 - Line = tab-separated columns `time tmsp ecu apid ctid type payload` (time is the storage time in **UTC**; `type` is the level for log messages, e.g. `error`).
 - Payload: verbose bool/int/float/string/raw/trace info, with VARI names and units; arrays, structs and fixed-point fall back to `<undecoded> hex`. Non-verbose: `[id] hex`. Control: service name, status, version string.
 - Corrupt data: resync on the next `DLT\x01`, skipped bytes counted. Files without storage headers aren't supported.
 - `writer` module + `examples/gen_dlt.rs` produce synthetic files.
 - 1 GiB synthetic DLT (12.5M messages): index 280 ms (single-threaded), 95 MiB; `ecu == ECU1` 37 ms, `apid == NAV AND level >= WARN` 29 ms, `level >= ERROR` 32 ms, `raw ~ /timeout/` 288 ms (renders every line), `apid == NAV AND raw ~ /timeout/` 60 ms.
 
-Done (step 3): the GUI opens files via `nerka_core::open`; sources with columns (`LogSource::columns`, DLT) are shown as a **table** in the existing view: a header row with the column names, cells aligned at column boundaries, faint dividers, and a divider drag in the header resizes the column (widths belong to the tab, shared by the main and filter views; not saved yet). Text that doesn't fit a cell is hidden and marked with "…". Selection, double-click, search highlighting and copy still work on the line text (copy keeps the tabs, so it pastes into a spreadsheet as columns). Plain text looks as before.
+Done (step 3): the GUI opens files via `nerka_core::open`; sources with columns (`LogSource::columns`, DLT) are shown as a **table** in the existing view: a header row with the column names, cells aligned at column boundaries, faint dividers, and a divider drag in the header resizes the column (widths belong to the tab, shared by the main and filter views; not saved yet). Text that doesn't fit a cell is hidden and marked with "…". Selection, double-click, search highlighting and copy still work on the line text (copy keeps the tabs, so it pastes into a spreadsheet as columns). Plain text looks as before. The Open dialog lists `.dlt` files.
 
 Open with the owner: save column widths? Sorting stays out (decided). Next after DLT: the search manager / highlighters (owner's own design).
 

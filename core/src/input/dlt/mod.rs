@@ -43,23 +43,26 @@ const TMSP: FieldId = 5;
 const SEID: FieldId = 6;
 const MID: FieldId = 7;
 const MODE: FieldId = 8;
+const PAYLOAD: FieldId = 9;
 
 const SCHEMA: &[FieldDef] = &[
-    FieldDef { name: "ecu", kind: FieldKind::Str },
-    FieldDef { name: "apid", kind: FieldKind::Str },
-    FieldDef { name: "ctid", kind: FieldKind::Str },
+    FieldDef { name: "ecu", kind: FieldKind::Str, costly: false },
+    FieldDef { name: "apid", kind: FieldKind::Str, costly: false },
+    FieldDef { name: "ctid", kind: FieldKind::Str, costly: false },
     // log, app_trace, nw_trace, control
-    FieldDef { name: "type", kind: FieldKind::Str },
+    FieldDef { name: "type", kind: FieldKind::Str, costly: false },
     // message counter
-    FieldDef { name: "mcnt", kind: FieldKind::U64 },
+    FieldDef { name: "mcnt", kind: FieldKind::U64, costly: false },
     // ECU uptime in 0.1 ms units
-    FieldDef { name: "tmsp", kind: FieldKind::U64 },
+    FieldDef { name: "tmsp", kind: FieldKind::U64, costly: false },
     // session id
-    FieldDef { name: "seid", kind: FieldKind::U64 },
+    FieldDef { name: "seid", kind: FieldKind::U64, costly: false },
     // message id of non-verbose messages (none on verbose ones: 0 is a valid id)
-    FieldDef { name: "mid", kind: FieldKind::U64 },
+    FieldDef { name: "mid", kind: FieldKind::U64, costly: false },
     // verbose, non-verbose
-    FieldDef { name: "mode", kind: FieldKind::Str },
+    FieldDef { name: "mode", kind: FieldKind::Str, costly: false },
+    // the decoded payload, i.e. the `payload` column
+    FieldDef { name: "payload", kind: FieldKind::Str, costly: true },
 ];
 
 /// Does `head` (the first bytes of a file) look like a DLT file?
@@ -255,11 +258,11 @@ impl LogSource for DltFile {
 
     fn field(&self, line: LineNo, id: FieldId) -> Option<FieldValue<'_>> {
         let m = self.msg(line)?;
-        let s = |b: &'static str| FieldValue::Str(b.as_bytes());
+        let s = |b: &'static str| FieldValue::Str(b.as_bytes().into());
         match id {
-            ECU => Some(FieldValue::Str(m.ecu())),
-            APID => m.apid().map(FieldValue::Str),
-            CTID => m.ctid().map(FieldValue::Str),
+            ECU => Some(FieldValue::Str(m.ecu().into())),
+            APID => m.apid().map(|b| FieldValue::Str(b.into())),
+            CTID => m.ctid().map(|b| FieldValue::Str(b.into())),
             TYPE => type_of(&m).map(s),
             MCNT => Some(FieldValue::U64(m.mcnt().into())),
             TMSP => m.timestamp().map(|t| FieldValue::U64(t.into())),
@@ -267,6 +270,11 @@ impl LogSource for DltFile {
             MID => non_verbose_id(&m).map(|t| FieldValue::U64(t.into())),
             // Without an extended header a message is non-verbose.
             MODE => Some(s(if m.verbose() { "verbose" } else { "non-verbose" })),
+            PAYLOAD => {
+                let mut out = Vec::new();
+                payload::render(&m, &mut out);
+                Some(FieldValue::Str(out.into()))
+            }
             _ => None,
         }
     }

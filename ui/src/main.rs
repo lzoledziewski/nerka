@@ -733,7 +733,8 @@ impl App {
 
     fn pick_files(&mut self, ctx: &egui::Context) {
         if let Some(paths) = rfd::FileDialog::new()
-            .add_filter("Logs", &["log", "txt", "out"])
+            .add_filter("Logs and traces", &["log", "txt", "out", "dlt"])
+            .add_filter("DLT traces", &["dlt"])
             .add_filter("All files", &["*"])
             .pick_files()
         {

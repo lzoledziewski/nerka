@@ -65,14 +65,15 @@ fn line_columns_and_fields() {
     assert_eq!(f.line_count(), 1);
     assert_eq!(line(&f, 0), "2025-10-18 00:00:00.123456\t1234.5678\tECU1\tNAV\tPOS\twarn\tslow");
     let field = |name| f.field(0, SCHEMA.iter().position(|d| d.name == name).unwrap());
-    assert_eq!(field("ecu"), Some(FieldValue::Str(b"ECU1")));
-    assert_eq!(field("apid"), Some(FieldValue::Str(b"NAV")));
-    assert_eq!(field("type"), Some(FieldValue::Str(b"log")));
+    assert_eq!(field("ecu"), Some(FieldValue::Str(b"ECU1"[..].into())));
+    assert_eq!(field("apid"), Some(FieldValue::Str(b"NAV"[..].into())));
+    assert_eq!(field("type"), Some(FieldValue::Str(b"log"[..].into())));
     assert_eq!(field("mcnt"), Some(FieldValue::U64(200)));
     assert_eq!(field("tmsp"), Some(FieldValue::U64(12_345_678)));
     assert_eq!(field("seid"), Some(FieldValue::U64(7)));
     assert_eq!(field("mid"), None);
-    assert_eq!(field("mode"), Some(FieldValue::Str(b"verbose")));
+    assert_eq!(field("mode"), Some(FieldValue::Str(b"verbose"[..].into())));
+    assert_eq!(field("payload"), Some(FieldValue::Str(b"slow"[..].into())));
     assert_eq!(f.supplied_level(0), Some(Some(Level::Warn)));
 }
 
@@ -89,12 +90,12 @@ fn optional_headers_missing() {
     };
     let f = file(&[m]);
     assert_eq!(line(&f, 0), "2025-10-18 00:00:00.000000\t\tSTOR\t\t\t\t[4660] 01 02");
-    assert_eq!(f.field(0, ECU), Some(FieldValue::Str(b"STOR")));
+    assert_eq!(f.field(0, ECU), Some(FieldValue::Str(b"STOR"[..].into())));
     assert_eq!(f.field(0, APID), None);
     assert_eq!(f.field(0, TYPE), None);
     assert_eq!(f.field(0, TMSP), None);
     assert_eq!(f.field(0, MID), Some(FieldValue::U64(0x1234)));
-    assert_eq!(f.field(0, MODE), Some(FieldValue::Str(b"non-verbose")));
+    assert_eq!(f.field(0, MODE), Some(FieldValue::Str(b"non-verbose"[..].into())));
     assert_eq!(f.supplied_level(0), Some(None));
 }
 
@@ -128,7 +129,7 @@ fn control_messages() {
     assert_eq!(payload(&f, 2), "[service 0x99]");
     assert!(line(&f, 0).contains("\tcontrol\t"));
     assert_eq!(f.supplied_level(0), Some(None));
-    assert_eq!(f.field(0, TYPE), Some(FieldValue::Str(b"control")));
+    assert_eq!(f.field(0, TYPE), Some(FieldValue::Str(b"control"[..].into())));
     assert_eq!(f.field(0, MID), None);
 }
 
@@ -245,6 +246,12 @@ fn engine_queries_match_naive_evaluation() {
     assert!(count("seid != 2 AND mcnt > 100") > 0);
     assert!(count(r"raw ~ /speed=1\d/ AND NOT apid == SYS") > 0);
     assert!(count("level == VERBOSE OR level == TRACE") > 0);
+    // `payload` sees only the payload column, `raw` the whole line.
+    assert_eq!(count(r"payload ~ /speed=1\d/"), count(r"raw ~ /speed=1\d/"));
+    assert!(count(r"payload ~ /speed=1\d/") > 0);
+    assert_eq!(count(r#"payload ~ "ECU""#), 0);
+    assert!(count(r#"raw ~ "ECU""#) > 0);
+    assert_eq!(count(r#"payload !~ "ECU" AND apid == NAV"#), count("apid == NAV"));
     // Columns are tab-separated, so a regex can span them.
     assert!(!run_on(&f, &Filter::Regex(Matcher::new("ECU2\tDIAG", Default::default()).unwrap())).is_empty());
     let inv = crate::MatcherOptions { invert: true, ..Default::default() };

@@ -7,8 +7,10 @@ use crate::event::{FieldDef, FieldId, FieldKind, FieldValue, Level};
 use std::borrow::Cow;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-pub(crate) const SCHEMA: &[FieldDef] =
-    &[FieldDef { name: "apid", kind: FieldKind::Str }, FieldDef { name: "mcnt", kind: FieldKind::U64 }];
+pub(crate) const SCHEMA: &[FieldDef] = &[
+    FieldDef { name: "apid", kind: FieldKind::Str, costly: false },
+    FieldDef { name: "mcnt", kind: FieldKind::U64, costly: false },
+];
 
 pub(crate) struct Row {
     pub text: &'static str,
@@ -50,7 +52,7 @@ impl LogSource for MemSource {
     fn field(&self, line: LineNo, id: FieldId) -> Option<FieldValue<'_>> {
         let r = self.rows.get(line as usize)?;
         match id {
-            0 => r.apid.map(|a| FieldValue::Str(a.as_bytes())),
+            0 => r.apid.map(|a| FieldValue::Str(a.as_bytes().into())),
             1 => r.mcnt.map(FieldValue::U64),
             _ => None,
         }

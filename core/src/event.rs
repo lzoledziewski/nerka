@@ -105,14 +105,18 @@ pub struct FieldDef {
     /// Lower-case name used in queries.
     pub name: &'static str,
     pub kind: FieldKind,
+    /// Getting the value decodes the line (e.g. a DLT payload), so
+    /// conditions on it are evaluated after the cheap ones.
+    pub costly: bool,
 }
 
 /// Index into [`crate::LogSource::schema`].
 pub type FieldId = usize;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FieldValue<'a> {
-    Str(&'a [u8]),
+    /// Borrowed for header fields, owned for decoded ones.
+    Str(Cow<'a, [u8]>),
     U64(u64),
 }
 

@@ -27,7 +27,10 @@
 //! by [`Query::bind`] against the source's schema, which also checks the
 //! operator and value against the field's kind: text fields take `==`,
 //! `!=`, `~`, `!~`; numeric fields take every comparison. A line without a
-//! value for a field only satisfies `!=` and `!~`.
+//! value for a field only satisfies `!=` and `!~`. As with `raw`, a STRING
+//! after `~` / `!~` is a literal substring. Fields marked
+//! [`FieldDef::costly`] (DLT `payload`, which decodes the message) are
+//! evaluated after the cheap conditions.
 //!
 //! Keywords and field names are case-insensitive. Evaluation reorders AND/OR operands so
 //! cheap checks run before regexes (spec §3.5).
@@ -84,6 +87,8 @@ pub struct FieldCond {
     /// Resolved by [`Query::bind`]; unbound conditions never match.
     pub id: Option<FieldId>,
     pub test: FieldTest,
+    /// Set by [`Query::bind`] from [`FieldDef::costly`].
+    pub costly: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -118,9 +123,9 @@ impl Expr {
                 None => *op == CmpOp::Ne,
             },
             Expr::Cond(Cond::Field(f)) => match (f.id.and_then(|id| ev.field(id)), &f.test) {
-                (Some(FieldValue::Str(v)), FieldTest::Str(op, want)) => op.test(v, want.as_slice()),
+                (Some(FieldValue::Str(v)), FieldTest::Str(op, want)) => op.test(&*v, want.as_slice()),
                 (Some(FieldValue::U64(v)), FieldTest::Num(op, want)) => op.test(v, *want),
-                (Some(FieldValue::Str(v)), FieldTest::Match(re)) => re.is_match(v),
+                (Some(FieldValue::Str(v)), FieldTest::Match(re)) => re.is_match(&v),
                 (None, FieldTest::Str(op, _) | FieldTest::Num(op, _)) => *op == CmpOp::Ne,
                 _ => false,
             },
@@ -141,7 +146,13 @@ impl Expr {
     fn cost(&self) -> u32 {
         match self {
             Expr::Cond(Cond::RawEq(_)) => 1,
-            Expr::Cond(Cond::Field(_)) => 1,
+            Expr::Cond(Cond::Field(f)) => {
+                if f.costly {
+                    10
+                } else {
+                    1
+                }
+            }
             Expr::Cond(Cond::Level(..)) => 2,
             Expr::Cond(Cond::RawMatch(_)) => 10,
             Expr::Not(x) => x.cost(),
@@ -210,6 +221,7 @@ impl FieldCond {
             }
         };
         self.id = Some(id);
+        self.costly = schema[id].costly;
         Ok(())
     }
 }
@@ -245,6 +257,8 @@ impl Query {
     /// bound query again is fine.
     pub fn bind(mut self, schema: &[FieldDef]) -> Result<Query, DslError> {
         self.expr.bind(schema)?;
+        // Costs are known only now.
+        self.expr = self.expr.optimize();
         Ok(self)
     }
 
@@ -362,7 +376,7 @@ mod tests {
         let e = Query::compile_for("service == api", &[]).unwrap_err();
         assert!(e.msg.contains("unknown field 'service'"), "{e}");
         assert_eq!(e.pos, 0);
-        assert!(Query::compile(r#"apid ~ "x""#).unwrap_err().msg.contains("regex"));
+        assert!(Query::compile("apid ~ 5").unwrap_err().msg.contains("regex"));
     }
 
     #[test]
@@ -394,5 +408,19 @@ mod tests {
         assert!(!q("apid == NAV").matches(b"NAV"));
         assert!(!q("apid != NAV").matches(b"NAV"));
         assert!(Query::compile_for("apid != NAV", crate::input::mem::SCHEMA).unwrap().matches(b"NAV"));
+    }
+
+    #[test]
+    fn costly_fields_run_last() {
+        let schema = [
+            FieldDef { name: "payload", kind: FieldKind::Str, costly: true },
+            FieldDef { name: "apid", kind: FieldKind::Str, costly: false },
+        ];
+        let q = Query::compile_for(r#"payload ~ "a.b" AND apid == NAV AND /x/"#, &schema).unwrap();
+        let Expr::And(xs) = q.expr() else { panic!("{:?}", q.expr()) };
+        assert!(matches!(&xs[0], Expr::Cond(Cond::Field(f)) if f.name == "apid"));
+        // A string after ~ is a literal substring, as for raw.
+        assert!(matches!(&xs[1], Expr::Cond(Cond::Field(f)) if f.costly
+            && matches!(&f.test, FieldTest::Match(re) if re.as_str() == r"a\.b")));
     }
 }
