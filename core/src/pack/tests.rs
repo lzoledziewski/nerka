@@ -169,5 +169,19 @@ fn library_loads_files_and_dirs() {
     assert_eq!(errs.len(), 1, "{errs:?}");
     assert!(errs[0].file.ends_with("c.nerka-pack"));
     assert_eq!(lenient.packs().len(), 2);
+
+    // Saving a query writes its pack file and reloads the pack.
+    let mut q = lenient.get("ota.swup").unwrap().1.clone();
+    q.text = "apid == SWUP2".into();
+    lenient.save_query("ota", &q).unwrap();
+    assert_eq!(lenient.get("ota.swup").unwrap().1.text, "apid == SWUP2");
+    assert!(std::fs::read_to_string(dir.join("b.nerka-pack")).unwrap().contains(
+        "    apid == SWUP2
+"
+    ));
+    q.text = "level >= LOUD".into();
+    assert!(lenient.save_query("ota", &q).is_err());
+    assert!(lenient.save_query("nope", &q).is_err());
+    assert_eq!(lenient.get("ota.swup").unwrap().1.text, "apid == SWUP2");
     std::fs::remove_dir_all(&dir).unwrap();
 }

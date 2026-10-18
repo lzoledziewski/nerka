@@ -20,9 +20,10 @@
 //! Recent filters are kept in `<config dir>/nerka/history` and offered by
 //! the 🕘 button next to the filter box.
 //!
-//! Search manager (`doc/search-manager.md`): the library panel lists the
-//! queries of the packs in `<config dir>/nerka/packs` (and `--pack`).
-//! Picks expand (in core) into plain NFD in the Filter or Search box. The
+//! Search manager (`doc/search-manager.md`): the Library pane lists the
+//! queries of the packs in `<config dir>/nerka/packs` (and `--pack`); the
+//! Selection pane holds the ones in use, in order, editable. Apply expands
+//! them (in core) into plain NFD in the Filter and Search boxes. The
 //! Search box looks only inside the filter result and colours its hits per
 //! query.
 
@@ -36,8 +37,8 @@ mod view;
 
 use eframe::egui::{self, Color32, Key, KeyboardShortcut, Modifiers, RichText};
 use job::{Job, Poll};
-use library::{LibraryView, Picks, Use};
-use nerka_core::pack::{self, Expansion, Library, Role};
+use library::{Applied, LibraryView, Picks, Use};
+use nerka_core::pack::{self, Library, Role};
 use nerka_core::{
     Bookmarks, Filter, Highlighter, LineNo, LogSource, Matcher, MatcherOptions, Query, SearchHistory, SearchHits,
     SearchResult, SearchSet,
@@ -52,8 +53,12 @@ fn main() -> eframe::Result {
     let mut initial: Vec<PathBuf> = Vec::new();
     // (history tag, pattern): the same tags the search history uses.
     let mut preset: Option<(&str, String)> = None;
-    // Library options: packs to load, picks and parameters for every file.
-    let (mut packs, mut picks, mut show_library) = (Vec::new(), Picks::default(), false);
+    // Library options: packs to load, selected queries and parameters for
+    // every file.
+    let (mut packs, mut show_library) = (Vec::new(), false);
+    let mut startup: Vec<(Use, String)> = Vec::new();
+    let mut highlight: Vec<String> = Vec::new();
+    let mut params = std::collections::BTreeMap::new();
     let mut args = std::env::args_os().skip(1);
     while let Some(a) = args.next() {
         let mut value = || args.next().map(|v| v.to_string_lossy().into_owned()).unwrap_or_default();
@@ -66,24 +71,24 @@ fn main() -> eframe::Result {
                 continue;
             }
             Some("--pick") => {
-                picks.set_filter(&value(), Some(Use::Include));
+                startup.push((Use::Include, value()));
                 continue;
             }
             Some("--exclude") => {
-                picks.set_filter(&value(), Some(Use::Exclude));
+                startup.push((Use::Exclude, value()));
                 continue;
             }
             Some("--highlight") => {
-                picks.toggle_highlight(&value());
+                highlight.push(value());
                 continue;
             }
             Some("--search-pick") => {
-                picks.set_search(&value(), true);
+                startup.push((Use::Search, value()));
                 continue;
             }
             Some("--param") => {
                 if let Some((k, v)) = value().split_once('=') {
-                    picks.params.insert(k.to_owned(), (v.to_owned(), false));
+                    params.insert(k.to_owned(), (v.to_owned(), false));
                 }
                 continue;
             }
@@ -113,6 +118,14 @@ fn main() -> eframe::Result {
             app.load_history();
             app.load_prefs();
             app.load_library();
+            let mut picks = Picks::default();
+            picks.params = params;
+            for (role, id) in &startup {
+                picks.add(&app.library, id, *role, None);
+            }
+            for id in &highlight {
+                picks.light_source(id);
+            }
             for p in initial {
                 app.open(&cc.egui_ctx, p);
                 // A filter given on the command line applies to every file it names.
@@ -121,11 +134,8 @@ fn main() -> eframe::Result {
                 }
                 if let Some(tab) = app.tabs.last_mut() {
                     tab.picks = picks.clone();
-                    if !picks.filter.is_empty() {
-                        tab.apply_filter_picks(&cc.egui_ctx, &app.library);
-                    }
-                    if !picks.search.is_empty() {
-                        tab.apply_search_picks(&cc.egui_ctx, &app.library);
+                    if !picks.nodes.is_empty() {
+                        tab.apply_selection(&cc.egui_ctx, &app.library);
                     }
                 }
             }
@@ -163,10 +173,9 @@ struct Tab {
 
     /// The library expansion the Filter box holds, while its text is
     /// unchanged: shown grouped, with chips.
-    filter_exp: Option<Arc<Expansion>>,
+    filter_exp: Option<Arc<Applied>>,
+    /// The Selection pane's queries.
     picks: Picks,
-    /// Colour of each included filter query, in expansion order.
-    filter_colors: Vec<Color32>,
     /// Whole-line colours of the filter queries switched on in `picks`.
     line_colors: Option<(Arc<ActiveSearch>, Arc<SearchHits>)>,
     colors_job: Option<(Arc<ActiveSearch>, Job<SearchHits>)>,
@@ -185,7 +194,7 @@ struct SearchBox {
     regex: bool,
     ignore_case: bool,
     /// The library expansion the box holds, while its text is unchanged.
-    exp: Option<Arc<Expansion>>,
+    exp: Option<Arc<Applied>>,
     /// The search that ran last. It runs again when the filter result changes.
     active: Option<Arc<ActiveSearch>>,
     hits: Option<(Arc<ActiveSearch>, Arc<SearchHits>)>,
@@ -202,8 +211,8 @@ struct ActiveSearch {
 
 impl SearchBox {
     /// The expansion, if the box still holds its text.
-    fn expansion(&self) -> Option<&Arc<Expansion>> {
-        self.exp.as_ref().filter(|e| e.nfd == self.pattern)
+    fn expansion(&self) -> Option<&Arc<Applied>> {
+        self.exp.as_ref().filter(|a| a.exp.nfd == self.pattern)
     }
 }
 
@@ -224,7 +233,6 @@ impl Tab {
             searching: None,
             filter_exp: None,
             picks: Picks::default(),
-            filter_colors: Vec::new(),
             line_colors: None,
             colors_job: None,
             search: SearchBox::default(),
@@ -303,7 +311,7 @@ impl Tab {
         if let Some((_, j)) = self.searching.take() {
             j.cancel();
         }
-        if self.filter_exp.as_ref().is_some_and(|e| e.nfd != self.pattern) {
+        if self.filter_exp.as_ref().is_some_and(|a| a.exp.nfd != self.pattern) {
             self.filter_exp = None;
         }
         if self.pattern.trim().is_empty() {
@@ -427,20 +435,32 @@ impl Tab {
         true
     }
 
-    /// Put the picked filter queries, expanded, into the Filter box and run
-    /// it. Returns the text to record in the history.
+    /// Apply the Selection pane: its filter queries go into the Filter bar,
+    /// its search queries into the Search box, and both run. A box without
+    /// queries in the selection is left as it is. Returns the filter text to
+    /// record in the history.
+    fn apply_selection(&mut self, ctx: &egui::Context, lib: &Library) -> Option<String> {
+        self.picks.error = None;
+        let recorded = if self.picks.has(Use::Include) || self.picks.has(Use::Exclude) {
+            self.apply_filter_picks(ctx, lib)
+        } else {
+            None
+        };
+        if self.picks.has(Use::Search) {
+            self.apply_search_picks(ctx, lib);
+        }
+        recorded
+    }
+
+    /// Put the selection's filter queries, expanded, into the Filter bar
+    /// and run it. Returns the text to record in the history.
     fn apply_filter_picks(&mut self, ctx: &egui::Context, lib: &Library) -> Option<String> {
-        match pack::expand(&self.picks.filter_selection(), lib, &self.picks.params()) {
-            Ok(e) => {
+        match self.picks.expand(lib, false) {
+            Ok(a) => {
                 self.picks.error = None;
                 self.mode = Mode::Query;
-                self.pattern = e.nfd.clone();
-                self.filter_colors = e
-                    .parts_with(Role::Include)
-                    .enumerate()
-                    .map(|(i, p)| library::query_color(lib, &p.query, i))
-                    .collect();
-                self.filter_exp = Some(Arc::new(e));
+                self.pattern = a.exp.nfd.clone();
+                self.filter_exp = Some(Arc::new(a));
                 self.start_search(ctx).then(|| self.pattern.clone())
             }
             Err(e) => {
@@ -450,15 +470,15 @@ impl Tab {
         }
     }
 
-    /// Put the ticked search queries, expanded, into the Search box and run it.
+    /// Put the selection's search queries, expanded, into the Search box
+    /// and run it.
     fn apply_search_picks(&mut self, ctx: &egui::Context, lib: &Library) {
-        match pack::expand(&self.picks.search_selection(), lib, &self.picks.params()) {
-            Ok(e) => {
-                self.picks.error = None;
+        match self.picks.expand(lib, true) {
+            Ok(a) => {
                 self.search.mode = Mode::Query;
-                self.search.pattern = e.nfd.clone();
-                self.search.exp = Some(Arc::new(e));
-                self.run_search_box(ctx, lib);
+                self.search.pattern = a.exp.nfd.clone();
+                self.search.exp = Some(Arc::new(a));
+                self.run_search_box(ctx);
             }
             Err(e) => self.picks.error = Some(format!("Search: {e}")),
         }
@@ -466,13 +486,11 @@ impl Tab {
 
     /// What the Search box asks for: one query per picked library query, or
     /// the box's text as one query.
-    fn build_search(&self, lib: &Library) -> Result<ActiveSearch, String> {
-        if let Some(e) = self.search.expansion() {
-            let set = e.search_set().map_err(|e| format!("Search: {e}"))?;
-            let names: Vec<String> = e.parts_with(Role::Include).map(|p| p.query.clone()).collect();
-            let colors = names.iter().enumerate().map(|(i, n)| library::query_color(lib, n, i)).collect();
+    fn build_search(&self) -> Result<ActiveSearch, String> {
+        if let Some(a) = self.search.expansion() {
+            let set = a.exp.search_set().map_err(|e| format!("Search: {e}"))?;
             let highlighters = set.include.iter().map(Filter::highlighter).collect();
-            return Ok(ActiveSearch { set, names, colors, highlighters });
+            return Ok(ActiveSearch { set, names: a.names.clone(), colors: a.colors.clone(), highlighters });
         }
         let f = match self.search.mode {
             Mode::Text => {
@@ -497,12 +515,12 @@ impl Tab {
     }
 
     /// Run the Search box (Enter, Find, or library picks).
-    fn run_search_box(&mut self, ctx: &egui::Context, lib: &Library) {
+    fn run_search_box(&mut self, ctx: &egui::Context) {
         if self.search.pattern.trim().is_empty() {
             self.clear_search();
             return;
         }
-        match self.build_search(lib) {
+        match self.build_search() {
             Ok(a) => {
                 self.search.active = Some(Arc::new(a));
                 self.rerun_search(ctx);
@@ -529,20 +547,20 @@ impl Tab {
             j.cancel();
         }
         self.line_colors = None;
-        let e = self.filter_exp.clone().filter(|e| e.nfd == self.pattern);
-        let (Some(e), Some(res), Some(file)) = (e, self.result.clone(), self.file.clone()) else { return };
+        let a = self.filter_exp.clone().filter(|a| a.exp.nfd == self.pattern);
+        let (Some(a), Some(res), Some(file)) = (a, self.result.clone(), self.file.clone()) else { return };
         if self.searching.is_some() {
             return;
         }
         let (mut include, mut names, mut colors) = (Vec::new(), Vec::new(), Vec::new());
-        for (i, p) in e.parts_with(Role::Include).enumerate() {
-            if !self.picks.is_highlighted(&p.query) {
+        for (i, p) in a.exp.parts.iter().enumerate() {
+            if p.role != Role::Include || !self.picks.is_lit(a.keys[i]) {
                 continue;
             }
-            let Ok(q) = Query::compile(e.part_nfd(p)) else { continue };
+            let Ok(q) = Query::compile(a.exp.part_nfd(p)) else { continue };
             include.push(Filter::Query(q));
-            names.push(p.query.clone());
-            colors.push(self.filter_colors.get(i).copied().unwrap_or(library::palette(i)));
+            names.push(a.names[i].clone());
+            colors.push(a.colors[i]);
         }
         if include.is_empty() {
             return;
@@ -741,7 +759,6 @@ impl Tab {
         ui: &mut egui::Ui,
         focus_search: &mut bool,
         history: &SearchHistory,
-        lib: &Library,
     ) -> Option<(&'static str, String)> {
         let mut searched = None;
         ui.horizontal(|ui| {
@@ -803,11 +820,10 @@ impl Tab {
                 searched = Some((self.filter_tag(), self.pattern.clone()));
             }
         });
-        if let Some(e) = self.filter_exp.clone().filter(|e| e.nfd == self.pattern) {
+        if let Some(a) = self.filter_exp.clone().filter(|a| a.exp.nfd == self.pattern) {
             let picks = &self.picks;
-            let clicked = expansion_view(ui, &e, lib, Some(&|id: &str| picks.is_highlighted(id)));
-            if let Some(id) = clicked {
-                self.picks.toggle_highlight(&id);
+            if let Some(key) = expansion_view(ui, &a, Some(&|k| picks.is_lit(k))) {
+                self.picks.toggle_lit(key);
                 self.recolor(ui.ctx());
             }
         }
@@ -815,8 +831,8 @@ impl Tab {
     }
 
     /// The Search box and the list of its hits (bottom panel).
-    fn search_panel(&mut self, ui: &mut egui::Ui, file: &dyn LogSource, lib: &Library) {
-        self.search_row(ui, lib);
+    fn search_panel(&mut self, ui: &mut egui::Ui, file: &dyn LogSource) {
+        self.search_row(ui);
         ui.add_space(2.0);
         let marks = self.search.hits.as_ref().map(|(a, h)| SearchMarks {
             hits: h,
@@ -855,7 +871,7 @@ impl Tab {
     }
 
     /// The Search box, under the Filter box: same modes, Enter runs it.
-    fn search_row(&mut self, ui: &mut egui::Ui, lib: &Library) {
+    fn search_row(&mut self, ui: &mut egui::Ui) {
         let mut go = false;
         let mut clear = false;
         ui.horizontal(|ui| {
@@ -887,10 +903,10 @@ impl Tab {
         if clear {
             self.clear_search();
         } else if go {
-            self.run_search_box(ui.ctx(), lib);
+            self.run_search_box(ui.ctx());
         }
         if let Some(e) = self.search.expansion().cloned() {
-            expansion_view(ui, &e, lib, None);
+            expansion_view(ui, &e, None);
         }
     }
 
@@ -937,15 +953,10 @@ fn short(id: &str) -> &str {
 /// others, a name chip in the query's colour, and its NFD. With `lit`, the
 /// included queries' chips switch their line colour: filled when on.
 /// Returns the query whose chip was clicked.
-fn expansion_view(
-    ui: &mut egui::Ui,
-    e: &Expansion,
-    lib: &Library,
-    lit: Option<&dyn Fn(&str) -> bool>,
-) -> Option<String> {
+fn expansion_view(ui: &mut egui::Ui, a: &Applied, lit: Option<&dyn Fn(u64) -> bool>) -> Option<u64> {
     let mut clicked = None;
     const MAX_LINES: usize = 8;
-    let shorts: Vec<&str> = e.parts.iter().map(|p| short(&p.query)).collect();
+    let e = &a.exp;
     let mut includes = 0;
     for (i, p) in e.parts.iter().enumerate() {
         let joiner = match p.role {
@@ -953,28 +964,27 @@ fn expansion_view(
             Role::Include => "OR",
             Role::Exclude => "AND NOT",
         };
-        let color = library::query_color(lib, &p.query, includes);
         if p.role == Role::Include {
             includes += 1;
         }
         if i >= MAX_LINES {
             continue;
         }
-        // The short name, unless two picked queries share it.
-        let name = if shorts.iter().filter(|s| **s == shorts[i]).count() > 1 { &p.query } else { shorts[i] };
+        let (name, color) = (&a.names[i], a.colors[i]);
+        let origin = if p.query.starts_with("_sel.") { "local query (not in a pack)" } else { &p.query };
         ui.horizontal(|ui| {
             ui.add_sized([52.0, 14.0], egui::Label::new(RichText::new(joiner).small().weak()));
             match (lit, p.role) {
                 (Some(lit), Role::Include) => {
-                    let on = lit(&p.query);
+                    let on = lit(a.keys[i]);
                     let tip = if on { "Lines coloured: click to stop" } else { "Click to colour its lines" };
                     let r = library::chip(ui, name, color, on).interact(egui::Sense::click());
-                    if r.on_hover_text(format!("{}\n{tip}", p.query)).clicked() {
-                        clicked = Some(p.query.clone());
+                    if r.on_hover_text(format!("{origin}\n{tip}")).clicked() {
+                        clicked = Some(a.keys[i]);
                     }
                 }
                 _ => {
-                    library::chip(ui, name, color, false).on_hover_text(&p.query);
+                    library::chip(ui, name, color, false).on_hover_text(origin);
                 }
             }
             ui.add(egui::Label::new(RichText::new(e.part_nfd(p)).monospace().small()).truncate());
@@ -1057,6 +1067,9 @@ impl App {
         for p in pack::default_dir().filter(|d| d.is_dir()).iter().chain(&self.pack_paths) {
             errors.extend(lib.load_lenient(p).into_iter().map(|e| e.to_string()));
         }
+        for t in &mut self.tabs {
+            t.picks.refresh(&lib);
+        }
         self.library = lib;
         self.library_errors = errors;
     }
@@ -1066,20 +1079,13 @@ impl App {
             library::Action::None => {}
             library::Action::Close => self.show_library = false,
             library::Action::Reload => self.load_library(),
-            library::Action::ApplyFilter => {
+            library::Action::Apply => {
                 let lib = std::mem::take(&mut self.library);
-                let recorded = self.tab().and_then(|t| t.apply_filter_picks(ctx, &lib));
+                let recorded = self.tab().and_then(|t| t.apply_selection(ctx, &lib));
                 self.library = lib;
                 if let Some(nfd) = recorded {
                     self.record_search("query", &nfd);
                 }
-            }
-            library::Action::ApplySearch => {
-                let lib = std::mem::take(&mut self.library);
-                if let Some(t) = self.tab() {
-                    t.apply_search_picks(ctx, &lib);
-                }
-                self.library = lib;
             }
         }
     }
@@ -1461,24 +1467,38 @@ impl eframe::App for App {
         };
 
         let before = tab.search_prefs();
-        let searched = egui::Panel::top("filter")
-            .show(ui, |ui| tab.filter_bar(ui, &mut focus_search, &self.history, &self.library))
-            .inner;
+        let searched =
+            egui::Panel::top("filter").show(ui, |ui| tab.filter_bar(ui, &mut focus_search, &self.history)).inner;
         let after = tab.search_prefs();
         if self.show_library {
-            let highlight = tab.picks.highlight.clone();
-            let action = egui::Panel::right("library")
+            let lit = |t: &Tab| t.picks.nodes.iter().map(|n| (n.key, n.lit)).collect::<Vec<_>>();
+            let lit_before = lit(tab);
+            // The library on the far right, the selection next to it.
+            let a1 = egui::Panel::right("library")
                 .resizable(true)
-                .default_size(320.0)
+                .default_size(260.0)
                 .show(ui, |ui| {
-                    library::panel(ui, &self.library, &self.library_errors, &mut tab.picks, &mut self.library_view)
+                    library::library_panel(
+                        ui,
+                        &self.library,
+                        &self.library_errors,
+                        &mut tab.picks,
+                        &mut self.library_view,
+                    )
                 })
                 .inner;
-            if tab.picks.highlight != highlight {
+            let a2 = egui::Panel::right("selection")
+                .resizable(true)
+                .default_size(320.0)
+                .show(ui, |ui| library::selection_panel(ui, &mut self.library, &mut tab.picks))
+                .inner;
+            if lit(tab) != lit_before {
                 tab.recolor(&ctx);
             }
-            if action != library::Action::None {
-                self.library_action(&ctx, action);
+            for a in [a1, a2] {
+                if a != library::Action::None {
+                    self.library_action(&ctx, a);
+                }
             }
         }
         let Some(tab) = self.tabs.get_mut(self.active) else { return };
@@ -1496,7 +1516,7 @@ impl eframe::App for App {
             .resizable(true)
             .default_size(260.0)
             .min_size(120.0)
-            .show(ui, |ui| tab.search_panel(ui, &*file, &self.library));
+            .show(ui, |ui| tab.search_panel(ui, &*file));
         egui::CentralPanel::default().show(ui, |ui| tab.main_panel(ui, &*file));
         if after != before {
             self.save_prefs_from(after);
@@ -1563,8 +1583,8 @@ query timeouts  labels: vision
         settle(&mut tab, &ctx);
 
         // Filter: errors about cam1, without timeouts.
-        tab.picks.set_filter("vision.cam", Some(Use::Include));
-        tab.picks.set_filter("vision.timeouts", Some(Use::Exclude));
+        tab.picks.add(&lib, "vision.cam", Use::Include, None);
+        tab.picks.add(&lib, "vision.timeouts", Use::Exclude, None);
         assert_eq!(tab.apply_filter_picks(&ctx, &lib), None, "a missing parameter is reported, not run");
         assert!(tab.picks.error.as_deref().unwrap().contains("'$cam'"), "{:?}", tab.picks.error);
         tab.picks.params.insert("cam".into(), ("cam1".into(), false));
@@ -1576,17 +1596,18 @@ query timeouts  labels: vision
 
         // Search inside the filter result only; then widen the filter and
         // the search follows it.
-        tab.picks.set_search("vision.drops", true);
-        tab.picks.set_search("vision.timeouts", true);
-        tab.apply_search_picks(&ctx, &lib);
+        tab.picks.add(&lib, "vision.drops", Use::Search, None);
+        tab.picks.add(&lib, "vision.timeouts", Use::Search, None);
+        tab.apply_selection(&ctx, &lib);
         settle(&mut tab, &ctx);
         assert_eq!(hits(&tab), [(1, vec!["drops"])]);
         let colors = &tab.search.hits.as_ref().unwrap().0.colors;
         assert_eq!(colors[0], library::parse_color("violet").unwrap());
         assert_ne!(colors[1], colors[0]);
 
-        tab.picks.set_filter("vision.timeouts", None);
-        tab.apply_filter_picks(&ctx, &lib).unwrap();
+        let excluded = tab.picks.nodes.iter().find(|n| n.role == Use::Exclude).unwrap().key;
+        tab.picks.remove(excluded);
+        tab.apply_selection(&ctx, &lib).unwrap();
         settle(&mut tab, &ctx);
         assert_eq!(tab.result.as_ref().unwrap().lines, [1, 5]);
         assert_eq!(hits(&tab), [(1, vec!["drops"]), (5, vec!["timeouts"])]);
@@ -1594,12 +1615,12 @@ query timeouts  labels: vision
         // Line colours are off by default; switched on, the later pick wins
         // where a line matches several.
         assert!(tab.line_colors.is_none());
-        tab.picks.toggle_highlight("vision.cam");
+        tab.picks.light_source("vision.cam");
         tab.recolor(&ctx);
         settle(&mut tab, &ctx);
         let (a, h) = tab.line_colors.clone().expect("line colours");
         assert_eq!(h.lines, [1, 5]);
-        assert_eq!(a.names, ["vision.cam"]);
+        assert_eq!(a.names, ["cam"]);
 
         // The main view shows only the kept lines; going to a hidden line
         // lands on the next kept one. n / N jump between search hits.
@@ -1617,7 +1638,7 @@ query timeouts  labels: vision
         // Editing the box drops the chips; the text is a plain query.
         tab.search.pattern.push_str(" OR /disk/");
         assert!(tab.search.expansion().is_none());
-        tab.run_search_box(&ctx, &lib);
+        tab.run_search_box(&ctx);
         settle(&mut tab, &ctx);
         assert_eq!(tab.search.hits.as_ref().unwrap().1.lines, [1, 5]);
 
@@ -1636,15 +1657,15 @@ query timeouts  labels: vision
         tab.search.mode = Mode::Text;
         tab.search.pattern = "Frame drop".into();
         tab.search.ignore_case = true;
-        tab.run_search_box(&ctx, &lib);
+        tab.run_search_box(&ctx);
         settle(&mut tab, &ctx);
         assert_eq!(tab.search.hits.as_ref().unwrap().1.lines, [0, 1, 2]);
         tab.search.pattern = "cam[2]".into();
-        tab.run_search_box(&ctx, &lib);
+        tab.run_search_box(&ctx);
         settle(&mut tab, &ctx);
         assert!(tab.search.hits.as_ref().unwrap().1.is_empty(), "literal by default");
         tab.search.regex = true;
-        tab.run_search_box(&ctx, &lib);
+        tab.run_search_box(&ctx);
         settle(&mut tab, &ctx);
         assert_eq!(tab.search.hits.as_ref().unwrap().1.lines, [2]);
         std::fs::remove_dir_all(&dir).unwrap();

@@ -143,6 +143,7 @@ fn header(line: &str, content: &str, ln: usize) -> Result<PackQuery, (usize, Str
         color: None,
         text: String::new(),
         line: ln,
+        end_line: ln,
     };
     let attrs = attributes(content, pos).map_err(|(b, m)| (col_of(line, b), m))?;
     let mut seen: Vec<&str> = Vec::new();
@@ -248,6 +249,7 @@ fn finish(file: &str, mut q: PackQuery, mut body: Vec<(usize, &str)>) -> Result<
     let cut = body.iter().filter(|(_, l)| !l.trim().is_empty()).map(|(_, l)| indent(l)).min().unwrap_or(0);
     let lines: Vec<&str> = body.iter().map(|(_, l)| if l.trim().is_empty() { "" } else { &l[cut..] }).collect();
     q.text = lines.join("\n");
+    q.end_line = body.last().map_or(q.line, |(ln, _)| *ln);
 
     // Byte offset in `q.text` -> (file line, char column).
     let file_pos = |off: usize| {

@@ -41,12 +41,14 @@
 
 mod expand;
 mod parser;
+mod write;
 
 use std::fmt;
 use std::path::{Path, PathBuf};
 
 pub use expand::{ExpandError, Expansion, ParamValue, Params, Part, Pick, Role, Selection, expand};
 pub use parser::parse_pack;
+pub use write::{create_pack_file, format_query, params_in, upsert_query};
 
 /// File extension of pack files when a directory is loaded.
 pub const PACK_EXTENSION: &str = "nerka-pack";
@@ -71,6 +73,8 @@ pub struct PackQuery {
     pub text: String,
     /// 0-based line of the `query` header in the file.
     pub line: usize,
+    /// 0-based line of the last body line (the block is `line..=end_line`).
+    pub end_line: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -176,6 +180,22 @@ impl Library {
             Err(e) => return vec![PackError { file: path.display().to_string(), pos: None, msg: e.to_string() }],
         };
         files.iter().filter_map(|f| self.load(f).err()).collect()
+    }
+
+    /// Write `q` into the file of pack `pack` ([`upsert_query`]: replaced
+    /// if its id exists, appended otherwise) and reload that pack. Nothing
+    /// is written if the result wouldn't parse.
+    pub fn save_query(&mut self, pack: &str, q: &PackQuery) -> Result<(), PackError> {
+        let Some(i) = self.packs.iter().position(|p| p.name == pack) else {
+            return Err(PackError { file: pack.to_owned(), pos: None, msg: format!("pack '{pack}' isn't loaded") });
+        };
+        let file = self.packs[i].file.clone();
+        let io_err = |e: std::io::Error| PackError { file: file.clone(), pos: None, msg: e.to_string() };
+        let text = std::fs::read_to_string(&file).map_err(io_err)?;
+        let new = upsert_query(&file, &text, q)?;
+        std::fs::write(&file, &new).map_err(io_err)?;
+        self.packs[i] = parse_pack(&file, &new)?;
+        Ok(())
     }
 
     /// The pack and query for a qualified id (`pack.query`).

@@ -1,114 +1,341 @@
-//! The search manager's library panel: queries from packs, grouped by
-//! label or by pack, picked for the Filter (include / exclude) or the
-//! Search (a tick), with parameter fields. Picks belong to the tab.
+//! The search manager in the GUI: a **Library** pane to browse the packs'
+//! queries and a **Selection** pane with the queries in use, in order.
 //!
-//! The panel only edits the picks. Expanding them into NFD is core's job
-//! (`nerka_core::pack::expand`); the tab puts the result into the Filter
-//! or Search box and runs it.
+//! Queries get into the selection by dragging them from the library or
+//! with their `+`; `−` removes them, the `⠿` handle reorders them. Each
+//! node has a role (include in / exclude from the Filter, or Search). Its
+//! text can be edited in place, new nodes can be written from scratch, and
+//! either can be saved into a pack file.
+//!
+//! Order matters: included filter queries are OR'ed in this order, and
+//! where line colours overlap the later node wins; search queries are
+//! numbered (and coloured) in this order.
+//!
+//! The panes only edit the selection. Expanding it into NFD is core's job
+//! (`nerka_core::pack::expand`): local (new or edited) nodes are put into a
+//! temporary pack so they expand exactly like library queries.
 
 use eframe::egui::{self, Color32, RichText};
-use nerka_core::pack::{Library, ParamValue, Params, Pick, Selection};
+use nerka_core::pack::{
+    self, Expansion, Library, Pack, PackQuery, ParamValue, Params, Pick, Role, Selection, format_query, params_in,
+    parse_pack, upsert_query,
+};
 use std::collections::BTreeMap;
 
-/// How a query takes part in the filter.
+/// How a node takes part.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Use {
+    /// Filter: lines it matches are kept (OR'ed with the other includes).
     Include,
+    /// Filter: lines it matches are dropped (AND NOT).
     Exclude,
+    /// Search inside the filter result.
+    Search,
 }
 
-/// What the tab picked from the library, plus parameter values.
-#[derive(Debug, Clone, Default)]
-pub struct Picks {
-    /// Qualified ids in the order they were picked.
-    pub filter: Vec<(String, Use)>,
-    pub search: Vec<String>,
-    /// Filter queries whose kept lines get a whole-line colour (off unless
-    /// switched on).
-    pub highlight: Vec<String>,
-    /// Parameter values by name, with "insert as regex" (raw).
-    pub params: BTreeMap<String, (String, bool)>,
-    /// The last expansion error, shown in the panel.
+impl Use {
+    fn symbol(self) -> &'static str {
+        match self {
+            Use::Include => "+",
+            Use::Exclude => "−",
+            Use::Search => "🔍",
+        }
+    }
+
+    fn describe(self) -> &'static str {
+        match self {
+            Use::Include => "+  include in the filter",
+            Use::Exclude => "−  exclude from the filter",
+            Use::Search => "🔍 search",
+        }
+    }
+}
+
+/// Name of the temporary pack that holds local nodes while expanding.
+const LOCAL_PACK: &str = "_sel";
+
+/// One query in the selection.
+#[derive(Debug, Clone)]
+pub struct Node {
+    /// Stable id in the UI.
+    pub key: u64,
+    /// The library query it came from (`pack.query`), if any.
+    pub source: Option<String>,
+    pub name: String,
+    /// NFD with `$params`.
+    pub text: String,
+    /// Qualified parent, kept from the library query.
+    pub parent: Option<String>,
+    pub labels: Vec<String>,
+    pub color: Option<String>,
+    pub role: Use,
+    /// Colour the lines it keeps (included filter queries only).
+    pub lit: bool,
+    /// Text or name differ from the library query (or there is none).
+    pub edited: bool,
+    /// Editor open.
+    pub open: bool,
+    /// Last save error.
     pub error: Option<String>,
 }
 
+impl Node {
+    /// The expansion id: the library query, unless edited.
+    fn expand_id(&self) -> String {
+        match &self.source {
+            Some(s) if !self.edited => s.clone(),
+            _ => format!("{LOCAL_PACK}.n{}", self.key),
+        }
+    }
+
+    fn as_query(&self, id: &str) -> PackQuery {
+        PackQuery {
+            id: id.to_owned(),
+            parent: self.parent.clone(),
+            labels: self.labels.clone(),
+            params: params_in(&self.text),
+            color: self.color.clone(),
+            text: self.text.clone(),
+            line: 0,
+            end_line: 0,
+        }
+    }
+
+    /// Check the text as the pack parser would.
+    fn validate(&self) -> Result<(), String> {
+        upsert_query(&self.name, &format!("pack {LOCAL_PACK}\n"), &self.as_query("check"))
+            .map(|_| ())
+            .map_err(|e| e.msg)
+    }
+}
+
+/// An expansion with, per part, the node it came from, a display name and
+/// a colour.
+#[derive(Debug, Clone)]
+pub struct Applied {
+    pub exp: Expansion,
+    pub keys: Vec<u64>,
+    pub names: Vec<String>,
+    pub colors: Vec<Color32>,
+}
+
+/// What the tab selected, in order, plus parameter values.
+#[derive(Debug, Clone, Default)]
+pub struct Picks {
+    pub nodes: Vec<Node>,
+    next_key: u64,
+    /// Parameter values by name, with "insert as regex" (raw).
+    pub params: BTreeMap<String, (String, bool)>,
+    /// The last expansion error, shown in the selection pane.
+    pub error: Option<String>,
+    /// Pack chosen in the editor's "Save to".
+    pub save_pack: String,
+    /// Name typed for a new pack file.
+    pub new_pack: String,
+}
+
 impl Picks {
-    pub fn filter_use(&self, id: &str) -> Option<Use> {
-        self.filter.iter().find(|(q, _)| q == id).map(|(_, u)| *u)
-    }
-
-    pub fn set_filter(&mut self, id: &str, u: Option<Use>) {
-        match (self.filter.iter().position(|(q, _)| q == id), u) {
-            (Some(i), Some(u)) => self.filter[i].1 = u,
-            (Some(i), None) => {
-                self.filter.remove(i);
-            }
-            (None, Some(u)) => self.filter.push((id.to_owned(), u)),
-            (None, None) => {}
+    fn new_node(&mut self, role: Use) -> Node {
+        self.next_key += 1;
+        Node {
+            key: self.next_key,
+            source: None,
+            name: format!("new_{}", self.next_key),
+            text: String::new(),
+            parent: None,
+            labels: vec![],
+            color: None,
+            role,
+            lit: false,
+            edited: true,
+            open: true,
+            error: None,
         }
     }
 
-    pub fn set_search(&mut self, id: &str, on: bool) {
-        let at = self.search.iter().position(|q| q == id);
-        match (at, on) {
-            (None, true) => self.search.push(id.to_owned()),
-            (Some(i), false) => {
-                self.search.remove(i);
-            }
-            _ => {}
+    /// A node for library query `id`, or `None` if it doesn't exist.
+    fn library_node(&mut self, lib: &Library, id: &str, role: Use) -> Option<Node> {
+        let (p, q) = lib.get(id)?;
+        let mut n = self.new_node(role);
+        n.source = Some(id.to_owned());
+        n.name = q.id.clone();
+        n.text = q.text.clone();
+        n.parent = p.parent_of(q);
+        n.labels = q.labels.clone();
+        n.color = q.color.clone();
+        n.edited = false;
+        n.open = false;
+        Some(n)
+    }
+
+    /// Add library query `id` at `at` (the end when `None`). A query
+    /// already selected in the same role isn't added twice.
+    pub fn add(&mut self, lib: &Library, id: &str, role: Use, at: Option<usize>) -> bool {
+        if self.nodes.iter().any(|n| n.source.as_deref() == Some(id) && !n.edited && n.role == role) {
+            return false;
+        }
+        let Some(n) = self.library_node(lib, id, role) else { return false };
+        let at = at.unwrap_or(self.nodes.len()).min(self.nodes.len());
+        self.nodes.insert(at, n);
+        true
+    }
+
+    /// A new, empty node at the end, with its editor open.
+    pub fn add_new(&mut self, role: Use) -> u64 {
+        let n = self.new_node(role);
+        let key = n.key;
+        self.nodes.push(n);
+        key
+    }
+
+    pub fn remove(&mut self, key: u64) {
+        self.nodes.retain(|n| n.key != key);
+    }
+
+    /// Move node `key` so it ends up before the node now at `to`
+    /// (`to == len` moves it to the end).
+    pub fn move_node(&mut self, key: u64, to: usize) {
+        let Some(from) = self.nodes.iter().position(|n| n.key == key) else { return };
+        let n = self.nodes.remove(from);
+        let to = if to > from { to - 1 } else { to };
+        self.nodes.insert(to.min(self.nodes.len()), n);
+    }
+
+    pub fn node_mut(&mut self, key: u64) -> Option<&mut Node> {
+        self.nodes.iter_mut().find(|n| n.key == key)
+    }
+
+    pub fn is_lit(&self, key: u64) -> bool {
+        self.nodes.iter().any(|n| n.key == key && n.lit)
+    }
+
+    pub fn toggle_lit(&mut self, key: u64) {
+        if let Some(n) = self.node_mut(key) {
+            n.lit = !n.lit;
         }
     }
 
-    pub fn toggle_highlight(&mut self, id: &str) {
-        match self.highlight.iter().position(|q| q == id) {
-            Some(i) => {
-                self.highlight.remove(i);
-            }
-            None => self.highlight.push(id.to_owned()),
+    /// Switch on the line colour of the node that came from `id`.
+    pub fn light_source(&mut self, id: &str) {
+        if let Some(n) = self.nodes.iter_mut().find(|n| n.source.as_deref() == Some(id)) {
+            n.lit = true;
         }
     }
 
-    pub fn is_highlighted(&self, id: &str) -> bool {
-        self.highlight.iter().any(|q| q == id)
+    pub fn has(&self, role: Use) -> bool {
+        self.nodes.iter().any(|n| n.role == role)
     }
 
-    /// Position of `id` among the included filter queries (its palette
-    /// slot, the same as in the expansion).
-    pub fn include_index(&self, id: &str) -> Option<usize> {
-        self.filter.iter().filter(|(_, u)| *u == Use::Include).position(|(q, _)| q == id)
-    }
-
-    pub fn filter_selection(&self) -> Selection {
-        let pick = |u| self.filter.iter().filter(|(_, x)| *x == u).map(|(q, _)| Pick::Query(q.clone())).collect();
-        Selection { include: pick(Use::Include), exclude: pick(Use::Exclude) }
-    }
-
-    pub fn search_selection(&self) -> Selection {
-        Selection { include: self.search.iter().map(|q| Pick::Query(q.clone())).collect(), exclude: vec![] }
+    /// After the packs were reloaded: unedited nodes take the library's
+    /// current text; nodes whose query disappeared become local copies.
+    pub fn refresh(&mut self, lib: &Library) {
+        for n in &mut self.nodes {
+            let Some(id) = n.source.clone() else { continue };
+            match lib.get(&id) {
+                Some((p, q)) if !n.edited => {
+                    n.text = q.text.clone();
+                    n.parent = p.parent_of(q);
+                    n.labels = q.labels.clone();
+                    n.color = q.color.clone();
+                }
+                Some(_) => {}
+                None => {
+                    n.source = None;
+                    n.edited = true;
+                }
+            }
+        }
     }
 
     pub fn params(&self) -> Params {
         self.params.iter().map(|(k, (v, raw))| (k.clone(), ParamValue { value: v.clone(), raw: *raw })).collect()
     }
+
+    /// The library plus a temporary pack with the local nodes.
+    fn with_locals(&self, lib: &Library) -> Result<Library, String> {
+        let mut text = format!("pack {LOCAL_PACK}\n");
+        for n in self.nodes.iter().filter(|n| n.edited || n.source.is_none()) {
+            if let Err(e) = n.validate() {
+                return Err(format!("'{}': {e}", n.name));
+            }
+            text += &format_query(&n.as_query(&format!("n{}", n.key)));
+            text.push('\n');
+        }
+        let local: Pack = parse_pack("selection", &text).map_err(|e| e.to_string())?;
+        let mut lib = lib.clone();
+        lib.add(local).map_err(|e| e.to_string())?;
+        Ok(lib)
+    }
+
+    /// Expand the filter nodes (`search == false`) or the search nodes.
+    pub fn expand(&self, lib: &Library, search: bool) -> Result<Applied, String> {
+        let full = self.with_locals(lib)?;
+        let mut sel = Selection::default();
+        let mut by_id: Vec<(String, &Node)> = Vec::new();
+        for n in &self.nodes {
+            let id = n.expand_id();
+            match (n.role, search) {
+                (Use::Include, false) | (Use::Search, true) => sel.include.push(Pick::Query(id.clone())),
+                (Use::Exclude, false) => sel.exclude.push(Pick::Query(id.clone())),
+                _ => continue,
+            }
+            by_id.push((id, n));
+        }
+        let exp = pack::expand(&sel, &full, &self.params()).map_err(|e| e.to_string())?;
+        let (mut keys, mut names, mut colors) = (Vec::new(), Vec::new(), Vec::new());
+        let mut includes = 0;
+        for p in &exp.parts {
+            let n = by_id.iter().find(|(id, _)| *id == p.query).map(|(_, n)| *n).expect("expanded from these nodes");
+            keys.push(n.key);
+            names.push(n.name.clone());
+            let slot = if p.role == Role::Include { includes } else { 0 };
+            colors.push(node_color(n, slot));
+            if p.role == Role::Include {
+                includes += 1;
+            }
+        }
+        Ok(Applied { exp, keys, names, colors })
+    }
+
+    /// Parameter names the selected nodes need, parent chains included.
+    fn params_needed(&self, lib: &Library) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        for n in &self.nodes {
+            let from_parent = n.parent.as_deref().map(|p| lib.params_needed([p])).unwrap_or_default();
+            for p in from_parent.into_iter().chain(params_in(&n.text)) {
+                if !out.contains(&p) {
+                    out.push(p);
+                }
+            }
+        }
+        out
+    }
 }
 
-/// What the user asked for in the panel.
+/// What the user asked for in a pane.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Action {
     None,
     Close,
     Reload,
-    ApplyFilter,
-    ApplySearch,
+    /// Put the selection into the Filter and Search boxes and run them.
+    Apply,
 }
 
-/// Panel settings shared by all tabs.
+/// Library pane settings shared by all tabs.
 #[derive(Debug, Default)]
 pub struct LibraryView {
     pub by_pack: bool,
 }
 
-/// Colours for search queries without a `color:` in their pack.
+/// Dragged between the panes.
+#[derive(Debug, Clone)]
+enum Drag {
+    Library(String),
+    Node(u64),
+}
+
+/// Colours for queries without a `color:` in their pack.
 const PALETTE: [Color32; 8] = [
     Color32::from_rgb(0, 160, 220),
     Color32::from_rgb(230, 90, 60),
@@ -142,14 +369,14 @@ pub fn parse_color(s: &str) -> Option<Color32> {
     })
 }
 
-/// Colour of a query: its pack colour, else the palette entry for `index`.
-pub fn query_color(lib: &Library, id: &str, index: usize) -> Color32 {
-    lib.get(id).and_then(|(_, q)| q.color.as_deref()).and_then(parse_color).unwrap_or(PALETTE[index % PALETTE.len()])
-}
-
-/// The colour of the `index`-th search query when it isn't from a pack.
+/// The colour of the `index`-th query when it has none of its own.
 pub fn palette(index: usize) -> Color32 {
     PALETTE[index % PALETTE.len()]
+}
+
+/// A node's colour: its own, else the palette entry for `slot`.
+fn node_color(n: &Node, slot: usize) -> Color32 {
+    n.color.as_deref().and_then(parse_color).unwrap_or(palette(slot))
 }
 
 /// A small coloured name tag; `strong` fills it with the colour.
@@ -163,7 +390,8 @@ pub fn chip(ui: &mut egui::Ui, text: &str, color: Color32, strong: bool) -> egui
         .response
 }
 
-pub fn panel(
+/// The Library pane: browse the packs; `+` or drag adds to the selection.
+pub fn library_panel(
     ui: &mut egui::Ui,
     lib: &Library,
     load_errors: &[String],
@@ -174,7 +402,7 @@ pub fn panel(
     ui.horizontal(|ui| {
         ui.heading("Library");
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if crate::close_button(ui).on_hover_text("Close panel").clicked() {
+            if crate::close_button(ui).on_hover_text("Close the library and the selection").clicked() {
                 action = Action::Close;
             }
             if ui.button("⟳").on_hover_text("Reload the pack files").clicked() {
@@ -193,44 +421,12 @@ pub fn panel(
     ui.separator();
     if lib.packs().is_empty() {
         ui.weak("No packs loaded. Put *.nerka-pack files into the pack folder, or start with --pack <dir|file>.");
-        if let Some(d) = nerka_core::pack::default_dir() {
+        if let Some(d) = pack::default_dir() {
             ui.weak(format!("Pack folder: {}", d.display()));
         }
         return action;
     }
-
-    // Bottom part first, so the list gets the space that is left.
-    egui::Panel::bottom("library-actions").show(ui, |ui| {
-        params_ui(ui, lib, picks);
-        if let Some(e) = &picks.error {
-            ui.colored_label(ui.visuals().error_fg_color, e);
-        }
-        ui.horizontal(|ui| {
-            let n_filter = picks.filter.len();
-            let n_search = picks.search.len();
-            if ui
-                .add_enabled(n_filter > 0, egui::Button::new(format!("Filter ({n_filter})")))
-                .on_hover_text("Put the picked filter queries into the Filter box and run it")
-                .clicked()
-            {
-                action = Action::ApplyFilter;
-            }
-            if ui
-                .add_enabled(n_search > 0, egui::Button::new(format!("Search ({n_search})")))
-                .on_hover_text("Put the ticked search queries into the Search box and run it")
-                .clicked()
-            {
-                action = Action::ApplySearch;
-            }
-            if ui.add_enabled(n_filter + n_search > 0, egui::Button::new("Clear")).clicked() {
-                picks.filter.clear();
-                picks.search.clear();
-                picks.error = None;
-            }
-        });
-        ui.weak("+ include · − exclude (Filter) · ☑ Search · ■ colour lines");
-    });
-
+    ui.weak("+ or drag a query into the selection");
     egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
         if view.by_pack {
             for p in lib.packs() {
@@ -265,95 +461,341 @@ pub fn panel(
     action
 }
 
-/// A label's or pack's queries, with buttons that pick all of them at
-/// once. A label is resolved now: queries labelled later don't join.
+/// A label's or pack's queries. "+ all" adds them now: a query labelled
+/// later doesn't join.
 fn group_ui(ui: &mut egui::Ui, lib: &Library, ids: &[String], picks: &mut Picks) {
-    ui.horizontal(|ui| {
-        ui.spacing_mut().item_spacing.x = 2.0;
-        if ui.small_button("+ all").on_hover_text("Include all in the filter").clicked() {
-            ids.iter().for_each(|id| picks.set_filter(id, Some(Use::Include)));
+    if ui.small_button("+ all").on_hover_text("Add all of them to the selection").clicked() {
+        for id in ids {
+            picks.add(lib, id, Use::Include, None);
         }
-        if ui.small_button("− all").on_hover_text("Exclude all from the filter").clicked() {
-            ids.iter().for_each(|id| picks.set_filter(id, Some(Use::Exclude)));
-        }
-        if ui.small_button("☑ all").on_hover_text("Search for all").clicked() {
-            ids.iter().for_each(|id| picks.set_search(id, true));
-        }
-        if ui.small_button("none").on_hover_text("Unpick all").clicked() {
-            for id in ids {
-                picks.set_filter(id, None);
-                picks.set_search(id, false);
-            }
-        }
-    });
+    }
     for id in ids {
-        query_row(ui, lib, id, picks);
+        let Some((pack, q)) = lib.get(id) else { continue };
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 4.0;
+            if ui.small_button("+").on_hover_text("Add to the selection (include in the filter)").clicked() {
+                picks.add(lib, id, Use::Include, None);
+            }
+            let color = q.color.as_deref().and_then(parse_color);
+            let (rect, _) = ui.allocate_exact_size(egui::vec2(8.0, 12.0), egui::Sense::hover());
+            if let Some(c) = color {
+                ui.painter().rect_filled(rect, 2.0, c);
+            }
+            let mut name = q.id.clone();
+            if !q.params.is_empty() {
+                name += &format!("({})", q.params.join(", "));
+            }
+            let mut tip = format!("{id}\n\n{}", q.text);
+            if let Some(parent) = pack.parent_of(q) {
+                tip += &format!("\n\nrefines {parent}");
+            }
+            if !q.labels.is_empty() {
+                tip += &format!("\nlabels: {}", q.labels.join(", "));
+            }
+            ui.dnd_drag_source(ui.scope_id().with(("lib-drag", id)), Drag::Library(id.clone()), |ui| {
+                ui.label(name);
+            })
+            .response
+            .on_hover_text(tip);
+            ui.weak(&pack.name);
+        });
     }
 }
 
-fn query_row(ui: &mut egui::Ui, lib: &Library, id: &str, picks: &mut Picks) {
-    let Some((pack, q)) = lib.get(id) else { return };
+/// The Selection pane: the queries in use, in order.
+pub fn selection_panel(ui: &mut egui::Ui, lib: &mut Library, picks: &mut Picks) -> Action {
+    let mut action = Action::None;
     ui.horizontal(|ui| {
-        ui.spacing_mut().item_spacing.x = 4.0;
-        let state = picks.filter_use(id);
-        let (sym, tip) = match state {
-            None => ("·", "Not in the filter: click to include"),
-            Some(Use::Include) => ("+", "Included in the filter (OR): click to exclude"),
-            Some(Use::Exclude) => ("−", "Excluded from the filter (AND NOT): click to drop"),
-        };
-        let b = egui::Button::new(RichText::new(sym).monospace().strong())
-            .selected(state.is_some())
-            .min_size(egui::vec2(20.0, 0.0));
-        if ui.add(b).on_hover_text(tip).clicked() {
-            let next = match state {
-                None => Some(Use::Include),
-                Some(Use::Include) => Some(Use::Exclude),
-                Some(Use::Exclude) => None,
-            };
-            picks.set_filter(id, next);
-        }
-        let mut on = picks.search.iter().any(|s| s == id);
-        if ui.checkbox(&mut on, "").on_hover_text("Search for it").changed() {
-            picks.set_search(id, on);
-        }
-        // The swatch switches the line colour of this query's filter lines.
-        let color = query_color(lib, id, picks.include_index(id).unwrap_or(0));
-        let lit = picks.is_highlighted(id);
-        let (rect, r) = ui.allocate_exact_size(egui::vec2(12.0, 14.0), egui::Sense::click());
-        let sw = egui::Rect::from_center_size(rect.center(), egui::vec2(10.0, 12.0));
-        if lit {
-            ui.painter().rect_filled(sw, 2.0, color);
-        } else {
-            ui.painter().rect_stroke(sw, 2.0, egui::Stroke::new(1.5, color), egui::StrokeKind::Inside);
-        }
-        let tip = if lit {
-            "Its filter lines are coloured: click to stop"
-        } else {
-            "Colour the lines this query keeps in the filter (later picks win where lines overlap)"
-        };
-        if r.on_hover_text(tip).clicked() {
-            picks.toggle_highlight(id);
-        }
-        let mut name = q.id.clone();
-        if !q.params.is_empty() {
-            name += &format!("({})", q.params.join(", "));
-        }
-        let mut tip = format!("{id}\n\n{}", q.text);
-        if let Some(parent) = pack.parent_of(q) {
-            tip += &format!("\n\nrefines {parent}");
-        }
-        if !q.labels.is_empty() {
-            tip += &format!("\nlabels: {}", q.labels.join(", "));
-        }
-        ui.label(name).on_hover_text(tip);
-        ui.weak(&pack.name);
+        ui.heading("Selection");
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if ui.button("+ New").on_hover_text("Write a new query").clicked() {
+                picks.add_new(Use::Include);
+            }
+        });
     });
+    ui.weak("Order counts: ⠿ drags · − removes · ✎ edits");
+    ui.separator();
+
+    // Bottom part first, so the list gets the space that is left.
+    egui::Panel::bottom("selection-actions").show(ui, |ui| {
+        params_ui(ui, lib, picks);
+        if let Some(e) = &picks.error {
+            ui.colored_label(ui.visuals().error_fg_color, e);
+        }
+        ui.horizontal(|ui| {
+            let any = !picks.nodes.is_empty();
+            if ui
+                .add_enabled(any, egui::Button::new(RichText::new("Apply").strong()))
+                .on_hover_text(
+                    "Put the filter queries into the Filter bar and the search queries into the Search box, and run them",
+                )
+                .clicked()
+            {
+                action = Action::Apply;
+            }
+            if ui.add_enabled(any, egui::Button::new("Clear")).on_hover_text("Remove every query").clicked() {
+                picks.nodes.clear();
+                picks.error = None;
+            }
+        });
+    });
+
+    let mut row_rects: Vec<egui::Rect> = Vec::new();
+    let mut remove = None;
+    let mut save: Option<u64> = None;
+    let mut create_pack = false;
+    // The drop zone fills the pane, so a drop anywhere below the list counts.
+    let pane_height = ui.available_height();
+    let (zone, dropped) = egui::ScrollArea::vertical()
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
+            ui.dnd_drop_zone::<Drag, ()>(egui::Frame::new().inner_margin(2.0), |ui| {
+                ui.set_min_width(ui.available_width());
+                ui.set_min_height(pane_height - 8.0);
+                if picks.nodes.is_empty() {
+                    ui.weak("Drag queries here from the library, press + there, or + New.");
+                }
+                let packs: Vec<String> = lib.packs().iter().map(|p| p.name.clone()).collect();
+                let (save_pack, new_pack) = (&mut picks.save_pack, &mut picks.new_pack);
+                for n in picks.nodes.iter_mut() {
+                    row_rects.push(node_row(ui, n, &mut remove));
+                    if n.open {
+                        match node_editor(ui, n, &packs, save_pack, new_pack) {
+                            Some(EditorAction::Save) => save = Some(n.key),
+                            Some(EditorAction::CreatePack) => create_pack = true,
+                            None => {}
+                        }
+                    }
+                }
+                // Room to drop at the end.
+                ui.allocate_space(egui::vec2(ui.available_width(), 28.0));
+            })
+        })
+        .inner;
+
+    // Where a drop would go: before the first row below the pointer.
+    let pointer = ui.ctx().pointer_interact_pos();
+    let insert_at = pointer.map_or(picks.nodes.len(), |p| row_rects.iter().filter(|r| r.center().y < p.y).count());
+    if zone.response.dnd_hover_payload::<Drag>().is_some() {
+        let y = row_rects.get(insert_at).map_or_else(
+            || row_rects.last().map_or(zone.response.rect.top() + 4.0, |r| r.bottom() + 2.0),
+            |r| r.top() - 2.0,
+        );
+        ui.painter().hline(
+            zone.response.rect.x_range(),
+            y,
+            egui::Stroke::new(2.0, ui.visuals().selection.stroke.color),
+        );
+    }
+    if let Some(d) = dropped {
+        match &*d {
+            Drag::Library(id) => {
+                picks.add(lib, id, Use::Include, Some(insert_at));
+            }
+            Drag::Node(key) => picks.move_node(*key, insert_at),
+        }
+    }
+    if let Some(key) = remove {
+        picks.remove(key);
+    }
+    if let Some(key) = save {
+        save_node(lib, picks, key);
+    }
+    if create_pack {
+        let name = picks.new_pack.trim().to_owned();
+        let res = pack::default_dir()
+            .ok_or_else(|| "no pack folder on this system".to_owned())
+            .and_then(|dir| pack::create_pack_file(&dir, &name).map_err(|e| e.to_string()))
+            .and_then(|path| lib.load(&path).map_err(|e| e.to_string()));
+        match res {
+            Ok(()) => {
+                picks.save_pack = name;
+                picks.new_pack.clear();
+                picks.error = None;
+            }
+            Err(e) => picks.error = Some(e),
+        }
+    }
+    action
 }
 
-/// Fields for the parameters the picked queries need.
+/// One node: handle, role, colour, name, edit and remove. Returns its rect.
+fn node_row(ui: &mut egui::Ui, n: &mut Node, remove: &mut Option<u64>) -> egui::Rect {
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 4.0;
+        ui.dnd_drag_source(ui.scope_id().with(("node-drag", n.key)), Drag::Node(n.key), |ui| {
+            ui.label(RichText::new("⠿").strong());
+        })
+        .response
+        .on_hover_text("Drag to reorder");
+        egui::ComboBox::from_id_salt(("role", n.key)).width(28.0).selected_text(n.role.symbol()).show_ui(ui, |ui| {
+            for u in [Use::Include, Use::Exclude, Use::Search] {
+                ui.selectable_value(&mut n.role, u, u.describe());
+            }
+        });
+        // Swatch: switches the line colour of an included filter query.
+        let color = node_color(n, 0);
+        let (rect, r) = ui.allocate_exact_size(egui::vec2(12.0, 14.0), egui::Sense::click());
+        let sw = egui::Rect::from_center_size(rect.center(), egui::vec2(10.0, 12.0));
+        match n.role {
+            Use::Include if n.lit => {
+                ui.painter().rect_filled(sw, 2.0, color);
+            }
+            Use::Include => {
+                ui.painter().rect_stroke(sw, 2.0, egui::Stroke::new(1.5, color), egui::StrokeKind::Inside);
+            }
+            Use::Search => {
+                ui.painter().rect_filled(sw, 2.0, color.gamma_multiply(0.6));
+            }
+            Use::Exclude => {}
+        }
+        if n.role == Use::Include {
+            let tip = if n.lit {
+                "Its lines are coloured: click to stop"
+            } else {
+                "Colour the lines it keeps (later queries win where lines overlap)"
+            };
+            if r.on_hover_text(tip).clicked() {
+                n.lit = !n.lit;
+            }
+        }
+        let mut name = RichText::new(&n.name);
+        if n.edited {
+            name = name.italics();
+        }
+        let tip = match &n.source {
+            Some(s) if n.edited => format!("edited copy of {s}\n\n{}", n.text),
+            Some(s) => format!("{s}\n\n{}", n.text),
+            None => format!("new query (not in a pack)\n\n{}", n.text),
+        };
+        ui.label(name).on_hover_text(tip);
+        if n.edited {
+            ui.weak("•").on_hover_text("Not saved in a pack");
+        }
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if ui.small_button("−").on_hover_text("Remove from the selection").clicked() {
+                *remove = Some(n.key);
+            }
+            if ui.selectable_label(n.open, "✎").on_hover_text("Edit").clicked() {
+                n.open = !n.open;
+            }
+        });
+    })
+    .response
+    .rect
+}
+
+enum EditorAction {
+    Save,
+    CreatePack,
+}
+
+/// Name and NFD text of a node, its validation, and Save to a pack.
+fn node_editor(
+    ui: &mut egui::Ui,
+    n: &mut Node,
+    packs: &[String],
+    save_pack: &mut String,
+    new_pack: &mut String,
+) -> Option<EditorAction> {
+    let mut action = None;
+    egui::Frame::group(ui.style()).show(ui, |ui| {
+        ui.horizontal(|ui| {
+            ui.label("Name");
+            if ui.add(egui::TextEdit::singleline(&mut n.name).desired_width(f32::INFINITY)).changed() {
+                n.edited = true;
+            }
+        });
+        let r = ui.add(
+            egui::TextEdit::multiline(&mut n.text)
+                .font(egui::TextStyle::Monospace)
+                .desired_rows(2)
+                .desired_width(f32::INFINITY)
+                .hint_text("NFD, e.g. level >= ERROR AND /timeout/   ($name for a parameter)"),
+        );
+        if r.changed() {
+            n.edited = true;
+            n.error = None;
+        }
+        if let Some(p) = n.parent.clone() {
+            ui.horizontal(|ui| {
+                ui.weak(format!("refines {p}"));
+                if ui.small_button("×").on_hover_text("Don't refine it (no parent)").clicked() {
+                    n.parent = None;
+                    n.edited = true;
+                }
+            });
+        }
+        let valid = n.validate();
+        match (&n.error, &valid) {
+            (Some(e), _) | (None, Err(e)) => {
+                ui.colored_label(ui.visuals().error_fg_color, e);
+            }
+            (None, Ok(())) => {
+                ui.weak("✓ valid");
+            }
+        }
+        if save_pack.is_empty()
+            && let Some((p, _)) = n.source.as_deref().and_then(|s| s.split_once('.'))
+        {
+            *save_pack = p.to_owned();
+        }
+        ui.horizontal(|ui| {
+            ui.label("Save to");
+            egui::ComboBox::from_id_salt(("save-pack", n.key))
+                .selected_text(if save_pack.is_empty() { "pack…" } else { save_pack.as_str() })
+                .show_ui(ui, |ui| {
+                    for p in packs {
+                        ui.selectable_value(save_pack, p.clone(), p);
+                    }
+                });
+            let can = valid.is_ok() && packs.contains(save_pack) && !n.name.trim().is_empty();
+            let tip =
+                format!("Write it into the {save_pack} pack file as query '{}' (replaces one with that name)", n.name);
+            if ui.add_enabled(can, egui::Button::new("Save")).on_hover_text(tip).clicked() {
+                action = Some(EditorAction::Save);
+            }
+        });
+        ui.horizontal(|ui| {
+            ui.weak("or a new pack");
+            ui.add(egui::TextEdit::singleline(new_pack).hint_text("name").desired_width(90.0));
+            if ui
+                .add_enabled(!new_pack.trim().is_empty(), egui::Button::new("Create"))
+                .on_hover_text("Create <name>.nerka-pack in the pack folder")
+                .clicked()
+            {
+                action = Some(EditorAction::CreatePack);
+            }
+        });
+    });
+    action
+}
+
+/// Write node `key` into the chosen pack; it then refers to that query.
+fn save_node(lib: &mut Library, picks: &mut Picks, key: u64) {
+    let pack_name = picks.save_pack.clone();
+    let Some(n) = picks.node_mut(key) else { return };
+    let name = n.name.trim().to_owned();
+    let mut q = n.as_query(&name);
+    // A parent in the same pack is written without the pack name.
+    if let Some(short) = q.parent.as_deref().and_then(|p| p.strip_prefix(&format!("{pack_name}."))) {
+        q.parent = Some(short.to_owned());
+    }
+    match lib.save_query(&pack_name, &q) {
+        Ok(()) => {
+            n.source = Some(format!("{pack_name}.{name}"));
+            n.name = name;
+            n.edited = false;
+            n.error = None;
+            n.open = false;
+        }
+        Err(e) => n.error = Some(e.to_string()),
+    }
+}
+
+/// Fields for the parameters the selected queries need.
 fn params_ui(ui: &mut egui::Ui, lib: &Library, picks: &mut Picks) {
-    let ids = picks.filter.iter().map(|(q, _)| q.as_str()).chain(picks.search.iter().map(String::as_str));
-    let names = lib.params_needed(ids);
+    let names = picks.params_needed(lib);
     if names.is_empty() {
         return;
     }
@@ -377,6 +819,101 @@ fn params_ui(ui: &mut egui::Ui, lib: &Library, picks: &mut Picks) {
 mod tests {
     use super::*;
 
+    fn lib() -> Library {
+        let mut lib = Library::new();
+        let text = "pack v\nquery scope(ecu)\n  ecu == $ecu\nquery drops  parent: scope  color: violet\n  /drop/\nquery slow\n  /slow/\n";
+        lib.add(parse_pack("v.nerka-pack", text).unwrap()).unwrap();
+        lib
+    }
+
+    /// One frame: the library on the right, the selection in the centre.
+    fn frame(ctx: &egui::Context, t: f64, events: Vec<egui::Event>, lib: &mut Library, picks: &mut Picks) {
+        let screen = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(1000.0, 600.0));
+        let input = egui::RawInput { screen_rect: Some(screen), time: Some(t), events, ..Default::default() };
+        let mut out = ctx.run_ui(input, |ui| {
+            egui::Panel::right("library").exact_size(300.0).show(ui, |ui| {
+                library_panel(ui, &lib.clone(), &[], picks, &mut LibraryView::default());
+            });
+            egui::CentralPanel::default().show(ui, |ui| {
+                selection_panel(ui, lib, picks);
+            });
+        });
+        out.textures_delta.clear();
+    }
+
+    fn button(pos: egui::Pos2, pressed: bool) -> egui::Event {
+        egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        }
+    }
+
+    #[test]
+    fn drag_from_the_library_into_the_selection_and_reorder() {
+        let ctx = egui::Context::default();
+        let (mut lib, mut picks) = (lib(), Picks::default());
+        let mut t = 0.0;
+        let mut step = |events, lib: &mut Library, picks: &mut Picks| {
+            t += 1.0 / 60.0;
+            frame(&ctx, t, events, lib, picks);
+        };
+        let drag = |from: egui::Pos2, to: egui::Pos2| {
+            [
+                vec![egui::Event::PointerMoved(from), button(from, true)],
+                vec![egui::Event::PointerMoved(from + egui::vec2(12.0, 0.0))],
+                vec![egui::Event::PointerMoved(to)],
+                vec![egui::Event::PointerMoved(to)],
+                vec![button(to, false)],
+                vec![],
+            ]
+        };
+        step(vec![], &mut lib, &mut picks);
+        // Find a library query's name by probing down the library pane: a
+        // press and a small move there starts a drag.
+        let mut found = None;
+        for y in (40..400).step_by(3) {
+            let p = egui::pos2(790.0, y as f32);
+            step(vec![egui::Event::PointerMoved(p), button(p, true)], &mut lib, &mut picks);
+            step(vec![egui::Event::PointerMoved(p + egui::vec2(12.0, 0.0))], &mut lib, &mut picks);
+            let dragging = egui::DragAndDrop::has_any_payload(&ctx);
+            step(vec![button(p, false)], &mut lib, &mut picks);
+            step(vec![], &mut lib, &mut picks);
+            if dragging {
+                found = Some(p);
+                break;
+            }
+        }
+        let from = found.expect("a draggable library query");
+        assert!(picks.nodes.is_empty(), "releasing in the library adds nothing");
+        // Drop it into the selection, twice in two roles' worth: the second
+        // drop of the same query in the same role is ignored.
+        for events in drag(from, egui::pos2(300.0, 150.0)) {
+            step(events, &mut lib, &mut picks);
+        }
+        assert_eq!(picks.nodes.len(), 1, "dropped into the selection");
+        let first = picks.nodes[0].name.clone();
+        // Add another with its + button path (the API), then drag the
+        // second node above the first by its handle.
+        let other = if first == "slow" { "v.drops" } else { "v.slow" };
+        picks.add(&lib, other, Use::Include, None);
+        step(vec![], &mut lib, &mut picks);
+        let mut moved = false;
+        for y in (60..300).step_by(3) {
+            let p = egui::pos2(12.0, y as f32);
+            for events in drag(p, egui::pos2(12.0, 70.0)) {
+                step(events, &mut lib, &mut picks);
+            }
+            if picks.nodes[0].name != first {
+                moved = true;
+                break;
+            }
+        }
+        assert!(moved, "the second node was dragged above the first");
+        assert_eq!(picks.nodes.len(), 2);
+    }
+
     #[test]
     fn colours() {
         assert_eq!(parse_color("#ff8000"), Some(Color32::from_rgb(255, 128, 0)));
@@ -386,27 +923,94 @@ mod tests {
     }
 
     #[test]
-    fn picks_keep_order_and_cycle() {
+    fn order_add_move_remove() {
+        let lib = lib();
         let mut p = Picks::default();
-        p.set_filter("a.x", Some(Use::Include));
-        p.set_filter("a.y", Some(Use::Exclude));
-        p.set_filter("a.z", Some(Use::Include));
-        p.set_filter("a.x", Some(Use::Exclude));
-        let s = p.filter_selection();
-        assert_eq!(s.include, [Pick::Query("a.z".into())]);
-        assert_eq!(s.exclude, [Pick::Query("a.x".into()), Pick::Query("a.y".into())]);
-        p.set_filter("a.y", None);
-        assert_eq!(p.filter.len(), 2);
-        p.set_search("a.y", true);
-        p.set_search("a.y", true);
-        assert_eq!(p.search_selection().include.len(), 1);
-        p.params.insert("cam".into(), ("c(1)".into(), false));
-        assert_eq!(p.params()["cam"], ParamValue::literal("c(1)"));
-        assert_eq!(p.include_index("a.z"), Some(0));
-        assert_eq!(p.include_index("a.x"), None);
-        p.toggle_highlight("a.z");
-        assert!(p.is_highlighted("a.z"));
-        p.toggle_highlight("a.z");
-        assert!(!p.is_highlighted("a.z"));
+        assert!(p.add(&lib, "v.drops", Use::Include, None));
+        assert!(p.add(&lib, "v.slow", Use::Include, None));
+        assert!(!p.add(&lib, "v.slow", Use::Include, None), "not twice in one role");
+        assert!(p.add(&lib, "v.slow", Use::Search, Some(0)));
+        assert!(!p.add(&lib, "v.nope", Use::Include, None));
+        let names = |p: &Picks| p.nodes.iter().map(|n| (n.name.clone(), n.role)).collect::<Vec<_>>();
+        assert_eq!(names(&p)[0], ("slow".into(), Use::Search));
+        let first = p.nodes[0].key;
+        p.move_node(first, 3);
+        assert_eq!(names(&p)[2], ("slow".into(), Use::Search));
+        p.move_node(first, 0);
+        assert_eq!(p.nodes[0].key, first);
+        p.remove(first);
+        assert_eq!(p.nodes.len(), 2);
+    }
+
+    #[test]
+    fn expansion_follows_the_order_and_local_nodes_expand_too() {
+        let lib = lib();
+        let mut p = Picks::default();
+        p.add(&lib, "v.slow", Use::Include, None);
+        p.add(&lib, "v.drops", Use::Include, None);
+        p.params.insert("ecu".into(), ("E1".into(), false));
+        let a = p.expand(&lib, false).unwrap();
+        assert_eq!(a.exp.nfd, r#"(/slow/) OR (ecu == "E1") AND (/drop/)"#);
+        assert_eq!(a.names, ["slow", "drops"]);
+        assert_eq!(a.colors, [palette(0), parse_color("violet").unwrap()]);
+        // Reordered: the expansion follows.
+        let k = p.nodes[1].key;
+        p.move_node(k, 0);
+        assert_eq!(p.expand(&lib, false).unwrap().exp.nfd, r#"(ecu == "E1") AND (/drop/) OR (/slow/)"#);
+
+        // An edited library node and a new one, excluded and searched.
+        p.nodes[0].text = "/dropped $what/".into();
+        p.nodes[0].edited = true;
+        let new = p.add_new(Use::Exclude);
+        p.node_mut(new).unwrap().text = "level <= DEBUG".into();
+        let s = p.add_new(Use::Search);
+        p.node_mut(s).unwrap().text = "/timeout/".into();
+        p.params.insert("what".into(), ("a.b".into(), false));
+        let a = p.expand(&lib, false).unwrap();
+        assert_eq!(a.exp.nfd, r#"((ecu == "E1") AND (/dropped a\.b/) OR (/slow/)) AND NOT (level <= DEBUG)"#);
+        assert_eq!(a.keys.len(), 3);
+        assert_eq!(p.expand(&lib, true).unwrap().exp.nfd, "(/timeout/)");
+        assert_eq!(p.params_needed(&lib), ["ecu", "what"]);
+
+        // Invalid local text is reported with the node's name.
+        p.node_mut(s).unwrap().text = "level >= LOUD".into();
+        let e = p.expand(&lib, true).unwrap_err();
+        assert!(e.contains("unknown level"), "{e}");
+    }
+
+    #[test]
+    fn saving_a_node_writes_the_pack_and_refreshing_follows_the_library() {
+        let dir = std::env::temp_dir().join(format!("nerka-gui-save-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("v.nerka-pack");
+        std::fs::write(&file, "pack v\n\nquery slow\n  /slow/\n").unwrap();
+        let mut lib = Library::new();
+        lib.load(&file).unwrap();
+        let mut p = Picks::default();
+        let k = p.add_new(Use::Include);
+        let n = p.node_mut(k).unwrap();
+        n.name = "fast".into();
+        n.text = "/fast $x/".into();
+        p.save_pack = "v".into();
+        save_node(&mut lib, &mut p, k);
+        let n = &p.nodes[0];
+        assert_eq!((n.source.as_deref(), n.edited, n.error.as_deref()), (Some("v.fast"), false, None));
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap(),
+            "pack v\n\nquery slow\n  /slow/\n\nquery fast(x)\n    /fast $x/\n"
+        );
+        // The library changes; an unedited node follows, an edited one doesn't.
+        p.add(&lib, "v.slow", Use::Include, None);
+        p.nodes[1].text = "/mine/".into();
+        p.nodes[1].edited = true;
+        std::fs::write(&file, "pack v\nquery fast\n  /quick/\n").unwrap();
+        let mut lib = Library::new();
+        lib.load(&file).unwrap();
+        p.refresh(&lib);
+        assert_eq!(p.nodes[0].text, "/quick/");
+        assert_eq!(p.nodes[1].text, "/mine/");
+        // v.slow is gone: the edited node stays, as a local query.
+        assert_eq!(p.nodes[1].source, None);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }
