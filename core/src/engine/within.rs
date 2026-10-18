@@ -175,7 +175,9 @@ fn by_scan(source: &dyn LogSource, within: &[LineNo], set: &SearchSet, progress:
 fn intersect<'a>(a: &'a [LineNo], b: &'a [LineNo]) -> impl Iterator<Item = LineNo> + 'a {
     let mut j = 0;
     a.iter().copied().filter(move |&l| {
-        j += b[j..].partition_point(|&x| x < l);
+        while b.get(j).is_some_and(|&x| x < l) {
+            j += 1;
+        }
         b.get(j) == Some(&l)
     })
 }

@@ -54,6 +54,20 @@ pub enum Error {
 
 pub type Result<T> = std::result::Result<T, Error>;
 
+/// Per-user config directory for nerka (`%APPDATA%\nerka`, or
+/// `$XDG_CONFIG_HOME/nerka`, `~/.config/nerka`), if one can be determined.
+pub fn config_dir() -> Option<std::path::PathBuf> {
+    use std::path::PathBuf;
+    let base = if cfg!(windows) {
+        std::env::var_os("APPDATA").map(PathBuf::from)
+    } else {
+        std::env::var_os("XDG_CONFIG_HOME")
+            .map(PathBuf::from)
+            .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))
+    };
+    base.map(|b| b.join("nerka"))
+}
+
 /// Shared progress / cancellation handle for long operations
 /// (indexing, searching). Cheap to clone, safe to poll from a UI thread.
 #[derive(Debug, Clone, Default)]

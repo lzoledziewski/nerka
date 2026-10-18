@@ -16,6 +16,8 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all
 cargo run -p nerka-cli -- filter 'level >= ERROR AND raw ~ /SSL/' app.log
 cargo run -p nerka-gui -- app.log --query 'level >= ERROR'
+cargo run -p nerka-cli -- --pack packs/ expand -l ota -p cam=CAM1 --parts   # pack picks -> NFD
+cargo run -p nerka-cli -- --pack packs/ search --in 'level >= WARN' -l ota app.log
 cargo run --release -p nerka-core --example gen_log -- big.log 1024   # 1 GiB test log
 cargo run --release -p nerka-cli -- search -c --stats ERROR big.log  # benchmark
 cargo run --release -p nerka-core --example gen_dlt -- big.dlt 1024   # 1 GiB DLT test file

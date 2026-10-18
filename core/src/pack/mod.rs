@@ -51,6 +51,11 @@ pub use parser::parse_pack;
 /// File extension of pack files when a directory is loaded.
 pub const PACK_EXTENSION: &str = "nerka-pack";
 
+/// The per-user pack directory (`<config dir>/packs`).
+pub fn default_dir() -> Option<PathBuf> {
+    crate::config_dir().map(|d| d.join("packs"))
+}
+
 /// One query of a pack.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PackQuery {
