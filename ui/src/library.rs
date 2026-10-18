@@ -689,8 +689,8 @@ fn tree_ui(
     });
 }
 
-/// One library query: `+`, `🔍`, `⋮` (edit, refine, exclude), colour, name
-/// (drag it into the selection), pack.
+/// One library query: `+`, `🔍`, colour, name (drag it into the
+/// selection), pack, and `⋮` (edit, refine, exclude) at the right.
 fn query_row(
     ui: &mut egui::Ui,
     lib: &Library,
@@ -706,27 +706,6 @@ fn query_row(
         picks.add(lib, id, Use::Include, None);
     }
     search_menu(ui, Target::Library(id.to_owned()), action);
-    ui.menu_button("⋮", |ui| {
-        if ui.button("Edit…").on_hover_text("Edit this query in its pack").clicked() {
-            *edit = Some(EditRequest { pack: pack.name.clone(), old: Some(q.id.clone()), parent: None });
-            ui.close();
-        }
-        if ui
-            .button("New query refining this…")
-            .on_hover_text("Its meaning will be this query AND the new text")
-            .clicked()
-        {
-            *edit = Some(EditRequest { pack: pack.name.clone(), old: None, parent: Some(id.to_owned()) });
-            ui.close();
-        }
-        ui.separator();
-        if ui.button("Exclude from the filter").on_hover_text("Add to the selection as − (AND NOT)").clicked() {
-            picks.add(lib, id, Use::Exclude, None);
-            ui.close();
-        }
-    })
-    .response
-    .on_hover_text("Edit, refine, exclude");
     let color = q.color.as_deref().and_then(parse_color);
     let (rect, _) = ui.allocate_exact_size(egui::vec2(8.0, 12.0), egui::Sense::hover());
     if let Some(c) = color {
@@ -764,6 +743,30 @@ fn query_row(
             .on_hover_text(format!("refines {p} (not in this group)"));
     }
     ui.weak(&pack.name);
+    // At the right end of the row.
+    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+        ui.menu_button("⋮", |ui| {
+            if ui.button("Edit…").on_hover_text("Edit this query in its pack").clicked() {
+                *edit = Some(EditRequest { pack: pack.name.clone(), old: Some(q.id.clone()), parent: None });
+                ui.close();
+            }
+            if ui
+                .button("New query refining this…")
+                .on_hover_text("Its meaning will be this query AND the new text")
+                .clicked()
+            {
+                *edit = Some(EditRequest { pack: pack.name.clone(), old: None, parent: Some(id.to_owned()) });
+                ui.close();
+            }
+            ui.separator();
+            if ui.button("Exclude from the filter").on_hover_text("Add to the selection as − (AND NOT)").clicked() {
+                picks.add(lib, id, Use::Exclude, None);
+                ui.close();
+            }
+        })
+        .response
+        .on_hover_text("Edit, refine, exclude");
+    });
 }
 
 enum EditOutcome {
