@@ -108,14 +108,14 @@ Steps 1–4 are built (core + CLI, no new dependency); step 5 (GUI) is not start
 - CLI: `--pack <dir|file>` (global, repeatable; the per-user directory is loaded too), `nerka packs`, `nerka expand -q ID -l LABEL -x ID -X LABEL -p NAME=VALUE --raw-param NAME=VALUE [--parts]`, `nerka search --in FILTER PATTERN FILE` and `nerka search [--in FILTER] -q/-l … FILE` (prints `line:[queries] text`; `-c` adds hits per query). Filtering by picks goes through `nerka filter "$(nerka expand …)"`.
 - 1 GiB text log: `search ERROR`, `level >= ERROR` and `level >= WARN AND raw ~ /timeout/` unchanged (~32 ms); `search --in 'level >= WARN' timeout` 36 ms filter + 57 ms search.
 
-Choices made while building (not in the decisions above; confirm or change):
+Choices made while building (not in the decisions above). Owner's answers, 2026-10-18, in italics:
 
-1. A parameter used as a bare value becomes a string (`ecu == "SOCB"`), so it can't stand for a field name or inject operators.
-2. Raw parameter values only differ from escaped ones inside regexes.
-3. Picking only excludes means "every line except these".
-4. Picking a label includes the labels below it (`system` → `system/vision`).
-5. A child's parent may live in another pack (`parent: vision.cam_scope`); a missing parent is an expansion error, not a load error.
-6. The CLI puts `-q` picks before `-l` picks (clap loses the order between the two options); without `--in`, a pick search runs over every line.
+1. A parameter used as a bare value becomes a string (`ecu == "SOCB"`), so it can't stand for a field name or inject operators. _Open: should a parameter be able to carry an operator?_
+2. Raw parameter values only differ from escaped ones inside regexes. _Open: owner asked for an explanation._
+3. Picking only excludes means "every line except these". _Confirmed._
+4. Picking a label includes the labels below it (`system` → `system/vision`). _OK for now._
+5. A child's parent may live in another pack (`parent: vision.cam_scope`); a missing parent is an expansion error, not a load error. _Doubts, but try it._
+6. The CLI puts `-q` picks before `-l` picks (clap loses the order between the two options); without `--in`, a pick search runs over every line. _Not evaluated: the CLI isn't a focus now._
 
 ## Open questions
 
