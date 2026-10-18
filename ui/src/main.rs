@@ -186,6 +186,8 @@ struct Tab {
     search: SearchBox,
 
     bookmarks: Bookmarks,
+    /// Bookmarks whose line is unfolded in the panel.
+    marks_open: std::collections::HashSet<LineNo>,
     status: String,
 }
 
@@ -266,6 +268,7 @@ impl Tab {
             colors_job: None,
             search: SearchBox::default(),
             bookmarks: Bookmarks::default(),
+            marks_open: Default::default(),
             status: String::new(),
         }
     }
@@ -744,21 +747,38 @@ impl Tab {
         let mut jump = None;
         let mut edits: Vec<(LineNo, String)> = Vec::new();
         let mut remove = None;
+        let mut fold = None;
         egui::ScrollArea::vertical().show(ui, |ui| {
             for (line, note) in self.bookmarks.iter() {
+                let open = self.marks_open.contains(&line);
                 ui.horizontal(|ui| {
-                    if ui.link(format!("{}", line + 1)).clicked() {
+                    if ui.link(format!("{}", line + 1)).on_hover_text("Go to the line").clicked() {
                         jump = Some(line);
                     }
-                    let preview: String = file
-                        .line_text(line)
-                        .unwrap_or_default()
-                        .chars()
-                        .map(|c| if c == '\t' { ' ' } else { c })
-                        .take(48)
-                        .collect();
-                    ui.add(egui::Label::new(egui::RichText::new(preview).monospace().weak()).truncate());
+                    let tip = if open { "Fold the line" } else { "Show the whole line" };
+                    if ui.small_button(if open { "▾" } else { "▸" }).on_hover_text(tip).clicked() {
+                        fold = Some(line);
+                    }
                 });
+                // The line wrapped to two rows ("…" if longer); unfolded, all
+                // of it. Wrapping uses the width the panel has, so it never
+                // makes the panel grow.
+                let text = bookmark_text(&file.line_text(line).unwrap_or_default());
+                let font = egui::FontId::monospace(11.5);
+                let mut job = egui::text::LayoutJob::single_section(
+                    text,
+                    egui::TextFormat { font_id: font, color: ui.visuals().weak_text_color(), ..Default::default() },
+                );
+                job.wrap = egui::text::TextWrapping {
+                    max_width: ui.available_width(),
+                    max_rows: if open { usize::MAX } else { BOOKMARK_ROWS },
+                    break_anywhere: true,
+                    overflow_character: Some('…'),
+                };
+                let r = ui.add(egui::Label::new(job).sense(egui::Sense::click()));
+                if r.on_hover_text(if open { "Click to fold" } else { "Click to show the whole line" }).clicked() {
+                    fold = Some(line);
+                }
                 // Right-to-left so the note field takes exactly the width left
                 // after the button. A guessed width overshoots by the item
                 // spacing, and a resizable panel grows to fit its content
@@ -779,6 +799,11 @@ impl Tab {
                 ui.add_space(4.0);
             }
         });
+        if let Some(l) = fold
+            && !self.marks_open.remove(&l)
+        {
+            self.marks_open.insert(l);
+        }
         let changed = !edits.is_empty() || remove.is_some();
         for (l, t) in edits {
             self.bookmarks.set_note(l, t);
@@ -984,6 +1009,21 @@ impl Tab {
         );
         self.view_output(&out, line_of_row);
     }
+}
+
+/// Rows of a bookmark's line shown while it is folded.
+const BOOKMARK_ROWS: usize = 2;
+/// Characters of a bookmark's line shown at most (unfolded).
+const BOOKMARK_CHARS: usize = 2000;
+
+/// A bookmarked line for the panel: tabs (DLT columns) as spaces, cut at
+/// [`BOOKMARK_CHARS`].
+fn bookmark_text(line: &str) -> String {
+    let mut s: String = line.chars().take(BOOKMARK_CHARS).map(|c| if c == '\t' { ' ' } else { c }).collect();
+    if line.chars().nth(BOOKMARK_CHARS).is_some() {
+        s.push('…');
+    }
+    s
 }
 
 /// `pack.query` -> `query`.
@@ -1635,6 +1675,15 @@ query timeouts  labels: vision
     fn hits(tab: &Tab) -> Vec<(LineNo, Vec<&str>)> {
         let (a, h) = tab.search.hits.as_ref().expect("search hits");
         (0..h.len()).map(|i| (h.lines[i], h.matched(i).map(|q| short(&a.names[q])).collect())).collect()
+    }
+
+    #[test]
+    fn bookmark_text_keeps_the_whole_line() {
+        assert_eq!(bookmark_text("10:00:01\tECU1\tconnection lost"), "10:00:01 ECU1 connection lost");
+        let long = "x".repeat(BOOKMARK_CHARS + 5);
+        let t = bookmark_text(&long);
+        assert_eq!(t.chars().count(), BOOKMARK_CHARS + 1);
+        assert!(t.ends_with('…'));
     }
 
     #[test]
