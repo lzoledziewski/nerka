@@ -1,0 +1,83 @@
+# Release builds for Linux and Windows.
+#
+# Push a tag like v0.1.0-alpha.1 to build both and publish them as a
+# GitHub pre-release (tags with a '-' suffix are marked pre-release).
+# Run it by hand (Actions tab, "Run workflow") to only build: the archives
+# are kept as workflow artifacts, nothing is published.
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # 22.04 so the binaries run on older distributions too (glibc 2.35).
+          - name: linux-x86_64
+            os: ubuntu-22.04
+          - name: windows-x86_64
+            os: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Linux GUI build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config libxkbcommon-dev libwayland-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libgl1-mesa-dev
+      - uses: Swatinem/rust-cache@v2
+      - name: Test
+        run: cargo test --workspace --release
+      - name: Build
+        run: cargo build --release --workspace
+      - name: Package (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          ref="${GITHUB_REF_NAME//\//-}"
+          dir="nerka-${ref}-${{ matrix.name }}"
+          mkdir "$dir"
+          cp target/release/nerka target/release/nerka-gui README.md "$dir/"
+          tar czf "$dir.tar.gz" "$dir"
+          echo "ASSET=$dir.tar.gz" >> "$GITHUB_ENV"
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ref = $env:GITHUB_REF_NAME -replace '/', '-'
+          $dir = "nerka-$ref-${{ matrix.name }}"
+          New-Item -ItemType Directory $dir | Out-Null
+          Copy-Item target/release/nerka.exe, target/release/nerka-gui.exe, README.md $dir
+          Compress-Archive -Path $dir -DestinationPath "$dir.zip"
+          "ASSET=$dir.zip" | Out-File -FilePath $env:GITHUB_ENV -Append
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.name }}
+          path: ${{ env.ASSET }}
+
+  publish:
+    name: GitHub pre-release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          generate_release_notes: true

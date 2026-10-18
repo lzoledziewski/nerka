@@ -9,7 +9,7 @@ _Last update: 2026-10-18 (search manager POC built on branch `claude/search-mana
 - Builds and runs on **Windows** (MSVC, debug and release). Clippy `-D warnings`, fmt and all tests pass (63 core, 15 GUI). The 1 GiB benchmarks have been run on Windows (numbers below and in the commit messages).
 - Committed on `main`, **not pushed** since `5b632c3` (don't push until the owner says so).
 - Only built for Windows so far. Linux/macOS builds and releases are open questions (see "Decisions pending").
-- `.github/workflows/ci.yml` and `.vscode/extensions.json` are still **not on disk**; their contents are in the appendix below.
+- **CI and releases (owner, 2026-10-18):** `.github/workflows/ci.yml` runs fmt, clippy and the tests on Linux and Windows for pushes to `main` and every PR (macOS left out: its runner minutes count 10x on a private repo). `release.yml` builds `nerka` + `nerka-gui` for Linux (Ubuntu 22.04, glibc 2.35+, `.tar.gz`) and Windows (`.zip`) on a `v*` tag and publishes them as a GitHub pre-release (tags with `-`, e.g. `v0.1.0-alpha.1`); run by hand it only builds artifacts. Version is `0.1.0-alpha.1`. `.vscode/extensions.json` is still not on disk (appendix).
 
 ## GUI as of now (`ui/`)
 
@@ -38,7 +38,7 @@ Owner feedback is driving this; these are deliberate choices, keep them:
 
 1. Owner tries the DLT table on real use; settle the open DLT questions below.
 2. **Search manager** POC: all five steps are built; the owner tries it and answers the GUI choices 7–12 in `search-manager.md` → "POC status".
-3. Recreate the two config files from the appendix (ask before adding CI).
+3. First alpha: after the search-manager PR is merged, tag `v0.1.0-alpha.1` on `main` and push the tag (owner's go-ahead) — `release.yml` publishes the pre-release.
 
 Text-log benchmark on Windows (1 GiB, 12M lines, release): index ~90 ms, `search ERROR` ~30 ms, `level >= ERROR` ~31 ms, `level >= WARN AND raw ~ /timeout/` ~30 ms, `search -v ERROR` ~100 ms.
 
@@ -107,7 +107,7 @@ Don't settle these silently: ask.
 2. **Level detection:** only upper-case tokens (`ERROR`, `[WARN]`, `level=INFO`) in the first 160 bytes are recognised. This needs real log samples from the owner.
 3. **Bookmark storage:** currently a sidecar `<log>.nerka-marks` next to the log. The alternative is a central app-data folder when the log's directory is read-only.
 4. **DLT column widths:** resizable per tab but not saved. Save them (globally or per file)?
-5. **Releases / downloads:** not set up. Options discussed: `gh release create` by hand, or a `.github/workflows/release.yml` that builds Windows/Linux/macOS on a `v*` tag and attaches zips (`softprops/action-gh-release`). Needs pushing, and adds the first CI file (ask first). Unsigned macOS binaries will warn; the `.exe` icon needs an unapproved build dependency.
+5. **Releases / downloads:** `release.yml` (Linux + Windows pre-releases on `v*` tags) is in place; open: macOS builds (unsigned binaries warn; 10x runner minutes), the `.exe` icon (needs an unapproved build dependency), and licence files in the archives.
 6. **Linux builds from this Windows PC:** no WSL, Docker or zig installed. Options: cross-compile with `cargo zigbuild --target x86_64-unknown-linux-gnu.2.17` (user-level installs; build only, untested), WSL (can also run the GUI), or GitHub Actions. `Cargo.lock` has no GTK (the file dialog uses D-Bus via `zbus`), so a cross build is expected to link; not verified.
 7. **Licence files:** add `LICENSE-MIT` and `LICENSE-APACHE`, and with which copyright line?
 
@@ -120,53 +120,6 @@ Don't settle these silently: ask.
 - DLT: only files with storage headers; no FIBEX (non-verbose payloads stay hex); arrays/structs/fixed-point arguments shown as hex; time in UTC only; the message index is built single-threaded (~280 ms per GiB).
 
 ## Appendix: files to recreate
-
-### `.github/workflows/ci.yml`
-
-```yaml
-name: CI
-
-on:
-  push:
-    branches: [main]
-  pull_request:
-
-env:
-  CARGO_TERM_COLOR: always
-
-jobs:
-  check:
-    name: ${{ matrix.os }}
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [windows-latest, ubuntu-latest, macos-latest]
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
-      - name: Format
-        run: cargo fmt --all --check
-      - name: Clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
-      - name: Test
-        run: cargo test --workspace
-      - name: Build release
-        run: cargo build --release --workspace
-      - name: Upload binaries
-        uses: actions/upload-artifact@v4
-        with:
-          name: nerka-${{ matrix.os }}
-          path: |
-            target/release/nerka
-            target/release/nerka-gui
-            target/release/nerka.exe
-            target/release/nerka-gui.exe
-          if-no-files-found: ignore
-```
 
 ### `.vscode/extensions.json`
 

@@ -25,6 +25,9 @@ cargo run --release -p nerka-cli -- filter -c --stats 'apid == NAV AND level >= 
 powershell -ExecutionPolicy Bypass -File tools/screenshot.ps1 -Out shot.png -AppArgs app.log  # GUI screenshot (Windows)
 ```
 
+CI (`.github/workflows/ci.yml`) runs fmt, clippy and tests on Linux and Windows; `release.yml`
+builds Linux/Windows archives and publishes a pre-release on a `v*` tag.
+
 `doc/status.md` records the current state and the owner's GUI decisions; read it
 before changing the UI, and update it when the state changes.
 
