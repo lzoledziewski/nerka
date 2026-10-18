@@ -2,11 +2,11 @@
 
 Snapshot of where the project stands. Update this file whenever the state changes.
 
-_Last update: 2026-10-18 (search manager POC steps 1–4 built on branch `claude/search-manager-poc-d451e1`: core + CLI; GUI step next)._
+_Last update: 2026-10-18 (search manager POC built on branch `claude/search-manager-poc-d451e1`: core, CLI and GUI; owner to try it)._
 
 ## State
 
-- Builds and runs on **Windows** (MSVC, debug and release). Clippy `-D warnings`, fmt and all tests pass (62 core, 11 GUI). The 1 GiB benchmarks have been run on Windows (numbers below and in the commit messages).
+- Builds and runs on **Windows** (MSVC, debug and release). Clippy `-D warnings`, fmt and all tests pass (63 core, 15 GUI). The 1 GiB benchmarks have been run on Windows (numbers below and in the commit messages).
 - Committed on `main`, **not pushed** since `5b632c3` (don't push until the owner says so).
 - Only built for Windows so far. Linux/macOS builds and releases are open questions (see "Decisions pending").
 - `.github/workflows/ci.yml` and `.vscode/extensions.json` are still **not on disk**; their contents are in the appendix below.
@@ -25,6 +25,7 @@ Owner feedback is driving this; these are deliberate choices, keep them:
 - **Scrolling:** the views read raw mouse-wheel events (3 rows per notch), not egui's smoothed delta; the smoothing made text look smeared. Rows and text origins snap to physical pixels. A headless test (`view::tests::wheel_scrolls_hovered_view_by_whole_lines`) runs the app's panel layout and injects wheel events. Use that pattern for other GUI input tests.
 - **Icon:** a kidney ("nerka") with messy log lines going in and clean lines coming out, drawn in code (`ui/src/icon.rs`). It shows on the window and taskbar only; the `.exe` file icon is still the default, because embedding it needs a build dependency the owner hasn't approved.
 - **About:** an "ℹ About" button at the right of the toolbar (or F1) opens a modal with the icon, version, author (© 2026 Łukasz Żołędziewski, email as a mailto link), licence and repository link. All of these come from `Cargo.toml` (`env!`), so keep `authors` / `repository` `.workspace = true` in each crate.
+- **Search manager (POC):** a 📚 Library panel (Ctrl+Shift+L) with the queries of the packs; picks expand into the Filter box or into the new **Search box** under it, which searches only inside the filter result and colours hits per query (n / N jump between search hits). Details and the choices still to confirm: `search-manager.md` → "POC status".
 - **Bookmarks:** these work (`m`, `b` / `B`, notes in the side panel, `<log>.nerka-marks` sidecar), but the owner wasn't sure about them yet. Hovering the 🔖 button explains them. Ask before investing more in them.
 
 ## Checking the GUI visually
@@ -34,7 +35,7 @@ Owner feedback is driving this; these are deliberate choices, keep them:
 ## Next steps
 
 1. Owner tries the DLT table on real use; settle the open DLT questions below.
-2. **Search manager** POC: steps 1–4 (core packs, expansion, search within the filter, CLI) are built; step 5 (GUI) is next. See `search-manager.md` → "POC status".
+2. **Search manager** POC: all five steps are built; the owner tries it and answers the GUI choices 7–12 in `search-manager.md` → "POC status".
 3. Recreate the two config files from the appendix (ask before adding CI).
 
 Text-log benchmark on Windows (1 GiB, 12M lines, release): index ~90 ms, `search ERROR` ~30 ms, `level >= ERROR` ~31 ms, `level >= WARN AND raw ~ /timeout/` ~30 ms, `search -v ERROR` ~100 ms.
@@ -79,7 +80,7 @@ Open with the owner: save column widths? Sorting stays out (decided). Next after
 - The plugin interface is also the licensing boundary: keep it stable and documented.
 - **Missing:** `LICENSE-MIT` and `LICENSE-APACHE` files in the repo root (a dual licence normally ships both).
 
-## Search manager (POC: core and CLI built, GUI next)
+## Search manager (POC built: core, CLI, GUI)
 
 Design agreed with the owner on 2026-10-18 after mockups: **`search-manager.md`** (decisions, model, POC scope, open questions). In short:
 

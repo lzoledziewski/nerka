@@ -157,6 +157,27 @@ impl Library {
         self.add(parse_pack(&path.display().to_string(), &text)?)
     }
 
+    /// Like [`load`](Self::load), but a bad file doesn't stop the others in
+    /// a directory: every pack that parses is added, and the errors are
+    /// returned.
+    pub fn load_lenient(&mut self, path: &Path) -> Vec<PackError> {
+        if !path.is_dir() {
+            return self.load(path).err().into_iter().collect();
+        }
+        let files = match std::fs::read_dir(path) {
+            Ok(rd) => {
+                let mut v: Vec<PathBuf> = rd
+                    .filter_map(|e| e.ok().map(|e| e.path()))
+                    .filter(|p| p.is_file() && p.extension().is_some_and(|x| x == PACK_EXTENSION))
+                    .collect();
+                v.sort();
+                v
+            }
+            Err(e) => return vec![PackError { file: path.display().to_string(), pos: None, msg: e.to_string() }],
+        };
+        files.iter().filter_map(|f| self.load(f).err()).collect()
+    }
+
     /// The pack and query for a qualified id (`pack.query`).
     pub fn get(&self, qualified: &str) -> Option<(&Pack, &PackQuery)> {
         let (pack, id) = qualified.split_once('.')?;

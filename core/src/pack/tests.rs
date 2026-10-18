@@ -163,5 +163,11 @@ fn library_loads_files_and_dirs() {
         "{e}"
     );
     assert!(Library::new().load(&dir.join("missing.nerka-pack")).unwrap_err().pos.is_none());
+    // Lenient loading keeps the good packs and lists the bad ones.
+    let mut lenient = Library::new();
+    let errs = lenient.load_lenient(&dir);
+    assert_eq!(errs.len(), 1, "{errs:?}");
+    assert!(errs[0].file.ends_with("c.nerka-pack"));
+    assert_eq!(lenient.packs().len(), 2);
     std::fs::remove_dir_all(&dir).unwrap();
 }

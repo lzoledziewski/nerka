@@ -194,6 +194,25 @@ pub fn expand(sel: &Selection, lib: &Library, params: &Params) -> Result<Expansi
     Ok(Expansion { nfd, parts })
 }
 
+impl Library {
+    /// Parameter names the queries need, their parent chains included, in
+    /// first-use order. Unknown ids and broken chains are skipped (expanding
+    /// reports them).
+    pub fn params_needed<'a>(&self, ids: impl IntoIterator<Item = &'a str>) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        for id in ids {
+            for qid in chain_of(self, id).unwrap_or_default() {
+                for p in self.get(&qid).map(|(_, q)| q.params.as_slice()).unwrap_or_default() {
+                    if !out.contains(p) {
+                        out.push(p.clone());
+                    }
+                }
+            }
+        }
+        out
+    }
+}
+
 /// Qualified ids from the root to `id`.
 fn chain_of(lib: &Library, id: &str) -> Result<Vec<String>, ExpandError> {
     let mut chain = vec![id.to_owned()];

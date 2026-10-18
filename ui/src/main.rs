@@ -9,42 +9,83 @@
 //!     nerka-gui app.log --query 'level >= ERROR AND raw ~ /SSL/'
 //!     nerka-gui app.log --text 'connection reset'
 //!     nerka-gui app.log --regex 'timeout|refused'
-//! Keys: Ctrl+F filter · Enter run · n/N next/prev match · Ctrl+G go to line
+//!     nerka-gui app.log --pack packs/ --pick vision.cam_scope --search-pick vision.frame_drops --param cam=CAM1
+//! Keys: Ctrl+F filter · Enter run · n/N next/prev search hit (or filter match
+//! when nothing is searched) · Ctrl+G go to line · Ctrl+Shift+L library
 //! · m toggle bookmark · b/B next/prev bookmark · Ctrl+C copy selection
 //! (or line) · Ctrl+A select all · Ctrl+Home/End
 //! · Ctrl+Tab / Ctrl+Shift+Tab next/prev tab · Ctrl+W close tab · F1 about.
 //!
 //! Recent filters are kept in `<config dir>/nerka/history` and offered by
 //! the 🕘 button next to the filter box.
+//!
+//! Search manager (`doc/search-manager.md`): the library panel lists the
+//! queries of the packs in `<config dir>/nerka/packs` (and `--pack`).
+//! Picks expand (in core) into plain NFD in the Filter or Search box. The
+//! Search box looks only inside the filter result and colours its hits per
+//! query.
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod icon;
 mod job;
+mod library;
 mod prefs;
 mod view;
 
-use eframe::egui::{self, Key, KeyboardShortcut, Modifiers};
+use eframe::egui::{self, Color32, Key, KeyboardShortcut, Modifiers, RichText};
 use job::{Job, Poll};
+use library::{LibraryView, Picks, Use};
+use nerka_core::pack::{self, Expansion, Library, Role};
 use nerka_core::{
-    Bookmarks, Filter, Highlighter, LineNo, LogSource, Matcher, MatcherOptions, Query, SearchHistory, SearchResult,
+    Bookmarks, Filter, Highlighter, LineNo, LogSource, Matcher, MatcherOptions, Query, SearchHistory, SearchHits,
+    SearchResult, SearchSet,
 };
 use prefs::SearchPrefs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
-use view::{Columns, Highlight, ViewOutput, ViewState, log_view};
+use view::{Columns, Highlight, SearchMarks, ViewOutput, ViewState, log_view};
 
 fn main() -> eframe::Result {
     let mut initial: Vec<PathBuf> = Vec::new();
     // (history tag, pattern): the same tags the search history uses.
     let mut preset: Option<(&str, String)> = None;
+    // Library options: packs to load, picks and parameters for every file.
+    let (mut packs, mut picks, mut show_library) = (Vec::new(), Picks::default(), false);
     let mut args = std::env::args_os().skip(1);
     while let Some(a) = args.next() {
+        let mut value = || args.next().map(|v| v.to_string_lossy().into_owned()).unwrap_or_default();
         let tag = match a.to_str() {
             Some("--query" | "-q") => "query",
             Some("--regex" | "-r") => "regex",
             Some("--text" | "-t") => "text",
+            Some("--pack") => {
+                packs.push(PathBuf::from(value()));
+                continue;
+            }
+            Some("--pick") => {
+                picks.set_filter(&value(), Some(Use::Include));
+                continue;
+            }
+            Some("--exclude") => {
+                picks.set_filter(&value(), Some(Use::Exclude));
+                continue;
+            }
+            Some("--search-pick") => {
+                picks.set_search(&value(), true);
+                continue;
+            }
+            Some("--param") => {
+                if let Some((k, v)) = value().split_once('=') {
+                    picks.params.insert(k.to_owned(), (v.to_owned(), false));
+                }
+                continue;
+            }
+            Some("--library") => {
+                show_library = true;
+                continue;
+            }
             _ => {
                 initial.push(PathBuf::from(a));
                 continue;
@@ -63,14 +104,24 @@ fn main() -> eframe::Result {
         "nerka",
         options,
         Box::new(move |cc| {
-            let mut app = App::default();
+            let mut app = App { pack_paths: packs, show_library, ..Default::default() };
             app.load_history();
             app.load_prefs();
+            app.load_library();
             for p in initial {
                 app.open(&cc.egui_ctx, p);
                 // A filter given on the command line applies to every file it names.
                 if let (Some((tag, pattern)), Some(tab)) = (&preset, app.tabs.last_mut()) {
                     tab.set_filter(tag, pattern);
+                }
+                if let Some(tab) = app.tabs.last_mut() {
+                    tab.picks = picks.clone();
+                    if !picks.filter.is_empty() {
+                        tab.apply_filter_picks(&cc.egui_ctx, &app.library);
+                    }
+                    if !picks.search.is_empty() {
+                        tab.apply_search_picks(&cc.egui_ctx, &app.library);
+                    }
                 }
             }
             app.active = 0;
@@ -104,8 +155,45 @@ struct Tab {
     result: Option<Arc<SearchResult>>,
     searching: Option<(Arc<Filter>, Job<SearchResult>)>,
 
+    /// The library expansion the Filter box holds, while its text is
+    /// unchanged: shown grouped, with chips.
+    filter_exp: Option<Arc<Expansion>>,
+    picks: Picks,
+    search: SearchBox,
+
     bookmarks: Bookmarks,
     status: String,
+}
+
+/// The Search box: looks only inside the filter result (the whole file
+/// when no filter is applied) and colours hits per query.
+#[derive(Default)]
+struct SearchBox {
+    mode: Mode,
+    pattern: String,
+    regex: bool,
+    ignore_case: bool,
+    /// The library expansion the box holds, while its text is unchanged.
+    exp: Option<Arc<Expansion>>,
+    /// The search that ran last. It runs again when the filter result changes.
+    active: Option<Arc<ActiveSearch>>,
+    hits: Option<(Arc<ActiveSearch>, Arc<SearchHits>)>,
+    job: Option<(Arc<ActiveSearch>, Job<SearchHits>)>,
+}
+
+/// A search ready to run: its queries, names, colours and highlighters.
+struct ActiveSearch {
+    set: SearchSet,
+    names: Vec<String>,
+    colors: Vec<Color32>,
+    highlighters: Vec<Highlighter>,
+}
+
+impl SearchBox {
+    /// The expansion, if the box still holds its text.
+    fn expansion(&self) -> Option<&Arc<Expansion>> {
+        self.exp.as_ref().filter(|e| e.nfd == self.pattern)
+    }
 }
 
 impl Tab {
@@ -124,6 +212,9 @@ impl Tab {
             highlighter: None,
             result: None,
             searching: None,
+            filter_exp: None,
+            picks: Picks::default(),
+            search: SearchBox::default(),
             bookmarks: Bookmarks::default(),
             status: String::new(),
         }
@@ -134,7 +225,7 @@ impl Tab {
     }
 
     fn is_busy(&self) -> bool {
-        self.loading.is_some() || self.searching.is_some()
+        self.loading.is_some() || self.searching.is_some() || self.search.job.is_some()
     }
 
     fn cancel_jobs(&mut self) {
@@ -142,6 +233,9 @@ impl Tab {
             j.cancel();
         }
         if let Some((_, j)) = self.searching.take() {
+            j.cancel();
+        }
+        if let Some((_, j)) = self.search.job.take() {
             j.cancel();
         }
     }
@@ -193,10 +287,14 @@ impl Tab {
         if let Some((_, j)) = self.searching.take() {
             j.cancel();
         }
+        if self.filter_exp.as_ref().is_some_and(|e| e.nfd != self.pattern) {
+            self.filter_exp = None;
+        }
         if self.pattern.trim().is_empty() {
             self.highlighter = None;
             self.result = None;
             self.status.clear();
+            self.rerun_search(ctx);
             return false;
         }
         match self.build_filter() {
@@ -233,6 +331,8 @@ impl Tab {
                             self.file = Some(Arc::from(f));
                             if !self.pattern.trim().is_empty() {
                                 self.start_search(ctx);
+                            } else {
+                                self.rerun_search(ctx);
                             }
                         }
                         Err(nerka_core::Error::Cancelled) => return false,
@@ -255,15 +355,150 @@ impl Tab {
                             self.highlighter = Some(Arc::new(f.highlighter()));
                             self.result = Some(Arc::new(res));
                             self.filter_view = ViewState::default();
+                            self.searching = None;
+                            // The search looks inside the filter result.
+                            self.rerun_search(ctx);
+                        }
+                        Err(nerka_core::Error::Cancelled) => self.searching = None,
+                        Err(e) => {
+                            self.status = format!("Filter failed: {e}");
+                            self.searching = None;
+                        }
+                    }
+                }
+            }
+        }
+        if let Some((a, job)) = &self.search.job {
+            match job.poll() {
+                Poll::Running => ctx.request_repaint_after(Duration::from_millis(50)),
+                Poll::Done(r, took) => {
+                    match r {
+                        Ok(hits) => {
+                            let mut msg = format!("{} search hits in {took:.2?}", hits.len());
+                            if a.names.len() > 1 {
+                                let counts = hits.counts(a.names.len());
+                                let per: Vec<String> =
+                                    a.names.iter().zip(counts).map(|(n, c)| format!("{} {c}", short(n))).collect();
+                                msg += &format!(" ({})", per.join(" · "));
+                            }
+                            self.status = msg;
+                            self.search.hits = Some((a.clone(), Arc::new(hits)));
                         }
                         Err(nerka_core::Error::Cancelled) => {}
                         Err(e) => self.status = format!("Search failed: {e}"),
                     }
-                    self.searching = None;
+                    self.search.job = None;
                 }
             }
         }
         true
+    }
+
+    /// Put the picked filter queries, expanded, into the Filter box and run
+    /// it. Returns the text to record in the history.
+    fn apply_filter_picks(&mut self, ctx: &egui::Context, lib: &Library) -> Option<String> {
+        match pack::expand(&self.picks.filter_selection(), lib, &self.picks.params()) {
+            Ok(e) => {
+                self.picks.error = None;
+                self.mode = Mode::Query;
+                self.pattern = e.nfd.clone();
+                self.filter_exp = Some(Arc::new(e));
+                self.start_search(ctx).then(|| self.pattern.clone())
+            }
+            Err(e) => {
+                self.picks.error = Some(format!("Filter: {e}"));
+                None
+            }
+        }
+    }
+
+    /// Put the ticked search queries, expanded, into the Search box and run it.
+    fn apply_search_picks(&mut self, ctx: &egui::Context, lib: &Library) {
+        match pack::expand(&self.picks.search_selection(), lib, &self.picks.params()) {
+            Ok(e) => {
+                self.picks.error = None;
+                self.search.mode = Mode::Query;
+                self.search.pattern = e.nfd.clone();
+                self.search.exp = Some(Arc::new(e));
+                self.run_search_box(ctx, lib);
+            }
+            Err(e) => self.picks.error = Some(format!("Search: {e}")),
+        }
+    }
+
+    /// What the Search box asks for: one query per picked library query, or
+    /// the box's text as one query.
+    fn build_search(&self, lib: &Library) -> Result<ActiveSearch, String> {
+        if let Some(e) = self.search.expansion() {
+            let set = e.search_set().map_err(|e| format!("Search: {e}"))?;
+            let names: Vec<String> = e.parts_with(Role::Include).map(|p| p.query.clone()).collect();
+            let colors = names.iter().enumerate().map(|(i, n)| library::query_color(lib, n, i)).collect();
+            let highlighters = set.include.iter().map(Filter::highlighter).collect();
+            return Ok(ActiveSearch { set, names, colors, highlighters });
+        }
+        let f = match self.search.mode {
+            Mode::Text => {
+                let o = MatcherOptions {
+                    fixed_string: !self.search.regex,
+                    case_insensitive: self.search.ignore_case,
+                    invert: false,
+                };
+                Filter::Regex(Matcher::new(&self.search.pattern, o).map_err(|e| format!("Search: invalid regex: {e}"))?)
+            }
+            Mode::Query => {
+                let schema = self.file.as_ref().map(|f| f.schema()).unwrap_or_default();
+                Filter::Query(Query::compile_for(&self.search.pattern, schema).map_err(|e| format!("Search: {e}"))?)
+            }
+        };
+        Ok(ActiveSearch {
+            highlighters: vec![f.highlighter()],
+            set: SearchSet { include: vec![f], exclude: vec![] },
+            names: vec![self.search.pattern.clone()],
+            colors: vec![library::palette(0)],
+        })
+    }
+
+    /// Run the Search box (Enter, Find, or library picks).
+    fn run_search_box(&mut self, ctx: &egui::Context, lib: &Library) {
+        if self.search.pattern.trim().is_empty() {
+            self.clear_search();
+            return;
+        }
+        match self.build_search(lib) {
+            Ok(a) => {
+                self.search.active = Some(Arc::new(a));
+                self.rerun_search(ctx);
+            }
+            Err(e) => self.status = e,
+        }
+    }
+
+    fn clear_search(&mut self) {
+        if let Some((_, j)) = self.search.job.take() {
+            j.cancel();
+        }
+        self.search.active = None;
+        self.search.hits = None;
+        self.search.exp = None;
+        self.search.pattern.clear();
+    }
+
+    /// Start (again) the active search over the current filter result.
+    /// Waits while the file loads or the filter runs; they call it again.
+    fn rerun_search(&mut self, ctx: &egui::Context) {
+        let (Some(a), Some(file)) = (self.search.active.clone(), self.file.clone()) else { return };
+        if let Some((_, j)) = self.search.job.take() {
+            j.cancel();
+        }
+        if self.searching.is_some() {
+            return;
+        }
+        let within = self.result.clone();
+        let aa = a.clone();
+        let job = Job::spawn(ctx, move |prog| {
+            nerka_core::search_within(&*file, within.as_ref().map(|r| r.lines.as_slice()), &aa.set, prog)
+        });
+        self.search.job = Some((a, job));
     }
 
     fn total_lines(&self) -> LineNo {
@@ -279,17 +514,26 @@ impl Tab {
         self.main_view.center_on(line.min(n.saturating_sub(1)), n);
     }
 
-    /// Jump the main view to the next/previous match after the selection.
+    /// Jump the main view to the next/previous search hit after the
+    /// selection, or filter match when nothing is searched.
     fn jump_match(&mut self, forward: bool) {
-        let Some(res) = self.result.clone() else { return };
-        if res.lines.is_empty() {
+        let hits = self.search.hits.as_ref().map(|(_, h)| h.clone()).filter(|h| !h.is_empty());
+        let lines: &[LineNo] = match (&hits, &self.result) {
+            (Some(h), _) => &h.lines,
+            (None, Some(r)) => &r.lines,
+            (None, None) => return,
+        };
+        if lines.is_empty() {
             return;
         }
         let cur = self.current_line();
-        let i = res.position_at_or_after(if forward { cur + 1 } else { cur });
-        let i = if forward { i.min(res.lines.len() - 1) } else { i.saturating_sub(1) };
-        self.goto_line(res.lines[i]);
-        self.filter_view.select(i as u64, res.lines.len() as u64);
+        let i = lines.partition_point(|&l| l < if forward { cur + 1 } else { cur });
+        let i = if forward { i.min(lines.len() - 1) } else { i.saturating_sub(1) };
+        let line = lines[i];
+        self.goto_line(line);
+        if let Some(res) = self.result.clone() {
+            self.filter_view.select(res.position_at_or_after(line) as u64, res.lines.len() as u64);
+        }
     }
 
     fn jump_bookmark(&mut self, forward: bool) {
@@ -413,6 +657,7 @@ impl Tab {
         file: &dyn LogSource,
         focus_search: &mut bool,
         history: &SearchHistory,
+        lib: &Library,
     ) -> Option<(&'static str, String)> {
         let mut searched = None;
         ui.horizontal(|ui| {
@@ -472,7 +717,16 @@ impl Tab {
                 searched = Some((self.filter_tag(), self.pattern.clone()));
             }
         });
+        if let Some(e) = self.filter_exp.clone().filter(|e| e.nfd == self.pattern) {
+            expansion_view(ui, &e, lib);
+        }
+        self.search_row(ui, lib);
         ui.add_space(2.0);
+        let marks = self.search.hits.as_ref().map(|(a, h)| SearchMarks {
+            hits: h,
+            colors: &a.colors,
+            highlighters: &a.highlighters,
+        });
         if let Some(res) = self.result.clone() {
             let out = log_view(
                 ui,
@@ -482,7 +736,11 @@ impl Tab {
                 &|row| res.lines[row as usize],
                 file,
                 &mut self.columns,
-                &Highlight { highlighter: self.highlighter.as_deref(), bookmarks: Some(&self.bookmarks) },
+                &Highlight {
+                    highlighter: self.highlighter.as_deref(),
+                    bookmarks: Some(&self.bookmarks),
+                    search: marks.as_ref(),
+                },
             );
             self.view_output(&out, |row| res.lines[row as usize]);
             // Selecting in the filter view moves the main view.
@@ -501,7 +759,50 @@ impl Tab {
         searched
     }
 
+    /// The Search box, under the Filter box: same modes, Enter runs it.
+    fn search_row(&mut self, ui: &mut egui::Ui, lib: &Library) {
+        let mut go = false;
+        let mut clear = false;
+        ui.horizontal(|ui| {
+            ui.label("🔍").on_hover_text("Search inside the filter result; n / N jump between hits");
+            ui.selectable_value(&mut self.search.mode, Mode::Text, "Text");
+            ui.selectable_value(&mut self.search.mode, Mode::Query, "Query");
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                go |= ui.button("Find").clicked();
+                clear = ui.add_enabled(self.search.active.is_some(), egui::Button::new("Clear")).clicked();
+                if self.search.mode == Mode::Text {
+                    ui.checkbox(&mut self.search.ignore_case, "Ignore case");
+                    ui.checkbox(&mut self.search.regex, "Regex");
+                }
+                let hint = match self.search.mode {
+                    Mode::Text => "search inside the filter result — Enter to find",
+                    Mode::Query => "NFD query, or tick queries in the library — Enter to find",
+                };
+                let r = ui.add(
+                    egui::TextEdit::singleline(&mut self.search.pattern)
+                        .hint_text(hint)
+                        .font(egui::TextStyle::Monospace)
+                        .desired_width(ui.available_width()),
+                );
+                go |= r.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
+            });
+        });
+        if clear {
+            self.clear_search();
+        } else if go {
+            self.run_search_box(ui.ctx(), lib);
+        }
+        if let Some(e) = self.search.expansion().cloned() {
+            expansion_view(ui, &e, lib);
+        }
+    }
+
     fn main_panel(&mut self, ui: &mut egui::Ui, file: &dyn LogSource) {
+        let marks = self.search.hits.as_ref().map(|(a, h)| SearchMarks {
+            hits: h,
+            colors: &a.colors,
+            highlighters: &a.highlighters,
+        });
         let out = log_view(
             ui,
             "main",
@@ -510,9 +811,50 @@ impl Tab {
             &|row| row,
             file,
             &mut self.columns,
-            &Highlight { highlighter: self.highlighter.as_deref(), bookmarks: Some(&self.bookmarks) },
+            &Highlight {
+                highlighter: self.highlighter.as_deref(),
+                bookmarks: Some(&self.bookmarks),
+                search: marks.as_ref(),
+            },
         );
         self.view_output(&out, |row| row);
+    }
+}
+
+/// `pack.query` -> `query`.
+fn short(id: &str) -> &str {
+    id.split_once('.').map_or(id, |(_, q)| q)
+}
+
+/// An expansion on several lines, one per picked query: how it joins the
+/// others, a name chip in the query's colour, and its NFD.
+fn expansion_view(ui: &mut egui::Ui, e: &Expansion, lib: &Library) {
+    const MAX_LINES: usize = 8;
+    let shorts: Vec<&str> = e.parts.iter().map(|p| short(&p.query)).collect();
+    let mut includes = 0;
+    for (i, p) in e.parts.iter().enumerate() {
+        let joiner = match p.role {
+            Role::Include if includes == 0 => "",
+            Role::Include => "OR",
+            Role::Exclude => "AND NOT",
+        };
+        let color = library::query_color(lib, &p.query, includes);
+        if p.role == Role::Include {
+            includes += 1;
+        }
+        if i >= MAX_LINES {
+            continue;
+        }
+        // The short name, unless two picked queries share it.
+        let name = if shorts.iter().filter(|s| **s == shorts[i]).count() > 1 { &p.query } else { shorts[i] };
+        ui.horizontal(|ui| {
+            ui.add_sized([52.0, 14.0], egui::Label::new(RichText::new(joiner).small().weak()));
+            library::chip(ui, name, color).on_hover_text(&p.query);
+            ui.add(egui::Label::new(RichText::new(e.part_nfd(p)).monospace().small()).truncate());
+        });
+    }
+    if e.parts.len() > MAX_LINES {
+        ui.weak(format!("… {} more (the full text is in the box above)", e.parts.len() - MAX_LINES));
     }
 }
 
@@ -534,6 +876,13 @@ struct App {
     status: String,
     focus_search: bool,
     window_title: String,
+    /// Query packs (search manager) and where they come from besides the
+    /// per-user folder.
+    library: Library,
+    library_errors: Vec<String>,
+    pack_paths: Vec<PathBuf>,
+    show_library: bool,
+    library_view: LibraryView,
 }
 
 /// A window-style close button: a thin painted "×" with a square hover
@@ -563,27 +912,49 @@ fn same_file(a: &Path, b: &Path) -> bool {
     }
 }
 
-/// Per-user config directory for nerka, if one can be determined.
-fn config_dir() -> Option<PathBuf> {
-    let base = if cfg!(windows) {
-        std::env::var_os("APPDATA").map(PathBuf::from)
-    } else {
-        std::env::var_os("XDG_CONFIG_HOME")
-            .map(PathBuf::from)
-            .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))
-    };
-    base.map(|b| b.join("nerka"))
-}
-
 fn history_path() -> Option<PathBuf> {
-    config_dir().map(|d| d.join("history"))
+    nerka_core::config_dir().map(|d| d.join("history"))
 }
 
 fn prefs_path() -> Option<PathBuf> {
-    config_dir().map(|d| d.join("prefs"))
+    nerka_core::config_dir().map(|d| d.join("prefs"))
 }
 
 impl App {
+    /// (Re)load the packs. Picks and running filters keep their expanded
+    /// text; only the next expansion sees the change.
+    fn load_library(&mut self) {
+        let mut lib = Library::new();
+        let mut errors = Vec::new();
+        for p in pack::default_dir().filter(|d| d.is_dir()).iter().chain(&self.pack_paths) {
+            errors.extend(lib.load_lenient(p).into_iter().map(|e| e.to_string()));
+        }
+        self.library = lib;
+        self.library_errors = errors;
+    }
+
+    fn library_action(&mut self, ctx: &egui::Context, action: library::Action) {
+        match action {
+            library::Action::None => {}
+            library::Action::Close => self.show_library = false,
+            library::Action::Reload => self.load_library(),
+            library::Action::ApplyFilter => {
+                let lib = std::mem::take(&mut self.library);
+                let recorded = self.tab().and_then(|t| t.apply_filter_picks(ctx, &lib));
+                self.library = lib;
+                if let Some(nfd) = recorded {
+                    self.record_search("query", &nfd);
+                }
+            }
+            library::Action::ApplySearch => {
+                let lib = std::mem::take(&mut self.library);
+                if let Some(t) = self.tab() {
+                    t.apply_search_picks(ctx, &lib);
+                }
+                self.library = lib;
+            }
+        }
+    }
     fn load_history(&mut self) {
         let Some(path) = history_path() else { return };
         match SearchHistory::load(&path) {
@@ -695,6 +1066,10 @@ impl App {
         }
         if shortcut(Modifiers::COMMAND, Key::F) {
             self.focus_search = true;
+        }
+        // Before Ctrl+L: matching ignores an unrequested Shift.
+        if shortcut(Modifiers::COMMAND | Modifiers::SHIFT, Key::L) {
+            self.show_library = !self.show_library;
         }
         if (shortcut(Modifiers::COMMAND, Key::G) || shortcut(Modifiers::COMMAND, Key::L)) && !self.tabs.is_empty() {
             self.goto = Some(String::new());
@@ -892,6 +1267,11 @@ impl eframe::App for App {
                     "Mark lines to come back to: m (or right-click) toggles a bookmark on the current line, \
                      b / Shift+B jump to the next / previous one. Saved next to the log as <file>.nerka-marks.",
                 );
+                let queries: usize = self.library.packs().iter().map(|p| p.queries.len()).sum();
+                ui.toggle_value(&mut self.show_library, format!("📚 Library ({queries})")).on_hover_text(
+                    "Saved queries from packs (*.nerka-pack): pick them for the filter or the search \
+                     (Ctrl+Shift+L)",
+                );
                 if let Some(f) = self.tabs.get(self.active).and_then(|t| t.file.as_ref()) {
                     ui.separator();
                     ui.label(format!("{} lines · {:.1} MiB", f.line_count(), f.size_bytes() as f64 / 1048576.0));
@@ -916,6 +1296,12 @@ impl eframe::App for App {
                         ui.label(format!("Indexing {}", t.path.display()));
                     } else if let Some((_, j)) = &t.searching {
                         ui.add(egui::ProgressBar::new(j.progress.fraction()).desired_width(200.0).show_percentage());
+                        if ui.button("Cancel").clicked() {
+                            j.cancel();
+                        }
+                    } else if let Some((_, j)) = &t.search.job {
+                        ui.add(egui::ProgressBar::new(j.progress.fraction()).desired_width(200.0).show_percentage());
+                        ui.label("Searching");
                         if ui.button("Cancel").clicked() {
                             j.cancel();
                         }
@@ -946,6 +1332,19 @@ impl eframe::App for App {
             return;
         };
 
+        if self.show_library {
+            let action = egui::Panel::right("library")
+                .resizable(true)
+                .default_size(320.0)
+                .show(ui, |ui| {
+                    library::panel(ui, &self.library, &self.library_errors, &mut tab.picks, &mut self.library_view)
+                })
+                .inner;
+            if action != library::Action::None {
+                self.library_action(&ctx, action);
+            }
+        }
+        let Some(tab) = self.tabs.get_mut(self.active) else { return };
         if show_bookmarks {
             let close = egui::Panel::right("bookmarks")
                 .resizable(true)
@@ -961,7 +1360,7 @@ impl eframe::App for App {
             .resizable(true)
             .default_size(260.0)
             .min_size(120.0)
-            .show(ui, |ui| tab.filter_panel(ui, &*file, &mut focus_search, &self.history))
+            .show(ui, |ui| tab.filter_panel(ui, &*file, &mut focus_search, &self.history, &self.library))
             .inner;
         let after = tab.search_prefs();
         egui::CentralPanel::default().show(ui, |ui| tab.main_panel(ui, &*file));
@@ -971,5 +1370,116 @@ impl eframe::App for App {
         if let Some((tag, pattern)) = searched {
             self.record_search(tag, &pattern);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const LOG: &str = "\
+[INFO] cam1 frame drop
+[ERROR] cam1 frame drop
+[ERROR] cam2 frame drop
+[WARN] cam1 timeout
+[ERROR] disk full
+[ERROR] cam1 timeout
+";
+
+    const PACK: &str = "\
+pack vision
+query errors  labels: triage
+    level >= ERROR
+query cam(cam)  parent: errors  labels: vision
+    raw ~ /$cam /
+query drops  labels: vision  color: violet
+    /frame drop/
+query timeouts  labels: vision
+    /timeout/
+";
+
+    /// Poll the tab's jobs until none is running.
+    fn settle(tab: &mut Tab, ctx: &egui::Context) {
+        for _ in 0..500 {
+            assert!(tab.poll_jobs(ctx), "{}", tab.status);
+            if !tab.is_busy() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        panic!("jobs still running");
+    }
+
+    fn hits(tab: &Tab) -> Vec<(LineNo, Vec<&str>)> {
+        let (a, h) = tab.search.hits.as_ref().expect("search hits");
+        (0..h.len()).map(|i| (h.lines[i], h.matched(i).map(|q| short(&a.names[q])).collect())).collect()
+    }
+
+    #[test]
+    fn library_picks_filter_then_search_inside_it() {
+        let dir = std::env::temp_dir().join(format!("nerka-gui-lib-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("app.log");
+        std::fs::write(&log, LOG).unwrap();
+        let mut lib = Library::new();
+        lib.add(pack::parse_pack("vision.nerka-pack", PACK).unwrap()).unwrap();
+
+        let ctx = egui::Context::default();
+        let mut tab = Tab::open(&ctx, log, &SearchPrefs::default());
+        settle(&mut tab, &ctx);
+
+        // Filter: errors about cam1, without timeouts.
+        tab.picks.set_filter("vision.cam", Some(Use::Include));
+        tab.picks.set_filter("vision.timeouts", Some(Use::Exclude));
+        assert_eq!(tab.apply_filter_picks(&ctx, &lib), None, "a missing parameter is reported, not run");
+        assert!(tab.picks.error.as_deref().unwrap().contains("'$cam'"), "{:?}", tab.picks.error);
+        tab.picks.params.insert("cam".into(), ("cam1".into(), false));
+        let nfd = tab.apply_filter_picks(&ctx, &lib).expect("runs");
+        assert_eq!(nfd, "(level >= ERROR) AND (raw ~ /cam1 /) AND NOT (/timeout/)");
+        assert_eq!(tab.mode, Mode::Query);
+        settle(&mut tab, &ctx);
+        assert_eq!(tab.result.as_ref().unwrap().lines, [1]);
+
+        // Search inside the filter result only; then widen the filter and
+        // the search follows it.
+        tab.picks.set_search("vision.drops", true);
+        tab.picks.set_search("vision.timeouts", true);
+        tab.apply_search_picks(&ctx, &lib);
+        settle(&mut tab, &ctx);
+        assert_eq!(hits(&tab), [(1, vec!["drops"])]);
+        let colors = &tab.search.hits.as_ref().unwrap().0.colors;
+        assert_eq!(colors[0], library::parse_color("violet").unwrap());
+        assert_ne!(colors[1], colors[0]);
+
+        tab.picks.set_filter("vision.timeouts", None);
+        tab.apply_filter_picks(&ctx, &lib).unwrap();
+        settle(&mut tab, &ctx);
+        assert_eq!(tab.result.as_ref().unwrap().lines, [1, 5]);
+        assert_eq!(hits(&tab), [(1, vec!["drops"]), (5, vec!["timeouts"])]);
+
+        // n / N jump between search hits.
+        tab.goto_line(0);
+        tab.jump_match(true);
+        assert_eq!(tab.current_line(), 1);
+        tab.jump_match(true);
+        assert_eq!(tab.current_line(), 5);
+        tab.jump_match(false);
+        assert_eq!(tab.current_line(), 1);
+
+        // Editing the box drops the chips; the text is a plain query.
+        tab.search.pattern.push_str(" OR /disk/");
+        assert!(tab.search.expansion().is_none());
+        tab.run_search_box(&ctx, &lib);
+        settle(&mut tab, &ctx);
+        assert_eq!(tab.search.hits.as_ref().unwrap().1.lines, [1, 5]);
+
+        // Without a filter the search covers the whole file.
+        tab.pattern.clear();
+        tab.start_search(&ctx);
+        settle(&mut tab, &ctx);
+        assert_eq!(tab.search.hits.as_ref().unwrap().1.lines, [0, 1, 2, 3, 4, 5]);
+        tab.clear_search();
+        assert!(tab.search.hits.is_none());
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

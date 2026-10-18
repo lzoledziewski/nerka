@@ -3,7 +3,7 @@
 //!
 //! Search never looks outside the filter's lines (`doc/search-manager.md`).
 //! A hit is a line that matches at least one *include* query and no
-//! *exclude* query; every include query that matches it is reported, so
+//! *exclude* query (without a filter: any line of the file); every include query that matches it is reported, so
 //! the UI can colour hits per query. With no include queries every line
 //! that no exclude query matches is a hit.
 //!
@@ -93,41 +93,70 @@ pub(crate) enum Path {
 /// whole buffer beats evaluating each of them.
 const SCAN_SHARE: u64 = 16;
 
-/// Search `set` inside `within` (the filter's lines, ascending).
+/// Search `set` inside `within` (the filter's lines, ascending), or in
+/// every line when there is no filter (`None`).
 pub fn search_within(
     source: &dyn LogSource,
-    within: &[LineNo],
+    within: Option<&[LineNo]>,
     set: &SearchSet,
     progress: &Progress,
 ) -> Result<SearchHits> {
     search_within_path(source, within, set, progress, Path::Auto)
 }
 
+/// The lines a search runs over.
+#[derive(Clone, Copy)]
+enum Within<'a> {
+    All(LineNo),
+    Lines(&'a [LineNo]),
+}
+
+impl Within<'_> {
+    fn len(&self) -> u64 {
+        match self {
+            Within::All(n) => *n,
+            Within::Lines(v) => v.len() as u64,
+        }
+    }
+
+    /// The `i`-th line.
+    fn line(&self, i: u64) -> LineNo {
+        match self {
+            Within::All(_) => i,
+            Within::Lines(v) => v[i as usize],
+        }
+    }
+}
+
 pub(crate) fn search_within_path(
     source: &dyn LogSource,
-    within: &[LineNo],
+    within: Option<&[LineNo]>,
     set: &SearchSet,
     progress: &Progress,
     path: Path,
 ) -> Result<SearchHits> {
+    let within = within.map_or(Within::All(source.line_count()), Within::Lines);
     let bind = |fs: &[Filter]| fs.iter().map(|f| f.bind(source.schema())).collect::<std::result::Result<Vec<_>, _>>();
     let set = SearchSet { include: bind(&set.include)?, exclude: bind(&set.exclude)? };
     let can_scan = !set.include.is_empty() && set.include.iter().all(|f| has_fast_path(source, f));
     let scan_it = match path {
-        Path::Auto => can_scan && within.len() as u64 * SCAN_SHARE >= source.line_count(),
+        Path::Auto => can_scan && within.len() * SCAN_SHARE >= source.line_count(),
         Path::Scan => can_scan,
         Path::PerLine => false,
     };
     if scan_it { by_scan(source, within, &set, progress) } else { per_line(source, within, &set, progress) }
 }
 
-fn by_scan(source: &dyn LogSource, within: &[LineNo], set: &SearchSet, progress: &Progress) -> Result<SearchHits> {
-    progress.set_total(set.include.iter().map(|f| work(source, f)).sum::<u64>() + within.len() as u64);
+fn by_scan(source: &dyn LogSource, within: Within<'_>, set: &SearchSet, progress: &Progress) -> Result<SearchHits> {
+    progress.set_total(set.include.iter().map(|f| work(source, f)).sum::<u64>() + within.len());
     // (line, include index) of every include hit inside the filter.
     let mut pairs: Vec<(LineNo, usize)> = Vec::new();
     for (q, f) in set.include.iter().enumerate() {
         let lines = scan(source, f, progress)?;
-        pairs.extend(intersect(&lines, within).map(|l| (l, q)));
+        match within {
+            Within::All(_) => pairs.extend(lines.into_iter().map(|l| (l, q))),
+            Within::Lines(w) => pairs.extend(intersect(&lines, w).map(|l| (l, q))),
+        }
     }
     pairs.sort_unstable();
     let mut hits = SearchHits::new(set.include.len());
@@ -139,7 +168,7 @@ fn by_scan(source: &dyn LogSource, within: &[LineNo], set: &SearchSet, progress:
             mask.fill(0);
         }
     }
-    progress.add(within.len() as u64 - hits.len() as u64);
+    progress.add(within.len() - hits.len() as u64);
     if set.exclude.is_empty() {
         progress.add(hits.len() as u64);
         return Ok(hits);
@@ -182,24 +211,29 @@ fn intersect<'a>(a: &'a [LineNo], b: &'a [LineNo]) -> impl Iterator<Item = LineN
     })
 }
 
-fn per_line(source: &dyn LogSource, within: &[LineNo], set: &SearchSet, progress: &Progress) -> Result<SearchHits> {
-    progress.set_total(within.len() as u64);
+fn per_line(source: &dyn LogSource, within: Within<'_>, set: &SearchSet, progress: &Progress) -> Result<SearchHits> {
+    let n = within.len();
+    progress.set_total(n);
     let words = SearchHits::new(set.include.len()).words;
-    let parts: Vec<SearchHits> = within
-        .par_chunks(LINES_PER_TASK as usize)
-        .map(|chunk| {
+    let tasks: Vec<std::ops::Range<u64>> =
+        (0..n.div_ceil(LINES_PER_TASK)).map(|t| t * LINES_PER_TASK..((t + 1) * LINES_PER_TASK).min(n)).collect();
+    let parts: Vec<SearchHits> = tasks
+        .into_par_iter()
+        .map(|range| {
             if progress.is_cancelled() {
                 return Err(crate::Error::Cancelled);
             }
             let mut hits = SearchHits::new(set.include.len());
             let mut mask = vec![0u64; words];
-            for &l in chunk {
+            let len = range.end - range.start;
+            for i in range {
+                let l = within.line(i);
                 let mut ev = Event::from_source(source, l);
                 if let Some(m) = eval(&mut ev, set, &mut mask) {
                     hits.push(l, m);
                 }
             }
-            progress.add(chunk.len() as u64);
+            progress.add(len);
             Ok(hits)
         })
         .collect::<Result<_>>()?;
@@ -255,8 +289,12 @@ mod tests {
         let set = SearchSet { include: include.iter().map(q).collect(), exclude: exclude.iter().map(q).collect() };
         let want = naive(source, &within, &set);
         for path in [Path::Auto, Path::Scan, Path::PerLine] {
-            let got = search_within_path(source, &within, &set, &Progress::new(), path).unwrap();
+            let got = search_within_path(source, Some(&within), &set, &Progress::new(), path).unwrap();
             assert_eq!(got, want, "{path:?} disagrees with naive");
+            // Without a filter: every line.
+            let all: Vec<LineNo> = (0..source.line_count()).collect();
+            let got = search_within_path(source, None, &set, &Progress::new(), path).unwrap();
+            assert_eq!(got, naive(source, &all, &set), "{path:?} without a filter disagrees with naive");
         }
         (0..want.len()).map(|i| (want.lines[i], want.matched(i).collect())).collect()
     }
@@ -316,9 +354,9 @@ mod tests {
         let m = |p: &str| Filter::Regex(Matcher::new(p, MatcherOptions::default()).unwrap());
         let set = SearchSet { include: vec![m("slow"), m("ok")], exclude: vec![] };
         for path in [Path::Scan, Path::PerLine] {
-            let hits = search_within_path(&text(), &[0, 3, 5], &set, &Progress::new(), path).unwrap();
+            let hits = search_within_path(&text(), Some(&[0, 3, 5]), &set, &Progress::new(), path).unwrap();
             assert!(hits.is_empty());
-            let hits = search_within_path(&src, &[1, 2], &set, &Progress::new(), path).unwrap();
+            let hits = search_within_path(&src, Some(&[1, 2]), &set, &Progress::new(), path).unwrap();
             assert_eq!(hits.lines, [1, 2]);
             assert_eq!(hits.counts(2), [1, 1]);
         }
@@ -328,12 +366,12 @@ mod tests {
     fn errors_and_cancel() {
         let q = |s: &str| Filter::Query(Query::compile(s).unwrap());
         let set = SearchSet { include: vec![q("apid == NAV")], exclude: vec![] };
-        assert!(matches!(search_within(&text(), &[0], &set, &Progress::new()), Err(crate::Error::Query(_))));
+        assert!(matches!(search_within(&text(), Some(&[0]), &set, &Progress::new()), Err(crate::Error::Query(_))));
         let p = Progress::new();
         p.cancel();
         let set = SearchSet { include: vec![q("/cam/")], exclude: vec![] };
         for path in [Path::Scan, Path::PerLine] {
-            let r = search_within_path(&text(), &[0, 1], &set, &p, path);
+            let r = search_within_path(&text(), Some(&[0, 1]), &set, &p, path);
             assert!(matches!(r, Err(crate::Error::Cancelled)), "{path:?}");
         }
     }

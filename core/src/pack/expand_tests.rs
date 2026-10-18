@@ -234,9 +234,18 @@ fn expansion_as_a_search_inside_a_filter() {
     let within = same_lines(&src, &filter.nfd, "apid == NAV");
     let search = expand(&sel(&["nav.slow", "nav.errs"], &["nav.big"]), &lib(), &params(&[("app", "NAV")])).unwrap();
     let set = search.search_set().unwrap();
-    let hits = crate::search_within(&src, &within, &set, &crate::Progress::new()).unwrap();
+    let hits = crate::search_within(&src, Some(&within), &set, &crate::Progress::new()).unwrap();
     let got: Vec<(crate::LineNo, Vec<usize>)> =
         (0..hits.len()).map(|i| (hits.lines[i], hits.matched(i).collect())).collect();
     // Line 5 is slow, an error and big: excluded.
     assert_eq!(got, [(1, vec![0]), (2, vec![1])]);
+}
+
+#[test]
+fn params_needed_follow_parent_chains() {
+    let mut lib = lib();
+    lib.add(pack(VISION)).unwrap();
+    assert_eq!(lib.params_needed(["nav.big", "txt.cam", "nav.all"]), ["app", "cam"]);
+    assert_eq!(lib.params_needed(["vision.cam_scope", "nope.x"]), ["ecu", "cam"]);
+    assert!(lib.params_needed(["nav.slow"; 0]).is_empty());
 }

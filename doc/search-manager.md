@@ -101,7 +101,7 @@ erka\packs\` (Linux: `~/.config/nerka/packs/`), plus `--pack <dir|file>` on the 
 
 ### POC status (2026-10-18)
 
-Steps 1–4 are built (core + CLI, no new dependency); step 5 (GUI) is not started.
+All five steps are built (no new dependency). Step 5 (GUI) is described at the end of this section.
 
 - `core/src/pack/`: parser (`parse_pack`, `Library`), `expand` → `Expansion { nfd, parts }`, `Expansion::search_set`.
 - `core/src/engine/within.rs`: `search_within(source, filter_lines, SearchSet)` → `SearchHits` (lines plus, per hit, which include queries matched; any number of queries). A hit matches any include query and no exclude query. Two paths: per-line over the filter's lines, or (every include query has a prefilter and the filter keeps ≥ 1/16 of the lines) the buffer scan per query intersected with the filter's lines. Tests run both against a naive per-line evaluation.
@@ -116,6 +116,25 @@ Choices made while building (not in the decisions above). Owner's answers, 2026-
 4. Picking a label includes the labels below it (`system` → `system/vision`). _OK for now._
 5. A child's parent may live in another pack (`parent: vision.cam_scope`); a missing parent is an expansion error, not a load error. _Doubts, but try it._
 6. The CLI puts `-q` picks before `-l` picks (clap loses the order between the two options); without `--in`, a pick search runs over every line. _Not evaluated: the CLI isn't a focus now._
+
+GUI (step 5), as built (`ui/src/library.rs`, `ui/src/main.rs`):
+
+- **Library panel** (📚 in the toolbar, Ctrl+Shift+L): queries grouped by label (default; a query shows under each of its labels, unlabelled ones last) or by pack. Per query: a button that cycles *not in filter → + include → − exclude*, a tick for Search, the pack colour, the name and its parameters; hover shows the NFD, the parent and the labels. Per group: `+ all`, `− all`, `☑ all`, `none` (a label is resolved when clicked). Below: a field for every parameter the picked queries need (parent chains included) with a "regex" tick for raw, the expansion error if any, and **Filter (n)** / **Search (n)** buttons that expand the picks into the boxes and run them. ⟳ reloads the packs; bad pack files are listed in red and the good ones still load.
+- **Filter box:** unchanged; the picks arrive as Query-mode NFD and the filter is recorded in the history as that text.
+- **Search box** under the Filter box: Text (with Regex and Ignore case) or Query, Enter or Find runs it, Clear removes it. It looks only inside the filter result (the whole file without a filter) and runs again by itself when the filter result changes. n / N jump between search hits while a search is active, otherwise between filter matches as before.
+- **Grouped display:** while a box holds an expansion unchanged, one line per picked query appears under it: how it joins (`OR`, `AND NOT`), a chip with the short name in the query's colour (qualified name on hover, or shown when two picks share a short name), and that query's NFD. Up to 8 lines; the full text stays in the box. Editing the text turns it into a plain query (no chips).
+- **Colours:** a search query's hits are highlighted in its pack colour (named colours or `#rrggbb`), otherwise in a palette colour by position; a typed search uses the first palette colour. Hit lines also get one thin stripe per matched query in the gutter, so queries without regex spans (`level >= ERROR`) show too. The filter's yellow stays; search colours win where they overlap.
+- **Command line** (also used for screenshots): `--pack <dir|file>`, `--pick ID`, `--exclude ID`, `--search-pick ID`, `--param NAME=VALUE`, `--library`.
+- Status line: hits and time, plus hits per query when there are several.
+
+Choices made for the GUI (open questions below answered provisionally; confirm or change):
+
+7. The Search box has the Filter box's modes, without Invert.
+8. Colours come from the pack, with a palette fallback; there is no colour picker in the UI.
+9. Parameter values live in the tab and aren't remembered between runs.
+10. Search history isn't kept; the filter history stores the expanded NFD but not the chip names (the history file is one `tag<TAB>pattern` per line; adding names needs a format change).
+11. Picks are per tab, the panel's grouping is shared by all tabs.
+12. Chips are display only (no × to drop a pick from the box).
 
 ## Open questions
 

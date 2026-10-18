@@ -210,12 +210,12 @@ fn run_search_within(
     let filter = within.map(|q| compile(q, f.schema())).transpose()?;
     let t = Instant::now();
     let lines = match filter {
-        Some(q) => search(&*f, &Filter::Query(q), &Progress::new())?.lines,
-        None => (0..f.line_count()).collect(),
+        Some(q) => Some(search(&*f, &Filter::Query(q), &Progress::new())?.lines),
+        None => None,
     };
     let t_filter = t.elapsed();
     let t = Instant::now();
-    let hits = search_within(&*f, &lines, &set, &Progress::new())?;
+    let hits = search_within(&*f, lines.as_deref(), &set, &Progress::new())?;
     let t_search = t.elapsed();
     if o.count {
         writeln!(out, "{}", hits.len())?;
@@ -242,7 +242,7 @@ fn run_search_within(
         eprintln!(
             "{} hits in {} filtered of {} lines | index {t_index:.2?} | filter {t_filter:.2?} | search {t_search:.2?}",
             hits.len(),
-            lines.len(),
+            lines.as_ref().map_or(f.line_count() as usize, Vec::len),
             f.line_count()
         );
     }
