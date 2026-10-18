@@ -17,8 +17,8 @@
 
 use eframe::egui::{self, Color32, RichText};
 use nerka_core::pack::{
-    self, Expansion, Library, Pack, PackQuery, ParamValue, Params, Pick, Role, Selection, format_query, params_in,
-    parse_pack, upsert_query,
+    self, Expansion, Library, Pack, PackQuery, ParamValue, Params, Pick, Role, Selection, format_query, is_name,
+    params_in, parse_pack, upsert_query,
 };
 use std::collections::BTreeMap;
 
@@ -66,8 +66,10 @@ pub struct Node {
     pub text: String,
     /// Qualified parent, kept from the library query.
     pub parent: Option<String>,
-    pub labels: Vec<String>,
-    pub color: Option<String>,
+    /// Labels as typed: comma-separated, `/` for hierarchy.
+    pub labels: String,
+    /// A colour name or `#rrggbb`; empty for none.
+    pub color: String,
     pub role: Use,
     /// Colour the lines it keeps (included filter queries only).
     pub lit: bool,
@@ -92,20 +94,23 @@ impl Node {
         PackQuery {
             id: id.to_owned(),
             parent: self.parent.clone(),
-            labels: self.labels.clone(),
+            labels: self.labels.split(',').map(str::trim).filter(|l| !l.is_empty()).map(str::to_owned).collect(),
             params: params_in(&self.text),
-            color: self.color.clone(),
+            color: Some(self.color.trim().to_owned()).filter(|c| !c.is_empty()),
             text: self.text.clone(),
             line: 0,
             end_line: 0,
         }
     }
 
-    /// Check the text as the pack parser would.
+    /// Check the name, labels, colour and text as the pack parser would.
     fn validate(&self) -> Result<(), String> {
-        upsert_query(&self.name, &format!("pack {LOCAL_PACK}\n"), &self.as_query("check"))
-            .map(|_| ())
-            .map_err(|e| e.msg)
+        let name = self.name.trim();
+        if !is_name(name) {
+            let hint = name.replace(|c: char| !(c.is_ascii_alphanumeric() || c == '_'), "_");
+            return Err(format!("Name: letters, digits and _ only, no spaces (e.g. {hint})"));
+        }
+        upsert_query(name, &format!("pack {LOCAL_PACK}\n"), &self.as_query(name)).map(|_| ()).map_err(|e| e.msg)
     }
 }
 
@@ -143,8 +148,8 @@ impl Picks {
             name: format!("new_{}", self.next_key),
             text: String::new(),
             parent: None,
-            labels: vec![],
-            color: None,
+            labels: String::new(),
+            color: String::new(),
             role,
             lit: false,
             edited: true,
@@ -161,8 +166,8 @@ impl Picks {
         n.name = q.id.clone();
         n.text = q.text.clone();
         n.parent = p.parent_of(q);
-        n.labels = q.labels.clone();
-        n.color = q.color.clone();
+        n.labels = q.labels.join(", ");
+        n.color = q.color.clone().unwrap_or_default();
         n.edited = false;
         n.open = false;
         Some(n)
@@ -235,8 +240,8 @@ impl Picks {
                 Some((p, q)) if !n.edited => {
                     n.text = q.text.clone();
                     n.parent = p.parent_of(q);
-                    n.labels = q.labels.clone();
-                    n.color = q.color.clone();
+                    n.labels = q.labels.join(", ");
+                    n.color = q.color.clone().unwrap_or_default();
                 }
                 Some(_) => {}
                 None => {
@@ -376,7 +381,7 @@ pub fn palette(index: usize) -> Color32 {
 
 /// A node's colour: its own, else the palette entry for `slot`.
 fn node_color(n: &Node, slot: usize) -> Color32 {
-    n.color.as_deref().and_then(parse_color).unwrap_or(palette(slot))
+    parse_color(n.color.trim()).unwrap_or(palette(slot))
 }
 
 /// A small coloured name tag; `strong` fills it with the colour.
@@ -717,6 +722,19 @@ fn node_editor(
             n.edited = true;
             n.error = None;
         }
+        ui.horizontal(|ui| {
+            ui.label("Labels");
+            let r = ui.add(
+                egui::TextEdit::singleline(&mut n.labels).hint_text("e.g. system/vision, perf").desired_width(140.0),
+            );
+            ui.label("Colour");
+            let c = ui.add(
+                egui::TextEdit::singleline(&mut n.color).hint_text("violet, #ff8000").desired_width(f32::INFINITY),
+            );
+            if r.changed() || c.changed() {
+                n.edited = true;
+            }
+        });
         if let Some(p) = n.parent.clone() {
             ui.horizontal(|ui| {
                 ui.weak(format!("refines {p}"));
@@ -749,7 +767,7 @@ fn node_editor(
                         ui.selectable_value(save_pack, p.clone(), p);
                     }
                 });
-            let can = valid.is_ok() && packs.contains(save_pack) && !n.name.trim().is_empty();
+            let can = valid.is_ok() && packs.contains(save_pack);
             let tip =
                 format!("Write it into the {save_pack} pack file as query '{}' (replaces one with that name)", n.name);
             if ui.add_enabled(can, egui::Button::new("Save")).on_hover_text(tip).clicked() {
@@ -912,6 +930,46 @@ mod tests {
         }
         assert!(moved, "the second node was dragged above the first");
         assert_eq!(picks.nodes.len(), 2);
+    }
+
+    #[test]
+    fn names_labels_and_colours_are_checked_and_saved() {
+        let mut p = Picks::default();
+        let k = p.add_new(Use::Include);
+        let n = p.node_mut(k).unwrap();
+        n.text = "apid == \"xyz\"".into();
+        n.name = "xyz logs".into();
+        let e = n.validate().unwrap_err();
+        assert!(e.contains("no spaces (e.g. xyz_logs)"), "{e}");
+        n.name = "xyz_logs".into();
+        n.labels = "aurix, system/ecu ,".into();
+        n.color = "Teal".into();
+        assert!(n.validate().unwrap_err().contains("invalid colour"));
+        n.color = "teal".into();
+        n.labels = "a b".into();
+        assert!(n.validate().unwrap_err().contains("separated by commas"));
+        n.labels = "aurix, system/ecu ,".into();
+        n.validate().unwrap();
+
+        let dir = std::env::temp_dir().join(format!("nerka-gui-labels-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("a.nerka-pack");
+        std::fs::write(&file, "pack a\n").unwrap();
+        let mut lib = Library::new();
+        lib.load(&file).unwrap();
+        p.save_pack = "a".into();
+        save_node(&mut lib, &mut p, k);
+        assert_eq!(p.nodes[0].error, None);
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap(),
+            "pack a\n\nquery xyz_logs  labels: aurix, system/ecu  color: teal\n    apid == \"xyz\"\n"
+        );
+        assert_eq!(lib.with_label("system"), ["a.xyz_logs"]);
+        // A library node shows its labels and colour as text.
+        let mut q = Picks::default();
+        q.add(&lib, "a.xyz_logs", Use::Include, None);
+        assert_eq!((q.nodes[0].labels.as_str(), q.nodes[0].color.as_str()), ("aurix, system/ecu", "teal"));
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

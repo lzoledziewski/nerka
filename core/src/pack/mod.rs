@@ -311,8 +311,8 @@ pub(crate) fn render<E>(
     Ok(out)
 }
 
-/// Is `s` a valid pack, query or parameter name?
-pub(crate) fn is_name(s: &str) -> bool {
+/// Is `s` a valid pack, query or parameter name (`[A-Za-z_][A-Za-z0-9_]*`)?
+pub fn is_name(s: &str) -> bool {
     let mut cs = s.chars();
     cs.next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_') && cs.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
