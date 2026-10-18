@@ -207,8 +207,18 @@ impl Library {
     /// source ("unknown field"). Unknown or broken queries give none (they
     /// fail elsewhere with their own error).
     pub fn missing_fields(&self, id: &str, schema: &[FieldDef]) -> Vec<String> {
+        self.missing_in(self.chain(id), schema)
+    }
+
+    /// Like [`missing_fields`](Self::missing_fields), for the query's own
+    /// text only (without its parents).
+    pub fn missing_own_fields(&self, id: &str, schema: &[FieldDef]) -> Vec<String> {
+        self.missing_in([id.to_owned()], schema)
+    }
+
+    fn missing_in(&self, ids: impl IntoIterator<Item = String>, schema: &[FieldDef]) -> Vec<String> {
         let mut out: Vec<String> = Vec::new();
-        for qid in self.chain(id) {
+        for qid in ids {
             let Some((_, q)) = self.get(&qid) else { continue };
             // Parameters as placeholder values: only the fields matter.
             let text = render(

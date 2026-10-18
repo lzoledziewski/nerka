@@ -252,6 +252,9 @@ fn missing_fields_follow_the_parent_chain() {
     assert!(lib.missing_fields("txt.cam", &[]).is_empty());
     // A child inherits its parent's fields; parameters don't matter.
     assert_eq!(lib.missing_fields("vision.cam_scope", SCHEMA), ["ecu", "ctid"]);
+    // Without its parents, nav.slow (/slow/) runs anywhere.
+    assert_eq!(lib.missing_fields("nav.slow", &[]), ["apid"]);
+    assert!(lib.missing_own_fields("nav.slow", &[]).is_empty());
     assert!(lib.missing_fields("nope.x", &[]).is_empty());
 }
 

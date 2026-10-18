@@ -77,6 +77,8 @@ pub struct Node {
     pub lit: bool,
     /// Text or name differ from the library query (or there is none).
     pub edited: bool,
+    /// Added without its parents: only its own text counts.
+    pub detached: bool,
     /// Editor open.
     pub open: bool,
     /// Last save error.
@@ -96,6 +98,7 @@ impl Node {
             role,
             lit: false,
             edited: true,
+            detached: false,
             open: true,
             error: None,
         }
@@ -117,10 +120,11 @@ impl Node {
         })
     }
 
-    /// The expansion id: the library query, unless edited.
+    /// The expansion id: the library query, unless edited or detached
+    /// (those expand from a local copy).
     fn expand_id(&self) -> String {
         match &self.source {
-            Some(s) if !self.edited => s.clone(),
+            Some(s) if !self.edited && !self.detached => s.clone(),
             _ => format!("{LOCAL_PACK}.n{}", self.key),
         }
     }
@@ -197,11 +201,26 @@ impl Picks {
     /// Add library query `id` at `at` (the end when `None`). A query
     /// already selected in the same role isn't added twice.
     pub fn add(&mut self, lib: &Library, id: &str, role: Use, at: Option<usize>) -> bool {
-        if self.nodes.iter().any(|n| n.source.as_deref() == Some(id) && !n.edited && n.role == role) {
+        self.add_node(lib, id, role, at, false)
+    }
+
+    /// Add library query `id` without its parents: only its own text, so a
+    /// child of a format-specific parent can run on other files.
+    pub fn add_detached(&mut self, lib: &Library, id: &str, role: Use) -> bool {
+        self.add_node(lib, id, role, None, true)
+    }
+
+    fn add_node(&mut self, lib: &Library, id: &str, role: Use, at: Option<usize>, detached: bool) -> bool {
+        let same = |n: &Node| n.source.as_deref() == Some(id) && !n.edited && n.role == role && n.detached == detached;
+        if self.nodes.iter().any(same) {
             return false;
         }
         let key = self.next_key();
-        let Some(n) = Node::of_library(key, lib, id, role) else { return false };
+        let Some(mut n) = Node::of_library(key, lib, id, role) else { return false };
+        if detached {
+            n.detached = true;
+            n.parent = None;
+        }
         let at = at.unwrap_or(self.nodes.len()).min(self.nodes.len());
         self.nodes.insert(at, n);
         true
@@ -268,7 +287,7 @@ impl Picks {
             match lib.get(&id) {
                 Some((p, q)) if !n.edited => {
                     n.text = q.text.clone();
-                    n.parent = p.parent_of(q);
+                    n.parent = if n.detached { None } else { p.parent_of(q) };
                     n.labels = q.labels.join(", ");
                     n.color = q.color.clone().unwrap_or_default();
                 }
@@ -288,7 +307,7 @@ impl Picks {
     /// The library plus a temporary pack with the local nodes.
     fn with_locals(&self, lib: &Library) -> Result<Library, String> {
         let mut text = format!("pack {LOCAL_PACK}\n");
-        for n in self.nodes.iter().filter(|n| n.edited || n.source.is_none()) {
+        for n in self.nodes.iter().filter(|n| n.edited || n.detached || n.source.is_none()) {
             if let Err(e) = n.validate() {
                 return Err(format!("'{}': {e}", n.name));
             }
@@ -790,9 +809,22 @@ fn query_row(
                 ui.close();
             }
             ui.separator();
-            if ui.button("Exclude from the filter").on_hover_text("Add to the selection as − (AND NOT)").clicked() {
+            let r = ui.add_enabled(usable, egui::Button::new("Exclude from the filter"));
+            if r.on_hover_text("Add to the selection as − (AND NOT)").on_disabled_hover_text(&why).clicked() {
                 picks.add(lib, id, Use::Exclude, None);
                 ui.close();
+            }
+            if let Some(parent) = pack.parent_of(q) {
+                // Its own text may run where its parents can't (a generic
+                // child of a DLT-only parent, on a text file).
+                let own_missing = schema.map(|s| lib.missing_own_fields(id, s)).unwrap_or_default();
+                let own_why = incompatible_text(&own_missing, schema.unwrap_or_default());
+                let r = ui.add_enabled(own_missing.is_empty(), egui::Button::new("Add without its parents"));
+                let tip = format!("Only its own text, without refining {parent}");
+                if r.on_hover_text(tip).on_disabled_hover_text(&own_why).clicked() {
+                    picks.add_detached(lib, id, Use::Include);
+                    ui.close();
+                }
             }
         })
         .response
@@ -1094,10 +1126,14 @@ fn node_row(ui: &mut egui::Ui, n: &mut Node, remove: &mut Option<u64>, action: &
         }
         let tip = match &n.source {
             Some(s) if n.edited => format!("edited copy of {s}\n\n{}", n.text),
+            Some(s) if n.detached => format!("{s}, without its parents\n\n{}", n.text),
             Some(s) => format!("{s}\n\n{}", n.text),
             None => format!("new query (not in a pack)\n\n{}", n.text),
         };
         ui.label(name).on_hover_text(tip);
+        if n.detached {
+            ui.weak("without parents").on_hover_text("Added without its parents: only its own text counts");
+        }
         if n.edited {
             ui.weak("•").on_hover_text("Not saved in a pack");
         }
@@ -1621,6 +1657,81 @@ mod tests {
         }
         let why = incompatible_text(&["apid".into()], &[]);
         assert_eq!(why, "Can't run on this file: it has no field 'apid' (it has: raw, level)");
+    }
+
+    #[test]
+    fn a_query_can_be_added_without_its_parents() {
+        let lib = lib();
+        let mut p = Picks::default();
+        p.params.insert("ecu".into(), ("E1".into(), false));
+        assert!(p.add_detached(&lib, "v.drops", Use::Include));
+        assert!(!p.add_detached(&lib, "v.drops", Use::Include), "not twice");
+        assert!(p.add(&lib, "v.drops", Use::Include, None), "with parents is another node");
+        let a = p.expand(&lib).unwrap();
+        assert_eq!(a.exp.nfd, r#"(/drop/) OR (ecu == "E1") AND (/drop/)"#);
+        // Refreshing keeps it without parents; searching it too.
+        p.refresh(&lib);
+        assert_eq!(p.nodes[0].parent, None);
+        let t = p.search_term(&lib, &Target::Node(p.nodes[0].key), 0).unwrap();
+        assert_eq!(t.nfd, "(/drop/)");
+    }
+
+    #[test]
+    fn on_a_text_file_a_generic_child_of_a_dlt_parent_adds_without_parents() {
+        let mut lib = Library::new();
+        let text = "pack soc
+query soc
+  ecu == SOCA
+query swup  parent: soc
+  /SWUP/
+";
+        lib.add(parse_pack("soc.nerka-pack", text).unwrap()).unwrap();
+        let (mut picks, mut view) = (Picks::default(), LibraryView { by_pack: true, editing: None });
+        let ctx = egui::Context::default();
+        let mut frame = |events: Vec<egui::Event>, picks: &mut Picks| {
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(500.0, 400.0))),
+                events,
+                ..Default::default()
+            };
+            let mut full = ctx.run_ui(input, |ui| {
+                egui::CentralPanel::default().show(ui, |ui| {
+                    library_panel(ui, &mut lib, &[], picks, &mut view, Some(&[]));
+                });
+            });
+            full.textures_delta.clear();
+            full.shapes
+        };
+        let click = |p: egui::Pos2| {
+            let ev = |pressed| egui::Event::PointerButton {
+                pos: p,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            };
+            [vec![egui::Event::PointerMoved(p), ev(true)], vec![ev(false)], vec![]]
+        };
+        let shapes = frame(vec![], &mut picks);
+        let row = find_text(&shapes, "swup").unwrap();
+        // + is disabled (the parent needs 'ecu')...
+        let plus = find_text_at_y(&shapes, "+", row.y).unwrap();
+        for ev in click(plus) {
+            frame(ev, &mut picks);
+        }
+        assert!(picks.nodes.is_empty());
+        // ...but ⋮ → Add without its parents works.
+        let dots = find_text_at_y(&frame(vec![], &mut picks), "⋮", row.y).unwrap();
+        let mut shapes = Vec::new();
+        for ev in click(dots) {
+            shapes = frame(ev, &mut picks);
+        }
+        let item = find_text(&shapes, "Add without its parents").expect("menu item");
+        for ev in click(item) {
+            frame(ev, &mut picks);
+        }
+        assert_eq!(picks.nodes.len(), 1);
+        assert!(picks.nodes[0].detached);
+        assert_eq!(picks.expand(&lib).unwrap().exp.nfd, "(/SWUP/)");
     }
 
     #[test]
