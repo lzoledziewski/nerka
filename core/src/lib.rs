@@ -13,6 +13,8 @@
 //! * [`event`] — lazily normalized fields (level, …) per line.
 //! * [`bookmarks`] — bookmarks/notes persisted in a sidecar file.
 //! * [`history`] — recently used filters.
+//! * [`pack`] — query packs (the search manager's library) and their
+//!   expansion into plain NFD.
 
 pub mod bookmarks;
 pub mod dsl;
@@ -20,6 +22,7 @@ pub mod engine;
 pub mod event;
 pub mod history;
 pub mod input;
+pub mod pack;
 
 pub use bookmarks::Bookmarks;
 pub use dsl::{DslError, Query};
@@ -30,6 +33,7 @@ pub use history::SearchHistory;
 pub use input::dlt::DltFile;
 pub use input::text::TextFile;
 pub use input::{ColumnDef, LogSource, open};
+pub use pack::{Library, Pack, PackError, PackQuery};
 
 /// Line numbers are 0-based internally; UIs add 1 for display.
 pub type LineNo = u64;

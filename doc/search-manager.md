@@ -50,11 +50,12 @@ The expanded NFD can get long (a label with ten queries). The filter and search 
 
 History stores the **expanded NFD** plus the chip names for display. Old entries keep working after packs change or disappear.
 
-## Pack file (tentative)
+## Pack file
 
-Plain text that merges well in git: one query per block, stable ids, order kept as written, nothing generated.
+Plain text that merges well in git: one query per block, stable ids, order kept as written, nothing generated. Files are UTF-8 with the extension `.nerka-pack`. Parser and full grammar: `core/src/pack/` (the doc comment of `mod.rs`).
 
 ```text
+# A comment: '#' in column 1, or ' #' followed by a space.
 pack vision   # camera team
 
 query cam_scope(ecu, cam)  labels: system/vision
@@ -64,7 +65,15 @@ query frame_drops(cam)  parent: cam_scope  labels: system/vision, perf  color: v
     payload ~ /$cam frame drop/
 ```
 
-Where packs are loaded from: `%APPDATA%\nerka\packs\` (Linux: `~/.config/nerka/packs/`), plus `--pack <dir|file>` on the CLI. Packs stored with a project are an open question.
+- `pack NAME` is the first non-comment line; one pack per file. Names (pack, query, parameter) are `[A-Za-z_][A-Za-z0-9_]*`, so `.` only separates pack and query (`vision.frame_drops`).
+- `query NAME(PARAMS)` then attributes, all optional and in any order: `parent:` (a query of the same pack, or `pack.query` from another pack), `labels:` (comma-separated, `/` for hierarchy), `color:` (a lowercase name or `#rrggbb`).
+- The body is the indented lines below the header, up to the next line starting in column 1. It is kept verbatim (no comments inside), with the common indent removed. Blank lines don't end a body.
+- `$name` or `${name}` is a parameter and must be declared in the query's own list. `$$` is a literal `$`; so is a `$` not followed by a name (the regex anchor in `/down$/`) and `\$` inside a regex or string.
+- The parser checks the body's NFD syntax (with placeholder parameter values) and reports every error as `file:line:column: message`. Field names are checked only when a query runs on a source.
+- Parents are resolved at expansion time, so a child can refine a query from another pack. A missing parent is an expansion error, not a parse error (the parent's pack may simply not be loaded).
+
+Where packs are loaded from: `%APPDATA%
+erka\packs\` (Linux: `~/.config/nerka/packs/`), plus `--pack <dir|file>` on the CLI (a directory loads its `*.nerka-pack` files, not recursively, in name order). Pack names must be unique across everything loaded. Packs stored with a project are an open question.
 
 ## Later (not in the POC)
 
