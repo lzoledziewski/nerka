@@ -11,6 +11,7 @@
 //! ```text
 //! # A comment: '#' at the start of a line, or ' #' followed by a space.
 //! pack vision                      # first non-comment line: the pack name
+//!                                  # (quoted if it has spaces: pack "camera team")
 //!
 //! query cam_scope(ecu, cam)  labels: system/vision
 //!     ecu == $ecu AND ctid == $cam
@@ -23,12 +24,14 @@
 //! ```
 //!
 //! ```text
-//! file    := comment* "pack" NAME query*
+//! file    := comment* "pack" PNAME query*
+//! PNAME   := NAME | '"' text '"'                   -- quoted like a QNAME
 //! query   := "query" QNAME [ "(" PARAM ("," PARAM)* ")" ] attr*  NEWLINE  body
 //! QNAME   := NAME | '"' text '"'                   -- quoted: spaces allowed,
 //!                                                     no . " # : at all
 //! attr    := "parent:" (NAME | NAME "." NAME       -- same pack, or pack.query
-//!                      | '"' [NAME "."] text '"')  -- quoted, for QNAMEs
+//!                      | '"' [text "."] text '"')  -- quoted, for PNAMEs
+//!                                                     and QNAMEs
 //!          | "labels:" LABEL ("," LABEL)*          -- LABEL: seg ("/" seg)*
 //!          | "color:" (lowercase name | "#" 6 hex digits)
 //! body    := indented lines (the NFD text, kept verbatim), up to the next

@@ -210,8 +210,16 @@ fn write_time(out: &mut Vec<u8>, secs: u32, usecs: i32) {
 
 fn render_line(m: &Message<'_>) -> Vec<u8> {
     let mut out = Vec::with_capacity(80 + m.payload().len() * 3);
+    render_header(m, &mut out);
+    out.push(b'\t');
+    payload::render(m, &mut out);
+    out
+}
+
+/// The columns before the payload, tab-separated (no trailing tab).
+fn render_header(m: &Message<'_>, out: &mut Vec<u8>) {
     let (secs, usecs) = m.storage_time();
-    write_time(&mut out, secs, usecs);
+    write_time(out, secs, usecs);
     out.push(b'\t');
     if let Some(t) = m.timestamp() {
         let _ = write!(out, "{}.{:04}", t / 10_000, t % 10_000);
@@ -222,9 +230,6 @@ fn render_line(m: &Message<'_>) -> Vec<u8> {
     }
     out.push(b'\t');
     out.extend_from_slice(type_column(m).as_bytes());
-    out.push(b'\t');
-    payload::render(m, &mut out);
-    out
 }
 
 impl LogSource for DltFile {
@@ -238,6 +243,17 @@ impl LogSource for DltFile {
 
     fn line_bytes(&self, line: LineNo) -> Option<Cow<'_, [u8]>> {
         self.msg(line).map(|m| Cow::Owned(render_line(&m)))
+    }
+
+    fn line_detail(&self, line: LineNo) -> Option<Vec<String>> {
+        let m = self.msg(line)?;
+        let mut head = Vec::new();
+        render_header(&m, &mut head);
+        let mut cells: Vec<String> = String::from_utf8_lossy(&head).split('\t').map(str::to_owned).collect();
+        let mut payload = Vec::new();
+        payload::render_formatted(&m, &mut payload);
+        cells.push(String::from_utf8_lossy(&payload).into_owned());
+        Some(cells)
     }
 
     fn size_bytes(&self) -> u64 {

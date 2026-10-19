@@ -80,8 +80,12 @@ fn assert_error(text: &str, line: usize, col: usize, msg: &str) {
 fn file_level_errors() {
     assert_error("  x\npack p\n", 1, 3, "indented text outside a query");
     assert_error("pack\n", 1, 5, "expected a pack name");
-    assert_error("pack a b\n", 1, 8, "single word");
+    assert_error("pack a b\n", 1, 8, "is quoted: pack \"my pack\"");
     assert_error("pack a.b\n", 1, 6, "invalid pack name 'a.b'");
+    assert_error("pack \"a b\n", 1, 6, "missing closing '\"'");
+    assert_error("pack \"a.b\"\n", 1, 7, "invalid pack name 'a.b'");
+    assert_error("pack \" a\"\n", 1, 7, "invalid pack name ' a'");
+    assert_error("pack \"a b\" c\n", 1, 12, "unexpected text after the pack name");
     assert_error("pack a\npack b\n", 2, 1, "second 'pack' line");
     assert_error("query a\n  /x/\n", 1, 1, "expected 'pack NAME'");
     assert_error("pack p\nqueries a\n", 2, 1, "expected 'query' but found 'queries'");
@@ -89,6 +93,36 @@ fn file_level_errors() {
     let e = parse_pack("t", "# only a comment\n").unwrap_err();
     assert_eq!((e.pos, e.msg.as_str()), (None, "no 'pack NAME' line"));
     assert_eq!(e.to_string(), "t: no 'pack NAME' line");
+}
+
+#[test]
+fn quoted_pack_names() {
+    let p = pack(
+        "pack \"camera team\"   # a comment
+query scope
+  /x/
+query drops  parent: scope
+  /y/
+",
+    );
+    assert_eq!(p.name, "camera team");
+    assert_eq!(p.parent_of(&p.queries[1]).as_deref(), Some("camera team.scope"));
+    let child = pack(
+        "pack other
+query c  parent: \"camera team.scope\"
+  /z/
+",
+    );
+    assert_eq!(child.queries[0].parent.as_deref(), Some("camera team.scope"));
+    let mut lib = Library::new();
+    lib.add(p).unwrap();
+    lib.add(child).unwrap();
+    assert_eq!(lib.chain("other.c"), ["camera team.scope", "other.c"]);
+    let sel = Selection { include: vec![Pick::Query("camera team.drops".into())], exclude: vec![] };
+    assert_eq!(expand(&sel, &lib, &Params::new()).unwrap().nfd, "(/x/) AND (/y/)");
+    // Written back quoted.
+    let q = PackQuery { parent: Some("camera team.scope".into()), ..lib.get("other.c").unwrap().1.clone() };
+    assert!(format_query(&q).starts_with("query c  parent: \"camera team.scope\""));
 }
 
 #[test]

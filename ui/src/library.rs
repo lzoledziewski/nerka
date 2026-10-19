@@ -90,7 +90,7 @@ impl Node {
         Node {
             key,
             source: None,
-            name: format!("new {key}"),
+            name: String::new(),
             text: String::new(),
             parent: None,
             labels: String::new(),
@@ -142,13 +142,35 @@ impl Node {
         }
     }
 
-    /// Check the name, labels, colour and text as the pack parser would.
-    fn validate(&self) -> Result<(), String> {
+    /// The name to show: the node's name, or (unnamed) its query text on
+    /// one line, shortened.
+    pub fn display_name(&self) -> String {
         let name = self.name.trim();
-        if !is_query_name(name) {
+        if !name.is_empty() {
+            return name.to_owned();
+        }
+        let text = self.text.split_whitespace().collect::<Vec<_>>().join(" ");
+        const MAX: usize = 40;
+        match text.char_indices().nth(MAX) {
+            _ if text.is_empty() => "(empty query)".to_owned(),
+            Some((cut, _)) => format!("{}…", &text[..cut]),
+            None => text,
+        }
+    }
+
+    /// Check the name, labels, colour and text as the pack parser would.
+    /// The name may be empty (an unnamed node) unless `need_name`: saving
+    /// into a pack needs one.
+    fn validate(&self, need_name: bool) -> Result<(), String> {
+        let name = self.name.trim();
+        if name.is_empty() && need_name {
+            return Err("Name it to save it in a pack".into());
+        }
+        if !name.is_empty() && !is_query_name(name) {
             return Err("Name: anything but . \" # : (spaces are fine)".into());
         }
-        upsert_query(name, &format!("pack {LOCAL_PACK}\n"), &self.as_query(name)).map(|_| ()).map_err(|e| e.msg)
+        let id = if name.is_empty() { "unnamed" } else { name };
+        upsert_query(id, &format!("pack {LOCAL_PACK}\n"), &self.as_query(id)).map(|_| ()).map_err(|e| e.msg)
     }
 }
 
@@ -308,8 +330,8 @@ impl Picks {
     fn with_locals(&self, lib: &Library) -> Result<Library, String> {
         let mut text = format!("pack {LOCAL_PACK}\n");
         for n in self.nodes.iter().filter(|n| n.edited || n.detached || n.source.is_none()) {
-            if let Err(e) = n.validate() {
-                return Err(format!("'{}': {e}", n.name));
+            if let Err(e) = n.validate(false) {
+                return Err(format!("'{}': {e}", n.display_name()));
             }
             text += &format_query(&n.as_query(&format!("n{}", n.key)));
             text.push('\n');
@@ -339,7 +361,7 @@ impl Picks {
         for p in &exp.parts {
             let n = by_id.iter().find(|(id, _)| *id == p.query).map(|(_, n)| *n).expect("expanded from these nodes");
             keys.push(n.key);
-            names.push(n.name.clone());
+            names.push(n.display_name());
             let slot = if p.role == Role::Include { includes } else { 0 };
             colors.push(node_color(n, slot));
             if p.role == Role::Include {
@@ -360,7 +382,7 @@ impl Picks {
             }
             Target::Node(key) => {
                 let n = self.nodes.iter().find(|n| n.key == *key).ok_or("the query was removed")?;
-                (n.expand_id(), n.name.clone(), node_color(n, slot))
+                (n.expand_id(), n.display_name(), node_color(n, slot))
             }
         };
         let sel = Selection { include: vec![Pick::Query(id)], exclude: vec![] };
@@ -849,7 +871,7 @@ fn library_editor(ui: &mut egui::Ui, lib: &mut Library, e: &mut LibEdit) -> Edit
     ui.label(RichText::new(title).strong());
     let own = e.old.as_ref().map(|o| format!("{}.{o}", e.pack));
     let parents = parent_choices(lib, own.as_deref());
-    let valid = fields_ui(ui, &mut e.node, &parents);
+    let valid = fields_ui(ui, &mut e.node, &parents, true);
     ui.horizontal(|ui| {
         if ui
             .add_enabled(valid.is_ok(), egui::Button::new("Save"))
@@ -902,10 +924,11 @@ fn library_editor(ui: &mut egui::Ui, lib: &mut Library, e: &mut LibEdit) -> Edit
 
 /// Name, labels, colour, parent and NFD text of a query, with validation.
 /// `parents` are the queries it may refine.
-fn fields_ui(ui: &mut egui::Ui, n: &mut Node, parents: &[String]) -> Result<(), String> {
+fn fields_ui(ui: &mut egui::Ui, n: &mut Node, parents: &[String], need_name: bool) -> Result<(), String> {
     egui::Grid::new(("fields", n.key)).num_columns(2).show(ui, |ui| {
         ui.label("Name");
-        if ui.add(egui::TextEdit::singleline(&mut n.name).desired_width(f32::INFINITY)).changed() {
+        let hint = if need_name { "" } else { "optional: shown from its query" };
+        if ui.add(egui::TextEdit::singleline(&mut n.name).hint_text(hint).desired_width(f32::INFINITY)).changed() {
             n.edited = true;
         }
         ui.end_row();
@@ -956,7 +979,7 @@ fn fields_ui(ui: &mut egui::Ui, n: &mut Node, parents: &[String]) -> Result<(), 
         n.edited = true;
         n.error = None;
     }
-    let valid = n.validate();
+    let valid = n.validate(need_name);
     match (&n.error, &valid) {
         (Some(e), _) | (None, Err(e)) => {
             ui.colored_label(ui.visuals().error_fg_color, e);
@@ -1120,7 +1143,10 @@ fn node_row(ui: &mut egui::Ui, n: &mut Node, remove: &mut Option<u64>, action: &
                 n.lit = !n.lit;
             }
         }
-        let mut name = RichText::new(&n.name);
+        let mut name = RichText::new(n.display_name());
+        if n.name.trim().is_empty() {
+            name = name.weak();
+        }
         if n.edited {
             name = name.italics();
         }
@@ -1167,7 +1193,8 @@ fn node_editor(
 ) -> Option<EditorAction> {
     let mut action = None;
     egui::Frame::group(ui.style()).show(ui, |ui| {
-        let valid = fields_ui(ui, n, parents);
+        let valid = fields_ui(ui, n, parents, false);
+        let named = n.validate(true);
         if save_pack.is_empty()
             && let Some((p, _)) = n.source.as_deref().and_then(|s| s.split_once('.'))
         {
@@ -1182,11 +1209,14 @@ fn node_editor(
                         ui.selectable_value(save_pack, p.clone(), p);
                     }
                 });
-            let can = valid.is_ok() && packs.contains(save_pack);
-            let tip = format!(
-                "Write it into the {save_pack} pack file as '{}' (renames the query it came from if it is in that pack)",
-                n.name.trim()
-            );
+            let can = valid.is_ok() && named.is_ok() && packs.contains(save_pack);
+            let tip = match &named {
+                Err(e) if valid.is_ok() => e.clone(),
+                _ => format!(
+                    "Write it into the {save_pack} pack file as '{}' (renames the query it came from if it is in that pack)",
+                    n.name.trim()
+                ),
+            };
             if ui.add_enabled(can, egui::Button::new("Save")).on_hover_text(tip).clicked() {
                 action = Some(EditorAction::Save);
             }
@@ -1213,6 +1243,10 @@ fn node_editor(
 fn save_node(lib: &mut Library, picks: &mut Picks, key: u64) -> Option<Option<(String, String)>> {
     let pack_name = picks.save_pack.clone();
     let n = picks.node_mut(key)?;
+    if let Err(e) = n.validate(true) {
+        n.error = Some(e);
+        return None;
+    }
     let name = n.name.trim().to_owned();
     let mut q = n.as_query(&name);
     // A parent in the same pack is written without the pack name.
@@ -1368,22 +1402,51 @@ mod tests {
     }
 
     #[test]
+    fn new_nodes_are_unnamed_and_shown_by_their_query() {
+        let lib = lib();
+        let mut p = Picks::default();
+        let k = p.add_new(Use::Include);
+        let n = p.node_mut(k).unwrap();
+        assert_eq!(n.name, "");
+        assert_eq!(n.display_name(), "(empty query)");
+        n.text = "level >= ERROR\n    AND /timeout/".into();
+        assert_eq!(n.display_name(), "level >= ERROR AND /timeout/");
+        n.validate(false).unwrap();
+        assert!(n.validate(true).unwrap_err().contains("Name it"));
+        n.text = format!("/{}/", "x".repeat(60));
+        assert_eq!(n.display_name(), format!("/{}…", "x".repeat(39)));
+        n.text = "/timeout/".into();
+        // It expands, and its chip shows the derived name.
+        let a = p.expand(&lib).unwrap();
+        assert_eq!(a.exp.nfd, "(/timeout/)");
+        assert_eq!(a.names, ["/timeout/"]);
+        // Saving into a pack needs a name.
+        p.save_pack = lib.packs()[0].name.clone();
+        let mut lib2 = lib.clone();
+        assert_eq!(save_node(&mut lib2, &mut p, k), None);
+        assert!(p.nodes[0].error.as_deref().unwrap().contains("Name it"));
+        // A name, once typed, is what shows.
+        p.nodes[0].name = "timeouts".into();
+        assert_eq!(p.nodes[0].display_name(), "timeouts");
+    }
+
+    #[test]
     fn names_labels_and_colours_are_checked_and_saved() {
         let mut p = Picks::default();
         let k = p.add_new(Use::Include);
         let n = p.node_mut(k).unwrap();
         n.text = "apid == \"xyz\"".into();
         n.name = "xyz.logs".into();
-        assert!(n.validate().unwrap_err().contains("anything but"));
+        assert!(n.validate(true).unwrap_err().contains("anything but"));
         n.name = " xyz logs ".into();
         n.labels = "aurix, system/ecu ,".into();
         n.color = "Teal".into();
-        assert!(n.validate().unwrap_err().contains("invalid colour"));
+        assert!(n.validate(true).unwrap_err().contains("invalid colour"));
         n.color = "teal".into();
         n.labels = "a b".into();
-        assert!(n.validate().unwrap_err().contains("separated by commas"));
+        assert!(n.validate(true).unwrap_err().contains("separated by commas"));
         n.labels = "aurix, system/ecu ,".into();
-        n.validate().unwrap();
+        n.validate(true).unwrap();
 
         let dir = std::env::temp_dir().join(format!("nerka-gui-labels-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();

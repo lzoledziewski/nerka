@@ -35,19 +35,40 @@ pub fn parse_pack(file: &str, text: &str) -> Result<Pack, PackError> {
         let Some(word) = content.split_whitespace().next() else { continue };
         match (word, &name) {
             ("pack", None) => {
-                let rest: Vec<&str> = content[4..].split_whitespace().collect();
-                match rest.as_slice() {
-                    [n] if is_name(n) => name = Some((*n).to_owned()),
-                    [] => return Err(err(ln, content.len(), "expected a pack name after 'pack'".into())),
-                    [n] => {
-                        let col = col_of(line, 4 + content[4..].find(n).unwrap_or(0));
-                        return Err(err(ln, col, format!("invalid pack name '{n}' (letters, digits and _)")));
+                let rest = content[4..].trim();
+                let rest_at = 4 + content[4..].len() - content[4..].trim_start().len();
+                if rest.is_empty() {
+                    return Err(err(ln, content.len(), "expected a pack name after 'pack'".into()));
+                }
+                if let Some(inner) = rest.strip_prefix('"') {
+                    // A quoted name may hold spaces: pack "camera team"
+                    let Some(close) = inner.find('"') else {
+                        return Err(err(ln, col_of(line, rest_at), "missing closing '\"' after the pack name".into()));
+                    };
+                    let n = &inner[..close];
+                    if !is_query_name(n) {
+                        let msg = format!("invalid pack name '{n}' (no . \" # : and no spaces at the ends)");
+                        return Err(err(ln, col_of(line, rest_at + 1), msg));
                     }
-                    [n, extra, ..] => {
-                        let after = 4 + content[4..].find(n).unwrap_or(0) + n.len();
+                    if !inner[close + 1..].trim().is_empty() {
+                        let after = rest_at + 1 + close + 1;
+                        let col = col_of(line, after + content[after..].len() - content[after..].trim_start().len());
+                        return Err(err(ln, col, "unexpected text after the pack name".into()));
+                    }
+                    name = Some(n.to_owned());
+                } else {
+                    let words: Vec<&str> = rest.split_whitespace().collect();
+                    let n = words[0];
+                    if !is_name(n) {
+                        let msg = format!("invalid pack name '{n}' (letters, digits and _, or a \"quoted name\")");
+                        return Err(err(ln, col_of(line, rest_at), msg));
+                    }
+                    if let Some(extra) = words.get(1) {
+                        let after = rest_at + n.len();
                         let col = col_of(line, after + content[after..].find(extra).unwrap_or(0));
-                        return Err(err(ln, col, "a pack name is a single word".into()));
+                        return Err(err(ln, col, "a pack name with spaces is quoted: pack \"my pack\"".into()));
                     }
+                    name = Some(n.to_owned());
                 }
             }
             ("pack", Some(_)) => return Err(err(ln, 0, "a file holds one pack: second 'pack' line".into())),
@@ -177,7 +198,7 @@ fn header(line: &str, content: &str, ln: usize) -> Result<PackQuery, (usize, Str
                 let inner = if quoted { &v[1..v.len() - 1] } else { v };
                 let name_ok = |n: &str| if quoted { is_query_name(n) } else { is_name(n) };
                 let ok = match inner.split_once('.') {
-                    Some((p, n)) => is_name(p) && name_ok(n),
+                    Some((p, n)) => name_ok(p) && name_ok(n),
                     None => name_ok(inner),
                 };
                 if !ok {

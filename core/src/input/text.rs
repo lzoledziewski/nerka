@@ -70,3 +70,16 @@ impl LogSource for TextFile {
         self.index.line_start(line)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn line_detail_is_the_whole_line() {
+        let f = TextFile::from_bytes("t", b"a\tb c\r\nnext\n".to_vec());
+        assert_eq!(f.line_detail(0), Some(vec!["a\tb c".to_owned()]));
+        assert_eq!(f.line_detail(1), Some(vec!["next".to_owned()]));
+        assert_eq!(f.line_detail(2), None);
+    }
+}

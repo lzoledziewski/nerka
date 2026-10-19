@@ -17,8 +17,9 @@
 //! (or line) · Ctrl+A select all · Ctrl+Home/End
 //! · Ctrl+Tab / Ctrl+Shift+Tab next/prev tab · Ctrl+W close tab · F1 about.
 //!
-//! Recent filters are kept in `<config dir>/nerka/history` and offered by
-//! the 🕘 button next to the filter box.
+//! Recent filters are kept in `<config dir>/nerka/history`, recent
+//! searches in `<config dir>/nerka/search-history`; the 🕘 button next to
+//! each box lists them, and ↑ / ↓ in the box steps through them.
 //!
 //! Search manager (`doc/search-manager.md`): the Library pane lists the
 //! queries of the packs in `<config dir>/nerka/packs` (and `--pack`); the
@@ -33,6 +34,7 @@ mod icon;
 mod job;
 mod library;
 mod prefs;
+mod recall;
 mod view;
 
 use eframe::egui::{self, Color32, Key, KeyboardShortcut, Modifiers, RichText};
@@ -184,11 +186,98 @@ struct Tab {
     line_colors: Option<(Arc<ActiveSearch>, Arc<SearchHits>)>,
     colors_job: Option<(Arc<ActiveSearch>, Job<SearchHits>)>,
     search: SearchBox,
+    /// ↑ / ↓ in the Filter box.
+    filter_recall: recall::Recall,
 
     bookmarks: Bookmarks,
     /// Bookmarks whose line is unfolded in the panel.
     marks_open: std::collections::HashSet<LineNo>,
+    /// The line shown whole in the line window (Enter), if open.
+    detail: Option<LineDetail>,
     status: String,
+}
+
+/// One line shown whole: its cells as the source formats them (a DLT
+/// payload keeps its own line breaks), read when the window opened.
+struct LineDetail {
+    line: LineNo,
+    cells: Vec<String>,
+    /// Column names of a table source; empty for plain text.
+    names: Vec<&'static str>,
+    wrap: bool,
+}
+
+/// Text shown in the line window at most; Copy still copies all of it.
+const DETAIL_MAX_BYTES: usize = 1 << 20;
+
+impl LineDetail {
+    fn of(file: &dyn LogSource, line: LineNo) -> Option<Self> {
+        let cells = file.line_detail(line)?;
+        let names = file.columns().iter().map(|c| c.name).collect();
+        Some(LineDetail { line, cells, names, wrap: true })
+    }
+
+    /// The window: the cells before the message as a name / value grid,
+    /// the message in a selectable box with its own line breaks. Returns
+    /// whether it is still open and the text to copy, if asked.
+    fn show(&mut self, ctx: &egui::Context) -> (bool, Option<String>) {
+        let mut open = true;
+        let mut copied = None;
+        let table = !self.names.is_empty();
+        egui::Window::new(format!("Line {}", self.line + 1))
+            .id(egui::Id::unique("line-detail"))
+            .open(&mut open)
+            .resizable(true)
+            .collapsible(false)
+            .default_size([640.0, 360.0])
+            .show(ctx, |ui| {
+                let msg = self.cells.last().map_or("", String::as_str);
+                ui.horizontal(|ui| {
+                    if table {
+                        let tip = format!("The {} column, with its own line breaks", self.names.last().unwrap_or(&""));
+                        if ui.button("Copy message").on_hover_text(tip).clicked() {
+                            copied = Some(msg.to_owned());
+                        }
+                        if ui.button("Copy line").on_hover_text("Every column, tab-separated").clicked() {
+                            copied = Some(self.cells.join("	"));
+                        }
+                    } else if ui.button("Copy").clicked() {
+                        copied = Some(msg.to_owned());
+                    }
+                    ui.checkbox(&mut self.wrap, "Wrap");
+                    let lines = msg.lines().count().max(1);
+                    let s = if lines == 1 { "" } else { "s" };
+                    ui.weak(format!("{} characters, {lines} line{s}", msg.chars().count()));
+                });
+                if table {
+                    egui::Grid::new("line-detail-cells").num_columns(2).spacing([12.0, 2.0]).show(ui, |ui| {
+                        for (name, value) in self.names.iter().zip(&self.cells[..self.cells.len() - 1]) {
+                            ui.label(RichText::new(*name).strong());
+                            ui.monospace(value);
+                            ui.end_row();
+                        }
+                    });
+                }
+                ui.separator();
+                let mut shown = msg;
+                if shown.len() > DETAIL_MAX_BYTES {
+                    let mut end = DETAIL_MAX_BYTES;
+                    while !shown.is_char_boundary(end) {
+                        end -= 1;
+                    }
+                    shown = &shown[..end];
+                    ui.weak(format!("Showing the first {} KiB; Copy copies all of it.", DETAIL_MAX_BYTES >> 10));
+                }
+                let scroll = if self.wrap { egui::ScrollArea::vertical() } else { egui::ScrollArea::both() };
+                scroll.auto_shrink([false, false]).show(ui, |ui| {
+                    // A `&str` buffer: selectable and copyable, not editable.
+                    let mut text = shown;
+                    let edit = egui::TextEdit::multiline(&mut text).font(egui::TextStyle::Monospace);
+                    ui.add(if self.wrap { edit.desired_width(f32::INFINITY) } else { edit.desired_width(f32::MAX) });
+                });
+            });
+        (open, copied)
+    }
 }
 
 /// The Search box: looks only inside the filter result (the whole file
@@ -206,6 +295,8 @@ struct SearchBox {
     active: Option<Arc<ActiveSearch>>,
     hits: Option<(Arc<ActiveSearch>, Arc<SearchHits>)>,
     job: Option<(Arc<ActiveSearch>, Job<SearchHits>)>,
+    /// ↑ / ↓ in the box.
+    recall: recall::Recall,
 }
 
 /// A search ready to run: its queries, names, colours and highlighters.
@@ -217,6 +308,28 @@ struct ActiveSearch {
 }
 
 impl SearchBox {
+    /// History tag for the box: `text`, `regex` or `query`.
+    fn tag(&self) -> &'static str {
+        match self.mode {
+            Mode::Text if self.regex => "regex",
+            Mode::Text => "text",
+            Mode::Query => "query",
+        }
+    }
+
+    /// Fill the box from a history tag and pattern; unknown tags are ignored.
+    fn set(&mut self, tag: &str, pattern: &str) {
+        match tag {
+            "text" | "regex" => {
+                self.mode = Mode::Text;
+                self.regex = tag == "regex";
+            }
+            "query" => self.mode = Mode::Query,
+            _ => return,
+        }
+        self.pattern = pattern.to_owned();
+    }
+
     /// The box's text for `terms`: OR'ed (AND binds tighter, and each term
     /// is a parenthesized chain, a string, a regex or `NOT` one of them).
     fn text_of(terms: &[Term]) -> String {
@@ -267,8 +380,10 @@ impl Tab {
             line_colors: None,
             colors_job: None,
             search: SearchBox::default(),
+            filter_recall: recall::Recall::default(),
             bookmarks: Bookmarks::default(),
             marks_open: Default::default(),
+            detail: None,
             status: String::new(),
         }
     }
@@ -722,6 +837,11 @@ impl Tab {
         if let Some(row) = out.toggle_bookmark {
             self.toggle_bookmark_at(line_of_row(row));
         }
+        if let Some(row) = out.detail
+            && let Some(file) = &self.file
+        {
+            self.detail = LineDetail::of(&**file, line_of_row(row));
+        }
     }
 
     /// Returns true when the panel's close button was clicked.
@@ -845,7 +965,7 @@ impl Tab {
                     });
                 })
                 .response
-                .on_hover_text("Recent filters");
+                .on_hover_text("Recent filters (or ↑ / ↓ in the box)");
             });
             ui.label(RichText::new("Filter").strong())
                 .on_hover_text("Decides which lines the main view shows; Enter applies it");
@@ -881,6 +1001,10 @@ impl Tab {
                     r.request_focus();
                     *focus_search = false;
                 }
+                let tag = self.filter_tag();
+                if let Some((tag, p)) = recall::keys(ui, &r, &mut self.filter_recall, history, (tag, &self.pattern)) {
+                    self.set_filter(&tag, &p);
+                }
                 go |= r.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
             });
             if go && self.start_search(ui.ctx()) {
@@ -897,9 +1021,15 @@ impl Tab {
         searched
     }
 
-    /// The Search box and the list of its hits (bottom panel).
-    fn search_panel(&mut self, ui: &mut egui::Ui, file: &dyn LogSource) {
-        self.search_row(ui);
+    /// The Search box and the list of its hits (bottom panel). Returns the
+    /// search that was run from the box, to record in its history.
+    fn search_panel(
+        &mut self,
+        ui: &mut egui::Ui,
+        file: &dyn LogSource,
+        history: &SearchHistory,
+    ) -> Option<(&'static str, String)> {
+        let searched = self.search_row(ui, history);
         ui.add_space(2.0);
         let marks = self.search.hits.as_ref().map(|(a, h)| SearchMarks {
             hits: h,
@@ -935,16 +1065,34 @@ impl Tab {
             // Fill the pane: panels remember their content size.
             ui.allocate_space(ui.available_size());
         }
+        searched
     }
 
     /// The Search box, under the Filter box: same modes, Enter runs it.
-    fn search_row(&mut self, ui: &mut egui::Ui) {
+    /// Returns the search it ran, to record in the history.
+    fn search_row(&mut self, ui: &mut egui::Ui, history: &SearchHistory) -> Option<(&'static str, String)> {
         let mut go = false;
         let mut clear = false;
         ui.horizontal(|ui| {
             ui.label("🔍").on_hover_text(
                 "Search the lines in the main view; hits are listed below and coloured, n / N jump between them",
             );
+            ui.add_enabled_ui(!history.is_empty(), |ui| {
+                ui.menu_button("🕘", |ui| {
+                    egui::ScrollArea::vertical().max_height(400.0).show(ui, |ui| {
+                        for (tag, pattern) in history.iter() {
+                            let label = egui::RichText::new(format!("{tag:<5}  {pattern}")).monospace();
+                            if ui.add(egui::Button::new(label).wrap_mode(egui::TextWrapMode::Truncate)).clicked() {
+                                // Fills the box only; Enter or Find runs it.
+                                self.search.set(tag, pattern);
+                                ui.close();
+                            }
+                        }
+                    });
+                })
+                .response
+                .on_hover_text("Recent searches (or ↑ / ↓ in the box)");
+            });
             ui.selectable_value(&mut self.search.mode, Mode::Text, "Text");
             ui.selectable_value(&mut self.search.mode, Mode::Query, "Query");
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -964,17 +1112,27 @@ impl Tab {
                         .font(egui::TextStyle::Monospace)
                         .desired_width(ui.available_width()),
                 );
+                let tag = self.search.tag();
+                let pattern = self.search.pattern.clone();
+                if let Some((tag, p)) = recall::keys(ui, &r, &mut self.search.recall, history, (tag, &pattern)) {
+                    self.search.set(&tag, &p);
+                }
                 go |= r.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
             });
         });
+        let mut searched = None;
         if clear {
             self.clear_search();
         } else if go {
             self.run_search_box(ui.ctx());
+            if self.search.active.is_some() {
+                searched = Some((self.search.tag(), self.search.pattern.clone()));
+            }
         }
         if let Some(terms) = self.search.current_terms() {
             terms_view(ui, terms);
         }
+        searched
     }
 
     fn main_panel(&mut self, ui: &mut egui::Ui, file: &dyn LogSource) {
@@ -1101,6 +1259,8 @@ struct App {
     /// The app icon as a texture for the About dialog, made on first use.
     about_icon: Option<egui::TextureHandle>,
     history: SearchHistory,
+    /// Recent searches (the Search box), kept apart from the filters.
+    search_history: SearchHistory,
     /// Search mode and options for new tabs: the last ones the user picked.
     prefs: SearchPrefs,
     /// Shown when no tab is open (e.g. why the last open failed).
@@ -1147,6 +1307,10 @@ fn history_path() -> Option<PathBuf> {
     nerka_core::config_dir().map(|d| d.join("history"))
 }
 
+fn search_history_path() -> Option<PathBuf> {
+    nerka_core::config_dir().map(|d| d.join("search-history"))
+}
+
 fn prefs_path() -> Option<PathBuf> {
     nerka_core::config_dir().map(|d| d.join("prefs"))
 }
@@ -1182,10 +1346,14 @@ impl App {
             }
             library::Action::Search { target, add } => {
                 let lib = std::mem::take(&mut self.library);
-                if let Some(t) = self.tab() {
+                let searched = self.tab().and_then(|t| {
                     t.search_for(ctx, &lib, &target, add);
-                }
+                    t.search.active.is_some().then(|| (t.search.tag(), t.search.pattern.clone()))
+                });
                 self.library = lib;
+                if let Some((tag, pattern)) = searched {
+                    self.record_search_box(tag, &pattern);
+                }
             }
             library::Action::Edited { renamed } => {
                 for t in &mut self.tabs {
@@ -1198,10 +1366,17 @@ impl App {
         }
     }
     fn load_history(&mut self) {
-        let Some(path) = history_path() else { return };
-        match SearchHistory::load(&path) {
-            Ok(h) => self.history = h,
-            Err(e) => self.status = format!("Could not read search history: {e}"),
+        if let Some(path) = history_path() {
+            match SearchHistory::load(&path) {
+                Ok(h) => self.history = h,
+                Err(e) => self.status = format!("Could not read filter history: {e}"),
+            }
+        }
+        if let Some(path) = search_history_path() {
+            match SearchHistory::load(&path) {
+                Ok(h) => self.search_history = h,
+                Err(e) => self.status = format!("Could not read search history: {e}"),
+            }
         }
     }
 
@@ -1227,10 +1402,22 @@ impl App {
         }
     }
 
+    /// Record a filter in the filter history.
     fn record_search(&mut self, tag: &str, pattern: &str) {
         if self.history.push(tag, pattern)
             && let Some(path) = history_path()
             && let Err(e) = self.history.save(&path)
+            && let Some(t) = self.tabs.get_mut(self.active)
+        {
+            t.status = format!("Could not save filter history: {e}");
+        }
+    }
+
+    /// Record a Search box search in the search history.
+    fn record_search_box(&mut self, tag: &str, pattern: &str) {
+        if self.search_history.push(tag, pattern)
+            && let Some(path) = search_history_path()
+            && let Err(e) = self.search_history.save(&path)
             && let Some(t) = self.tabs.get_mut(self.active)
         {
             t.status = format!("Could not save search history: {e}");
@@ -1497,6 +1684,18 @@ impl eframe::App for App {
         self.update_title(&ctx);
         self.goto_dialog(&ctx);
         self.about_dialog(&ctx);
+        if let Some(t) = self.tabs.get_mut(self.active)
+            && let Some(d) = &mut t.detail
+        {
+            let (open, copied) = d.show(&ctx);
+            if let Some(text) = copied {
+                ctx.copy_text(text);
+                t.status = "Copied".into();
+            }
+            if !open {
+                t.detail = None;
+            }
+        }
 
         egui::Panel::top("toolbar").show(ui, |ui| {
             ui.horizontal(|ui| {
@@ -1621,17 +1820,22 @@ impl eframe::App for App {
                 self.show_bookmarks = false;
             }
         }
-        egui::Panel::bottom("search")
+        let search_history = &self.search_history;
+        let found = egui::Panel::bottom("search")
             .resizable(true)
             .default_size(260.0)
             .min_size(120.0)
-            .show(ui, |ui| tab.search_panel(ui, &*file));
+            .show(ui, |ui| tab.search_panel(ui, &*file, search_history))
+            .inner;
         egui::CentralPanel::default().show(ui, |ui| tab.main_panel(ui, &*file));
         if after != before {
             self.save_prefs_from(after);
         }
         if let Some((tag, pattern)) = searched {
             self.record_search(tag, &pattern);
+        }
+        if let Some((tag, pattern)) = found {
+            self.record_search_box(tag, &pattern);
         }
     }
 }
@@ -1676,6 +1880,42 @@ query timeouts  labels: vision
     fn hits(tab: &Tab) -> Vec<(LineNo, Vec<&str>)> {
         let (a, h) = tab.search.hits.as_ref().expect("search hits");
         (0..h.len()).map(|i| (h.lines[i], h.matched(i).map(|q| short(&a.names[q])).collect())).collect()
+    }
+
+    #[test]
+    fn the_line_window_shows_a_dlt_payload_with_its_line_breaks() {
+        use nerka_core::input::dlt::writer::{Msg, Value};
+        let mut buf = Vec::new();
+        let args = vec![Value::Str("first line\n\tsecond line".into()).into()];
+        Msg::log(nerka_core::Level::Error, "ECU1", "NAV", "POS", args).encode(&mut buf);
+        let file = nerka_core::DltFile::from_bytes("t.dlt", buf);
+        let mut d = LineDetail::of(&file, 0).unwrap();
+        assert_eq!(d.names.len(), d.cells.len());
+        assert_eq!(d.cells.last().unwrap(), "first line\n\tsecond line");
+
+        let ctx = egui::Context::default();
+        let mut texts = Vec::new();
+        for t in 0..3 {
+            let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(900.0, 600.0));
+            let input = egui::RawInput { screen_rect: Some(screen), time: Some(t as f64 / 60.0), ..Default::default() };
+            let mut out = ctx.run_ui(input, |ui| {
+                let (open, copied) = d.show(ui.ctx());
+                assert!(open);
+                assert_eq!(copied, None);
+            });
+            texts = out
+                .shapes
+                .iter()
+                .filter_map(|s| match &s.shape {
+                    egui::Shape::Text(t) => Some(t.galley.text().to_owned()),
+                    _ => None,
+                })
+                .collect();
+            out.textures_delta.clear();
+        }
+        for want in ["Line 1", "Copy message", "Copy line", "apid", "NAV", "first line\n\tsecond line"] {
+            assert!(texts.iter().any(|t| t == want), "{want:?} not in {texts:?}");
+        }
     }
 
     #[test]

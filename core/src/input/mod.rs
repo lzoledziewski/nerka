@@ -82,6 +82,19 @@ pub trait LogSource: Send + Sync {
         })
     }
 
+    /// The line's cells for a detailed view of one line: one per
+    /// [`Self::columns`] entry (plain text: the whole line as one cell).
+    /// Unlike [`Self::line_text`], which flattens a decoded message's own
+    /// line breaks and tabs into spaces so it stays one row of cells, the
+    /// values keep them (DLT: a payload logged as several lines).
+    fn line_detail(&self, line: LineNo) -> Option<Vec<String>> {
+        let text = self.line_text(line)?;
+        Some(match self.columns().len() {
+            0 => vec![text.into_owned()],
+            n => text.splitn(n, '\t').map(str::to_owned).collect(),
+        })
+    }
+
     /// Size of the underlying file or buffer.
     fn size_bytes(&self) -> u64 {
         0

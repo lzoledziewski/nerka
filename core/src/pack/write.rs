@@ -2,7 +2,7 @@
 //! replaced or appended, every other line (comments, blank lines, other
 //! queries, their order) stays as it was.
 
-use super::{Ctx, PACK_EXTENSION, PackError, PackQuery, is_name, parse_pack, render};
+use super::{Ctx, PACK_EXTENSION, PackError, PackQuery, is_name, is_query_name, parse_pack, render};
 
 /// A query name as written in a file: quoted unless it is a NAME.
 fn quoted(name: &str) -> String {
@@ -120,19 +120,20 @@ pub fn params_in(text: &str) -> Vec<String> {
     out
 }
 
-/// Create `<dir>/<name>.nerka-pack` holding just `pack <name>`. Fails if
-/// the name is invalid or the file exists.
+/// Create `<dir>/<name>.nerka-pack` holding just `pack <name>` (quoted
+/// when needed). Fails if the name is invalid, can't be a file name, or the
+/// file exists.
 pub fn create_pack_file(dir: &Path, name: &str) -> Result<PathBuf, PackError> {
     let path = dir.join(format!("{name}.{PACK_EXTENSION}"));
     let err = |msg: String| PackError { file: path.display().to_string(), pos: None, msg };
-    if !is_name(name) {
-        return Err(err(format!("invalid pack name '{name}' (letters, digits and _)")));
+    if !is_query_name(name) || name.contains(['/', '\\', '*', '?', '<', '>', '|']) {
+        return Err(err(format!("invalid pack name '{name}' (no . \" # : / \\ * ? < > | and no spaces at the ends)")));
     }
     if path.exists() {
         return Err(err("the file already exists".into()));
     }
     std::fs::create_dir_all(dir).map_err(|e| err(e.to_string()))?;
-    std::fs::write(&path, format!("pack {name}\n")).map_err(|e| err(e.to_string()))?;
+    std::fs::write(&path, format!("pack {}\n", quoted(name))).map_err(|e| err(e.to_string()))?;
     Ok(path)
 }
 
@@ -230,7 +231,16 @@ query b
         let path = create_pack_file(&dir, "mine").unwrap();
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "pack mine\n");
         assert!(create_pack_file(&dir, "mine").unwrap_err().msg.contains("exists"));
-        assert!(create_pack_file(&dir, "my-pack").is_err());
+        let spaced = create_pack_file(&dir, "camera team").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&spaced).unwrap(),
+            "pack \"camera team\"
+"
+        );
+        assert_eq!(parse_pack("t", &std::fs::read_to_string(&spaced).unwrap()).unwrap().name, "camera team");
+        assert!(create_pack_file(&dir, "a.b").is_err());
+        assert!(create_pack_file(&dir, "a/b").is_err());
+        assert!(create_pack_file(&dir, " x").is_err());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }
