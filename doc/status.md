@@ -111,6 +111,7 @@ Don't settle these silently: ask.
 4. **DLT column widths:** resizable per tab but not saved. Save them (globally or per file)?
 5. **Releases / downloads:** `release.yml` (Linux + Windows pre-releases on `v*` tags, archives with the README and both licence files) is in place; open: macOS builds (unsigned binaries warn; 10x runner minutes) and the `.exe` icon (needs an unapproved build dependency).
 6. **Linux builds from this Windows PC:** no WSL, Docker or zig installed. Options: cross-compile with `cargo zigbuild --target x86_64-unknown-linux-gnu.2.17` (user-level installs; build only, untested), WSL (can also run the GUI), or GitHub Actions. `Cargo.lock` has no GTK (the file dialog uses D-Bus via `zbus`), so a cross build is expected to link; not verified.
+7. **Copying multi-line messages (owner, 2026-10-19: action item, rethink later):** a decoded message's own line breaks and tabs show as spaces in the views and are kept only in the line window (Enter). Ctrl+C / Copy in the views copy the display text (formatting dropped); the line window's Copy message / Copy line keep it. The owner isn't fully happy with this, but neither single rule is good: always copying with the original formatting breaks the one-row-per-line, tab-separated paste (spreadsheets, grep), while always copying the display text loses stack traces and JSON. Revisit (e.g. a copy mode, or a second shortcut).
 
 ## Known limitations
 

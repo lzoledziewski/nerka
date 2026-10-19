@@ -272,8 +272,27 @@ impl LineDetail {
                 scroll.auto_shrink([false, false]).show(ui, |ui| {
                     // A `&str` buffer: selectable and copyable, not editable.
                     let mut text = shown;
-                    let edit = egui::TextEdit::multiline(&mut text).font(egui::TextStyle::Monospace);
-                    ui.add(if self.wrap { edit.desired_width(f32::INFINITY) } else { edit.desired_width(f32::MAX) });
+                    // A text box never gets wider than the space it is in, so
+                    // without Wrap the layout ignores that width and the box
+                    // takes the text's own width (the scroll area scrolls it).
+                    let wrap = self.wrap;
+                    let mut layouter = |ui: &egui::Ui, buf: &dyn egui::TextBuffer, wrap_width: f32| {
+                        let font = egui::TextStyle::Monospace.resolve(ui.style());
+                        let width = if wrap { wrap_width } else { f32::INFINITY };
+                        let job = egui::text::LayoutJob::simple(
+                            buf.as_str().to_owned(),
+                            font,
+                            ui.visuals().text_color(),
+                            width,
+                        );
+                        ui.fonts_mut(|f| f.layout_job(job))
+                    };
+                    let edit = egui::TextEdit::multiline(&mut text)
+                        .font(egui::TextStyle::Monospace)
+                        .desired_width(f32::INFINITY)
+                        .clip_text(false)
+                        .layouter(&mut layouter);
+                    ui.add(edit);
                 });
             });
         (open, copied)
@@ -1916,6 +1935,42 @@ query timeouts  labels: vision
         for want in ["Line 1", "Copy message", "Copy line", "apid", "NAV", "first line\n\tsecond line"] {
             assert!(texts.iter().any(|t| t == want), "{want:?} not in {texts:?}");
         }
+    }
+
+    #[test]
+    fn the_line_window_wraps_long_lines_only_with_wrap() {
+        let long = format!("short\n{}", "word ".repeat(200));
+        let file = nerka_core::TextFile::from_bytes("t", long.replace('\n', " | ").into_bytes());
+        let mut d = LineDetail::of(&file, 0).unwrap();
+        d.cells = vec![long.clone()];
+        let ctx = egui::Context::default();
+        // Rows of the message's galley, after a few frames.
+        let rows = |d: &mut LineDetail| {
+            let mut n = 0;
+            for t in 0..3 {
+                let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(900.0, 600.0));
+                let input =
+                    egui::RawInput { screen_rect: Some(screen), time: Some(t as f64 / 60.0), ..Default::default() };
+                let mut out = ctx.run_ui(input, |ui| {
+                    d.show(ui.ctx());
+                });
+                if t == 2 {
+                    n = out
+                        .shapes
+                        .iter()
+                        .find_map(|s| match &s.shape {
+                            egui::Shape::Text(t) if t.galley.text() == long => Some(t.galley.rows.len()),
+                            _ => None,
+                        })
+                        .expect("the message is shown");
+                }
+                out.textures_delta.clear();
+            }
+            n
+        };
+        assert!(rows(&mut d) > 2, "wrapped");
+        d.wrap = false;
+        assert_eq!(rows(&mut d), 2, "one row per line of the message");
     }
 
     #[test]
