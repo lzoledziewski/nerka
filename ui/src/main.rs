@@ -40,7 +40,7 @@ mod view;
 use eframe::egui::{self, Color32, Key, KeyboardShortcut, Modifiers, RichText};
 use job::{Job, Poll};
 use library::{Applied, LibraryView, Picks, Target, Term, Use};
-use nerka_core::dsl::{AutoRead, read_auto};
+use nerka_core::dsl::{AutoRead, Plain, read_auto};
 use nerka_core::pack::{self, Library, Role};
 use nerka_core::{
     Bookmarks, FieldDef, Filter, Highlighter, LineNo, LogSource, Matcher, MatcherOptions, Query, SearchHistory,
@@ -204,6 +204,8 @@ enum Preview {
     None,
     /// Auto: literal text, with why it isn't a query, if it looked like one.
     AutoText { text: String, why: Option<String> },
+    /// Auto: a query that is only a regex (`/…/flags`).
+    AutoRegex(String),
     /// Auto: a query, as rewritten into NFD.
     AutoQuery(String),
     /// NFD mode: the query doesn't compile.
@@ -244,8 +246,15 @@ fn read_box(
                     let why = Some(err.to_string());
                     (text(&t, literal), Preview::AutoText { text: t, why })
                 }
-                AutoRead::Query { nfd, query } => {
-                    let preview = Preview::AutoQuery(nfd.clone());
+                AutoRead::Query { nfd, query, plain } => {
+                    // A query that is only a text search is shown as one.
+                    let preview = match plain {
+                        Some(Plain::Text(text)) => Preview::AutoText { text, why: None },
+                        Some(Plain::Regex { pattern, ignore_case }) => {
+                            Preview::AutoRegex(format!("/{pattern}/{}", if ignore_case { "i" } else { "" }))
+                        }
+                        None => Preview::AutoQuery(nfd.clone()),
+                    };
                     if !options.invert {
                         return (Ok(Filter::Query(query)), preview);
                     }
@@ -271,6 +280,12 @@ fn preview_ui(ui: &mut egui::Ui, preview: &Preview) -> bool {
                 if let Some(why) = why {
                     ui.label(small("(not a query)".into()).weak()).on_hover_text(why);
                 }
+            });
+        }
+        Preview::AutoRegex(re) => {
+            ui.horizontal(|ui| {
+                ui.label(small("→ regex:".into()).weak());
+                ui.add(egui::Label::new(small(re.clone()).monospace()).truncate());
             });
         }
         Preview::AutoQuery(nfd) => {
@@ -2130,6 +2145,12 @@ query timeouts  labels: vision
         let (k, p) = read(Mode::Auto, "level >= LOUD");
         assert!(k == "text" && matches!(p, Preview::AutoText { why: Some(_), .. }), "{p:?}");
         assert_eq!(read(Mode::Auto, ""), ("text", Preview::None));
+        // Quoted text or a lone regex is a query that only searches text.
+        assert_eq!(
+            read(Mode::Auto, "\"ctid = BOOT\""),
+            ("query", Preview::AutoText { text: "ctid = BOOT".into(), why: None })
+        );
+        assert_eq!(read(Mode::Auto, "/SSL|CERT/i"), ("query", Preview::AutoRegex("/SSL|CERT/i".into())));
         // Text mode never reads a query; NFD mode never falls back.
         assert_eq!(read(Mode::Text, "level >= ERROR"), ("text", Preview::None));
         assert_eq!(read(Mode::Query, "level >= ERROR"), ("query", Preview::None));

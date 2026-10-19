@@ -17,6 +17,7 @@ The Filter and Search boxes had two modes, Text and Query. Both are useful, but 
 - **Text** is always literal text (or a regex with **Regex** ticked), never a query: for the rare text that Auto would read as a query.
 - **NFD** is strict: an error is an error, shown with a **Search as text instead** button.
 - A **preview line** under the box says how it will be read before Enter: `→ text: …`, `→ query: …`, or `→ text (not a query: …)`.
+- A query that is nothing but a text search (one `"quoted string"` or `/regex/`, alone or as `raw ~ …`) is previewed as `→ text: …` / `→ regex: …`, not as a query (owner, 2026-10-19). It still runs as written: quoted text keeps its case.
 - **The library isn't affected:** packs, library picks and expansions are plain NFD as before and put the box into NFD mode. Plain words are an Auto-only reading; the NFD language itself doesn't change.
 
 ## How Auto reads the box (core: `dsl::auto`)

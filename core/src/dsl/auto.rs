@@ -8,7 +8,7 @@
 //! `NOT`. Each run of phrase words becomes one `"…"` (or `/…/i` with ignore
 //! case), spanning the words exactly as typed.
 
-use super::parser::{Tok, tokens};
+use super::parser::{OpTok, Tok, tokens};
 use super::{DslError, Query};
 use crate::event::FieldDef;
 use crate::{MatcherOptions, text_to_nfd};
@@ -19,10 +19,21 @@ pub enum AutoRead {
     /// Literal text: the box is one phrase (trimmed).
     Text(String),
     /// A query: the box rewritten into NFD, compiled for the source.
-    Query { nfd: String, query: Query },
+    /// `plain` is set when the query is nothing but a text search (one
+    /// quoted string or regex, alone or as `raw ~ …`), so a UI can say so.
+    Query { nfd: String, query: Query, plain: Option<Plain> },
     /// Not a valid query, so literal text (the whole box, trimmed); `err`
     /// is why it isn't a query, at a byte offset into the box.
     NotQuery { text: String, err: DslError },
+}
+
+/// A query that is only a text search.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Plain {
+    /// Lines containing this text (exact case: it was quoted).
+    Text(String),
+    /// Lines matching this regex.
+    Regex { pattern: String, ignore_case: bool },
 }
 
 /// Read `src` as Auto does. `ignore_case` applies to the phrases; `schema`
@@ -76,7 +87,19 @@ pub fn read_auto(src: &str, ignore_case: bool, schema: &[FieldDef]) -> AutoRead 
         return AutoRead::Text(text);
     }
     match Query::compile_for(&nfd, schema) {
-        Ok(query) => AutoRead::Query { nfd, query },
+        Ok(query) => {
+            let term = match toks.as_slice() {
+                [(t, _)] => Some(t),
+                [(Tok::Word(w), _), (Tok::Op(OpTok::Match), _), (t, _)] if w.eq_ignore_ascii_case("raw") => Some(t),
+                _ => None,
+            };
+            let plain = match term {
+                Some(Tok::Str(s)) => Some(Plain::Text(s.clone())),
+                Some(Tok::Regex { pat, ci }) => Some(Plain::Regex { pattern: pat.clone(), ignore_case: *ci }),
+                _ => None,
+            };
+            AutoRead::Query { nfd, query, plain }
+        }
         Err(err) => {
             // Positions are in the rewritten text; map them back to the box
             // only where nothing before them was rewritten.
@@ -136,6 +159,21 @@ mod tests {
         );
         // A phrase in double quotes or a regex is written out: kept as is.
         assert_eq!(read("\"a b\" OR c").unwrap(), "\"a b\" OR \"c\"");
+    }
+
+    #[test]
+    fn queries_that_are_only_text_say_so() {
+        let plain = |src: &str| match read_auto(src, false, &[]) {
+            AutoRead::Query { plain, .. } => plain,
+            r => panic!("{src}: {r:?}"),
+        };
+        assert_eq!(plain("\"ctid = BOOT\""), Some(Plain::Text("ctid = BOOT".into())));
+        assert_eq!(plain("raw ~ \"x y\""), Some(Plain::Text("x y".into())));
+        assert_eq!(plain("/SSL|CERT/i"), Some(Plain::Regex { pattern: "SSL|CERT".into(), ignore_case: true }));
+        assert_eq!(plain("RAW ~ /a b/"), Some(Plain::Regex { pattern: "a b".into(), ignore_case: false }));
+        assert_eq!(plain("NOT \"x\""), None);
+        assert_eq!(plain("\"a\" OR \"b\""), None);
+        assert_eq!(plain("level >= ERROR"), None);
     }
 
     #[test]
