@@ -127,7 +127,7 @@ GUI (step 5), as built (`ui/src/library.rs`, `ui/src/main.rs`):
 - **Layout (owner, 2026-10-18, after trying the first version):** the Filter decides what the main view shows; the Search looks among those lines and lists its hits in the bottom pane.
 - **Filter box** (top of the window, under the tabs): the picks arrive as Query-mode NFD and the filter is recorded in the history as that text.
 - **Line colours:** an included filter query can colour the whole lines it keeps (off by default; click its swatch in the selection or its chip under the Filter bar, filled = on). A later node wins where lines overlap. Core reuses `search_within` over the filter result for it; the hit masks are indexed in selection order, and the view takes the last one that matched. Startup: `--highlight ID`.
-- **Search box** under the Filter box: Text (with Regex and Ignore case) or Query, Enter or Find runs it, Clear removes it. It looks only inside the filter result (the whole file without a filter) and runs again by itself when the filter result changes. Hits are listed in the bottom pane; clicking one moves the main view there. n / N jump between search hits.
+- **Search box** under the Filter box: the same modes as the Filter box (Auto, Text with Regex, NFD; Ignore case; `search-modes.md`), Enter or Find runs it, Clear removes it. It looks only inside the filter result (the whole file without a filter) and runs again by itself when the filter result changes. Hits are listed in the bottom pane; clicking one moves the main view there. n / N jump between search hits.
 - **Grouped display:** while a box holds an expansion unchanged, one line per picked query appears under it: how it joins (`OR`, `AND NOT`), a chip with the short name in the query's colour (qualified name on hover, or shown when two picks share a short name), and that query's NFD. Up to 8 lines; the full text stays in the box. Editing the text turns it into a plain query (no chips).
 - **Colours:** a search query's hits are highlighted in its pack colour (named colours or `#rrggbb`), otherwise in a palette colour by position; a typed search uses the first palette colour. Hit lines also get one thin stripe per matched query in the gutter, so queries without regex spans (`level >= ERROR`) show too. The filter's yellow stays; search colours win where they overlap.
 - **Command line** (also used for screenshots): `--pack <dir|file>`, `--pick ID`, `--exclude ID`, `--search-pick ID`, `--param NAME=VALUE`, `--library`.
@@ -135,7 +135,7 @@ GUI (step 5), as built (`ui/src/library.rs`, `ui/src/main.rs`):
 
 Choices made for the GUI (open questions below answered provisionally; confirm or change):
 
-7. The Search box has the Filter box's modes, without Invert.
+7. The Search box has the Filter box's modes (Auto, Text, NFD since 2026-10-19), without Invert.
 8. Colours come from the pack, with a palette fallback; there is no colour picker in the UI.
 9. Parameter values live in the tab and aren't remembered between runs.
 10. ~~Search history isn't kept~~ The Search box has its own history with ↑ / ↓ (owner, issue #5; see `status.md`). Both histories store the expanded NFD but not the chip names (the history file is one `tag<TAB>pattern` per line; adding names needs a format change).

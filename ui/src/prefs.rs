@@ -15,9 +15,9 @@ pub struct SearchPrefs {
 }
 
 impl Default for SearchPrefs {
-    /// Text mode searches literally until "Regex" is ticked.
+    /// Auto mode; Text mode searches literally until "Regex" is ticked.
     fn default() -> Self {
-        Self { mode: Mode::Text, options: MatcherOptions { fixed_string: true, ..Default::default() } }
+        Self { mode: Mode::Auto, options: MatcherOptions { fixed_string: true, ..Default::default() } }
     }
 }
 
@@ -31,6 +31,7 @@ impl SearchPrefs {
                 v => {
                     if key.trim() == "mode" {
                         match v {
+                            "auto" => p.mode = Mode::Auto,
                             "text" => p.mode = Mode::Text,
                             "query" => p.mode = Mode::Query,
                             _ => {}
@@ -51,6 +52,7 @@ impl SearchPrefs {
 
     pub fn serialize(&self) -> String {
         let mode = match self.mode {
+            Mode::Auto => "auto",
             Mode::Text => "text",
             Mode::Query => "query",
         };
@@ -95,7 +97,7 @@ mod tests {
     fn bad_input_falls_back_to_defaults() {
         assert_eq!(SearchPrefs::parse(""), SearchPrefs::default());
         let p = SearchPrefs::parse("mode=weird\nregex=maybe\nfoo=true\nignore_case = true\n");
-        assert_eq!(p.mode, Mode::Text);
+        assert_eq!(p.mode, Mode::Auto);
         assert!(p.options.fixed_string);
         assert!(p.options.case_insensitive);
     }

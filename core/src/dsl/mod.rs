@@ -32,14 +32,20 @@
 //! [`FieldDef::costly`] (DLT `payload`, which decodes the message) are
 //! evaluated after the cheap conditions.
 //!
+//! The search boxes' Auto mode (`auto.rs`, `doc/search-modes.md`) reads plain
+//! words as text and rewrites them into this grammar; NFD itself has no
+//! bare text.
+//!
 //! Keywords and field names are case-insensitive. Evaluation reorders AND/OR operands so
 //! cheap checks run before regexes (spec §3.5).
 
+mod auto;
 mod parser;
 
 use crate::event::{Event, FieldDef, FieldId, FieldKind, FieldValue, Level};
 use regex::bytes::Regex;
 
+pub use auto::{AutoRead, Plain, read_auto};
 pub use parser::parse;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

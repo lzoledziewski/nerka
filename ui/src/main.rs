@@ -40,10 +40,11 @@ mod view;
 use eframe::egui::{self, Color32, Key, KeyboardShortcut, Modifiers, RichText};
 use job::{Job, Poll};
 use library::{Applied, LibraryView, Picks, Target, Term, Use};
+use nerka_core::dsl::{AutoRead, Plain, read_auto};
 use nerka_core::pack::{self, Library, Role};
 use nerka_core::{
-    Bookmarks, Filter, Highlighter, LineNo, LogSource, Matcher, MatcherOptions, Query, SearchHistory, SearchHits,
-    SearchResult, SearchSet, text_to_nfd,
+    Bookmarks, FieldDef, Filter, Highlighter, LineNo, LogSource, Matcher, MatcherOptions, Query, SearchHistory,
+    SearchHits, SearchResult, SearchSet, text_to_nfd,
 };
 use prefs::SearchPrefs;
 use std::path::{Path, PathBuf};
@@ -151,13 +152,176 @@ fn main() -> eframe::Result {
     )
 }
 
+/// How a Filter or Search box reads its text (`doc/search-modes.md`).
 #[derive(Debug, Default, PartialEq, Clone, Copy)]
 enum Mode {
-    /// klogg-style search box: plain text, or a regex when "Regex" is ticked.
+    /// Plain words are an exact phrase, NFD syntax a query, mixed; a box
+    /// that isn't a valid query is literal text (core: `read_auto`).
     #[default]
+    Auto,
+    /// klogg-style search box: plain text, or a regex when "Regex" is ticked.
     Text,
-    /// NFD query: `level >= ERROR AND raw ~ /SSL/`.
+    /// Strict NFD query: `level >= ERROR AND raw ~ /SSL/`.
     Query,
+}
+
+impl Mode {
+    fn label(self) -> &'static str {
+        match self {
+            Mode::Auto => "Auto",
+            Mode::Text => "Text",
+            Mode::Query => "NFD",
+        }
+    }
+
+    fn describe(self) -> &'static str {
+        match self {
+            Mode::Auto => "Words are text, NFD is a query, both mix; anything else is text",
+            Mode::Text => "Always literal text (or a regex with Regex ticked)",
+            Mode::Query => "Strict NFD: level >= ERROR AND raw ~ /SSL|CERT/i AND NOT /healthcheck/",
+        }
+    }
+}
+
+/// The mode list of a box.
+fn mode_combo(ui: &mut egui::Ui, id: &str, mode: &mut Mode) {
+    egui::ComboBox::from_id_salt(id)
+        .width(58.0)
+        .selected_text(mode.label())
+        .show_ui(ui, |ui| {
+            for m in [Mode::Auto, Mode::Text, Mode::Query] {
+                ui.selectable_value(mode, m, m.label()).on_hover_text(m.describe());
+            }
+        })
+        .response
+        .on_hover_text(mode.describe());
+}
+
+/// How a box will be read, for the line under it.
+#[derive(Debug, Clone, PartialEq)]
+enum Preview {
+    /// Nothing to say (empty box, or Text / valid NFD: the mode says it).
+    None,
+    /// Auto: literal text, with why it isn't a query, if it looked like one.
+    AutoText { text: String, why: Option<String> },
+    /// Auto: a query that is only a regex (`/…/flags`).
+    AutoRegex(String),
+    /// Auto: a query, as rewritten into NFD.
+    AutoQuery(String),
+    /// NFD mode: the query doesn't compile.
+    QueryError(String),
+}
+
+/// What a box with `mode`, `pattern` and `options` runs, and its preview.
+/// `options.fixed_string` is the Regex checkbox (Text mode only);
+/// `invert` applies in Auto and Text mode.
+fn read_box(
+    mode: Mode,
+    pattern: &str,
+    options: &MatcherOptions,
+    schema: &[FieldDef],
+) -> (Result<Filter, String>, Preview) {
+    let text = |t: &str, o: MatcherOptions| {
+        Matcher::new(t, o).map(Filter::Regex).map_err(|e| {
+            let detail = std::error::Error::source(&e).map(|s| s.to_string()).unwrap_or_default();
+            format!("Invalid regex: {}", detail.lines().last().unwrap_or(""))
+        })
+    };
+    match mode {
+        Mode::Text => (text(pattern, options.clone()), Preview::None),
+        Mode::Query => match Query::compile_for(pattern, schema) {
+            Ok(q) => (Ok(Filter::Query(q)), Preview::None),
+            Err(e) if pattern.trim().is_empty() => (Err(format!("Query error: {e}")), Preview::None),
+            Err(e) => (Err(format!("Query error: {e}")), Preview::QueryError(e.to_string())),
+        },
+        Mode::Auto => {
+            let literal = MatcherOptions { fixed_string: true, ..options.clone() };
+            match read_auto(pattern, options.case_insensitive, schema) {
+                AutoRead::Text(t) => {
+                    let preview =
+                        if t.is_empty() { Preview::None } else { Preview::AutoText { text: t.clone(), why: None } };
+                    (text(&t, literal), preview)
+                }
+                AutoRead::NotQuery { text: t, err } => {
+                    let why = Some(err.to_string());
+                    (text(&t, literal), Preview::AutoText { text: t, why })
+                }
+                AutoRead::Query { nfd, query, plain } => {
+                    // A query that is only a text search is shown as one.
+                    let preview = match plain {
+                        Some(Plain::Text(text)) => Preview::AutoText { text, why: None },
+                        Some(Plain::Regex { pattern, ignore_case }) => {
+                            Preview::AutoRegex(format!("/{pattern}/{}", if ignore_case { "i" } else { "" }))
+                        }
+                        None => Preview::AutoQuery(nfd.clone()),
+                    };
+                    if !options.invert {
+                        return (Ok(Filter::Query(query)), preview);
+                    }
+                    let not = Query::compile_for(&format!("NOT ({nfd})"), schema).map(Filter::Query);
+                    (not.map_err(|e| format!("Query error: {e}")), preview)
+                }
+            }
+        }
+    }
+}
+
+/// The line under a box. Returns true when "Search as text instead" was
+/// clicked.
+fn preview_ui(ui: &mut egui::Ui, preview: &Preview) -> bool {
+    let mut as_text = false;
+    let small = |s: String| RichText::new(s).small();
+    match preview {
+        Preview::None => {}
+        Preview::AutoText { text, why } => {
+            ui.horizontal(|ui| {
+                ui.label(small("→ text:".into()).weak());
+                ui.add(egui::Label::new(small(text.clone()).monospace()).truncate());
+                if let Some(why) = why {
+                    ui.label(small("(not a query)".into()).weak()).on_hover_text(why);
+                }
+            });
+        }
+        Preview::AutoRegex(re) => {
+            ui.horizontal(|ui| {
+                ui.label(small("→ regex:".into()).weak());
+                ui.add(egui::Label::new(small(re.clone()).monospace()).truncate());
+            });
+        }
+        Preview::AutoQuery(nfd) => {
+            ui.horizontal(|ui| {
+                ui.label(small("→ query:".into()).weak());
+                ui.add(egui::Label::new(small(nfd.clone()).monospace()).truncate());
+            });
+        }
+        Preview::QueryError(e) => {
+            ui.horizontal(|ui| {
+                as_text =
+                    ui.small_button("Search as text instead").on_hover_text("Switch to Text mode and run it").clicked();
+                ui.add(egui::Label::new(small(format!("✗ {e}")).color(ui.visuals().error_fg_color)).truncate());
+            });
+        }
+    }
+    as_text
+}
+
+/// A box's preview, worked out again only when what it depends on changed.
+#[derive(Default)]
+struct PreviewCache {
+    key: String,
+    preview: Option<Preview>,
+}
+
+impl PreviewCache {
+    fn get(&mut self, mode: Mode, pattern: &str, options: &MatcherOptions, schema: &[FieldDef]) -> Preview {
+        let key =
+            format!("{mode:?}|{}|{}|{}|{pattern}", options.fixed_string, options.case_insensitive, options.invert);
+        if self.key != key || self.preview.is_none() {
+            self.preview = Some(read_box(mode, pattern, options, schema).1);
+            self.key = key;
+        }
+        self.preview.clone().unwrap_or(Preview::None)
+    }
 }
 
 /// One open file with its own filter, view positions and bookmarks.
@@ -188,6 +352,7 @@ struct Tab {
     search: SearchBox,
     /// ↑ / ↓ in the Filter box.
     filter_recall: recall::Recall,
+    filter_preview: PreviewCache,
 
     bookmarks: Bookmarks,
     /// Bookmarks whose line is unfolded in the panel.
@@ -316,6 +481,7 @@ struct SearchBox {
     job: Option<(Arc<ActiveSearch>, Job<SearchHits>)>,
     /// ↑ / ↓ in the box.
     recall: recall::Recall,
+    preview: PreviewCache,
 }
 
 /// A search ready to run: its queries, names, colours and highlighters.
@@ -327,9 +493,10 @@ struct ActiveSearch {
 }
 
 impl SearchBox {
-    /// History tag for the box: `text`, `regex` or `query`.
+    /// History tag for the box: `auto`, `text`, `regex` or `query`.
     fn tag(&self) -> &'static str {
         match self.mode {
+            Mode::Auto => "auto",
             Mode::Text if self.regex => "regex",
             Mode::Text => "text",
             Mode::Query => "query",
@@ -344,9 +511,15 @@ impl SearchBox {
                 self.regex = tag == "regex";
             }
             "query" => self.mode = Mode::Query,
+            "auto" => self.mode = Mode::Auto,
             _ => return,
         }
         self.pattern = pattern.to_owned();
+    }
+
+    /// The box's options as matcher options (Regex unticked = literal).
+    fn options(&self) -> MatcherOptions {
+        MatcherOptions { fixed_string: !self.regex, case_insensitive: self.ignore_case, invert: false }
     }
 
     /// The box's text for `terms`: OR'ed (AND binds tighter, and each term
@@ -368,11 +541,15 @@ impl SearchBox {
             return None;
         }
         let nfd = match self.mode {
-            Mode::Text => text_to_nfd(
-                text,
-                &MatcherOptions { fixed_string: !self.regex, case_insensitive: self.ignore_case, invert: false },
-            ),
+            Mode::Text => text_to_nfd(text, &self.options()),
             Mode::Query => format!("({text})"),
+            // Field names don't matter here: the term is compiled later.
+            Mode::Auto => match read_auto(text, self.ignore_case, &[]) {
+                AutoRead::Query { nfd, .. } => format!("({nfd})"),
+                AutoRead::Text(t) | AutoRead::NotQuery { text: t, .. } => {
+                    text_to_nfd(&t, &MatcherOptions { fixed_string: true, ..self.options() })
+                }
+            },
         };
         let name: String = text.chars().take(24).collect();
         Some(Term { name, nfd, color: library::palette(0) })
@@ -400,6 +577,7 @@ impl Tab {
             colors_job: None,
             search: SearchBox::default(),
             filter_recall: recall::Recall::default(),
+            filter_preview: PreviewCache::default(),
             bookmarks: Bookmarks::default(),
             marks_open: Default::default(),
             detail: None,
@@ -434,9 +612,10 @@ impl Tab {
         SearchPrefs { mode: self.mode, options: self.options.clone() }
     }
 
-    /// History tag for the current filter: `text`, `regex` or `query`.
+    /// History tag for the current filter: `auto`, `text`, `regex` or `query`.
     fn filter_tag(&self) -> &'static str {
         match self.mode {
+            Mode::Auto => "auto",
             Mode::Text if self.options.fixed_string => "text",
             Mode::Text => "regex",
             Mode::Query => "query",
@@ -451,6 +630,7 @@ impl Tab {
                 self.options.fixed_string = tag == "text";
             }
             "query" => self.mode = Mode::Query,
+            "auto" => self.mode = Mode::Auto,
             _ => return false,
         }
         self.pattern = pattern.to_owned();
@@ -458,16 +638,8 @@ impl Tab {
     }
 
     fn build_filter(&self) -> Result<Filter, String> {
-        match self.mode {
-            Mode::Text => Matcher::new(&self.pattern, self.options.clone()).map(Filter::Regex).map_err(|e| {
-                let detail = std::error::Error::source(&e).map(|s| s.to_string()).unwrap_or_default();
-                format!("Invalid regex: {}", detail.lines().last().unwrap_or(""))
-            }),
-            Mode::Query => {
-                let schema = self.file.as_ref().map(|f| f.schema()).unwrap_or_default();
-                Query::compile_for(&self.pattern, schema).map(Filter::Query).map_err(|e| format!("Query error: {e}"))
-            }
-        }
+        let schema = self.file.as_ref().map(|f| f.schema()).unwrap_or_default();
+        read_box(self.mode, &self.pattern, &self.options, schema).0
     }
 
     /// Start searching with the current filter; returns whether a search
@@ -671,20 +843,10 @@ impl Tab {
                 highlighters,
             });
         }
-        let f = match self.search.mode {
-            Mode::Text => {
-                let o = MatcherOptions {
-                    fixed_string: !self.search.regex,
-                    case_insensitive: self.search.ignore_case,
-                    invert: false,
-                };
-                Filter::Regex(Matcher::new(&self.search.pattern, o).map_err(|e| format!("Search: invalid regex: {e}"))?)
-            }
-            Mode::Query => {
-                let schema = self.file.as_ref().map(|f| f.schema()).unwrap_or_default();
-                Filter::Query(Query::compile_for(&self.search.pattern, schema).map_err(|e| format!("Search: {e}"))?)
-            }
-        };
+        let schema = self.file.as_ref().map(|f| f.schema()).unwrap_or_default();
+        let f = read_box(self.search.mode, &self.search.pattern, &self.search.options(), schema)
+            .0
+            .map_err(|e| format!("Search: {e}"))?;
         Ok(ActiveSearch {
             highlighters: vec![f.highlighter()],
             set: SearchSet { include: vec![f], exclude: vec![] },
@@ -990,10 +1152,9 @@ impl Tab {
                 .on_hover_text("Decides which lines the main view shows; Enter applies it");
             // Mode and checkboxes only change how the box is read; only
             // Enter or the Filter button runs it.
-            ui.selectable_value(&mut self.mode, Mode::Text, "Text");
-            ui.selectable_value(&mut self.mode, Mode::Query, "Query")
-                .on_hover_text("level >= ERROR AND raw ~ /SSL|CERT/i AND NOT /healthcheck/");
+            mode_combo(ui, "filter-mode", &mut self.mode);
             let hint = match self.mode {
+                Mode::Auto => "filter: text, or level >= ERROR AND timeout — Enter to apply",
                 Mode::Text if self.options.fixed_string => "filter: lines to keep (text) — Enter to apply",
                 Mode::Text => "filter: lines to keep (regex) — Enter to apply",
                 Mode::Query => "filter: level >= ERROR AND raw ~ /SSL/ — Enter to apply",
@@ -1002,9 +1163,12 @@ impl Tab {
             // so the row never grows wider than the panel.
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 go |= ui.button("Filter").on_hover_text("Show only the matching lines in the main view").clicked();
-                if self.mode == Mode::Text {
+                if self.mode != Mode::Query {
                     ui.checkbox(&mut self.options.invert, "Invert");
-                    ui.checkbox(&mut self.options.case_insensitive, "Ignore case");
+                    ui.checkbox(&mut self.options.case_insensitive, "Ignore case")
+                        .on_hover_text("For the text; a /regex/ or \"string\" written out says itself");
+                }
+                if self.mode == Mode::Text {
                     let mut regex = !self.options.fixed_string;
                     if ui.checkbox(&mut regex, "Regex").changed() {
                         self.options.fixed_string = !regex;
@@ -1035,6 +1199,16 @@ impl Tab {
             if let Some(key) = expansion_view(ui, &a, Some(&|k| picks.is_lit(k))) {
                 self.picks.toggle_lit(key);
                 self.recolor(ui.ctx());
+            }
+        } else {
+            let schema = self.file.as_ref().map(|f| f.schema()).unwrap_or_default();
+            let preview = self.filter_preview.get(self.mode, &self.pattern, &self.options, schema);
+            if preview_ui(ui, &preview) {
+                self.mode = Mode::Text;
+                self.options.fixed_string = true;
+                if self.start_search(ui.ctx()) {
+                    searched = Some((self.filter_tag(), self.pattern.clone()));
+                }
             }
         }
         searched
@@ -1112,16 +1286,18 @@ impl Tab {
                 .response
                 .on_hover_text("Recent searches (or ↑ / ↓ in the box)");
             });
-            ui.selectable_value(&mut self.search.mode, Mode::Text, "Text");
-            ui.selectable_value(&mut self.search.mode, Mode::Query, "Query");
+            mode_combo(ui, "search-mode", &mut self.search.mode);
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 go |= ui.button("Find").clicked();
                 clear = ui.add_enabled(self.search.active.is_some(), egui::Button::new("Clear")).clicked();
-                if self.search.mode == Mode::Text {
+                if self.search.mode != Mode::Query {
                     ui.checkbox(&mut self.search.ignore_case, "Ignore case");
+                }
+                if self.search.mode == Mode::Text {
                     ui.checkbox(&mut self.search.regex, "Regex");
                 }
                 let hint = match self.search.mode {
+                    Mode::Auto => "search: text, or level >= ERROR AND timeout — Enter to find",
                     Mode::Text => "search: lines to find among the filtered ones — Enter to find",
                     Mode::Query => "NFD query, or tick queries in the library — Enter to find",
                 };
@@ -1150,6 +1326,18 @@ impl Tab {
         }
         if let Some(terms) = self.search.current_terms() {
             terms_view(ui, terms);
+        } else {
+            let schema = self.file.as_ref().map(|f| f.schema()).unwrap_or_default();
+            let s = &mut self.search;
+            let preview = s.preview.get(s.mode, &s.pattern, &s.options(), schema);
+            if preview_ui(ui, &preview) {
+                self.search.mode = Mode::Text;
+                self.search.regex = false;
+                self.run_search_box(ui.ctx());
+                if self.search.active.is_some() {
+                    searched = Some((self.search.tag(), self.search.pattern.clone()));
+                }
+            }
         }
         searched
     }
@@ -1935,6 +2123,52 @@ query timeouts  labels: vision
         for want in ["Line 1", "Copy message", "Copy line", "apid", "NAV", "first line\n\tsecond line"] {
             assert!(texts.iter().any(|t| t == want), "{want:?} not in {texts:?}");
         }
+    }
+
+    #[test]
+    fn boxes_read_their_text_by_mode() {
+        let lit = MatcherOptions { fixed_string: true, ..Default::default() };
+        let kind = |r: &Result<Filter, String>| match r {
+            Ok(Filter::Regex(_)) => "text",
+            Ok(Filter::Query(_)) => "query",
+            Err(_) => "error",
+        };
+        let read = |mode, s: &str| {
+            let (f, p) = read_box(mode, s, &lit, &[]);
+            (kind(&f), p)
+        };
+        assert_eq!(
+            read(Mode::Auto, "connection reset"),
+            ("text", Preview::AutoText { text: "connection reset".into(), why: None })
+        );
+        assert_eq!(read(Mode::Auto, "level >= ERROR"), ("query", Preview::AutoQuery("level >= ERROR".into())));
+        let (k, p) = read(Mode::Auto, "level >= LOUD");
+        assert!(k == "text" && matches!(p, Preview::AutoText { why: Some(_), .. }), "{p:?}");
+        assert_eq!(read(Mode::Auto, ""), ("text", Preview::None));
+        // Quoted text or a lone regex is a query that only searches text.
+        assert_eq!(
+            read(Mode::Auto, "\"ctid = BOOT\""),
+            ("query", Preview::AutoText { text: "ctid = BOOT".into(), why: None })
+        );
+        assert_eq!(read(Mode::Auto, "/SSL|CERT/i"), ("query", Preview::AutoRegex("/SSL|CERT/i".into())));
+        // Text mode never reads a query; NFD mode never falls back.
+        assert_eq!(read(Mode::Text, "level >= ERROR"), ("text", Preview::None));
+        assert_eq!(read(Mode::Query, "level >= ERROR"), ("query", Preview::None));
+        let (k, p) = read(Mode::Query, "connection reset");
+        assert!(k == "error" && matches!(p, Preview::QueryError(_)), "{p:?}");
+
+        // Invert in Auto wraps a query in NOT; ignore case reaches phrases.
+        let file = nerka_core::TextFile::from_bytes("t", LOG.as_bytes().to_vec());
+        let run = |mode, s: &str, o: &MatcherOptions| {
+            let f = read_box(mode, s, o, &[]).0.unwrap();
+            nerka_core::search(&file, &f, &nerka_core::Progress::default()).unwrap().lines
+        };
+        let inv = MatcherOptions { invert: true, ..lit.clone() };
+        assert_eq!(run(Mode::Auto, "timeout AND level >= ERROR", &lit), [5]);
+        assert_eq!(run(Mode::Auto, "timeout AND level >= ERROR", &inv), [0, 1, 2, 3, 4]);
+        let ci = MatcherOptions { case_insensitive: true, ..lit.clone() };
+        assert_eq!(run(Mode::Auto, "CAM1 FRAME AND level >= ERROR", &ci), [1]);
+        assert!(run(Mode::Auto, "CAM1 FRAME AND level >= ERROR", &lit).is_empty());
     }
 
     #[test]
