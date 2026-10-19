@@ -1306,6 +1306,8 @@ impl Tab {
             colors: &a.colors,
             highlighters: &a.highlighters,
         });
+        let lines =
+            self.line_colors.as_ref().map(|(a, h)| SearchMarks { hits: h, colors: &a.colors, highlighters: &[] });
         if let Some((_, hits)) = self.search.hits.clone() {
             let out = log_view(
                 ui,
@@ -1315,7 +1317,13 @@ impl Tab {
                 &|row| hits.lines[row as usize],
                 file,
                 &mut self.columns,
-                &Highlight { highlighter: None, bookmarks: Some(&self.bookmarks), search: marks.as_ref(), lines: None },
+                &Highlight {
+                    highlighter: None,
+                    bookmarks: Some(&self.bookmarks),
+                    search: marks.as_ref(),
+                    // The filter queries' line colours, as in the main view.
+                    lines: lines.as_ref(),
+                },
             );
             self.view_output(&out, |row| hits.lines[row as usize]);
             // Selecting a hit moves the main view to it.
@@ -2513,6 +2521,51 @@ query timeouts  labels: vision
         two.use_preset(&ctx, &lib, &p);
         settle(&mut two, &ctx);
         assert_eq!((two.mode, two.result.as_ref().unwrap().lines.as_slice()), (Mode::Auto, &[4][..]));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn search_hits_show_the_line_colours_too() {
+        let dir = std::env::temp_dir().join(format!("nerka-gui-hitcolours-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("app.log");
+        std::fs::write(&log, LOG).unwrap();
+        let mut lib = Library::new();
+        lib.add(pack::parse_pack("vision.nerka-pack", PACK).unwrap()).unwrap();
+        let ctx = egui::Context::default();
+        let mut tab = Tab::open(&ctx, log, &SearchPrefs::default());
+        settle(&mut tab, &ctx);
+        tab.picks.add(&lib, "vision.drops", Use::Include, None);
+        tab.picks.light_source("vision.drops");
+        tab.apply_filter_picks(&ctx, &lib).unwrap();
+        tab.search.mode = Mode::Auto;
+        tab.search.pattern = "cam1".into();
+        tab.run_search_box(&ctx);
+        settle(&mut tab, &ctx);
+        assert!(tab.line_colors.is_some());
+
+        let violet = library::parse_color("violet").unwrap();
+        let tints: Vec<Color32> =
+            [70, 90].iter().map(|&a| Color32::from_rgba_unmultiplied(violet.r(), violet.g(), violet.b(), a)).collect();
+        let file = tab.file.clone().unwrap();
+        let mut tinted = 0;
+        for t in 0..2 {
+            let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(900.0, 400.0));
+            let input = egui::RawInput { screen_rect: Some(screen), time: Some(t as f64), ..Default::default() };
+            let mut out = ctx.run_ui(input, |ui| {
+                egui::CentralPanel::default().show(ui, |ui| {
+                    tab.search_panel(ui, &*file, &SearchHistory::default());
+                });
+            });
+            out.textures_delta.clear();
+            tinted = out
+                .shapes
+                .iter()
+                .filter(|s| matches!(&s.shape, egui::Shape::Rect(r) if tints.contains(&r.fill)))
+                .count();
+        }
+        // Hits: lines 0 and 1 (cam1 frame drop); both are kept and coloured.
+        assert_eq!(tinted, 2);
         std::fs::remove_dir_all(&dir).ok();
     }
 
