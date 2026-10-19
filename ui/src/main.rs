@@ -346,12 +346,18 @@ struct Tab {
     filter_exp: Option<Arc<Applied>>,
     /// The Selection pane's queries.
     picks: Picks,
+    /// The selection as last expanded, for line colours: they follow the
+    /// selection, not the Filter box text, so editing the box keeps them.
+    colors_exp: Option<Arc<Applied>>,
     /// Whole-line colours of the filter queries switched on in `picks`.
     line_colors: Option<(Arc<ActiveSearch>, Arc<SearchHits>)>,
     colors_job: Option<(Arc<ActiveSearch>, Job<SearchHits>)>,
     search: SearchBox,
     /// ↑ / ↓ in the Filter box.
     filter_recall: recall::Recall,
+    /// The chips under the Filter and Search boxes are unfolded (one line
+    /// per query with its text).
+    chips_open: bool,
     filter_preview: PreviewCache,
 
     bookmarks: Bookmarks,
@@ -573,10 +579,12 @@ impl Tab {
             searching: None,
             filter_exp: None,
             picks: Picks::default(),
+            colors_exp: None,
             line_colors: None,
             colors_job: None,
             search: SearchBox::default(),
             filter_recall: recall::Recall::default(),
+            chips_open: false,
             filter_preview: PreviewCache::default(),
             bookmarks: Bookmarks::default(),
             marks_open: Default::default(),
@@ -787,7 +795,9 @@ impl Tab {
                 self.picks.error = None;
                 self.mode = Mode::Query;
                 self.pattern = a.exp.nfd.clone();
-                self.filter_exp = Some(Arc::new(a));
+                let a = Arc::new(a);
+                self.colors_exp = Some(a.clone());
+                self.filter_exp = Some(a);
                 self.start_search(ctx).then(|| self.pattern.clone())
             }
             Err(e) => {
@@ -888,8 +898,9 @@ impl Tab {
             j.cancel();
         }
         self.line_colors = None;
-        let a = self.filter_exp.clone().filter(|a| a.exp.nfd == self.pattern);
-        let (Some(a), Some(res), Some(file)) = (a, self.result.clone(), self.file.clone()) else { return };
+        let (Some(a), Some(res), Some(file)) = (self.colors_exp.clone(), self.result.clone(), self.file.clone()) else {
+            return;
+        };
         if self.searching.is_some() {
             return;
         }
@@ -911,6 +922,16 @@ impl Tab {
         let aa = a.clone();
         let job = Job::spawn(ctx, move |prog| nerka_core::search_within(&*file, Some(&res.lines), &aa.set, prog));
         self.colors_job = Some((a, job));
+    }
+
+    /// The selection changed (a colour switched, a node added or edited):
+    /// expand it again for the line colours and recolour. A selection that
+    /// doesn't expand keeps the last colours.
+    fn recolor_from(&mut self, ctx: &egui::Context, lib: &Library) {
+        if let Ok(a) = self.picks.expand(lib) {
+            self.colors_exp = Some(Arc::new(a));
+        }
+        self.recolor(ctx);
     }
 
     /// Start (again) the active search over the current filter result.
@@ -1196,7 +1217,8 @@ impl Tab {
         });
         if let Some(a) = self.filter_exp.clone().filter(|a| a.exp.nfd == self.pattern) {
             let picks = &self.picks;
-            if let Some(key) = expansion_view(ui, &a, Some(&|k| picks.is_lit(k))) {
+            let lines = expansion_lines(&a, &|k| picks.is_lit(k));
+            if let Some(key) = chips_view(ui, &lines, &mut self.chips_open) {
                 self.picks.toggle_lit(key);
                 self.recolor(ui.ctx());
             }
@@ -1325,7 +1347,8 @@ impl Tab {
             }
         }
         if let Some(terms) = self.search.current_terms() {
-            terms_view(ui, terms);
+            let lines = term_lines(terms);
+            chips_view(ui, &lines, &mut self.chips_open);
         } else {
             let schema = self.file.as_ref().map(|f| f.schema()).unwrap_or_default();
             let s = &mut self.search;
@@ -1396,62 +1419,123 @@ fn short(id: &str) -> &str {
     id.split_once('.').map_or(id, |(_, q)| q)
 }
 
-/// An expansion on several lines, one per picked query: how it joins the
-/// others, a name chip in the query's colour, and its NFD. With `lit`, the
-/// included queries' chips switch their line colour: filled when on.
-/// Returns the query whose chip was clicked.
-fn expansion_view(ui: &mut egui::Ui, a: &Applied, lit: Option<&dyn Fn(u64) -> bool>) -> Option<u64> {
-    let mut clicked = None;
+/// One picked query under a box: how it joins the others, its name chip
+/// and colour, its NFD, and (filter queries) the key of its selection node
+/// with whether its lines are coloured.
+struct ChipLine<'a> {
+    joiner: &'static str,
+    name: &'a str,
+    color: Color32,
+    nfd: &'a str,
+    origin: &'a str,
+    lit: Option<(u64, bool)>,
+}
+
+/// The picked queries under a box. Folded (the default): one row of name
+/// chips, the NFD on hover. Unfolded (▸ / ▾): one line per query with its
+/// NFD. A chip with `lit` switches its line colour (filled when on);
+/// returns the node whose chip was clicked.
+fn chips_view(ui: &mut egui::Ui, lines: &[ChipLine<'_>], open: &mut bool) -> Option<u64> {
     const MAX_LINES: usize = 8;
-    let e = &a.exp;
-    let mut includes = 0;
-    for (i, p) in e.parts.iter().enumerate() {
-        let joiner = match p.role {
-            Role::Include if includes == 0 => "",
-            Role::Include => "OR",
-            Role::Exclude => "AND NOT",
+    let mut clicked = None;
+    let mut chip = |ui: &mut egui::Ui, l: &ChipLine<'_>, folded: bool| {
+        let tip = |extra: &str| {
+            let nfd = if folded { format!("\n{}", l.nfd) } else { String::new() };
+            format!("{}{nfd}{extra}", l.origin)
         };
-        if p.role == Role::Include {
-            includes += 1;
-        }
-        if i >= MAX_LINES {
-            continue;
-        }
-        let (name, color) = (&a.names[i], a.colors[i]);
-        let origin = if p.query.starts_with("_sel.") { "local query (not in a pack)" } else { &p.query };
-        ui.horizontal(|ui| {
-            ui.add_sized([52.0, 14.0], egui::Label::new(RichText::new(joiner).small().weak()));
-            match (lit, p.role) {
-                (Some(lit), Role::Include) => {
-                    let on = lit(a.keys[i]);
-                    let tip = if on { "Lines coloured: click to stop" } else { "Click to colour its lines" };
-                    let r = library::chip(ui, name, color, on).interact(egui::Sense::click());
-                    if r.on_hover_text(format!("{origin}\n{tip}")).clicked() {
-                        clicked = Some(a.keys[i]);
-                    }
-                }
-                _ => {
-                    library::chip(ui, name, color, false).on_hover_text(origin);
+        match l.lit {
+            Some((key, on)) => {
+                let what = if on { "\nLines coloured: click to stop" } else { "\nClick to colour its lines" };
+                let r = library::chip(ui, l.name, l.color, on).interact(egui::Sense::click());
+                if r.on_hover_text(tip(what)).clicked() {
+                    clicked = Some(key);
                 }
             }
-            ui.add(egui::Label::new(RichText::new(e.part_nfd(p)).monospace().small()).truncate());
+            None => {
+                library::chip(ui, l.name, l.color, false).on_hover_text(tip(""));
+            }
+        }
+    };
+    let fold = |ui: &mut egui::Ui, open: &mut bool| {
+        let (icon, tip) = if *open { ("▾", "Show the names only") } else { ("▸", "Show each query's text") };
+        if ui.add(egui::Button::new(RichText::new(icon).small()).frame(false)).on_hover_text(tip).clicked() {
+            *open = !*open;
+        }
+    };
+    if !*open {
+        ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().item_spacing.x = 4.0;
+            fold(ui, open);
+            for l in lines {
+                if !l.joiner.is_empty() {
+                    ui.label(RichText::new(l.joiner).small().weak());
+                }
+                chip(ui, l, true);
+            }
+        });
+        return clicked;
+    }
+    for (i, l) in lines.iter().enumerate().take(MAX_LINES) {
+        ui.horizontal(|ui| {
+            if i == 0 {
+                fold(ui, open);
+            }
+            let w = if i == 0 { 38.0 } else { 52.0 };
+            ui.add_sized([w, 14.0], egui::Label::new(RichText::new(l.joiner).small().weak()));
+            chip(ui, l, false);
+            ui.add(egui::Label::new(RichText::new(l.nfd).monospace().small()).truncate());
         });
     }
-    if e.parts.len() > MAX_LINES {
-        ui.weak(format!("… {} more (the full text is in the box above)", e.parts.len() - MAX_LINES));
+    if lines.len() > MAX_LINES {
+        ui.weak(format!("… {} more (the full text is in the box above)", lines.len() - MAX_LINES));
     }
     clicked
 }
 
-/// The Search box's queries, one per line: OR, a chip, the NFD.
-fn terms_view(ui: &mut egui::Ui, terms: &[Term]) {
-    for (i, t) in terms.iter().enumerate() {
-        ui.horizontal(|ui| {
-            ui.add_sized([52.0, 14.0], egui::Label::new(RichText::new(if i == 0 { "" } else { "OR" }).small().weak()));
-            library::chip(ui, &t.name, t.color, false);
-            ui.add(egui::Label::new(RichText::new(&t.nfd).monospace().small()).truncate());
-        });
-    }
+/// The chip lines of a Filter box expansion; `lit` says whether a node's
+/// lines are coloured (included queries only).
+fn expansion_lines<'a>(a: &'a Applied, lit: &dyn Fn(u64) -> bool) -> Vec<ChipLine<'a>> {
+    let mut includes = 0;
+    a.exp
+        .parts
+        .iter()
+        .enumerate()
+        .map(|(i, p)| {
+            let joiner = match p.role {
+                Role::Include if includes == 0 => "",
+                Role::Include => "OR",
+                Role::Exclude => "AND NOT",
+            };
+            if p.role == Role::Include {
+                includes += 1;
+            }
+            let origin = if p.query.starts_with("_sel.") { "local query (not in a pack)" } else { p.query.as_str() };
+            ChipLine {
+                joiner,
+                name: &a.names[i],
+                color: a.colors[i],
+                nfd: a.exp.part_nfd(p),
+                origin,
+                lit: (p.role == Role::Include).then(|| (a.keys[i], lit(a.keys[i]))),
+            }
+        })
+        .collect()
+}
+
+/// The chip lines of the Search box's queries (OR'ed).
+fn term_lines(terms: &[Term]) -> Vec<ChipLine<'_>> {
+    terms
+        .iter()
+        .enumerate()
+        .map(|(i, t)| ChipLine {
+            joiner: if i == 0 { "" } else { "OR" },
+            name: &t.name,
+            color: t.color,
+            nfd: &t.nfd,
+            origin: "search query",
+            lit: None,
+        })
+        .collect()
 }
 
 #[derive(Default)]
@@ -2008,7 +2092,7 @@ impl eframe::App for App {
                 .show(ui, |ui| library::selection_panel(ui, &mut self.library, &mut tab.picks))
                 .inner;
             if lit(tab) != lit_before {
-                tab.recolor(&ctx);
+                tab.recolor_from(&ctx, &self.library);
             }
             for a in [a1, a2] {
                 if a != library::Action::None {
@@ -2126,6 +2210,67 @@ query timeouts  labels: vision
     }
 
     #[test]
+    fn chips_fold_into_one_row_and_unfold_into_lines() {
+        let lines = [
+            ChipLine {
+                joiner: "",
+                name: "ssl",
+                color: Color32::RED,
+                nfd: "(/SSL/)",
+                origin: "demo.ssl",
+                lit: Some((1, true)),
+            },
+            ChipLine {
+                joiner: "OR",
+                name: "disk",
+                color: Color32::BLUE,
+                nfd: "(/disk/)",
+                origin: "demo.disk",
+                lit: Some((2, false)),
+            },
+            ChipLine {
+                joiner: "AND NOT",
+                name: "noise",
+                color: Color32::GRAY,
+                nfd: "(/nav/)",
+                origin: "demo.noise",
+                lit: None,
+            },
+        ];
+        let ctx = egui::Context::default();
+        let texts = |open: &mut bool| {
+            let mut out = Vec::new();
+            for t in 0..2 {
+                let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(900.0, 300.0));
+                let input = egui::RawInput { screen_rect: Some(screen), time: Some(t as f64), ..Default::default() };
+                let mut o = ctx.run_ui(input, |ui| {
+                    egui::CentralPanel::default().show(ui, |ui| {
+                        chips_view(ui, &lines, open);
+                    });
+                });
+                o.textures_delta.clear();
+                out = o
+                    .shapes
+                    .iter()
+                    .filter_map(|s| match &s.shape {
+                        egui::Shape::Text(t) => Some((t.galley.text().to_owned(), t.pos.y.round())),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>();
+            }
+            out
+        };
+        let folded = texts(&mut false);
+        let y = |s: &str, v: &[(String, f32)]| v.iter().find(|(t, _)| t == s).map(|(_, y)| *y);
+        assert!(folded.iter().all(|(t, _)| !t.starts_with('(')), "no NFD while folded: {folded:?}");
+        assert_eq!(y("ssl", &folded), y("noise", &folded), "one row");
+        assert!(y("AND NOT", &folded).is_some());
+        let open = texts(&mut true);
+        assert!(y("(/disk/)", &open).is_some(), "{open:?}");
+        assert!(y("ssl", &open) < y("noise", &open), "one line per query");
+    }
+
+    #[test]
     fn boxes_read_their_text_by_mode() {
         let lit = MatcherOptions { fixed_string: true, ..Default::default() };
         let kind = |r: &Result<Filter, String>| match r {
@@ -2214,6 +2359,51 @@ query timeouts  labels: vision
         let t = bookmark_text(&long);
         assert_eq!(t.chars().count(), BOOKMARK_CHARS + 1);
         assert!(t.ends_with('…'));
+    }
+
+    #[test]
+    fn line_colours_follow_the_selection_not_the_box_text() {
+        let dir = std::env::temp_dir().join(format!("nerka-gui-colours-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("app.log");
+        std::fs::write(&log, LOG).unwrap();
+        let mut lib = Library::new();
+        lib.add(pack::parse_pack("vision.nerka-pack", PACK).unwrap()).unwrap();
+        let ctx = egui::Context::default();
+        let mut tab = Tab::open(&ctx, log, &SearchPrefs::default());
+        settle(&mut tab, &ctx);
+
+        tab.picks.add(&lib, "vision.errors", Use::Include, None);
+        tab.picks.add(&lib, "vision.timeouts", Use::Include, None);
+        tab.apply_filter_picks(&ctx, &lib).expect("runs");
+        settle(&mut tab, &ctx);
+        assert_eq!(tab.result.as_ref().unwrap().lines, [1, 2, 3, 4, 5]);
+        tab.picks.light_source("vision.timeouts");
+        tab.recolor_from(&ctx, &lib);
+        settle(&mut tab, &ctx);
+        assert_eq!(tab.line_colors.clone().expect("line colours").1.lines, [3, 5]);
+
+        // Editing the Filter box by hand keeps them, among the lines the
+        // new filter keeps.
+        tab.pattern = "(level >= ERROR)".into();
+        tab.start_search(&ctx);
+        settle(&mut tab, &ctx);
+        assert_eq!(tab.result.as_ref().unwrap().lines, [1, 2, 4, 5]);
+        assert_eq!(tab.line_colors.clone().expect("after a manual edit").1.lines, [5]);
+
+        // A node switched on after Apply colours too; one removed doesn't.
+        tab.picks.light_source("vision.errors");
+        tab.recolor_from(&ctx, &lib);
+        settle(&mut tab, &ctx);
+        assert_eq!(tab.line_colors.clone().unwrap().1.lines, [1, 2, 4, 5]);
+        let keys: Vec<u64> = tab.picks.nodes.iter().map(|n| n.key).collect();
+        for k in keys {
+            tab.picks.remove(k);
+        }
+        tab.recolor_from(&ctx, &lib);
+        settle(&mut tab, &ctx);
+        assert!(tab.line_colors.is_none());
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
