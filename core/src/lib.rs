@@ -24,6 +24,7 @@ pub mod event;
 pub mod history;
 pub mod input;
 pub mod pack;
+pub mod preset;
 
 pub use bookmarks::Bookmarks;
 pub use dsl::{DslError, Query};

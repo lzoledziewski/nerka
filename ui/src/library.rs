@@ -26,6 +26,7 @@ use nerka_core::pack::{
     self, Expansion, Library, Pack, PackQuery, ParamValue, Params, Pick, Role, Selection, format_query, is_query_name,
     params_in, parse_pack, upsert_query,
 };
+use nerka_core::preset::{NodeSource, Preset, PresetNode, PresetParam};
 use std::collections::BTreeMap;
 
 /// How a node takes part in the filter.
@@ -388,6 +389,69 @@ impl Picks {
         let sel = Selection { include: vec![Pick::Query(id)], exclude: vec![] };
         let exp = pack::expand(&sel, &full, &self.params()).map_err(|e| e.to_string())?;
         Ok(Term { name, nfd: exp.nfd, color })
+    }
+
+    /// The selection as a preset (without the box texts): library queries
+    /// by id, edited and new ones as copies, parameter values.
+    pub fn to_preset(&self, name: &str) -> Preset {
+        let mut p = Preset { name: name.to_owned(), ..Default::default() };
+        for n in &self.nodes {
+            let source = if n.edited || n.source.is_none() {
+                let id = format!("n{}", p.locals.len() + 1);
+                p.locals.push(n.as_query(&id));
+                NodeSource::Local { id, from: n.source.clone(), name: n.name.trim().to_owned() }
+            } else {
+                NodeSource::Library(n.source.clone().unwrap_or_default())
+            };
+            p.nodes.push(PresetNode { source, exclude: n.role == Use::Exclude, lit: n.lit, detached: n.detached });
+        }
+        p.params = self
+            .params
+            .iter()
+            .map(|(k, (v, raw))| PresetParam { name: k.clone(), value: v.clone(), raw: *raw })
+            .collect();
+        p
+    }
+
+    /// Replace the selection with `preset`'s. A library query that isn't
+    /// loaded becomes an empty local node, and the error says so.
+    pub fn use_preset(&mut self, lib: &Library, preset: &Preset) {
+        self.nodes.clear();
+        self.error = None;
+        let mut missing = Vec::new();
+        for pn in &preset.nodes {
+            let key = self.next_key();
+            let role = if pn.exclude { Use::Exclude } else { Use::Include };
+            let mut n = match &pn.source {
+                NodeSource::Library(id) => Node::of_library(key, lib, id, role).unwrap_or_else(|| {
+                    missing.push(id.clone());
+                    Node { name: id.clone(), source: None, open: false, ..Node::blank(key, role) }
+                }),
+                NodeSource::Local { id, from, name } => {
+                    let q = preset.local(id).expect("the preset parser checks local ids");
+                    Node {
+                        source: from.clone(),
+                        name: name.clone(),
+                        text: q.text.clone(),
+                        parent: q.parent.clone(),
+                        labels: q.labels.join(", "),
+                        color: q.color.clone().unwrap_or_default(),
+                        open: false,
+                        ..Node::blank(key, role)
+                    }
+                }
+            };
+            n.lit = pn.lit && role == Use::Include;
+            if pn.detached {
+                n.detached = true;
+                n.parent = None;
+            }
+            self.nodes.push(n);
+        }
+        self.params = preset.params.iter().map(|p| (p.name.clone(), (p.value.clone(), p.raw))).collect();
+        if !missing.is_empty() {
+            self.error = Some(format!("Preset '{}': not loaded: {}", preset.name, missing.join(", ")));
+        }
     }
 
     /// Parameter names the selected nodes need, parent chains included.
@@ -1399,6 +1463,51 @@ mod tests {
         }
         assert!(moved, "the second node was dragged above the first");
         assert_eq!(picks.nodes.len(), 2);
+    }
+
+    #[test]
+    fn a_selection_round_trips_through_a_preset() {
+        let lib = lib();
+        let mut p = Picks::default();
+        let ids: Vec<String> =
+            lib.packs().iter().flat_map(|pk| pk.queries.iter().map(move |q| format!("{}.{}", pk.name, q.id))).collect();
+        p.add(&lib, &ids[0], Use::Include, None);
+        p.add(&lib, &ids[1], Use::Exclude, None);
+        p.add_detached(&lib, &ids[2], Use::Include);
+        // An edited copy and a new, unnamed node.
+        p.add(&lib, &ids[0], Use::Exclude, None);
+        let k = p.nodes[3].key;
+        let n = p.node_mut(k).unwrap();
+        n.text = "/edited/".into();
+        n.edited = true;
+        let k = p.add_new(Use::Include);
+        p.node_mut(k).unwrap().text = "level >= ERROR".into();
+        p.toggle_lit(k);
+        p.params.insert("ecu".into(), ("ECU 1".into(), false));
+        p.params.insert("x".into(), ("a b".into(), true));
+
+        let preset = p.to_preset("mine");
+        let text = preset.serialize();
+        let back = nerka_core::preset::parse_preset("t", &text).unwrap_or_else(|e| panic!("{e}\n{text}"));
+        let mut q = Picks::default();
+        q.use_preset(&lib, &back);
+        assert_eq!(q.error, None);
+        let shape = |p: &Picks| {
+            p.nodes
+                .iter()
+                .map(|n| (n.source.clone(), n.name.clone(), n.text.clone(), n.role, n.lit, n.detached, n.edited))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(shape(&q), shape(&p));
+        assert_eq!(q.params, p.params);
+        assert_eq!(q.expand(&lib).unwrap().exp.nfd, p.expand(&lib).unwrap().exp.nfd);
+
+        // A query that isn't loaded any more is reported, not dropped.
+        let mut gone = back.clone();
+        gone.nodes[0].source = NodeSource::Library("nope.gone".into());
+        q.use_preset(&lib, &gone);
+        assert_eq!(q.nodes.len(), p.nodes.len());
+        assert!(q.error.as_deref().unwrap().contains("nope.gone"));
     }
 
     #[test]
