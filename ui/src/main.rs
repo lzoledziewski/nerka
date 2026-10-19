@@ -34,6 +34,7 @@ mod icon;
 mod job;
 mod library;
 mod prefs;
+mod presets;
 mod recall;
 mod view;
 
@@ -42,6 +43,7 @@ use job::{Job, Poll};
 use library::{Applied, LibraryView, Picks, Target, Term, Use};
 use nerka_core::dsl::{AutoRead, Plain, read_auto};
 use nerka_core::pack::{self, Library, Role};
+use nerka_core::preset::{BoxText, Preset};
 use nerka_core::{
     Bookmarks, FieldDef, Filter, Highlighter, LineNo, LogSource, Matcher, MatcherOptions, Query, SearchHistory,
     SearchHits, SearchResult, SearchSet, text_to_nfd,
@@ -122,6 +124,7 @@ fn main() -> eframe::Result {
             app.load_history();
             app.load_prefs();
             app.load_library();
+            app.presets.load();
             let mut picks = Picks::default();
             picks.params = params;
             for (role, id) in &startup {
@@ -346,6 +349,8 @@ struct Tab {
     filter_exp: Option<Arc<Applied>>,
     /// The Selection pane's queries.
     picks: Picks,
+    /// The preset last used or made in this tab.
+    preset: Option<String>,
     /// The selection as last expanded, for line colours: they follow the
     /// selection, not the Filter box text, so editing the box keeps them.
     colors_exp: Option<Arc<Applied>>,
@@ -579,6 +584,7 @@ impl Tab {
             searching: None,
             filter_exp: None,
             picks: Picks::default(),
+            preset: None,
             colors_exp: None,
             line_colors: None,
             colors_job: None,
@@ -922,6 +928,55 @@ impl Tab {
         let aa = a.clone();
         let job = Job::spawn(ctx, move |prog| nerka_core::search_within(&*file, Some(&res.lines), &aa.set, prog));
         self.colors_job = Some((a, job));
+    }
+
+    /// This tab as a preset: the selection, parameters, and the boxes'
+    /// typed text (the Filter box as "the selection" when it holds the
+    /// selection's expansion; the Search box only when typed).
+    fn to_preset(&self, name: &str) -> Preset {
+        let mut p = self.picks.to_preset(name);
+        p.filter = if self.filter_exp.as_ref().is_some_and(|a| a.exp.nfd == self.pattern) {
+            Some(BoxText::Selection)
+        } else if !self.pattern.trim().is_empty() {
+            Some(BoxText::Typed { tag: self.filter_tag().to_owned(), text: self.pattern.trim().to_owned() })
+        } else {
+            None
+        };
+        p.search = (self.search.current_terms().is_none() && !self.search.pattern.trim().is_empty())
+            .then(|| BoxText::Typed { tag: self.search.tag().to_owned(), text: self.search.pattern.trim().to_owned() });
+        p
+    }
+
+    /// Use a preset: its selection replaces this tab's, then the Filter and
+    /// Search boxes get its text and run.
+    fn use_preset(&mut self, ctx: &egui::Context, lib: &Library, p: &Preset) {
+        self.picks.use_preset(lib, p);
+        self.colors_exp = self.picks.expand(lib).ok().map(Arc::new);
+        self.filter_exp = None;
+        match &p.filter {
+            Some(BoxText::Selection) => {
+                let err = self.picks.error.take();
+                self.apply_filter_picks(ctx, lib);
+                self.picks.error = self.picks.error.take().or(err);
+            }
+            Some(BoxText::Typed { tag, text }) => {
+                self.set_filter(tag, text);
+                self.start_search(ctx);
+            }
+            None => {
+                self.pattern.clear();
+                self.start_search(ctx);
+            }
+        }
+        match &p.search {
+            Some(BoxText::Typed { tag, text }) => {
+                self.search.terms.clear();
+                self.search.set(tag, text);
+                self.run_search_box(ctx);
+            }
+            _ => self.clear_search(),
+        }
+        self.preset = Some(p.name.clone());
     }
 
     /// The selection changed (a colour switched, a node added or edited):
@@ -1565,6 +1620,7 @@ struct App {
     pack_paths: Vec<PathBuf>,
     show_library: bool,
     library_view: LibraryView,
+    presets: presets::Presets,
 }
 
 /// A window-style close button: a thin painted "×" with a square hover
@@ -1620,6 +1676,45 @@ impl App {
         }
         self.library = lib;
         self.library_errors = errors;
+    }
+
+    fn preset_action(&mut self, ctx: &egui::Context, action: presets::Action) {
+        use presets::Action as A;
+        let Some(tab) = self.tabs.get_mut(self.active) else { return };
+        let res = match action {
+            A::None => Ok(()),
+            A::Use(i) => {
+                let p = self.presets.entries[i].preset.clone();
+                tab.use_preset(ctx, &self.library, &p);
+                Ok(())
+            }
+            A::New { name, store } => {
+                let p = tab.to_preset(&name);
+                self.presets.put(p, store).map(|_| tab.preset = Some(name))
+            }
+            A::Update(i) => {
+                let p = tab.to_preset(&self.presets.entries[i].preset.name);
+                self.presets.put(p, false).map(|_| ())
+            }
+            A::Store(i) => {
+                let p = self.presets.entries[i].preset.clone();
+                self.presets.put(p, true).map(|_| ())
+            }
+            A::Delete(i) => {
+                let name = self.presets.entries[i].preset.name.clone();
+                self.presets.delete(i).map(|()| {
+                    for t in &mut self.tabs {
+                        if t.preset.as_deref() == Some(name.as_str()) {
+                            t.preset = None;
+                        }
+                    }
+                })
+            }
+        };
+        match res {
+            Ok(()) => self.presets.errors.retain(|e| !e.starts_with("Preset: ")),
+            Err(e) => self.presets.errors.push(format!("Preset: {e}")),
+        }
     }
 
     fn library_action(&mut self, ctx: &egui::Context, action: library::Action) {
@@ -2086,11 +2181,20 @@ impl eframe::App for App {
                     )
                 })
                 .inner;
-            let a2 = egui::Panel::right("selection")
+            let current = tab.preset.clone();
+            let (a2, pa) = egui::Panel::right("selection")
                 .resizable(true)
                 .default_size(320.0)
-                .show(ui, |ui| library::selection_panel(ui, &mut self.library, &mut tab.picks))
+                .show(ui, |ui| {
+                    let pa = presets::presets_bar(ui, &mut self.presets, current.as_deref());
+                    ui.separator();
+                    (library::selection_panel(ui, &mut self.library, &mut tab.picks), pa)
+                })
                 .inner;
+            if pa != presets::Action::None {
+                self.preset_action(&ctx, pa);
+            }
+            let Some(tab) = self.tabs.get_mut(self.active) else { return };
             if lit(tab) != lit_before {
                 tab.recolor_from(&ctx, &self.library);
             }
@@ -2359,6 +2463,57 @@ query timeouts  labels: vision
         let t = bookmark_text(&long);
         assert_eq!(t.chars().count(), BOOKMARK_CHARS + 1);
         assert!(t.ends_with('…'));
+    }
+
+    #[test]
+    fn a_preset_made_in_one_tab_sets_up_another() {
+        let dir = std::env::temp_dir().join(format!("nerka-gui-preset-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (log1, log2) = (dir.join("one.log"), dir.join("two.log"));
+        std::fs::write(&log1, LOG).unwrap();
+        std::fs::write(&log2, format!("{LOG}[ERROR] cam1 frame drop again\n")).unwrap();
+        let mut lib = Library::new();
+        lib.add(pack::parse_pack("vision.nerka-pack", PACK).unwrap()).unwrap();
+        let ctx = egui::Context::default();
+
+        let mut one = Tab::open(&ctx, log1, &SearchPrefs::default());
+        settle(&mut one, &ctx);
+        one.picks.add(&lib, "vision.cam", Use::Include, None);
+        one.picks.add(&lib, "vision.timeouts", Use::Exclude, None);
+        one.picks.params.insert("cam".into(), ("cam1".into(), false));
+        one.picks.light_source("vision.cam");
+        one.apply_filter_picks(&ctx, &lib).unwrap();
+        one.search.mode = Mode::Auto;
+        one.search.pattern = "frame drop".into();
+        one.run_search_box(&ctx);
+        settle(&mut one, &ctx);
+        let p = one.to_preset("cam triage");
+        assert_eq!(p.filter, Some(BoxText::Selection));
+        assert_eq!(p.search, Some(BoxText::Typed { tag: "auto".into(), text: "frame drop".into() }));
+        // Through the file format, as it would be saved.
+        let p = nerka_core::preset::parse_preset("t", &p.serialize()).unwrap();
+
+        let mut two = Tab::open(&ctx, log2, &SearchPrefs::default());
+        settle(&mut two, &ctx);
+        two.use_preset(&ctx, &lib, &p);
+        settle(&mut two, &ctx);
+        assert_eq!(two.preset.as_deref(), Some("cam triage"));
+        assert_eq!(two.pattern, one.pattern);
+        assert_eq!(two.result.as_ref().unwrap().lines, [1, 6]);
+        assert_eq!(two.search.hits.as_ref().unwrap().1.lines, [1, 6]);
+        assert_eq!(two.line_colors.as_ref().expect("the colour came along").1.lines, [1, 6]);
+
+        // A typed filter comes back as typed text, in its mode.
+        one.mode = Mode::Auto;
+        one.pattern = "disk full".into();
+        one.start_search(&ctx);
+        settle(&mut one, &ctx);
+        let p = one.to_preset("typed");
+        assert_eq!(p.filter, Some(BoxText::Typed { tag: "auto".into(), text: "disk full".into() }));
+        two.use_preset(&ctx, &lib, &p);
+        settle(&mut two, &ctx);
+        assert_eq!((two.mode, two.result.as_ref().unwrap().lines.as_slice()), (Mode::Auto, &[4][..]));
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
