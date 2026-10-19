@@ -153,6 +153,21 @@ fn control_characters_stay_in_their_column() {
 }
 
 #[test]
+fn line_detail_keeps_the_payload_formatting() {
+    let multi = Value::Str("first\r\n\tsecond\rthird\nfourth\x01".into());
+    let f = file(&[Msg::log(Level::Warn, "E", "A", "C", vec![multi.into(), Value::U(7, 1).into()])]);
+    let cells = f.line_detail(0).unwrap();
+    assert_eq!(cells.len(), COLUMNS.len());
+    assert_eq!(cells.last().unwrap(), "first\n\tsecond\nthird\nfourth  7");
+    // The other cells are the line's own.
+    let l = line(&f, 0);
+    let flat: Vec<&str> = l.splitn(COLUMNS.len(), '\t').collect();
+    assert_eq!(cells[..COLUMNS.len() - 1], flat[..COLUMNS.len() - 1]);
+    assert_eq!(*flat.last().unwrap(), "first   second third fourth  7");
+    assert_eq!(f.line_detail(1), None);
+}
+
+#[test]
 fn corrupt_data_is_skipped_and_counted() {
     let m = |s: &str| Msg::log(Level::Info, "E", "A", "C", vec![Value::Str(s.into()).into()]);
     let mut buf = Vec::new();

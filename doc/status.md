@@ -2,11 +2,11 @@
 
 Snapshot of where the project stands. Update this file whenever the state changes.
 
-_Last update: 2026-10-18 (search manager POC built on branch `claude/search-manager-poc-d451e1`: core, CLI and GUI; owner to try it)._
+_Last update: 2026-10-19 (GitHub issues #3–#6 on branch `claude/issues-3-6`: unnamed selection entries, pack names with spaces, search history with ↑ / ↓, long lines; #2 closed as invalid by the owner)._
 
 ## State
 
-- Builds and runs on **Windows** (MSVC, debug and release). Clippy `-D warnings`, fmt and all tests pass (63 core, 15 GUI). The 1 GiB benchmarks have been run on Windows (numbers below and in the commit messages).
+- Builds and runs on **Windows** (MSVC, debug and release). Clippy `-D warnings`, fmt and all tests pass (75 core, 32 GUI). The 1 GiB benchmarks have been run on Windows (numbers below and in the commit messages).
 - Committed on `main`, **not pushed** since `5b632c3` (don't push until the owner says so).
 - Only built for Windows so far. Linux/macOS builds and releases are open questions (see "Decisions pending").
 - **CI and releases (owner, 2026-10-18):** `.github/workflows/ci.yml` runs fmt, clippy and the tests on Linux and Windows for pushes to `main` and every PR (macOS left out: its runner minutes count 10x on a private repo). `release.yml` builds `nerka` + `nerka-gui` for Linux (Ubuntu 22.04, glibc 2.35+, `.tar.gz`) and Windows (`.zip`) on a `v*` tag and publishes them as a GitHub pre-release (tags with `-`, e.g. `v0.1.0-alpha.1`); run by hand it only builds artifacts. Version is `0.1.0-alpha.1`. `.vscode/extensions.json` is still not on disk (appendix).
@@ -21,7 +21,9 @@ Owner feedback is driving this; these are deliberate choices, keep them:
 - **Filter box:** modes **Text** (literal by default; a **Regex** checkbox switches to regex; also Ignore case and Invert) and **Query** (NFD). Its button is **Filter** (it was labelled Search, which was confusing). The row is laid out right to left so it never gets wider than the window. If it did, the result view's scrollbar would end up off-screen (that was a real bug).
 - **When a search runs (owner's decision):** only on Enter or the Search button. Ticking Regex / Ignore case / Invert, switching Text/Query or picking a history entry only changes the box's settings or contents; nothing runs until Enter. The last mode + checkbox combination is saved to `%APPDATA%\nerka\prefs` (or `$XDG_CONFIG_HOME/nerka/prefs`) and becomes the default for new tabs.
 - **Search history:** the 🕘 button lists recent filters; picking one fills the box. They are stored in `%APPDATA%\nerka\history` (or `$XDG_CONFIG_HOME/nerka/history`) as `text|regex|query<TAB>pattern`, using `core::SearchHistory`.
-- **Text selection:** drag, Shift+click, double-click (word), Shift+arrows (lines), Ctrl+A, Esc. Ctrl+C copies the selection, or the current line if nothing is selected (at most 100k lines). The right-click menu has Copy, Select all and Toggle bookmark.
+- **Search box history (owner, issue #5):** the Search box has its own history, kept apart from the filters in `search-history` next to `history` (same format), with its own 🕘 button. Searches from the box (Enter / Find) and from a library 🔍 are recorded. In both boxes ↑ / ↓ step through the history shell-style (↓ past the newest entry gives back what was typed; typing stops browsing); like the 🕘 menu, this only fills the box, nothing runs until Enter.
+- **Text selection:** drag, Shift+click, double-click (word), Shift+arrows (lines), Ctrl+A, Esc. Ctrl+C copies the selection, or the current line if nothing is selected (at most 100k lines). The right-click menu has Copy, Select all, Show whole line and Toggle bookmark.
+- **Long lines (owner, issue #6):** a horizontal scrollbar appears under a view when the visible lines are wider than it (Shift+wheel and ← / → still scroll too). **Enter** (or the right-click menu's **Show whole line…**) opens a line window: for a table (DLT) the header columns as a name / value grid, then the message with its own line breaks and tabs as the logger wrote them (`LogSource::line_detail` in core; the table row shows them as spaces), wrapped or not, selectable, with **Copy message** and **Copy line** (columns tab-separated, the message's line breaks kept); plain text shows the whole line (not cut at 4 KiB) with **Copy**. The window shows at most 1 MiB; Copy copies everything.
 - **Go to line:** Ctrl+G / Ctrl+L opens a dialog. There is no toolbar field (the owner asked for it to be removed).
 - **Look:** no tint on matching lines in the main view (the owner disliked the blue); the cursor line is neutral grey. Scrollbar thumbs use the text colour at 50% and are 14 px wide.
 - **Scrolling:** the views read raw mouse-wheel events (3 rows per notch), not egui's smoothed delta; the smoothing made text look smeared. Rows and text origins snap to physical pixels. A headless test (`view::tests::wheel_scrolls_hovered_view_by_whole_lines`) runs the app's panel layout and injects wheel events. Use that pattern for other GUI input tests.
@@ -109,6 +111,7 @@ Don't settle these silently: ask.
 4. **DLT column widths:** resizable per tab but not saved. Save them (globally or per file)?
 5. **Releases / downloads:** `release.yml` (Linux + Windows pre-releases on `v*` tags, archives with the README and both licence files) is in place; open: macOS builds (unsigned binaries warn; 10x runner minutes) and the `.exe` icon (needs an unapproved build dependency).
 6. **Linux builds from this Windows PC:** no WSL, Docker or zig installed. Options: cross-compile with `cargo zigbuild --target x86_64-unknown-linux-gnu.2.17` (user-level installs; build only, untested), WSL (can also run the GUI), or GitHub Actions. `Cargo.lock` has no GTK (the file dialog uses D-Bus via `zbus`), so a cross build is expected to link; not verified.
+7. **Copying multi-line messages (owner, 2026-10-19: action item, rethink later):** a decoded message's own line breaks and tabs show as spaces in the views and are kept only in the line window (Enter). Ctrl+C / Copy in the views copy the display text (formatting dropped); the line window's Copy message / Copy line keep it. The owner isn't fully happy with this, but neither single rule is good: always copying with the original formatting breaks the one-row-per-line, tab-separated paste (spreadsheets, grep), while always copying the display text loses stack traces and JSON. Revisit (e.g. a copy mode, or a second shortcut).
 
 ## Known limitations
 

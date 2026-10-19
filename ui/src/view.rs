@@ -9,6 +9,10 @@
 //! (whole lines), Ctrl+A. Ctrl+C copies the selection, or the current line
 //! when nothing is selected.
 //!
+//! Long lines scroll sideways: the horizontal scrollbar (shown when the
+//! visible lines are wider than the view), Shift+wheel or ← / →. Enter or
+//! the context menu asks for the whole current line (`ViewOutput::detail`).
+//!
 //! Sources with columns (DLT) are shown as a table: each line's
 //! tab-separated cells are aligned under a header row whose dividers can be
 //! dragged to resize columns. The line text stays the unit of selection,
@@ -57,6 +61,8 @@ pub struct ViewState {
     scroll_acc: f32,
     /// Table column whose right divider is being dragged.
     resizing: Option<usize>,
+    /// Width of the widest line painted in the last frame, in pixels.
+    content_w: f32,
 }
 
 /// Column layout of a table view. A tab's views share one, so they stay
@@ -162,6 +168,8 @@ pub struct ViewOutput {
     pub copied: Option<(u64, bool)>,
     /// "Toggle bookmark" chosen from the context menu, for this row.
     pub toggle_bookmark: Option<u64>,
+    /// The whole line was asked for (Enter or the context menu), for this row.
+    pub detail: Option<u64>,
 }
 
 /// Draw `rows` rows; `line_of_row` maps a view row to a file line.
@@ -188,8 +196,15 @@ pub fn log_view(
 
     let (outer, response) = ui.allocate_exact_size(ui.available_size(), Sense::click_and_drag());
     let id = ui.scope_id().with(id);
-    let text_rect = Rect::from_min_max(outer.min, pos2(outer.max.x - SCROLLBAR_W, outer.max.y));
-    let bar_rect = Rect::from_min_max(pos2(text_rect.max.x, outer.min.y), outer.max);
+    // A horizontal scrollbar while the lines painted last frame were wider
+    // than the text area.
+    let clip_w = (outer.width() - SCROLLBAR_W - gutter_w).max(0.0);
+    let max_x = |content_w: f32| (content_w - clip_w + char_w * 2.0).max(0.0);
+    let hbar_h = if max_x(state.content_w) > 0.0 { SCROLLBAR_W } else { 0.0 };
+    let text_rect = Rect::from_min_max(outer.min, pos2(outer.max.x - SCROLLBAR_W, outer.max.y - hbar_h));
+    let bar_rect = Rect::from_min_max(pos2(text_rect.max.x, outer.min.y), pos2(outer.max.x, text_rect.max.y));
+    let hbar_rect =
+        Rect::from_min_max(pos2(text_rect.min.x + gutter_w, text_rect.max.y), pos2(text_rect.max.x, outer.max.y));
     // Rows go below the table header, if there is one.
     let rows_rect =
         Rect::from_min_max(pos2(text_rect.min.x, text_rect.min.y + if table { row_h } else { 0.0 }), text_rect.max);
@@ -344,6 +359,7 @@ pub fn log_view(
     }
 
     let mut copy = false;
+    let mut detail = None;
     if has_focus && rows > 0 {
         let sel = state.selected.unwrap_or(state.top);
         let page = state.page;
@@ -376,6 +392,9 @@ pub fn log_view(
             if i.key_pressed(Key::Escape) {
                 state.sel = None
             }
+            if i.key_pressed(Key::Enter) && !i.modifiers.any() {
+                detail = Some(sel.min(rows - 1))
+            }
             if i.key_pressed(Key::A) && ctrl {
                 state.sel = Some((TextPos { row: 0, col: 0 }, TextPos { row: rows - 1, col: usize::MAX }))
             }
@@ -405,6 +424,10 @@ pub fn log_view(
         }
         if ui.add_enabled(rows > 0, egui::Button::new("Select all")).clicked() {
             state.sel = Some((TextPos { row: 0, col: 0 }, TextPos { row: rows - 1, col: usize::MAX }));
+            ui.close();
+        }
+        if ui.add_enabled(state.selected.is_some(), egui::Button::new("Show whole line…  (Enter)")).clicked() {
+            detail = state.selected;
             ui.close();
         }
         ui.separator();
@@ -452,6 +475,21 @@ pub fn log_view(
         state.top = (f * max_top as f64).round() as u64;
     }
     state.top = state.top.min(max_top);
+    let hbar = ui.interact(hbar_rect, id.with("hbar"), Sense::click_and_drag());
+    let hmax = max_x(state.content_w);
+    let hthumb_w = if hmax > 0.0 {
+        (hbar_rect.width() * clip_w / (clip_w + hmax)).clamp(32.0_f32.min(hbar_rect.width()), hbar_rect.width())
+    } else {
+        hbar_rect.width()
+    };
+    let htrack = (hbar_rect.width() - hthumb_w).max(1.0);
+    if hbar_h > 0.0
+        && (hbar.dragged() || hbar.clicked())
+        && let Some(p) = hbar.interact_pointer_pos()
+    {
+        let f = ((p.x - hbar_rect.left() - hthumb_w / 2.0) / htrack).clamp(0.0, 1.0);
+        state.x_off = (f * hmax).round();
+    }
     if over_divider || state.resizing.is_some() {
         ui.ctx().set_cursor_icon(CursorIcon::ResizeColumn);
     } else if response.hovered() && !bar.hovered() {
@@ -550,7 +588,8 @@ pub fn log_view(
         max_w = max_w.max(galley.size().x);
         painter.with_clip_rect(text_clip).galley(pos2(snap(text_x0 - state.x_off), snap(y + 1.0)), galley, text_color);
     }
-    state.x_off = state.x_off.min((max_w - text_clip.width() * 0.5).max(0.0));
+    state.content_w = max_w;
+    state.x_off = state.x_off.min(max_x(max_w));
 
     if table {
         let full = Rect::from_min_max(text_rect.min, header_rect.max);
@@ -591,11 +630,26 @@ pub fn log_view(
     if bar.hovered() {
         ui.ctx().set_cursor_icon(CursorIcon::Default);
     }
+    if hbar_h > 0.0 {
+        painter.rect_filled(
+            hbar_rect.union(Rect::from_min_max(pos2(text_rect.min.x, hbar_rect.min.y), hbar_rect.max)),
+            0.0,
+            vis.faint_bg_color,
+        );
+        painter.hline(hbar_rect.x_range(), hbar_rect.top(), vis.widgets.noninteractive.bg_stroke);
+        let x = hbar_rect.left() + if hmax == 0.0 { 0.0 } else { htrack * (state.x_off / hmax).clamp(0.0, 1.0) };
+        let thumb = Rect::from_min_size(pos2(x, hbar_rect.top() + 2.0), vec2(hthumb_w, SCROLLBAR_W - 4.0));
+        let col = text_color.gamma_multiply(if hbar.dragged() || hbar.hovered() { 0.7 } else { 0.5 });
+        painter.rect_filled(thumb, 4.0, col);
+        if hbar.hovered() {
+            ui.ctx().set_cursor_icon(CursorIcon::Default);
+        }
+    }
     if has_focus {
         painter.rect_stroke(outer.shrink(0.5), 0.0, Stroke::new(1.0, vis.selection.stroke.color), StrokeKind::Inside);
     }
 
-    ViewOutput { clicked, has_focus, copied, toggle_bookmark }
+    ViewOutput { clicked, has_focus, copied, toggle_bookmark, detail }
 }
 
 /// How a line's characters map to display columns. In plain text a tab is
@@ -954,6 +1008,71 @@ mod tests {
         assert_eq!(columns.widths[1], 3);
         assert_eq!(state.resizing, None);
         assert_eq!(state.selected, None, "header drags don't select rows");
+    }
+
+    #[test]
+    fn long_lines_get_a_horizontal_scrollbar_and_enter_asks_for_the_line() {
+        let long = format!("start {} end\nshort\n", "x".repeat(400));
+        let file = nerka_core::TextFile::from_bytes("t", long.into_bytes());
+        let short = nerka_core::TextFile::from_bytes("s", b"short\nlines\n".to_vec());
+        let ctx = egui::Context::default();
+        let hl = Highlight { highlighter: None, bookmarks: None, search: None, lines: None };
+        let mut t = 0.0;
+        let mut step = |events: Vec<egui::Event>, state: &mut ViewState, file: &nerka_core::TextFile| {
+            t += 1.0 / 60.0;
+            let screen = Rect::from_min_size(pos2(0.0, 0.0), vec2(600.0, 300.0));
+            let input = egui::RawInput { screen_rect: Some(screen), time: Some(t), events, ..Default::default() };
+            let mut res = None;
+            let mut out = ctx.run_ui(input, |ui| {
+                egui::CentralPanel::default().frame(egui::Frame::NONE).show(ui, |ui| {
+                    res = Some(log_view(ui, "v", state, file.line_count(), &|r| r, file, &mut Columns::default(), &hl));
+                });
+            });
+            out.textures_delta.clear();
+            res.unwrap()
+        };
+        let button = |pos, pressed| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+
+        // Short lines: no scrollbar, and nothing to scroll to.
+        let mut s = ViewState::default();
+        step(vec![], &mut s, &short);
+        step(vec![], &mut s, &short);
+        assert_eq!(s.x_off, 0.0);
+        assert!(s.content_w < 600.0);
+
+        let mut s = ViewState::default();
+        step(vec![], &mut s, &file);
+        step(vec![], &mut s, &file);
+        assert!(s.content_w > 600.0, "{}", s.content_w);
+        // Drag the thumb (bottom left) to the far right: the end of the
+        // line comes into view.
+        let thumb = pos2(80.0, 300.0 - SCROLLBAR_W / 2.0);
+        step(vec![egui::Event::PointerMoved(thumb), button(thumb, true)], &mut s, &file);
+        let right = pos2(600.0, thumb.y);
+        step(vec![egui::Event::PointerMoved(right)], &mut s, &file);
+        step(vec![button(right, false)], &mut s, &file);
+        let max = s.content_w - (600.0 - SCROLLBAR_W) + 40.0;
+        assert!(s.x_off > s.content_w - 600.0 && s.x_off < max, "x_off {} content {}", s.x_off, s.content_w);
+        assert_eq!(s.selected, None, "scrollbar drags don't select rows");
+
+        // Click the first row, then Enter asks for it.
+        let row = pos2(300.0, 8.0);
+        step(vec![egui::Event::PointerMoved(row), button(row, true)], &mut s, &file);
+        step(vec![button(row, false)], &mut s, &file);
+        let enter = egui::Event::Key {
+            key: Key::Enter,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        };
+        let out = step(vec![enter], &mut s, &file);
+        assert_eq!(out.detail, Some(0));
     }
 
     #[test]

@@ -22,6 +22,17 @@ const UNSUPPORTED: u32 = 0x100 | 0x4000;
 /// be decoded is shown as hex. Control characters become spaces so the
 /// text stays on one line and in one column.
 pub(crate) fn render(msg: &Message<'_>, out: &mut Vec<u8>) {
+    render_as(msg, out, false);
+}
+
+/// Like [`render`], but the payload's own line breaks (`\n`, `\r\n`, a
+/// lone `\r`, all as `\n`) and tabs are kept, as the logging code wrote
+/// them. Other control characters still become spaces.
+pub(crate) fn render_formatted(msg: &Message<'_>, out: &mut Vec<u8>) {
+    render_as(msg, out, true);
+}
+
+fn render_as(msg: &Message<'_>, out: &mut Vec<u8>, keep_breaks: bool) {
     let start = out.len();
     let mut r = Rd { b: msg.payload(), be: msg.big_endian() };
     if msg.mstp() == Some(MSTP_CONTROL) {
@@ -57,6 +68,22 @@ pub(crate) fn render(msg: &Message<'_>, out: &mut Vec<u8>) {
             }
             None => hex(r.b, out),
         }
+    }
+    if keep_breaks {
+        let text = out.split_off(start);
+        let mut it = text.iter().copied().peekable();
+        while let Some(b) = it.next() {
+            match b {
+                b'\r' => {
+                    it.next_if_eq(&b'\n');
+                    out.push(b'\n');
+                }
+                b'\n' | b'\t' => out.push(b),
+                b if b < 0x20 || b == 0x7F => out.push(b' '),
+                b => out.push(b),
+            }
+        }
+        return;
     }
     for b in &mut out[start..] {
         if *b < 0x20 || *b == 0x7F {
