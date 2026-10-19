@@ -5,7 +5,7 @@ use crate::event::Level;
 use regex::bytes::RegexBuilder;
 
 #[derive(Debug, Clone, PartialEq)]
-enum Tok {
+pub(super) enum Tok {
     LParen,
     RParen,
     And,
@@ -19,7 +19,7 @@ enum Tok {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
-enum OpTok {
+pub(super) enum OpTok {
     Cmp(CmpOp),
     Match,
     NotMatch,
@@ -145,6 +145,19 @@ struct Parser<'a> {
     lex: Lexer<'a>,
     tok: Tok,
     pos: usize,
+}
+
+/// Every token of `src` with its byte range (without the final `End`).
+pub(super) fn tokens(src: &str) -> Result<Vec<(Tok, std::ops::Range<usize>)>, DslError> {
+    let mut lex = Lexer { s: src, pos: 0 };
+    let mut out = Vec::new();
+    loop {
+        let (t, start) = lex.next()?;
+        if t == Tok::End {
+            return Ok(out);
+        }
+        out.push((t, start..lex.pos));
+    }
 }
 
 pub fn parse(src: &str) -> Result<Expr, DslError> {
