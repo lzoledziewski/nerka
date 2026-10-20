@@ -45,7 +45,7 @@ mod parser;
 use crate::event::{Event, FieldDef, FieldId, FieldKind, FieldValue, Level};
 use regex::bytes::Regex;
 
-pub use auto::{AutoRead, Plain, read_auto};
+pub use auto::{AutoRead, Plain, read_auto, read_auto_with};
 pub use parser::parse;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

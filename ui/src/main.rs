@@ -41,7 +41,7 @@ mod view;
 use eframe::egui::{self, Color32, Key, KeyboardShortcut, Modifiers, RichText};
 use job::{Job, Poll};
 use library::{Applied, LibraryView, Picks, Target, Term, Use};
-use nerka_core::dsl::{AutoRead, Plain, read_auto};
+use nerka_core::dsl::{AutoRead, Plain, read_auto_with};
 use nerka_core::pack::{self, Library, Role};
 use nerka_core::preset::{BoxText, Preset};
 use nerka_core::{
@@ -205,8 +205,9 @@ fn mode_combo(ui: &mut egui::Ui, id: &str, mode: &mut Mode) {
 enum Preview {
     /// Nothing to say (empty box, or Text / valid NFD: the mode says it).
     None,
-    /// Auto: literal text, with why it isn't a query, if it looked like one.
-    AutoText { text: String, why: Option<String> },
+    /// Auto: literal text (or, with Regex, a regex), with why it isn't a
+    /// query, if it looked like one.
+    AutoText { text: String, why: Option<String>, regex: bool },
     /// Auto: a query that is only a regex (`/…/flags`).
     AutoRegex(String),
     /// Auto: a query, as rewritten into NFD.
@@ -238,21 +239,25 @@ fn read_box(
             Err(e) => (Err(format!("Query error: {e}")), Preview::QueryError(e.to_string())),
         },
         Mode::Auto => {
-            let literal = MatcherOptions { fixed_string: true, ..options.clone() };
-            match read_auto(pattern, options.case_insensitive, schema) {
+            // Phrases and plain text are literal, or regexes with Regex ticked.
+            let regex = !options.fixed_string;
+            match read_auto_with(pattern, options, schema) {
                 AutoRead::Text(t) => {
-                    let preview =
-                        if t.is_empty() { Preview::None } else { Preview::AutoText { text: t.clone(), why: None } };
-                    (text(&t, literal), preview)
+                    let preview = if t.is_empty() {
+                        Preview::None
+                    } else {
+                        Preview::AutoText { text: t.clone(), why: None, regex }
+                    };
+                    (text(&t, options.clone()), preview)
                 }
                 AutoRead::NotQuery { text: t, err } => {
                     let why = Some(err.to_string());
-                    (text(&t, literal), Preview::AutoText { text: t, why })
+                    (text(&t, options.clone()), Preview::AutoText { text: t, why, regex })
                 }
                 AutoRead::Query { nfd, query, plain } => {
                     // A query that is only a text search is shown as one.
                     let preview = match plain {
-                        Some(Plain::Text(text)) => Preview::AutoText { text, why: None },
+                        Some(Plain::Text(text)) => Preview::AutoText { text, why: None, regex: false },
                         Some(Plain::Regex { pattern, ignore_case }) => {
                             Preview::AutoRegex(format!("/{pattern}/{}", if ignore_case { "i" } else { "" }))
                         }
@@ -276,9 +281,9 @@ fn preview_ui(ui: &mut egui::Ui, preview: &Preview) -> bool {
     let small = |s: String| RichText::new(s).small();
     match preview {
         Preview::None => {}
-        Preview::AutoText { text, why } => {
+        Preview::AutoText { text, why, regex } => {
             ui.horizontal(|ui| {
-                ui.label(small("→ text:".into()).weak());
+                ui.label(small(if *regex { "→ regex:" } else { "→ text:" }.into()).weak());
                 ui.add(egui::Label::new(small(text.clone()).monospace()).truncate());
                 if let Some(why) = why {
                     ui.label(small("(not a query)".into()).weak()).on_hover_text(why);
@@ -555,11 +560,9 @@ impl SearchBox {
             Mode::Text => text_to_nfd(text, &self.options()),
             Mode::Query => format!("({text})"),
             // Field names don't matter here: the term is compiled later.
-            Mode::Auto => match read_auto(text, self.ignore_case, &[]) {
+            Mode::Auto => match read_auto_with(text, &self.options(), &[]) {
                 AutoRead::Query { nfd, .. } => format!("({nfd})"),
-                AutoRead::Text(t) | AutoRead::NotQuery { text: t, .. } => {
-                    text_to_nfd(&t, &MatcherOptions { fixed_string: true, ..self.options() })
-                }
+                AutoRead::Text(t) | AutoRead::NotQuery { text: t, .. } => text_to_nfd(&t, &self.options()),
             },
         };
         let name: String = text.chars().take(24).collect();
@@ -589,7 +592,12 @@ impl Tab {
             colors_exp: None,
             line_colors: None,
             colors_job: None,
-            search: SearchBox::default(),
+            search: SearchBox {
+                mode: prefs.search_mode,
+                regex: prefs.search_regex,
+                ignore_case: prefs.search_ignore_case,
+                ..SearchBox::default()
+            },
             filter_recall: recall::Recall::default(),
             chips_open: false,
             filter_preview: PreviewCache::default(),
@@ -624,7 +632,14 @@ impl Tab {
     }
 
     fn search_prefs(&self) -> SearchPrefs {
-        SearchPrefs { mode: self.mode, options: self.options.clone(), ..SearchPrefs::default() }
+        SearchPrefs {
+            mode: self.mode,
+            options: self.options.clone(),
+            search_mode: self.search.mode,
+            search_regex: self.search.regex,
+            search_ignore_case: self.search.ignore_case,
+            ..SearchPrefs::default()
+        }
     }
 
     /// History tag for the current filter: `auto`, `text`, `regex` or `query`.
@@ -1245,7 +1260,7 @@ impl Tab {
                     ui.checkbox(&mut self.options.case_insensitive, "Ignore case")
                         .on_hover_text("For the text; a /regex/ or \"string\" written out says itself");
                 }
-                if self.mode == Mode::Text {
+                if self.mode != Mode::Query {
                     let mut regex = !self.options.fixed_string;
                     if ui.checkbox(&mut regex, "Regex").changed() {
                         self.options.fixed_string = !regex;
@@ -1379,8 +1394,9 @@ impl Tab {
                 if self.search.mode != Mode::Query {
                     ui.checkbox(&mut self.search.ignore_case, "Ignore case");
                 }
-                if self.search.mode == Mode::Text {
-                    ui.checkbox(&mut self.search.regex, "Regex");
+                if self.search.mode != Mode::Query {
+                    ui.checkbox(&mut self.search.regex, "Regex")
+                        .on_hover_text("Text, and Auto's plain words, as a regex (mix with NFD: /…/)");
                 }
                 let hint = match self.search.mode {
                     Mode::Auto => "search: text, or level >= ERROR AND timeout — Enter to find",
@@ -2426,6 +2442,36 @@ query timeouts  labels: vision
         assert!(y("ssl", &open) < y("noise", &open), "one line per query");
     }
 
+    fn p_why(p: &Preview) -> Option<String> {
+        match p {
+            Preview::AutoText { why, .. } => why.clone(),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn a_new_tab_takes_both_boxes_settings_from_the_prefs() {
+        let dir = std::env::temp_dir().join(format!("nerka-gui-prefs-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("app.log");
+        std::fs::write(&log, LOG).unwrap();
+        let prefs = SearchPrefs {
+            mode: Mode::Text,
+            options: MatcherOptions { fixed_string: false, case_insensitive: true, invert: false },
+            search_mode: Mode::Auto,
+            search_regex: true,
+            search_ignore_case: true,
+            ..SearchPrefs::default()
+        };
+        let ctx = egui::Context::default();
+        let tab = Tab::open(&ctx, log, &prefs);
+        let got = tab.search_prefs();
+        assert_eq!(got, prefs);
+        // Through the prefs file, as the next start reads it.
+        assert_eq!(SearchPrefs::parse(&prefs.serialize()), prefs);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     #[test]
     fn boxes_read_their_text_by_mode() {
         let lit = MatcherOptions { fixed_string: true, ..Default::default() };
@@ -2440,7 +2486,7 @@ query timeouts  labels: vision
         };
         assert_eq!(
             read(Mode::Auto, "connection reset"),
-            ("text", Preview::AutoText { text: "connection reset".into(), why: None })
+            ("text", Preview::AutoText { text: "connection reset".into(), why: None, regex: false })
         );
         assert_eq!(read(Mode::Auto, "level >= ERROR"), ("query", Preview::AutoQuery("level >= ERROR".into())));
         let (k, p) = read(Mode::Auto, "level >= LOUD");
@@ -2449,9 +2495,18 @@ query timeouts  labels: vision
         // Quoted text or a lone regex is a query that only searches text.
         assert_eq!(
             read(Mode::Auto, "\"ctid = BOOT\""),
-            ("query", Preview::AutoText { text: "ctid = BOOT".into(), why: None })
+            ("query", Preview::AutoText { text: "ctid = BOOT".into(), why: None, regex: false })
         );
         assert_eq!(read(Mode::Auto, "/SSL|CERT/i"), ("query", Preview::AutoRegex("/SSL|CERT/i".into())));
+        // Regex ticked: Auto's plain words and its text are regexes.
+        let re = MatcherOptions { fixed_string: false, ..Default::default() };
+        let (f, p) = read_box(Mode::Auto, "cam[12] frame", &re, &[]);
+        assert!(matches!(f, Ok(Filter::Regex(_))), "{p:?}");
+        assert_eq!(p, Preview::AutoText { text: "cam[12] frame".into(), why: p_why(&p), regex: true });
+        let (_, p) = read_box(Mode::Auto, "drop.* AND level >= ERROR", &re, &[]);
+        assert!(matches!(p, Preview::AutoText { regex: true, .. }), "{p:?}");
+        let (f, p) = read_box(Mode::Auto, "fr.me AND level >= ERROR", &re, &[]);
+        assert_eq!((kind(&f), p), ("query", Preview::AutoQuery("/fr.me/ AND level >= ERROR".into())));
         // Text mode never reads a query; NFD mode never falls back.
         assert_eq!(read(Mode::Text, "level >= ERROR"), ("text", Preview::None));
         assert_eq!(read(Mode::Query, "level >= ERROR"), ("query", Preview::None));

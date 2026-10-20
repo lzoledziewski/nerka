@@ -36,9 +36,19 @@ pub enum Plain {
     Regex { pattern: String, ignore_case: bool },
 }
 
-/// Read `src` as Auto does. `ignore_case` applies to the phrases; `schema`
-/// is the open source's fields (a query must compile for it).
+/// Read `src` as Auto does, phrases literal. `ignore_case` applies to the
+/// phrases; `schema` is the open source's fields (a query must compile for
+/// it).
 pub fn read_auto(src: &str, ignore_case: bool, schema: &[FieldDef]) -> AutoRead {
+    let literal = MatcherOptions { fixed_string: true, case_insensitive: ignore_case, invert: false };
+    read_auto_with(src, &literal, schema)
+}
+
+/// Read `src` as Auto does, phrases as `phrases` says: literal, or regexes
+/// (`fixed_string: false`, the Regex checkbox), with or without case.
+/// [`AutoRead::Text`] and [`AutoRead::NotQuery`] carry the box's text; the
+/// caller reads it with the same options.
+pub fn read_auto_with(src: &str, phrases: &MatcherOptions, schema: &[FieldDef]) -> AutoRead {
     let text = src.trim().to_owned();
     let toks = match tokens(src) {
         Ok(t) => t,
@@ -57,7 +67,7 @@ pub fn read_auto(src: &str, ignore_case: bool, schema: &[FieldDef]) -> AutoRead 
     let is_op = |i: usize| matches!(toks.get(i), Some((Tok::Op(_), _)));
     let phrase_word = |i: usize| word(i) && !is_op(i + 1) && !(i > 0 && is_op(i - 1));
 
-    let options = MatcherOptions { fixed_string: true, case_insensitive: ignore_case, invert: false };
+    let options = MatcherOptions { invert: false, ..phrases.clone() };
     let mut nfd = String::with_capacity(src.len() + 8);
     let mut copied = 0; // `src` is copied up to here
     let mut phrases = 0;
@@ -181,6 +191,22 @@ mod tests {
         assert_eq!(read_with("connection reset", true, &[]), text("connection reset"));
         assert_eq!(read_with("a.b AND /X/", true, &[]).unwrap(), "/a\\.b/i AND /X/");
         assert_eq!(read_with("x AND \"Y\"", true, &[]).unwrap(), "/x/i AND \"Y\"");
+    }
+
+    #[test]
+    fn phrases_can_be_regexes() {
+        let re = |ci| MatcherOptions { fixed_string: false, case_insensitive: ci, invert: false };
+        let read_re = |src: &str, ci| match read_auto_with(src, &re(ci), &[]) {
+            AutoRead::Query { nfd, .. } => Ok(nfd),
+            AutoRead::Text(t) | AutoRead::NotQuery { text: t, .. } => Err(t),
+        };
+        assert_eq!(read_re("time.out AND level >= ERROR", false).unwrap(), "/time.out/ AND level >= ERROR");
+        assert_eq!(read_re("time.out AND level >= ERROR", true).unwrap(), "/time.out/i AND level >= ERROR");
+        // Regex syntax NFD doesn't know makes the whole box one regex.
+        assert_eq!(read_re("time(out)? AND level >= ERROR", false), Err("time(out)? AND level >= ERROR".into()));
+        assert_eq!(read_re("a|b", false), Err("a|b".into()));
+        // Literal by default.
+        assert_eq!(read("time.out AND level >= ERROR").unwrap(), "\"time.out\" AND level >= ERROR");
     }
 
     #[test]

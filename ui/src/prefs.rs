@@ -11,8 +11,13 @@ use std::path::Path;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct SearchPrefs {
+    /// The Filter box's mode and checkboxes.
     pub mode: Mode,
     pub options: MatcherOptions,
+    /// The Search box's mode and checkboxes.
+    pub search_mode: Mode,
+    pub search_regex: bool,
+    pub search_ignore_case: bool,
     /// UDP destination ports that carry DLT in captures (pcap, MF4).
     pub dlt_ports: Vec<u16>,
 }
@@ -23,6 +28,9 @@ impl Default for SearchPrefs {
         Self {
             mode: Mode::Auto,
             options: MatcherOptions { fixed_string: true, ..Default::default() },
+            search_mode: Mode::Auto,
+            search_regex: false,
+            search_ignore_case: false,
             dlt_ports: nerka_core::input::capture::DEFAULT_DLT_PORTS.to_vec(),
         }
     }
@@ -41,13 +49,16 @@ impl SearchPrefs {
                     {
                         p.dlt_ports = ports;
                     }
-                    if key.trim() == "mode" {
-                        match v {
-                            "auto" => p.mode = Mode::Auto,
-                            "text" => p.mode = Mode::Text,
-                            "query" => p.mode = Mode::Query,
-                            _ => {}
-                        }
+                    let mode = match v {
+                        "auto" => Some(Mode::Auto),
+                        "text" => Some(Mode::Text),
+                        "query" => Some(Mode::Query),
+                        _ => None,
+                    };
+                    match (key.trim(), mode) {
+                        ("mode", Some(m)) => p.mode = m,
+                        ("search_mode", Some(m)) => p.search_mode = m,
+                        _ => {}
                     }
                     continue;
                 }
@@ -56,6 +67,8 @@ impl SearchPrefs {
                 "regex" => p.options.fixed_string = !flag,
                 "ignore_case" => p.options.case_insensitive = flag,
                 "invert" => p.options.invert = flag,
+                "search_regex" => p.search_regex = flag,
+                "search_ignore_case" => p.search_ignore_case = flag,
                 _ => {}
             }
         }
@@ -63,16 +76,20 @@ impl SearchPrefs {
     }
 
     pub fn serialize(&self) -> String {
-        let mode = match self.mode {
+        let name = |m: Mode| match m {
             Mode::Auto => "auto",
             Mode::Text => "text",
             Mode::Query => "query",
         };
         format!(
-            "mode={mode}\nregex={}\nignore_case={}\ninvert={}\ndlt_ports={}\n",
+            "mode={}\nregex={}\nignore_case={}\ninvert={}\nsearch_mode={}\nsearch_regex={}\nsearch_ignore_case={}\ndlt_ports={}\n",
+            name(self.mode),
             !self.options.fixed_string,
             self.options.case_insensitive,
             self.options.invert,
+            name(self.search_mode),
+            self.search_regex,
+            self.search_ignore_case,
             ports_text(&self.dlt_ports)
         )
     }
@@ -131,6 +148,9 @@ mod tests {
         let p = SearchPrefs {
             mode: Mode::Query,
             options: MatcherOptions { fixed_string: false, case_insensitive: true, invert: true },
+            search_mode: Mode::Text,
+            search_regex: true,
+            search_ignore_case: true,
             dlt_ports: vec![3490, 3489],
         };
         assert_eq!(SearchPrefs::parse(&p.serialize()), p);
