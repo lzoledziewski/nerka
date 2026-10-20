@@ -10,6 +10,7 @@
 //!     nerka-gui app.log --query 'level >= ERROR AND raw ~ /SSL/'
 //!     nerka-gui app.log --text 'connection reset'
 //!     nerka-gui app.log --regex 'timeout|refused'
+//!     nerka-gui --new-window --name 'OTA crash' trace.dlt   (else files go to the window focused last)
 //!     nerka-gui app.log --pack packs/ --pick vision.cam_scope --search-pick vision.frame_drops --param cam=CAM1 --highlight vision.cam_scope
 //! Keys: Ctrl+F filter · Enter run · n/N next/prev search hit · Ctrl+G go to
 //! line (the nearest kept line when filtered) · Ctrl+Shift+L library
@@ -31,6 +32,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod icon;
+mod instance;
 mod job;
 mod library;
 mod prefs;
@@ -65,6 +67,7 @@ fn main() -> eframe::Result {
     let mut searches: Vec<String> = Vec::new();
     let mut highlight: Vec<String> = Vec::new();
     let mut params = std::collections::BTreeMap::new();
+    let (mut new_window, mut window_name, mut preset_file) = (false, None, None);
     let mut args = std::env::args_os().skip(1);
     while let Some(a) = args.next() {
         let mut value = || args.next().map(|v| v.to_string_lossy().into_owned()).unwrap_or_default();
@@ -102,12 +105,39 @@ fn main() -> eframe::Result {
                 show_library = true;
                 continue;
             }
+            Some("--new-window") => {
+                new_window = true;
+                continue;
+            }
+            Some("--name") => {
+                window_name = Some(value());
+                continue;
+            }
+            // A tab moved from another window: its filter, search and
+            // selection, as a preset file (deleted once read).
+            Some("--preset-file") => {
+                preset_file = Some(PathBuf::from(value()));
+                continue;
+            }
             _ => {
                 initial.push(PathBuf::from(a));
                 continue;
             }
         };
         preset = args.next().map(|v| (tag, v.to_string_lossy().into_owned()));
+    }
+    // Plain `nerka-gui FILE…`: the window focused last opens them.
+    let plain = preset.is_none()
+        && packs.is_empty()
+        && startup.is_empty()
+        && searches.is_empty()
+        && highlight.is_empty()
+        && params.is_empty()
+        && !show_library
+        && preset_file.is_none()
+        && window_name.is_none();
+    if plain && !new_window && !initial.is_empty() && instance::hand_off(&initial) {
+        return Ok(());
     }
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -120,7 +150,9 @@ fn main() -> eframe::Result {
         "nerka",
         options,
         Box::new(move |cc| {
-            let mut app = App { pack_paths: packs, show_library, ..Default::default() };
+            let mut app = App { pack_paths: packs, show_library, window_name, ..Default::default() };
+            let ctx = cc.egui_ctx.clone();
+            app.server = instance::Server::start(move || ctx.request_repaint());
             app.load_history();
             app.load_prefs();
             app.load_library();
@@ -133,8 +165,18 @@ fn main() -> eframe::Result {
             for id in &highlight {
                 picks.light_source(id);
             }
+            let moved = preset_file.and_then(|f| {
+                let text = std::fs::read_to_string(&f).ok();
+                let _ = std::fs::remove_file(&f);
+                nerka_core::preset::parse_preset("moved tab", &text?).ok()
+            });
             for p in initial {
                 app.open(&cc.egui_ctx, p);
+                if let (Some(p), Some(tab)) = (&moved, app.tabs.last_mut()) {
+                    tab.use_preset(&cc.egui_ctx, &app.library, p);
+                    tab.preset = None;
+                    continue;
+                }
                 // A filter given on the command line applies to every file it names.
                 if let (Some((tag, pattern)), Some(tab)) = (&preset, app.tabs.last_mut()) {
                     tab.set_filter(tag, pattern);
@@ -1647,6 +1689,12 @@ struct App {
     library_view: LibraryView,
     /// The ⚙ menu's ports field while it is edited.
     ports_text: Option<String>,
+    /// This window's name (title, Alt+Tab).
+    window_name: Option<String>,
+    /// Listener for files other `nerka-gui` starts hand to this window.
+    server: Option<instance::Server>,
+    /// Tabs moved to new windows so far (temp file names).
+    moves: u32,
     presets: presets::Presets,
 }
 
@@ -1806,6 +1854,14 @@ impl App {
     fn settings_menu(&mut self, ui: &mut egui::Ui) {
         let mut save = None;
         ui.menu_button("⚙", |ui| {
+            ui.label(RichText::new("This window").strong());
+            ui.horizontal(|ui| {
+                ui.label("Name");
+                let name = self.window_name.get_or_insert_with(String::new);
+                ui.add(egui::TextEdit::singleline(name).hint_text("e.g. OTA crash").desired_width(140.0))
+                    .on_hover_text("Shown first in the title, so Alt+Tab tells windows apart");
+            });
+            ui.separator();
             ui.label(RichText::new("DLT in captures").strong());
             ui.horizontal(|ui| {
                 ui.label("UDP ports");
@@ -2001,8 +2057,50 @@ impl App {
         }
     }
 
+    /// Files another `nerka-gui` handed to this window; whether it has focus.
+    fn poll_instance(&mut self, ctx: &egui::Context) {
+        let Some(server) = &mut self.server else { return };
+        server.set_focused(ctx.input(|i| i.viewport().focused).unwrap_or(false));
+        let requests = server.poll();
+        for r in requests {
+            let instance::Request::Open(files) = r;
+            for f in files {
+                self.open(ctx, f);
+            }
+            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+            ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+        }
+    }
+
+    /// Open tab `i`'s file in a new window, with its filter, search and
+    /// selection (as a preset file), and close it here.
+    fn move_tab(&mut self, i: usize) {
+        let Some(t) = self.tabs.get(i) else { return };
+        let path = t.path.clone();
+        let file = std::env::temp_dir().join(format!("nerka-move-{}-{}.nerka-preset", std::process::id(), self.moves));
+        self.moves += 1;
+        let res = std::env::current_exe().and_then(|exe| {
+            std::fs::write(&file, t.to_preset("moved tab").serialize())?;
+            let mut cmd = std::process::Command::new(exe);
+            cmd.arg("--new-window").arg("--preset-file").arg(&file);
+            for p in &self.pack_paths {
+                cmd.arg("--pack").arg(p);
+            }
+            cmd.arg(&path).spawn().map(|_| ())
+        });
+        match res {
+            Ok(()) => self.close(i),
+            Err(e) => {
+                let _ = std::fs::remove_file(&file);
+                if let Some(t) = self.tabs.get_mut(i) {
+                    t.status = format!("Could not open a new window: {e}");
+                }
+            }
+        }
+    }
+
     fn tab_bar(&mut self, ui: &mut egui::Ui) {
-        let (mut select, mut close, mut close_others) = (None, None, None);
+        let (mut select, mut close, mut close_others, mut moved) = (None, None, None, None);
         egui::ScrollArea::horizontal().show(ui, |ui| {
             ui.horizontal(|ui| {
                 for (i, t) in self.tabs.iter().enumerate() {
@@ -2020,6 +2118,13 @@ impl App {
                         }
                         if ui.button("Close other tabs").clicked() {
                             close_others = Some(i);
+                        }
+                        if ui
+                            .button("Move to new window")
+                            .on_hover_text("With its filter, search and selection")
+                            .clicked()
+                        {
+                            moved = Some(i);
                         }
                         if ui.button("Copy full path").clicked() {
                             ui.ctx().copy_text(t.path.display().to_string());
@@ -2039,6 +2144,8 @@ impl App {
             self.close(i);
         } else if let Some(i) = close_others {
             self.close_others(i);
+        } else if let Some(i) = moved {
+            self.move_tab(i);
         }
     }
 
@@ -2118,9 +2225,13 @@ impl App {
     }
 
     fn update_title(&mut self, ctx: &egui::Context) {
-        let title = match self.tabs.get(self.active) {
-            Some(t) => format!("nerka — {}", t.path.display()),
-            None => "nerka".to_owned(),
+        // The window's name first, so Alt+Tab shows it.
+        let file = self.tabs.get(self.active).map(|t| t.path.display().to_string());
+        let title = match (self.window_name.as_deref().filter(|n| !n.trim().is_empty()), file) {
+            (Some(n), Some(f)) => format!("{} · {f} — nerka", n.trim()),
+            (Some(n), None) => format!("{} — nerka", n.trim()),
+            (None, Some(f)) => format!("nerka — {f}"),
+            (None, None) => "nerka".to_owned(),
         };
         if title != self.window_title {
             ctx.send_viewport_cmd(egui::ViewportCommand::Title(title.clone()));
@@ -2132,6 +2243,7 @@ impl App {
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+        self.poll_instance(&ctx);
         self.poll_jobs(&ctx);
         self.handle_input(&ctx);
         self.update_title(&ctx);
