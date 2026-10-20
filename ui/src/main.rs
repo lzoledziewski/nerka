@@ -1691,11 +1691,49 @@ struct App {
     ports_text: Option<String>,
     /// This window's name (title, Alt+Tab).
     window_name: Option<String>,
+    /// The Settings window is open.
+    settings_open: bool,
     /// Listener for files other `nerka-gui` starts hand to this window.
     server: Option<instance::Server>,
     /// Tabs moved to new windows so far (temp file names).
     moves: u32,
     presets: presets::Presets,
+}
+
+/// The Settings window's fields: this window's name and the DLT ports
+/// (`ports` as typed). Returns the ports when they were changed to a
+/// valid list.
+fn settings_ui(ui: &mut egui::Ui, name: &mut String, ports: &mut String) -> Option<Vec<u16>> {
+    let mut save = None;
+    egui::Grid::new("settings-grid").num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| {
+        ui.label(RichText::new("This window").strong());
+        ui.end_row();
+        ui.label("Name");
+        ui.add(egui::TextEdit::singleline(name).hint_text("e.g. OTA crash").desired_width(200.0))
+            .on_hover_text("Shown first in the title, so Alt+Tab tells windows apart");
+        ui.end_row();
+        ui.label(RichText::new("DLT in captures").strong());
+        ui.end_row();
+        ui.label("UDP ports");
+        let r = ui.add(egui::TextEdit::singleline(ports).desired_width(200.0)).on_hover_text(
+            "Destination ports whose UDP payloads are DLT (pcap, pcapng, MF4), separated by spaces. Default: 3490",
+        );
+        ui.end_row();
+        ui.label("");
+        match prefs::parse_ports(ports) {
+            Some(p) => {
+                if r.changed() {
+                    save = Some(p);
+                }
+                ui.weak("Used for captures opened from now on");
+            }
+            None => {
+                ui.colored_label(ui.visuals().error_fg_color, "Port numbers 1–65535, separated by spaces");
+            }
+        }
+        ui.end_row();
+    });
+    save
 }
 
 /// A window-style close button: a thin painted "×" with a square hover
@@ -1851,37 +1889,28 @@ impl App {
 
     /// Remember the active tab's mode and options if the user changed them.
     /// ⚙: settings that aren't per tab (the DLT ports of captures).
-    fn settings_menu(&mut self, ui: &mut egui::Ui) {
+    /// The Settings window (⚙, Ctrl+,): this window's name and the DLT
+    /// ports of captures. A window, not a menu: a menu closes on any click,
+    /// so its text fields couldn't be typed in.
+    fn settings_window(&mut self, ctx: &egui::Context) {
+        if !self.settings_open {
+            return;
+        }
+        let mut open = true;
         let mut save = None;
-        ui.menu_button("⚙", |ui| {
-            ui.label(RichText::new("This window").strong());
-            ui.horizontal(|ui| {
-                ui.label("Name");
-                let name = self.window_name.get_or_insert_with(String::new);
-                ui.add(egui::TextEdit::singleline(name).hint_text("e.g. OTA crash").desired_width(140.0))
-                    .on_hover_text("Shown first in the title, so Alt+Tab tells windows apart");
+        egui::Window::new("Settings")
+            .id(egui::Id::unique("settings"))
+            .open(&mut open)
+            .resizable(false)
+            .collapsible(false)
+            .show(ctx, |ui| {
+                let ports = self.ports_text.get_or_insert_with(|| prefs::ports_text(&self.prefs.dlt_ports));
+                save = settings_ui(ui, self.window_name.get_or_insert_with(String::new), ports);
             });
-            ui.separator();
-            ui.label(RichText::new("DLT in captures").strong());
-            ui.horizontal(|ui| {
-                ui.label("UDP ports");
-                let text = self.ports_text.get_or_insert_with(|| prefs::ports_text(&self.prefs.dlt_ports));
-                let r = ui.add(egui::TextEdit::singleline(text).desired_width(120.0)).on_hover_text(
-                    "Destination ports whose UDP payloads are DLT (pcap, pcapng, MF4), separated by spaces. \
-                     Default: 3490",
-                );
-                match prefs::parse_ports(text) {
-                    Some(p) if r.changed() => save = Some(p),
-                    Some(_) => {}
-                    None => {
-                        ui.colored_label(ui.visuals().error_fg_color, "ports 1–65535");
-                    }
-                }
-            });
-            ui.weak("Used for captures opened from now on");
-        })
-        .response
-        .on_hover_text("Settings");
+        if !open {
+            self.settings_open = false;
+            self.ports_text = None;
+        }
         if let Some(ports) = save
             && ports != self.prefs.dlt_ports
         {
@@ -2015,6 +2044,9 @@ impl App {
         }
         if shortcut(Modifiers::NONE, Key::F1) {
             self.about = true;
+        }
+        if shortcut(Modifiers::COMMAND, Key::Comma) {
+            self.settings_open = !self.settings_open;
         }
         // Shift variants first: matching ignores an unrequested Shift.
         if shortcut(Modifiers::COMMAND | Modifiers::SHIFT, Key::Tab) || shortcut(Modifiers::COMMAND, Key::PageUp) {
@@ -2249,6 +2281,7 @@ impl eframe::App for App {
         self.update_title(&ctx);
         self.goto_dialog(&ctx);
         self.about_dialog(&ctx);
+        self.settings_window(&ctx);
         if let Some(t) = self.tabs.get_mut(self.active)
             && let Some(d) = &mut t.detail
         {
@@ -2286,7 +2319,9 @@ impl eframe::App for App {
                     if ui.button("ℹ About").on_hover_text("F1").clicked() {
                         self.about = true;
                     }
-                    self.settings_menu(ui);
+                    if ui.selectable_label(self.settings_open, "⚙").on_hover_text("Settings (Ctrl+,)").clicked() {
+                        self.settings_open = !self.settings_open;
+                    }
                 });
             });
         });
@@ -2582,6 +2617,67 @@ query timeouts  labels: vision
         // Through the prefs file, as the next start reads it.
         assert_eq!(SearchPrefs::parse(&prefs.serialize()), prefs);
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn the_settings_window_takes_typing() {
+        let ctx = egui::Context::default();
+        let (mut name, mut ports) = (String::new(), "3490".to_owned());
+        let mut saved = None;
+        let mut rects = Vec::new();
+        let mut frame =
+            |events: Vec<egui::Event>, name: &mut String, ports: &mut String, rects: &mut Vec<egui::Rect>| {
+                let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0));
+                let input = egui::RawInput { screen_rect: Some(screen), events, ..Default::default() };
+                let mut out = ctx.run_ui(input, |ui| {
+                    egui::Window::new("Settings").show(ui.ctx(), |ui| {
+                        if let Some(p) = settings_ui(ui, name, ports) {
+                            saved = Some(p);
+                        }
+                    });
+                });
+                out.textures_delta.clear();
+                // Where the fields' texts are: the name's hint, the ports.
+                rects.clear();
+                for want in ["e.g. OTA crash", "3490"] {
+                    for s in &out.shapes {
+                        if let egui::Shape::Text(t) = &s.shape
+                            && t.galley.text() == want
+                        {
+                            rects.push(egui::Rect::from_min_size(t.pos, t.galley.size()));
+                        }
+                    }
+                }
+            };
+        let click = |p: egui::Pos2| {
+            vec![
+                egui::Event::PointerMoved(p),
+                egui::Event::PointerButton {
+                    pos: p,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+                egui::Event::PointerButton {
+                    pos: p,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ]
+        };
+        for _ in 0..3 {
+            frame(vec![], &mut name, &mut ports, &mut rects);
+        }
+        assert!(rects.len() >= 2, "two text fields: {rects:?}");
+        let (name_at, ports_at) = (rects[0].center(), rects[1].right_center() + egui::vec2(2.0, 0.0));
+        frame(click(name_at), &mut name, &mut ports, &mut rects);
+        frame(vec![egui::Event::Text("OTA crash".into())], &mut name, &mut ports, &mut rects);
+        assert_eq!(name, "OTA crash");
+        frame(click(ports_at), &mut name, &mut ports, &mut rects);
+        frame(vec![egui::Event::Text(" 3489".into())], &mut name, &mut ports, &mut rects);
+        assert_eq!(ports, "3490 3489");
+        assert_eq!(saved, Some(vec![3490, 3489]));
     }
 
     #[test]
