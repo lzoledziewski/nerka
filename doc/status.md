@@ -9,7 +9,7 @@ _Last update: 2026-10-19 (GitHub issues #3–#6 on branch `claude/issues-3-6`: u
 - Builds and runs on **Windows** (MSVC, debug and release). Clippy `-D warnings`, fmt and all tests pass (75 core, 32 GUI). The 1 GiB benchmarks have been run on Windows (numbers below and in the commit messages).
 - Committed on `main`, **not pushed** since `5b632c3` (don't push until the owner says so).
 - Only built for Windows so far. Linux/macOS builds and releases are open questions (see "Decisions pending").
-- **CI and releases (owner, 2026-10-18):** `.github/workflows/ci.yml` runs fmt, clippy and the tests on Linux and Windows for pushes to `main` and every PR (macOS left out: its runner minutes count 10x on a private repo). `release.yml` builds `nerka` + `nerka-gui` for Linux (Ubuntu 22.04, glibc 2.35+, `.tar.gz`) and Windows (`.zip`) on a `v*` tag and publishes them as a GitHub pre-release (tags with `-`, e.g. `v0.1.0-alpha.1`); run by hand it only builds artifacts. Version is `0.1.0-alpha.2`. `.vscode/extensions.json` is still not on disk (appendix).
+- **CI and releases (owner, 2026-10-18):** `.github/workflows/ci.yml` runs fmt, clippy and the tests on Linux and Windows for pushes to `main` and every PR (macOS left out: its runner minutes count 10x on a private repo). `release.yml` builds `nerka` + `nerka-gui` for Linux (Ubuntu 22.04, glibc 2.35+, `.tar.gz`) and Windows (`.zip`) on a `v*` tag and publishes them as a GitHub pre-release (tags with `-`, e.g. `v0.1.0-alpha.1`); run by hand it only builds artifacts. Version is `0.1.0-alpha.3`. `.vscode/extensions.json` is still not on disk (appendix).
 
 ## GUI as of now (`ui/`)
 
