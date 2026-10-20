@@ -13,6 +13,7 @@ The Filter and Search boxes had two modes, Text and Query. Both are useful, but 
   - NFD syntax is a query (`level >= ERROR`, `apid == NAV`, `/re/`, `"text"`, `AND` / `OR` / `NOT`, parentheses);
   - a run of plain words is one **exact phrase** (`connection reset` = lines containing exactly that), and phrases mix with NFD: `connection reset AND level >= ERROR`;
   - the **Ignore case** checkbox applies to the phrases (not to a `/re/` or `"text"` written out: those say what they want);
+  - the **Regex** checkbox (owner, 2026-10-20; shared with Text mode) makes the phrases and the plain-text fallback regexes: `fr.me AND level >= ERROR` → `/fr.me/ AND level >= ERROR`; regex syntax NFD doesn't know (`(`, `|`, `*`, `[`) makes the whole box one regex, so mix regexes with NFD as `/…/`;
   - if the box isn't a valid query, it is searched as **literal text** as a whole (a pasted log line with `(`, `[`, `:` or `>=` just works).
 - **Text** is always literal text (or a regex with **Regex** ticked), never a query: for the rare text that Auto would read as a query.
 - **NFD** is strict: an error is an error, shown with a **Search as text instead** button.
@@ -44,4 +45,4 @@ Examples:
 ## History and prefs
 
 - History entries carry the mode tag (`auto`, `text`, `regex`, `query`); picking one restores the mode it ran in. Old entries keep working.
-- The last mode and checkboxes are still remembered as the default for new tabs (`prefs`); new installs start in Auto.
+- The last mode and checkboxes of **both** boxes are remembered as the default for new tabs (`prefs`: `mode`, `regex`, `ignore_case`, `invert` for the Filter box; `search_mode`, `search_regex`, `search_ignore_case` for the Search box; fixed 2026-10-20: the Search box's weren't saved); new installs start in Auto.

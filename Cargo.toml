@@ -4,7 +4,7 @@ members = ["core", "cli", "ui"]
 default-members = ["core", "cli"]
 
 [workspace.package]
-version = "0.1.0-alpha.2"
+version = "0.1.0-alpha.3"
 edition = "2024"
 rust-version = "1.85"
 license = "MIT OR Apache-2.0"
@@ -22,6 +22,7 @@ clap = { version = "4.6", features = ["derive"] }
 anyhow = "1"
 eframe = "0.37"
 rfd = "0.17"
+winresource = { version = "0.1.34", default-features = false }
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"

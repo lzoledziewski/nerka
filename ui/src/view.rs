@@ -9,6 +9,11 @@
 //! (whole lines), Ctrl+A. Ctrl+C copies the selection, or the current line
 //! when nothing is selected.
 //!
+//! Picked lines (issue #12): Ctrl+click (or Ctrl+Space on the cursor line)
+//! picks or unpicks single lines anywhere; Ctrl+C then copies the picked
+//! lines whole, in file order. A plain click or Esc clears them. Picks are
+//! file lines, so they stay when the filter changes.
+//!
 //! Long lines scroll sideways: the horizontal scrollbar (shown when the
 //! visible lines are wider than the view), Shift+wheel or ← / →. Enter or
 //! the context menu asks for the whole current line (`ViewOutput::detail`).
@@ -56,6 +61,8 @@ pub struct ViewState {
     pub page: u64,
     /// Text selection as (anchor, head); empty when both are equal.
     pub sel: Option<(TextPos, TextPos)>,
+    /// Lines picked one by one (Ctrl+click), as file lines.
+    pub picked: std::collections::BTreeSet<LineNo>,
     dragging: bool,
     /// Fraction of a row scrolled but not applied yet (trackpads).
     scroll_acc: f32,
@@ -268,8 +275,14 @@ pub fn log_view(
         TextPos { row: row.min(rows.saturating_sub(1)), col }
     };
     let mut clicked = None;
-    let (pressed, released, shift, pointer) = ui.input(|i| {
-        (i.pointer.primary_pressed(), i.pointer.primary_released(), i.modifiers.shift, i.pointer.interact_pos())
+    let (pressed, released, shift, command, pointer) = ui.input(|i| {
+        (
+            i.pointer.primary_pressed(),
+            i.pointer.primary_released(),
+            i.modifiers.shift,
+            i.modifiers.command,
+            i.pointer.interact_pos(),
+        )
     });
     // ----- table header: drag a divider to resize its column -----
     let x0 = snap(text_x0 - state.x_off);
@@ -306,6 +319,24 @@ pub fn log_view(
         && response.contains_pointer()
     {
         let pos = hit(state, p);
+        if command && !shift {
+            // Pick or unpick this line; no text selection.
+            let line = line_of_row(pos.row);
+            if !state.picked.remove(&line) {
+                state.picked.insert(line);
+            }
+            state.sel = None;
+            state.selected = Some(pos.row);
+            clicked = Some(pos.row);
+        } else {
+            if !shift {
+                state.picked.clear();
+            }
+            select_from(state, shift, pos);
+            clicked = Some(pos.row);
+        }
+    }
+    fn select_from(state: &mut ViewState, shift: bool, pos: TextPos) {
         let anchor = match (shift, state.sel, state.selected) {
             (true, Some((a, _)), _) => a,
             (true, None, Some(r)) => TextPos { row: r, col: 0 },
@@ -314,7 +345,6 @@ pub fn log_view(
         state.sel = Some((anchor, pos));
         state.selected = Some(pos.row);
         state.dragging = true;
-        clicked = Some(pos.row);
     }
     if state.dragging {
         if released || !ui.input(|i| i.pointer.primary_down()) {
@@ -390,7 +420,14 @@ pub fn log_view(
                 state.x_off = (state.x_off - char_w * 8.0).max(0.0)
             }
             if i.key_pressed(Key::Escape) {
-                state.sel = None
+                state.sel = None;
+                state.picked.clear();
+            }
+            if i.key_pressed(Key::Space) && ctrl {
+                let line = line_of_row(sel.min(rows - 1));
+                if !state.picked.remove(&line) {
+                    state.picked.insert(line);
+                }
             }
             if i.key_pressed(Key::Enter) && !i.modifiers.any() {
                 detail = Some(sel.min(rows - 1))
@@ -418,8 +455,18 @@ pub fn log_view(
     let mut toggle_bookmark = None;
     response.context_menu(|ui| {
         let has_sel = state.selection().is_some();
-        if ui.add_enabled(rows > 0, egui::Button::new(if has_sel { "Copy" } else { "Copy line" })).clicked() {
+        let label = match state.picked.len() {
+            0 if has_sel => "Copy".to_owned(),
+            0 => "Copy line".to_owned(),
+            1 => "Copy the picked line".to_owned(),
+            n => format!("Copy the {n} picked lines"),
+        };
+        if ui.add_enabled(rows > 0, egui::Button::new(label)).clicked() {
             copy = true;
+            ui.close();
+        }
+        if !state.picked.is_empty() && ui.button("Unpick all  (Esc)").clicked() {
+            state.picked.clear();
             ui.close();
         }
         if ui.add_enabled(rows > 0, egui::Button::new("Select all")).clicked() {
@@ -438,7 +485,19 @@ pub fn log_view(
     });
 
     let mut copied = None;
-    if copy && rows > 0 {
+    if copy && !state.picked.is_empty() {
+        // Picked lines, whole, in file order.
+        let mut out = String::new();
+        let n = state.picked.len().min(MAX_COPY_LINES as usize);
+        for (k, &line) in state.picked.iter().take(n).enumerate() {
+            if k > 0 {
+                out.push('\n');
+            }
+            out.push_str(&source.line_text(line).unwrap_or_default());
+        }
+        ui.ctx().copy_text(out);
+        copied = Some((n as u64, n < state.picked.len()));
+    } else if copy && rows > 0 {
         let (start, end) = state.selection().unwrap_or_else(|| {
             let r = state.selected.unwrap_or(state.top);
             (TextPos { row: r, col: 0 }, TextPos { row: r, col: usize::MAX })
@@ -532,6 +591,10 @@ pub fn log_view(
         }
         if state.selected == Some(row) {
             painter.rect_filled(row_rect, 0.0, cursor_bg);
+        }
+        if state.picked.contains(&line) {
+            let text_part = Rect::from_min_max(pos2(text_clip.min.x, row_rect.min.y), row_rect.max);
+            painter.rect_filled(text_part, 0.0, sel_bg);
         }
         let matched = hl.search.and_then(|s| s.matched(line));
         if let (Some(qs), Some(s)) = (&matched, hl.search) {
@@ -1073,6 +1136,89 @@ mod tests {
         };
         let out = step(vec![enter], &mut s, &file);
         assert_eq!(out.detail, Some(0));
+    }
+
+    #[test]
+    fn ctrl_click_picks_single_lines_and_copy_takes_them() {
+        let text: String = (0..20).map(|i| format!("line {i}\n")).collect();
+        let file = nerka_core::TextFile::from_bytes("t", text.into_bytes());
+        // Every second line, as a filtered view shows them.
+        let rows: Vec<u64> = (0..20).step_by(2).collect();
+        let ctx = egui::Context::default();
+        let hl = Highlight { highlighter: None, bookmarks: None, search: None, lines: None };
+        let mut t = 0.0;
+        let mut step = |events: Vec<egui::Event>, state: &mut ViewState| {
+            t += 1.0 / 60.0;
+            let screen = Rect::from_min_size(pos2(0.0, 0.0), vec2(600.0, 400.0));
+            // Ctrl held for the frame when the events carry it.
+            let modifiers = events
+                .iter()
+                .find_map(|e| match e {
+                    egui::Event::PointerButton { modifiers, .. } | egui::Event::Key { modifiers, .. } => {
+                        Some(*modifiers)
+                    }
+                    _ => None,
+                })
+                .unwrap_or_default();
+            let mut events = events;
+            events.insert(0, egui::Event::ModifiersChanged(modifiers));
+            let input = egui::RawInput { screen_rect: Some(screen), time: Some(t), events, ..Default::default() };
+            let mut res = None;
+            let mut out = ctx.run_ui(input, |ui| {
+                egui::CentralPanel::default().frame(egui::Frame::NONE).show(ui, |ui| {
+                    let r = log_view(
+                        ui,
+                        "v",
+                        state,
+                        rows.len() as u64,
+                        &|r| rows[r as usize],
+                        &file,
+                        &mut Columns::default(),
+                        &hl,
+                    );
+                    res = Some(r);
+                });
+            });
+            out.textures_delta.clear();
+            let copied: Vec<String> = out
+                .platform_output
+                .commands
+                .iter()
+                .filter_map(|c| match c {
+                    egui::OutputCommand::CopyText(s) => Some(s.clone()),
+                    _ => None,
+                })
+                .collect();
+            (res.unwrap(), copied)
+        };
+        let ctrl = egui::Modifiers::COMMAND;
+        let click = |y: f32, modifiers| {
+            let pos = pos2(200.0, y);
+            vec![
+                egui::Event::PointerMoved(pos),
+                egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed: true, modifiers },
+                egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed: false, modifiers },
+            ]
+        };
+        let key =
+            |key, modifiers| egui::Event::Key { key, physical_key: None, pressed: true, repeat: false, modifiers };
+        let mut s = ViewState::default();
+        step(vec![], &mut s);
+        let row_h = 17.0;
+        // Ctrl+click rows 3 and 1 (lines 6 and 2), and row 5 twice (unpicked).
+        for row in [3.0, 1.0, 5.0, 5.0] {
+            step(click(row * row_h + 6.0, ctrl), &mut s);
+        }
+        assert_eq!(s.picked.iter().copied().collect::<Vec<_>>(), [2, 6], "{:?}", s.picked);
+        assert_eq!(s.sel, None, "picking selects no text");
+        let (out, copied) = step(vec![egui::Event::Copy], &mut s);
+        assert_eq!(out.copied, Some((2, false)));
+        assert_eq!(copied, ["line 2\nline 6"]);
+        // Ctrl+Space picks the cursor line; a plain click clears the picks.
+        step(vec![key(Key::Space, ctrl)], &mut s);
+        assert_eq!(s.picked.len(), 3);
+        step(click(row_h * 2.0 + 6.0, egui::Modifiers::NONE), &mut s);
+        assert!(s.picked.is_empty());
     }
 
     #[test]

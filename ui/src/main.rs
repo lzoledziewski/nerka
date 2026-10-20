@@ -10,6 +10,7 @@
 //!     nerka-gui app.log --query 'level >= ERROR AND raw ~ /SSL/'
 //!     nerka-gui app.log --text 'connection reset'
 //!     nerka-gui app.log --regex 'timeout|refused'
+//!     nerka-gui --new-window --name 'OTA crash' trace.dlt   (else files go to the window focused last)
 //!     nerka-gui app.log --pack packs/ --pick vision.cam_scope --search-pick vision.frame_drops --param cam=CAM1 --highlight vision.cam_scope
 //! Keys: Ctrl+F filter · Enter run · n/N next/prev search hit · Ctrl+G go to
 //! line (the nearest kept line when filtered) · Ctrl+Shift+L library
@@ -31,6 +32,8 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod icon;
+mod icon_art;
+mod instance;
 mod job;
 mod library;
 mod prefs;
@@ -41,7 +44,7 @@ mod view;
 use eframe::egui::{self, Color32, Key, KeyboardShortcut, Modifiers, RichText};
 use job::{Job, Poll};
 use library::{Applied, LibraryView, Picks, Target, Term, Use};
-use nerka_core::dsl::{AutoRead, Plain, read_auto};
+use nerka_core::dsl::{AutoRead, Plain, read_auto_with};
 use nerka_core::pack::{self, Library, Role};
 use nerka_core::preset::{BoxText, Preset};
 use nerka_core::{
@@ -65,6 +68,7 @@ fn main() -> eframe::Result {
     let mut searches: Vec<String> = Vec::new();
     let mut highlight: Vec<String> = Vec::new();
     let mut params = std::collections::BTreeMap::new();
+    let (mut new_window, mut window_name, mut preset_file) = (false, None, None);
     let mut args = std::env::args_os().skip(1);
     while let Some(a) = args.next() {
         let mut value = || args.next().map(|v| v.to_string_lossy().into_owned()).unwrap_or_default();
@@ -102,12 +106,39 @@ fn main() -> eframe::Result {
                 show_library = true;
                 continue;
             }
+            Some("--new-window") => {
+                new_window = true;
+                continue;
+            }
+            Some("--name") => {
+                window_name = Some(value());
+                continue;
+            }
+            // A tab moved from another window: its filter, search and
+            // selection, as a preset file (deleted once read).
+            Some("--preset-file") => {
+                preset_file = Some(PathBuf::from(value()));
+                continue;
+            }
             _ => {
                 initial.push(PathBuf::from(a));
                 continue;
             }
         };
         preset = args.next().map(|v| (tag, v.to_string_lossy().into_owned()));
+    }
+    // Plain `nerka-gui FILE…`: the window focused last opens them.
+    let plain = preset.is_none()
+        && packs.is_empty()
+        && startup.is_empty()
+        && searches.is_empty()
+        && highlight.is_empty()
+        && params.is_empty()
+        && !show_library
+        && preset_file.is_none()
+        && window_name.is_none();
+    if plain && !new_window && !initial.is_empty() && instance::hand_off(&initial) {
+        return Ok(());
     }
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -120,7 +151,9 @@ fn main() -> eframe::Result {
         "nerka",
         options,
         Box::new(move |cc| {
-            let mut app = App { pack_paths: packs, show_library, ..Default::default() };
+            let mut app = App { pack_paths: packs, show_library, window_name, ..Default::default() };
+            let ctx = cc.egui_ctx.clone();
+            app.server = instance::Server::start(move || ctx.request_repaint());
             app.load_history();
             app.load_prefs();
             app.load_library();
@@ -133,8 +166,18 @@ fn main() -> eframe::Result {
             for id in &highlight {
                 picks.light_source(id);
             }
+            let moved = preset_file.and_then(|f| {
+                let text = std::fs::read_to_string(&f).ok();
+                let _ = std::fs::remove_file(&f);
+                nerka_core::preset::parse_preset("moved tab", &text?).ok()
+            });
             for p in initial {
                 app.open(&cc.egui_ctx, p);
+                if let (Some(p), Some(tab)) = (&moved, app.tabs.last_mut()) {
+                    tab.use_preset(&cc.egui_ctx, &app.library, p);
+                    tab.preset = None;
+                    continue;
+                }
                 // A filter given on the command line applies to every file it names.
                 if let (Some((tag, pattern)), Some(tab)) = (&preset, app.tabs.last_mut()) {
                     tab.set_filter(tag, pattern);
@@ -205,8 +248,9 @@ fn mode_combo(ui: &mut egui::Ui, id: &str, mode: &mut Mode) {
 enum Preview {
     /// Nothing to say (empty box, or Text / valid NFD: the mode says it).
     None,
-    /// Auto: literal text, with why it isn't a query, if it looked like one.
-    AutoText { text: String, why: Option<String> },
+    /// Auto: literal text (or, with Regex, a regex), with why it isn't a
+    /// query, if it looked like one.
+    AutoText { text: String, why: Option<String>, regex: bool },
     /// Auto: a query that is only a regex (`/…/flags`).
     AutoRegex(String),
     /// Auto: a query, as rewritten into NFD.
@@ -238,21 +282,25 @@ fn read_box(
             Err(e) => (Err(format!("Query error: {e}")), Preview::QueryError(e.to_string())),
         },
         Mode::Auto => {
-            let literal = MatcherOptions { fixed_string: true, ..options.clone() };
-            match read_auto(pattern, options.case_insensitive, schema) {
+            // Phrases and plain text are literal, or regexes with Regex ticked.
+            let regex = !options.fixed_string;
+            match read_auto_with(pattern, options, schema) {
                 AutoRead::Text(t) => {
-                    let preview =
-                        if t.is_empty() { Preview::None } else { Preview::AutoText { text: t.clone(), why: None } };
-                    (text(&t, literal), preview)
+                    let preview = if t.is_empty() {
+                        Preview::None
+                    } else {
+                        Preview::AutoText { text: t.clone(), why: None, regex }
+                    };
+                    (text(&t, options.clone()), preview)
                 }
                 AutoRead::NotQuery { text: t, err } => {
                     let why = Some(err.to_string());
-                    (text(&t, literal), Preview::AutoText { text: t, why })
+                    (text(&t, options.clone()), Preview::AutoText { text: t, why, regex })
                 }
                 AutoRead::Query { nfd, query, plain } => {
                     // A query that is only a text search is shown as one.
                     let preview = match plain {
-                        Some(Plain::Text(text)) => Preview::AutoText { text, why: None },
+                        Some(Plain::Text(text)) => Preview::AutoText { text, why: None, regex: false },
                         Some(Plain::Regex { pattern, ignore_case }) => {
                             Preview::AutoRegex(format!("/{pattern}/{}", if ignore_case { "i" } else { "" }))
                         }
@@ -276,9 +324,9 @@ fn preview_ui(ui: &mut egui::Ui, preview: &Preview) -> bool {
     let small = |s: String| RichText::new(s).small();
     match preview {
         Preview::None => {}
-        Preview::AutoText { text, why } => {
+        Preview::AutoText { text, why, regex } => {
             ui.horizontal(|ui| {
-                ui.label(small("→ text:".into()).weak());
+                ui.label(small(if *regex { "→ regex:" } else { "→ text:" }.into()).weak());
                 ui.add(egui::Label::new(small(text.clone()).monospace()).truncate());
                 if let Some(why) = why {
                     ui.label(small("(not a query)".into()).weak()).on_hover_text(why);
@@ -555,11 +603,9 @@ impl SearchBox {
             Mode::Text => text_to_nfd(text, &self.options()),
             Mode::Query => format!("({text})"),
             // Field names don't matter here: the term is compiled later.
-            Mode::Auto => match read_auto(text, self.ignore_case, &[]) {
+            Mode::Auto => match read_auto_with(text, &self.options(), &[]) {
                 AutoRead::Query { nfd, .. } => format!("({nfd})"),
-                AutoRead::Text(t) | AutoRead::NotQuery { text: t, .. } => {
-                    text_to_nfd(&t, &MatcherOptions { fixed_string: true, ..self.options() })
-                }
+                AutoRead::Text(t) | AutoRead::NotQuery { text: t, .. } => text_to_nfd(&t, &self.options()),
             },
         };
         let name: String = text.chars().take(24).collect();
@@ -589,7 +635,12 @@ impl Tab {
             colors_exp: None,
             line_colors: None,
             colors_job: None,
-            search: SearchBox::default(),
+            search: SearchBox {
+                mode: prefs.search_mode,
+                regex: prefs.search_regex,
+                ignore_case: prefs.search_ignore_case,
+                ..SearchBox::default()
+            },
             filter_recall: recall::Recall::default(),
             chips_open: false,
             filter_preview: PreviewCache::default(),
@@ -624,7 +675,14 @@ impl Tab {
     }
 
     fn search_prefs(&self) -> SearchPrefs {
-        SearchPrefs { mode: self.mode, options: self.options.clone(), ..SearchPrefs::default() }
+        SearchPrefs {
+            mode: self.mode,
+            options: self.options.clone(),
+            search_mode: self.search.mode,
+            search_regex: self.search.regex,
+            search_ignore_case: self.search.ignore_case,
+            ..SearchPrefs::default()
+        }
     }
 
     /// History tag for the current filter: `auto`, `text`, `regex` or `query`.
@@ -1245,7 +1303,7 @@ impl Tab {
                     ui.checkbox(&mut self.options.case_insensitive, "Ignore case")
                         .on_hover_text("For the text; a /regex/ or \"string\" written out says itself");
                 }
-                if self.mode == Mode::Text {
+                if self.mode != Mode::Query {
                     let mut regex = !self.options.fixed_string;
                     if ui.checkbox(&mut regex, "Regex").changed() {
                         self.options.fixed_string = !regex;
@@ -1379,8 +1437,9 @@ impl Tab {
                 if self.search.mode != Mode::Query {
                     ui.checkbox(&mut self.search.ignore_case, "Ignore case");
                 }
-                if self.search.mode == Mode::Text {
-                    ui.checkbox(&mut self.search.regex, "Regex");
+                if self.search.mode != Mode::Query {
+                    ui.checkbox(&mut self.search.regex, "Regex")
+                        .on_hover_text("Text, and Auto's plain words, as a regex (mix with NFD: /…/)");
                 }
                 let hint = match self.search.mode {
                     Mode::Auto => "search: text, or level >= ERROR AND timeout — Enter to find",
@@ -1631,7 +1690,51 @@ struct App {
     library_view: LibraryView,
     /// The ⚙ menu's ports field while it is edited.
     ports_text: Option<String>,
+    /// This window's name (title, Alt+Tab).
+    window_name: Option<String>,
+    /// The Settings window is open.
+    settings_open: bool,
+    /// Listener for files other `nerka-gui` starts hand to this window.
+    server: Option<instance::Server>,
+    /// Tabs moved to new windows so far (temp file names).
+    moves: u32,
     presets: presets::Presets,
+}
+
+/// The Settings window's fields: this window's name and the DLT ports
+/// (`ports` as typed). Returns the ports when they were changed to a
+/// valid list.
+fn settings_ui(ui: &mut egui::Ui, name: &mut String, ports: &mut String) -> Option<Vec<u16>> {
+    let mut save = None;
+    egui::Grid::new("settings-grid").num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| {
+        ui.label(RichText::new("This window").strong());
+        ui.end_row();
+        ui.label("Name");
+        ui.add(egui::TextEdit::singleline(name).hint_text("e.g. OTA crash").desired_width(200.0))
+            .on_hover_text("Shown first in the title, so Alt+Tab tells windows apart");
+        ui.end_row();
+        ui.label(RichText::new("DLT in captures").strong());
+        ui.end_row();
+        ui.label("UDP ports");
+        let r = ui.add(egui::TextEdit::singleline(ports).desired_width(200.0)).on_hover_text(
+            "Destination ports whose UDP payloads are DLT (pcap, pcapng, MF4), separated by spaces. Default: 3490",
+        );
+        ui.end_row();
+        ui.label("");
+        match prefs::parse_ports(ports) {
+            Some(p) => {
+                if r.changed() {
+                    save = Some(p);
+                }
+                ui.weak("Used for captures opened from now on");
+            }
+            None => {
+                ui.colored_label(ui.visuals().error_fg_color, "Port numbers 1–65535, separated by spaces");
+            }
+        }
+        ui.end_row();
+    });
+    save
 }
 
 /// A window-style close button: a thin painted "×" with a square hover
@@ -1670,6 +1773,10 @@ fn search_history_path() -> Option<PathBuf> {
 }
 
 fn prefs_path() -> Option<PathBuf> {
+    // Tests never touch the user's settings.
+    if cfg!(test) {
+        return None;
+    }
     nerka_core::config_dir().map(|d| d.join("prefs"))
 }
 
@@ -1787,29 +1894,28 @@ impl App {
 
     /// Remember the active tab's mode and options if the user changed them.
     /// ⚙: settings that aren't per tab (the DLT ports of captures).
-    fn settings_menu(&mut self, ui: &mut egui::Ui) {
+    /// The Settings window (⚙, Ctrl+,): this window's name and the DLT
+    /// ports of captures. A window, not a menu: a menu closes on any click,
+    /// so its text fields couldn't be typed in.
+    fn settings_window(&mut self, ctx: &egui::Context) {
+        if !self.settings_open {
+            return;
+        }
+        let mut open = true;
         let mut save = None;
-        ui.menu_button("⚙", |ui| {
-            ui.label(RichText::new("DLT in captures").strong());
-            ui.horizontal(|ui| {
-                ui.label("UDP ports");
-                let text = self.ports_text.get_or_insert_with(|| prefs::ports_text(&self.prefs.dlt_ports));
-                let r = ui.add(egui::TextEdit::singleline(text).desired_width(120.0)).on_hover_text(
-                    "Destination ports whose UDP payloads are DLT (pcap, pcapng, MF4), separated by spaces. \
-                     Default: 3490",
-                );
-                match prefs::parse_ports(text) {
-                    Some(p) if r.changed() => save = Some(p),
-                    Some(_) => {}
-                    None => {
-                        ui.colored_label(ui.visuals().error_fg_color, "ports 1–65535");
-                    }
-                }
+        egui::Window::new("Settings")
+            .id(egui::Id::unique("settings"))
+            .open(&mut open)
+            .resizable(false)
+            .collapsible(false)
+            .show(ctx, |ui| {
+                let ports = self.ports_text.get_or_insert_with(|| prefs::ports_text(&self.prefs.dlt_ports));
+                save = settings_ui(ui, self.window_name.get_or_insert_with(String::new), ports);
             });
-            ui.weak("Used for captures opened from now on");
-        })
-        .response
-        .on_hover_text("Settings");
+        if !open {
+            self.settings_open = false;
+            self.ports_text = None;
+        }
         if let Some(ports) = save
             && ports != self.prefs.dlt_ports
         {
@@ -1944,6 +2050,9 @@ impl App {
         if shortcut(Modifiers::NONE, Key::F1) {
             self.about = true;
         }
+        if shortcut(Modifiers::COMMAND, Key::Comma) {
+            self.settings_open = !self.settings_open;
+        }
         // Shift variants first: matching ignores an unrequested Shift.
         if shortcut(Modifiers::COMMAND | Modifiers::SHIFT, Key::Tab) || shortcut(Modifiers::COMMAND, Key::PageUp) {
             self.cycle_tab(false);
@@ -1985,8 +2094,50 @@ impl App {
         }
     }
 
+    /// Files another `nerka-gui` handed to this window; whether it has focus.
+    fn poll_instance(&mut self, ctx: &egui::Context) {
+        let Some(server) = &mut self.server else { return };
+        server.set_focused(ctx.input(|i| i.viewport().focused).unwrap_or(false));
+        let requests = server.poll();
+        for r in requests {
+            let instance::Request::Open(files) = r;
+            for f in files {
+                self.open(ctx, f);
+            }
+            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+            ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+        }
+    }
+
+    /// Open tab `i`'s file in a new window, with its filter, search and
+    /// selection (as a preset file), and close it here.
+    fn move_tab(&mut self, i: usize) {
+        let Some(t) = self.tabs.get(i) else { return };
+        let path = t.path.clone();
+        let file = std::env::temp_dir().join(format!("nerka-move-{}-{}.nerka-preset", std::process::id(), self.moves));
+        self.moves += 1;
+        let res = std::env::current_exe().and_then(|exe| {
+            std::fs::write(&file, t.to_preset("moved tab").serialize())?;
+            let mut cmd = std::process::Command::new(exe);
+            cmd.arg("--new-window").arg("--preset-file").arg(&file);
+            for p in &self.pack_paths {
+                cmd.arg("--pack").arg(p);
+            }
+            cmd.arg(&path).spawn().map(|_| ())
+        });
+        match res {
+            Ok(()) => self.close(i),
+            Err(e) => {
+                let _ = std::fs::remove_file(&file);
+                if let Some(t) = self.tabs.get_mut(i) {
+                    t.status = format!("Could not open a new window: {e}");
+                }
+            }
+        }
+    }
+
     fn tab_bar(&mut self, ui: &mut egui::Ui) {
-        let (mut select, mut close, mut close_others) = (None, None, None);
+        let (mut select, mut close, mut close_others, mut moved) = (None, None, None, None);
         egui::ScrollArea::horizontal().show(ui, |ui| {
             ui.horizontal(|ui| {
                 for (i, t) in self.tabs.iter().enumerate() {
@@ -2004,6 +2155,13 @@ impl App {
                         }
                         if ui.button("Close other tabs").clicked() {
                             close_others = Some(i);
+                        }
+                        if ui
+                            .button("Move to new window")
+                            .on_hover_text("With its filter, search and selection")
+                            .clicked()
+                        {
+                            moved = Some(i);
                         }
                         if ui.button("Copy full path").clicked() {
                             ui.ctx().copy_text(t.path.display().to_string());
@@ -2023,6 +2181,8 @@ impl App {
             self.close(i);
         } else if let Some(i) = close_others {
             self.close_others(i);
+        } else if let Some(i) = moved {
+            self.move_tab(i);
         }
     }
 
@@ -2102,9 +2262,13 @@ impl App {
     }
 
     fn update_title(&mut self, ctx: &egui::Context) {
-        let title = match self.tabs.get(self.active) {
-            Some(t) => format!("nerka — {}", t.path.display()),
-            None => "nerka".to_owned(),
+        // The window's name first, so Alt+Tab shows it.
+        let file = self.tabs.get(self.active).map(|t| t.path.display().to_string());
+        let title = match (self.window_name.as_deref().filter(|n| !n.trim().is_empty()), file) {
+            (Some(n), Some(f)) => format!("{} · {f} — nerka", n.trim()),
+            (Some(n), None) => format!("{} — nerka", n.trim()),
+            (None, Some(f)) => format!("nerka — {f}"),
+            (None, None) => "nerka".to_owned(),
         };
         if title != self.window_title {
             ctx.send_viewport_cmd(egui::ViewportCommand::Title(title.clone()));
@@ -2115,12 +2279,21 @@ impl App {
 
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        self.frame(ui);
+    }
+}
+
+impl App {
+    /// One frame of the whole window (also driven by tests).
+    fn frame(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
+        self.poll_instance(&ctx);
         self.poll_jobs(&ctx);
         self.handle_input(&ctx);
         self.update_title(&ctx);
         self.goto_dialog(&ctx);
         self.about_dialog(&ctx);
+        self.settings_window(&ctx);
         if let Some(t) = self.tabs.get_mut(self.active)
             && let Some(d) = &mut t.detail
         {
@@ -2158,7 +2331,9 @@ impl eframe::App for App {
                     if ui.button("ℹ About").on_hover_text("F1").clicked() {
                         self.about = true;
                     }
-                    self.settings_menu(ui);
+                    if ui.selectable_label(self.settings_open, "⚙").on_hover_text("Settings (Ctrl+,)").clicked() {
+                        self.settings_open = !self.settings_open;
+                    }
                 });
             });
         });
@@ -2211,10 +2386,11 @@ impl eframe::App for App {
             return;
         };
 
+        // Both boxes' settings, compared after the frame (the Search box is
+        // drawn last) to remember changes.
         let before = tab.search_prefs();
         let searched =
             egui::Panel::top("filter").show(ui, |ui| tab.filter_bar(ui, &mut focus_search, &self.history)).inner;
-        let after = tab.search_prefs();
         if self.show_library {
             let lit = |t: &Tab| t.picks.nodes.iter().map(|n| (n.key, n.lit)).collect::<Vec<_>>();
             let lit_before = lit(tab);
@@ -2275,6 +2451,7 @@ impl eframe::App for App {
             .show(ui, |ui| tab.search_panel(ui, &*file, search_history))
             .inner;
         egui::CentralPanel::default().show(ui, |ui| tab.main_panel(ui, &*file));
+        let after = tab.search_prefs();
         if after != before {
             self.save_prefs_from(after);
         }
@@ -2426,6 +2603,165 @@ query timeouts  labels: vision
         assert!(y("ssl", &open) < y("noise", &open), "one line per query");
     }
 
+    fn p_why(p: &Preview) -> Option<String> {
+        match p {
+            Preview::AutoText { why, .. } => why.clone(),
+            _ => None,
+        }
+    }
+
+    /// Bug: ticking the Search box's Regex / Ignore case wasn't saved, as
+    /// the settings were compared before the Search box was drawn.
+    #[test]
+    fn ticking_the_search_box_checkboxes_is_remembered() {
+        let dir = std::env::temp_dir().join(format!("nerka-gui-searchprefs-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("app.log");
+        std::fs::write(&log, LOG).unwrap();
+        let ctx = egui::Context::default();
+        let mut app = App::default();
+        app.open(&ctx, log);
+        settle(&mut app.tabs[0], &ctx);
+        let mut t = 0.0;
+        let mut frame = |app: &mut App, events: Vec<egui::Event>| {
+            t += 1.0 / 60.0;
+            let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1200.0, 800.0));
+            let input = egui::RawInput { screen_rect: Some(screen), time: Some(t), events, ..Default::default() };
+            let mut out = ctx.run_ui(input, |ui| app.frame(ui));
+            out.textures_delta.clear();
+            out.shapes
+        };
+        // The lowest "Regex" / "Ignore case" labels are the Search box's.
+        let lowest = |shapes: &[egui::epaint::ClippedShape], label: &str| {
+            shapes
+                .iter()
+                .filter_map(|s| match &s.shape {
+                    egui::Shape::Text(t) if t.galley.text() == label => Some(t.pos + t.galley.size() / 2.0),
+                    _ => None,
+                })
+                .max_by(|a, b| a.y.total_cmp(&b.y))
+        };
+        let click = |p: egui::Pos2| {
+            vec![
+                egui::Event::PointerMoved(p),
+                egui::Event::PointerButton {
+                    pos: p,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+                egui::Event::PointerButton {
+                    pos: p,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ]
+        };
+        let mut shapes = Vec::new();
+        for _ in 0..3 {
+            shapes = frame(&mut app, vec![]);
+        }
+        assert!(!app.prefs.search_regex && !app.prefs.search_ignore_case);
+        let regex = lowest(&shapes, "Regex").expect("the Search box's Regex");
+        frame(&mut app, click(regex));
+        let shapes = frame(&mut app, vec![]);
+        assert!(app.tabs[0].search.regex, "the click ticked it");
+        assert!(app.prefs.search_regex, "and it is remembered");
+        let ci = lowest(&shapes, "Ignore case").expect("the Search box's Ignore case");
+        frame(&mut app, click(ci));
+        frame(&mut app, vec![]);
+        assert!(app.prefs.search_ignore_case);
+        // A new tab starts with them.
+        let tab = Tab::open(&ctx, dir.join("app.log"), &app.prefs);
+        assert!(tab.search.regex && tab.search.ignore_case);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_new_tab_takes_both_boxes_settings_from_the_prefs() {
+        let dir = std::env::temp_dir().join(format!("nerka-gui-prefs-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("app.log");
+        std::fs::write(&log, LOG).unwrap();
+        let prefs = SearchPrefs {
+            mode: Mode::Text,
+            options: MatcherOptions { fixed_string: false, case_insensitive: true, invert: false },
+            search_mode: Mode::Auto,
+            search_regex: true,
+            search_ignore_case: true,
+            ..SearchPrefs::default()
+        };
+        let ctx = egui::Context::default();
+        let tab = Tab::open(&ctx, log, &prefs);
+        let got = tab.search_prefs();
+        assert_eq!(got, prefs);
+        // Through the prefs file, as the next start reads it.
+        assert_eq!(SearchPrefs::parse(&prefs.serialize()), prefs);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn the_settings_window_takes_typing() {
+        let ctx = egui::Context::default();
+        let (mut name, mut ports) = (String::new(), "3490".to_owned());
+        let mut saved = None;
+        let mut rects = Vec::new();
+        let mut frame =
+            |events: Vec<egui::Event>, name: &mut String, ports: &mut String, rects: &mut Vec<egui::Rect>| {
+                let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0));
+                let input = egui::RawInput { screen_rect: Some(screen), events, ..Default::default() };
+                let mut out = ctx.run_ui(input, |ui| {
+                    egui::Window::new("Settings").show(ui.ctx(), |ui| {
+                        if let Some(p) = settings_ui(ui, name, ports) {
+                            saved = Some(p);
+                        }
+                    });
+                });
+                out.textures_delta.clear();
+                // Where the fields' texts are: the name's hint, the ports.
+                rects.clear();
+                for want in ["e.g. OTA crash", "3490"] {
+                    for s in &out.shapes {
+                        if let egui::Shape::Text(t) = &s.shape
+                            && t.galley.text() == want
+                        {
+                            rects.push(egui::Rect::from_min_size(t.pos, t.galley.size()));
+                        }
+                    }
+                }
+            };
+        let click = |p: egui::Pos2| {
+            vec![
+                egui::Event::PointerMoved(p),
+                egui::Event::PointerButton {
+                    pos: p,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+                egui::Event::PointerButton {
+                    pos: p,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ]
+        };
+        for _ in 0..3 {
+            frame(vec![], &mut name, &mut ports, &mut rects);
+        }
+        assert!(rects.len() >= 2, "two text fields: {rects:?}");
+        let (name_at, ports_at) = (rects[0].center(), rects[1].right_center() + egui::vec2(2.0, 0.0));
+        frame(click(name_at), &mut name, &mut ports, &mut rects);
+        frame(vec![egui::Event::Text("OTA crash".into())], &mut name, &mut ports, &mut rects);
+        assert_eq!(name, "OTA crash");
+        frame(click(ports_at), &mut name, &mut ports, &mut rects);
+        frame(vec![egui::Event::Text(" 3489".into())], &mut name, &mut ports, &mut rects);
+        assert_eq!(ports, "3490 3489");
+        assert_eq!(saved, Some(vec![3490, 3489]));
+    }
+
     #[test]
     fn boxes_read_their_text_by_mode() {
         let lit = MatcherOptions { fixed_string: true, ..Default::default() };
@@ -2440,7 +2776,7 @@ query timeouts  labels: vision
         };
         assert_eq!(
             read(Mode::Auto, "connection reset"),
-            ("text", Preview::AutoText { text: "connection reset".into(), why: None })
+            ("text", Preview::AutoText { text: "connection reset".into(), why: None, regex: false })
         );
         assert_eq!(read(Mode::Auto, "level >= ERROR"), ("query", Preview::AutoQuery("level >= ERROR".into())));
         let (k, p) = read(Mode::Auto, "level >= LOUD");
@@ -2449,9 +2785,18 @@ query timeouts  labels: vision
         // Quoted text or a lone regex is a query that only searches text.
         assert_eq!(
             read(Mode::Auto, "\"ctid = BOOT\""),
-            ("query", Preview::AutoText { text: "ctid = BOOT".into(), why: None })
+            ("query", Preview::AutoText { text: "ctid = BOOT".into(), why: None, regex: false })
         );
         assert_eq!(read(Mode::Auto, "/SSL|CERT/i"), ("query", Preview::AutoRegex("/SSL|CERT/i".into())));
+        // Regex ticked: Auto's plain words and its text are regexes.
+        let re = MatcherOptions { fixed_string: false, ..Default::default() };
+        let (f, p) = read_box(Mode::Auto, "cam[12] frame", &re, &[]);
+        assert!(matches!(f, Ok(Filter::Regex(_))), "{p:?}");
+        assert_eq!(p, Preview::AutoText { text: "cam[12] frame".into(), why: p_why(&p), regex: true });
+        let (_, p) = read_box(Mode::Auto, "drop.* AND level >= ERROR", &re, &[]);
+        assert!(matches!(p, Preview::AutoText { regex: true, .. }), "{p:?}");
+        let (f, p) = read_box(Mode::Auto, "fr.me AND level >= ERROR", &re, &[]);
+        assert_eq!((kind(&f), p), ("query", Preview::AutoQuery("/fr.me/ AND level >= ERROR".into())));
         // Text mode never reads a query; NFD mode never falls back.
         assert_eq!(read(Mode::Text, "level >= ERROR"), ("text", Preview::None));
         assert_eq!(read(Mode::Query, "level >= ERROR"), ("query", Preview::None));
