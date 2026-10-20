@@ -10,6 +10,12 @@
 //! [`COLUMNS`]. Corrupt or truncated data between messages is skipped (the
 //! reader resyncs on the next `DLT\x01`) and counted in
 //! [`DltFile::skipped_bytes`].
+//!
+//! DLT found inside other files (pcap, MF4) is read in place: those readers
+//! index every message's standard header with the capture's time
+//! ([`Framed`]), and bytes that aren't contiguous in the file (a reassembled
+//! datagram) live in a side buffer. No temporary `.dlt` is written. A
+//! message without an ECU id takes its capture channel's.
 
 mod format;
 mod payload;
@@ -18,7 +24,7 @@ pub mod writer;
 use super::{Bytes, ColumnDef};
 use crate::event::{FieldDef, FieldId, FieldKind, FieldValue, Level};
 use crate::{LineNo, LogSource, Progress, Result};
-use format::{MAGIC, MSTP_APP_TRACE, MSTP_CONTROL, MSTP_LOG, MSTP_NW_TRACE, Message};
+use format::{MAGIC, MSTP_APP_TRACE, MSTP_CONTROL, MSTP_LOG, MSTP_NW_TRACE, Message, NO_ECU, STORAGE_LEN, Storage};
 use std::borrow::Cow;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -65,17 +71,75 @@ const SCHEMA: &[FieldDef] = &[
     FieldDef { name: "payload", kind: FieldKind::Str, costly: true },
 ];
 
+/// Length of the well-formed DLT message whose standard header is at
+/// `buf[0]` (no storage header), if one is there and fits.
+pub(crate) fn message_len(buf: &[u8]) -> Option<usize> {
+    Message::parse_std(buf, Storage { secs: 0, usecs: 0, ecu: NO_ECU }).map(|m| m.len())
+}
+
 /// Does `head` (the first bytes of a file) look like a DLT file?
 pub fn is_dlt(head: &[u8]) -> bool {
     head.starts_with(MAGIC)
+}
+
+/// A DLT message inside another file (a capture): where its standard
+/// header is, the capture channel it came from and the storage time the
+/// capture gives it. 16 bytes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Framed {
+    /// Bits 0–47: offset of the standard header, in the file or (bit 63)
+    /// in the side buffer; bits 48–62: channel.
+    at: u64,
+    secs: u32,
+    usecs: i32,
+}
+
+const OFFSET_MASK: u64 = (1 << 48) - 1;
+const IN_SIDE: u64 = 1 << 63;
+const CHANNEL_SHIFT: u32 = 48;
+/// Channels a capture can name (15 bits).
+pub const MAX_CHANNELS: usize = 1 << 15;
+
+impl Framed {
+    /// A message at `offset` (in the side buffer if `side`), from capture
+    /// channel `channel` (an index into the source's channel ECU table),
+    /// stored at `secs` + `usecs`. `None` if the offset or channel don't fit.
+    pub fn new(offset: u64, side: bool, channel: usize, secs: u32, usecs: i32) -> Option<Framed> {
+        if offset > OFFSET_MASK || channel >= MAX_CHANNELS {
+            return None;
+        }
+        let at = offset | ((channel as u64) << CHANNEL_SHIFT) | if side { IN_SIDE } else { 0 };
+        Some(Framed { at, secs, usecs })
+    }
+
+    fn offset(&self) -> usize {
+        (self.at & OFFSET_MASK) as usize
+    }
+
+    fn in_side(&self) -> bool {
+        self.at & IN_SIDE != 0
+    }
+
+    fn channel(&self) -> usize {
+        ((self.at & !IN_SIDE) >> CHANNEL_SHIFT) as usize
+    }
+}
+
+/// Where the messages are.
+enum Index {
+    /// A `.dlt` file: the offset of each message's storage header.
+    Stored(Vec<u64>),
+    /// DLT inside a capture: each message's place and capture time, the
+    /// bytes that aren't contiguous in the file, and per channel the ECU id
+    /// for messages that don't carry one.
+    Framed { msgs: Vec<Framed>, side: Vec<u8>, channel_ecus: Vec<[u8; 4]> },
 }
 
 pub struct DltFile {
     name: String,
     path: Option<PathBuf>,
     data: Bytes,
-    /// Offset of each message's storage header.
-    offsets: Vec<u64>,
+    index: Index,
     skipped: u64,
 }
 
@@ -84,13 +148,31 @@ impl DltFile {
         let path = path.as_ref();
         let data = Bytes::map(path)?;
         let (offsets, skipped) = build_index(data.bytes(), progress)?;
-        Ok(Self { name: path.display().to_string(), path: Some(path.to_path_buf()), data, offsets, skipped })
+        let name = path.display().to_string();
+        Ok(Self { name, path: Some(path.to_path_buf()), data, index: Index::Stored(offsets), skipped })
     }
 
     /// In-memory source, handy for tests.
     pub fn from_bytes(name: impl Into<String>, bytes: Vec<u8>) -> Self {
         let (offsets, skipped) = build_index(&bytes, &Progress::new()).expect("not cancelled");
-        Self { name: name.into(), path: None, data: Bytes::Owned(bytes), offsets, skipped }
+        Self { name: name.into(), path: None, data: Bytes::Owned(bytes), index: Index::Stored(offsets), skipped }
+    }
+
+    /// DLT messages found inside another file (`data`, e.g. a mapped pcap):
+    /// `msgs` in display order, `side` holding the messages placed there,
+    /// `channel_ecus` the ECU id per capture channel (for messages without
+    /// one; NUL-padded, all zero for none). `skipped` counts bytes of DLT
+    /// traffic that weren't messages.
+    pub(crate) fn from_frames(
+        name: String,
+        path: Option<PathBuf>,
+        data: Bytes,
+        msgs: Vec<Framed>,
+        side: Vec<u8>,
+        channel_ecus: Vec<[u8; 4]>,
+        skipped: u64,
+    ) -> Self {
+        Self { name, path, data, index: Index::Framed { msgs, side, channel_ecus }, skipped }
     }
 
     pub fn path(&self) -> Option<&Path> {
@@ -103,8 +185,17 @@ impl DltFile {
     }
 
     fn msg(&self, line: LineNo) -> Option<Message<'_>> {
-        let off = *self.offsets.get(usize::try_from(line).ok()?)? as usize;
-        Message::parse(&self.data.bytes()[off..])
+        let i = usize::try_from(line).ok()?;
+        match &self.index {
+            Index::Stored(offsets) => Message::parse(&self.data.bytes()[*offsets.get(i)? as usize..]),
+            Index::Framed { msgs, side, channel_ecus } => {
+                let f = msgs.get(i)?;
+                let buf = if f.in_side() { side.as_slice() } else { self.data.bytes() };
+                let ecu = channel_ecus.get(f.channel()).unwrap_or(NO_ECU);
+                let storage = Storage { secs: f.secs, usecs: f.usecs, ecu };
+                Message::parse_std(buf.get(f.offset()..)?, storage)
+            }
+        }
     }
 }
 
@@ -119,7 +210,7 @@ fn build_index(buf: &[u8], progress: &Progress) -> Result<(Vec<u64>, u64)> {
         match Message::parse(&buf[pos..]) {
             Some(m) => {
                 offsets.push(pos as u64);
-                pos += m.len();
+                pos += STORAGE_LEN + m.len();
             }
             None => {
                 let next = finder.find(&buf[pos + 1..]).map_or(buf.len(), |i| pos + 1 + i);
@@ -238,7 +329,10 @@ impl LogSource for DltFile {
     }
 
     fn line_count(&self) -> LineNo {
-        self.offsets.len() as LineNo
+        match &self.index {
+            Index::Stored(o) => o.len() as LineNo,
+            Index::Framed { msgs, .. } => msgs.len() as LineNo,
+        }
     }
 
     fn line_bytes(&self, line: LineNo) -> Option<Cow<'_, [u8]>> {
@@ -261,7 +355,12 @@ impl LogSource for DltFile {
     }
 
     fn index_memory_bytes(&self) -> usize {
-        self.offsets.capacity() * size_of::<u64>()
+        match &self.index {
+            Index::Stored(o) => o.capacity() * size_of::<u64>(),
+            Index::Framed { msgs, side, channel_ecus } => {
+                msgs.capacity() * size_of::<Framed>() + side.capacity() + channel_ecus.capacity() * 4
+            }
+        }
     }
 
     fn columns(&self) -> &[ColumnDef] {

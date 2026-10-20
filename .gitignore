@@ -5,3 +5,6 @@
 *.log
 *.dlt
 *.nerka-marks
+*.pcap
+*.pcapng
+*.mf4

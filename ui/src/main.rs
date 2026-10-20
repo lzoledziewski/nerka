@@ -570,10 +570,11 @@ impl SearchBox {
 impl Tab {
     fn open(ctx: &egui::Context, path: PathBuf, prefs: &SearchPrefs) -> Self {
         let p = path.clone();
+        let options = prefs.open_options();
         Self {
             path,
             file: None,
-            loading: Some(Job::spawn(ctx, move |prog| nerka_core::open(&p, prog))),
+            loading: Some(Job::spawn(ctx, move |prog| nerka_core::open_with(&p, &options, prog))),
             main_view: ViewState::default(),
             hits_view: ViewState::default(),
             columns: Columns::default(),
@@ -623,7 +624,7 @@ impl Tab {
     }
 
     fn search_prefs(&self) -> SearchPrefs {
-        SearchPrefs { mode: self.mode, options: self.options.clone() }
+        SearchPrefs { mode: self.mode, options: self.options.clone(), ..SearchPrefs::default() }
     }
 
     /// History tag for the current filter: `auto`, `text`, `regex` or `query`.
@@ -1628,6 +1629,8 @@ struct App {
     pack_paths: Vec<PathBuf>,
     show_library: bool,
     library_view: LibraryView,
+    /// The ⚙ menu's ports field while it is edited.
+    ports_text: Option<String>,
     presets: presets::Presets,
 }
 
@@ -1783,7 +1786,45 @@ impl App {
     }
 
     /// Remember the active tab's mode and options if the user changed them.
+    /// ⚙: settings that aren't per tab (the DLT ports of captures).
+    fn settings_menu(&mut self, ui: &mut egui::Ui) {
+        let mut save = None;
+        ui.menu_button("⚙", |ui| {
+            ui.label(RichText::new("DLT in captures").strong());
+            ui.horizontal(|ui| {
+                ui.label("UDP ports");
+                let text = self.ports_text.get_or_insert_with(|| prefs::ports_text(&self.prefs.dlt_ports));
+                let r = ui.add(egui::TextEdit::singleline(text).desired_width(120.0)).on_hover_text(
+                    "Destination ports whose UDP payloads are DLT (pcap, pcapng, MF4), separated by spaces. \
+                     Default: 3490",
+                );
+                match prefs::parse_ports(text) {
+                    Some(p) if r.changed() => save = Some(p),
+                    Some(_) => {}
+                    None => {
+                        ui.colored_label(ui.visuals().error_fg_color, "ports 1–65535");
+                    }
+                }
+            });
+            ui.weak("Used for captures opened from now on");
+        })
+        .response
+        .on_hover_text("Settings");
+        if let Some(ports) = save
+            && ports != self.prefs.dlt_ports
+        {
+            self.prefs.dlt_ports = ports;
+            if let Some(path) = prefs_path()
+                && let Err(e) = self.prefs.save(&path)
+            {
+                self.status = format!("Could not save preferences: {e}");
+            }
+        }
+    }
+
     fn save_prefs_from(&mut self, prefs: SearchPrefs) {
+        // A tab knows its search settings only; the ports stay.
+        let prefs = SearchPrefs { dlt_ports: self.prefs.dlt_ports.clone(), ..prefs };
         if prefs == self.prefs {
             return;
         }
@@ -1931,8 +1972,10 @@ impl App {
 
     fn pick_files(&mut self, ctx: &egui::Context) {
         if let Some(paths) = rfd::FileDialog::new()
-            .add_filter("Logs and traces", &["log", "txt", "out", "dlt"])
+            .add_filter("Logs and traces", &["log", "txt", "out", "dlt", "pcap", "pcapng", "mf4"])
             .add_filter("DLT traces", &["dlt"])
+            .add_filter("Network captures (DLT over UDP)", &["pcap", "pcapng"])
+            .add_filter("MF4 bus logs (DLT)", &["mf4"])
             .add_filter("All files", &["*"])
             .pick_files()
         {
@@ -2115,6 +2158,7 @@ impl eframe::App for App {
                     if ui.button("ℹ About").on_hover_text("F1").clicked() {
                         self.about = true;
                     }
+                    self.settings_menu(ui);
                 });
             });
         });

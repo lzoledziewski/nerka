@@ -35,7 +35,7 @@ pub use event::{Event, FieldDef, FieldId, FieldKind, FieldValue, Level};
 pub use history::SearchHistory;
 pub use input::dlt::DltFile;
 pub use input::text::TextFile;
-pub use input::{ColumnDef, LogSource, open};
+pub use input::{ColumnDef, LogSource, OpenOptions, open, open_with};
 pub use pack::{Library, Pack, PackError, PackQuery};
 
 /// Line numbers are 0-based internally; UIs add 1 for display.
@@ -51,6 +51,8 @@ pub enum Error {
     Query(#[from] DslError),
     #[error("operation cancelled")]
     Cancelled,
+    #[error("{0}")]
+    Format(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
