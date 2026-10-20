@@ -171,18 +171,20 @@ fn main() -> eframe::Result {
                 let _ = std::fs::remove_file(&f);
                 nerka_core::preset::parse_preset("moved tab", &text?).ok()
             });
-            for p in initial {
-                app.open(&cc.egui_ctx, p);
+            // The files named open as one view (separate tabs if their
+            // kinds differ).
+            if !initial.is_empty() {
+                app.open_files(&cc.egui_ctx, initial);
                 if let (Some(p), Some(tab)) = (&moved, app.tabs.last_mut()) {
                     tab.use_preset(&cc.egui_ctx, &app.library, p);
                     tab.preset = None;
-                    continue;
                 }
-                // A filter given on the command line applies to every file it names.
-                if let (Some((tag, pattern)), Some(tab)) = (&preset, app.tabs.last_mut()) {
+                if let (Some((tag, pattern)), Some(tab)) = (&preset, app.tabs.last_mut())
+                    && moved.is_none()
+                {
                     tab.set_filter(tag, pattern);
                 }
-                if let Some(tab) = app.tabs.last_mut() {
+                if let Some(tab) = app.tabs.last_mut().filter(|_| moved.is_none()) {
                     tab.picks = picks.clone();
                     if !picks.nodes.is_empty() {
                         tab.apply_selection(&cc.egui_ctx, &app.library);
@@ -375,9 +377,18 @@ impl PreviewCache {
     }
 }
 
-/// One open file with its own filter, view positions and bookmarks.
+/// One open file (or several of one kind, one after another) with its own
+/// filter, view positions and bookmarks.
 struct Tab {
+    /// The first file.
     path: PathBuf,
+    /// Every file, in order (one for a plain tab).
+    paths: Vec<PathBuf>,
+    /// `(first line, line count)` of each file in the view, once loaded.
+    part_files: Vec<(LineNo, LineNo)>,
+    /// The files turned out to be of different kinds: why. The app then
+    /// opens them as separate tabs.
+    mixed: Option<String>,
     file: Option<Arc<dyn LogSource>>,
     loading: Option<Job<Box<dyn LogSource>>>,
     /// The lines the filter keeps (all lines without a filter).
@@ -614,13 +625,23 @@ impl SearchBox {
 }
 
 impl Tab {
+    #[cfg(test)]
     fn open(ctx: &egui::Context, path: PathBuf, prefs: &SearchPrefs) -> Self {
-        let p = path.clone();
+        Self::open_many(ctx, vec![path], prefs)
+    }
+
+    /// One tab for `paths`: one file, or several of one kind one after
+    /// another (nerka_core::open_many checks the kind).
+    fn open_many(ctx: &egui::Context, paths: Vec<PathBuf>, prefs: &SearchPrefs) -> Self {
+        let ps = paths.clone();
         let options = prefs.open_options();
         Self {
-            path,
+            path: paths[0].clone(),
+            paths,
+            part_files: Vec::new(),
+            mixed: None,
             file: None,
-            loading: Some(Job::spawn(ctx, move |prog| nerka_core::open_with(&p, &options, prog))),
+            loading: Some(Job::spawn(ctx, move |prog| nerka_core::open_many(&ps, &options, prog))),
             main_view: ViewState::default(),
             hits_view: ViewState::default(),
             columns: Columns::default(),
@@ -652,7 +673,17 @@ impl Tab {
     }
 
     fn title(&self) -> String {
-        self.path.file_name().map_or_else(|| self.path.display().to_string(), |n| n.to_string_lossy().into_owned())
+        let name =
+            |p: &Path| p.file_name().map_or_else(|| p.display().to_string(), |n| n.to_string_lossy().into_owned());
+        match self.paths.len() {
+            0 | 1 => name(&self.path),
+            n => format!("{} + {}", name(&self.path), n - 1),
+        }
+    }
+
+    /// Every file of the tab, one per line (hover text).
+    fn files_text(&self) -> String {
+        self.paths.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join("\n")
     }
 
     fn is_busy(&self) -> bool {
@@ -759,8 +790,12 @@ impl Tab {
                     self.loading = None;
                     match r {
                         Ok(f) => {
-                            self.status = format!("Indexed {} lines in {took:.2?}", f.line_count());
-                            self.bookmarks = Bookmarks::load_for(&self.path).unwrap_or_else(|e| {
+                            self.status = match self.paths.len() {
+                                1 => format!("Indexed {} lines in {took:.2?}", f.line_count()),
+                                n => format!("Indexed {} lines of {n} files in {took:.2?}", f.line_count()),
+                            };
+                            self.part_files = f.part_files();
+                            self.bookmarks = self.load_bookmarks().unwrap_or_else(|e| {
                                 self.status = format!("Could not read bookmarks: {e}");
                                 Bookmarks::default()
                             });
@@ -773,6 +808,11 @@ impl Tab {
                             }
                         }
                         Err(nerka_core::Error::Cancelled) => return false,
+                        // Several files of different kinds: opened as tabs.
+                        Err(nerka_core::Error::Format(why)) if self.paths.len() > 1 && why.contains("one kind") => {
+                            self.mixed = Some(why);
+                            return false;
+                        }
                         Err(e) => {
                             let src = std::error::Error::source(&e).map(|s| format!(" ({s})")).unwrap_or_default();
                             self.status = format!("Cannot open {}: {e}{src}", self.path.display());
@@ -1135,8 +1175,25 @@ impl Tab {
         self.save_bookmarks();
     }
 
+    /// Each file keeps its own sidecar; a view of several maps lines.
+    fn load_bookmarks(&self) -> std::io::Result<Bookmarks> {
+        if self.paths.len() == 1 {
+            return Bookmarks::load_for(&self.path);
+        }
+        let files: Vec<(&Path, LineNo)> =
+            self.paths.iter().zip(&self.part_files).map(|(p, &(first, _))| (p.as_path(), first)).collect();
+        Bookmarks::load_for_parts(&files)
+    }
+
     fn save_bookmarks(&mut self) {
-        if let Err(e) = self.bookmarks.save_for(&self.path) {
+        let res = if self.paths.len() == 1 {
+            self.bookmarks.save_for(&self.path)
+        } else {
+            let files: Vec<(&Path, LineNo, LineNo)> =
+                self.paths.iter().zip(&self.part_files).map(|(p, &(first, n))| (p.as_path(), first, n)).collect();
+            self.bookmarks.save_for_parts(&files)
+        };
+        if let Err(e) = res {
             self.status = format!("Could not save bookmarks: {e}");
         }
     }
@@ -1971,12 +2028,33 @@ impl App {
 
     /// Open `path` in a new tab, or switch to it if it is already open.
     fn open(&mut self, ctx: &egui::Context, path: PathBuf) {
-        if let Some(i) = self.tabs.iter().position(|t| same_file(&t.path, &path)) {
+        self.open_files(ctx, vec![path]);
+    }
+
+    /// Files opened together become one view, one after another (owner,
+    /// 2026-10-20), if they are of one kind; otherwise separate tabs. A view
+    /// already open with the same files is switched to.
+    fn open_files(&mut self, ctx: &egui::Context, paths: Vec<PathBuf>) {
+        if paths.is_empty() {
+            return;
+        }
+        let same = |t: &Tab| t.paths.len() == paths.len() && t.paths.iter().zip(&paths).all(|(a, b)| same_file(a, b));
+        if let Some(i) = self.tabs.iter().position(same) {
             self.active = i;
             return;
         }
-        self.tabs.push(Tab::open(ctx, path, &self.prefs));
+        self.tabs.push(Tab::open_many(ctx, paths, &self.prefs));
         self.active = self.tabs.len() - 1;
+    }
+
+    /// Tab `i`'s files as separate tabs (its own files stay in their order).
+    fn split_tab(&mut self, ctx: &egui::Context, i: usize) {
+        let Some(t) = self.tabs.get(i) else { return };
+        let paths = t.paths.clone();
+        self.close(i);
+        for p in paths {
+            self.open(ctx, p);
+        }
     }
 
     fn close(&mut self, i: usize) {
@@ -2014,6 +2092,17 @@ impl App {
                 i += 1;
                 continue;
             }
+            if let Some(why) = self.tabs[i].mixed.take() {
+                let paths = self.tabs[i].paths.clone();
+                self.close(i);
+                for p in paths {
+                    self.open(ctx, p);
+                }
+                if let Some(t) = self.tab() {
+                    t.status = format!("Opened as separate tabs: {why}");
+                }
+                continue;
+            }
             let msg = std::mem::take(&mut self.tabs[i].status);
             self.close(i);
             match self.tab() {
@@ -2027,9 +2116,7 @@ impl App {
         let dropped: Vec<PathBuf> = ctx.input(|i| {
             i.raw.dropped_files.iter().map(|f| f.path().to_path_buf()).filter(|p| !p.as_os_str().is_empty()).collect()
         });
-        for p in dropped {
-            self.open(ctx, p);
-        }
+        self.open_files(ctx, dropped);
         let shortcut = |m, k| ctx.input_mut(|i| i.consume_shortcut(&KeyboardShortcut::new(m, k)));
         if shortcut(Modifiers::COMMAND, Key::O) {
             self.pick_files(ctx);
@@ -2088,9 +2175,7 @@ impl App {
             .add_filter("All files", &["*"])
             .pick_files()
         {
-            for p in paths {
-                self.open(ctx, p);
-            }
+            self.open_files(ctx, paths);
         }
     }
 
@@ -2101,9 +2186,7 @@ impl App {
         let requests = server.poll();
         for r in requests {
             let instance::Request::Open(files) = r;
-            for f in files {
-                self.open(ctx, f);
-            }
+            self.open_files(ctx, files);
             ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
             ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
         }
@@ -2113,7 +2196,7 @@ impl App {
     /// selection (as a preset file), and close it here.
     fn move_tab(&mut self, i: usize) {
         let Some(t) = self.tabs.get(i) else { return };
-        let path = t.path.clone();
+        let paths = t.paths.clone();
         let file = std::env::temp_dir().join(format!("nerka-move-{}-{}.nerka-preset", std::process::id(), self.moves));
         self.moves += 1;
         let res = std::env::current_exe().and_then(|exe| {
@@ -2123,7 +2206,7 @@ impl App {
             for p in &self.pack_paths {
                 cmd.arg("--pack").arg(p);
             }
-            cmd.arg(&path).spawn().map(|_| ())
+            cmd.args(&paths).spawn().map(|_| ())
         });
         match res {
             Ok(()) => self.close(i),
@@ -2137,12 +2220,12 @@ impl App {
     }
 
     fn tab_bar(&mut self, ui: &mut egui::Ui) {
-        let (mut select, mut close, mut close_others, mut moved) = (None, None, None, None);
+        let (mut select, mut close, mut close_others, mut moved, mut split) = (None, None, None, None, None);
         egui::ScrollArea::horizontal().show(ui, |ui| {
             ui.horizontal(|ui| {
                 for (i, t) in self.tabs.iter().enumerate() {
                     let label = if t.is_busy() { format!("⏳ {}", t.title()) } else { t.title() };
-                    let r = ui.selectable_label(i == self.active, label).on_hover_text(t.path.display().to_string());
+                    let r = ui.selectable_label(i == self.active, label).on_hover_text(t.files_text());
                     if r.clicked() {
                         select = Some(i);
                     }
@@ -2163,8 +2246,11 @@ impl App {
                         {
                             moved = Some(i);
                         }
-                        if ui.button("Copy full path").clicked() {
-                            ui.ctx().copy_text(t.path.display().to_string());
+                        if ui.button(if t.paths.len() > 1 { "Copy full paths" } else { "Copy full path" }).clicked() {
+                            ui.ctx().copy_text(t.files_text());
+                        }
+                        if t.paths.len() > 1 && ui.button("Open the files as separate tabs").clicked() {
+                            split = Some(i);
                         }
                     });
                     if close_button(ui).on_hover_text("Close (Ctrl+W)").clicked() {
@@ -2183,6 +2269,9 @@ impl App {
             self.close_others(i);
         } else if let Some(i) = moved {
             self.move_tab(i);
+        } else if let Some(i) = split {
+            let ctx = ui.ctx().clone();
+            self.split_tab(&ctx, i);
         }
     }
 
@@ -2263,7 +2352,10 @@ impl App {
 
     fn update_title(&mut self, ctx: &egui::Context) {
         // The window's name first, so Alt+Tab shows it.
-        let file = self.tabs.get(self.active).map(|t| t.path.display().to_string());
+        let file = self.tabs.get(self.active).map(|t| match t.paths.len() {
+            1 => t.path.display().to_string(),
+            _ => t.title(),
+        });
         let title = match (self.window_name.as_deref().filter(|n| !n.trim().is_empty()), file) {
             (Some(n), Some(f)) => format!("{} · {f} — nerka", n.trim()),
             (Some(n), None) => format!("{} — nerka", n.trim()),
@@ -2675,6 +2767,96 @@ query timeouts  labels: vision
         // A new tab starts with them.
         let tab = Tab::open(&ctx, dir.join("app.log"), &app.prefs);
         assert!(tab.search.regex && tab.search.ignore_case);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Settle every tab's jobs, as frames would.
+    fn settle_app(app: &mut App, ctx: &egui::Context) {
+        for _ in 0..500 {
+            app.poll_jobs(ctx);
+            if app.tabs.iter().all(|t| !t.is_busy()) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        panic!("jobs still running");
+    }
+
+    #[test]
+    fn files_opened_together_are_one_view_with_bookmarks_per_file() {
+        let dir = std::env::temp_dir().join(format!("nerka-gui-concat-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (a, b) = (dir.join("a.log"), dir.join("b.log"));
+        std::fs::write(
+            &a,
+            "[INFO] a one
+[ERROR] a two
+",
+        )
+        .unwrap();
+        std::fs::write(
+            &b,
+            "[ERROR] b one
+[INFO] b two
+[ERROR] b three
+",
+        )
+        .unwrap();
+        let ctx = egui::Context::default();
+        let mut app = App::default();
+        app.open_files(&ctx, vec![a.clone(), b.clone()]);
+        settle_app(&mut app, &ctx);
+        assert_eq!(app.tabs.len(), 1);
+        let t = &mut app.tabs[0];
+        assert_eq!(t.title(), "a.log + 1");
+        assert_eq!(t.part_files, [(0, 2), (2, 3)]);
+        assert_eq!(t.file.as_ref().unwrap().line_count(), 5);
+        // Filter by level and by file across both.
+        t.mode = Mode::Query;
+        t.pattern = "level >= ERROR AND NOT file == a.log".into();
+        t.start_search(&ctx);
+        settle(t, &ctx);
+        assert_eq!(t.result.as_ref().unwrap().lines, [2, 4]);
+        // A bookmark in b goes to b's own sidecar, as b numbers its lines.
+        t.toggle_bookmark_at(3);
+        assert_eq!(
+            std::fs::read_to_string(Bookmarks::sidecar_path(&b)).unwrap(),
+            "2	
+"
+        );
+        assert!(!Bookmarks::sidecar_path(&a).exists());
+        // Opening the same files again switches to the view.
+        app.open_files(&ctx, vec![a.clone(), b.clone()]);
+        assert_eq!(app.tabs.len(), 1);
+        // Split into tabs: one per file, b's bookmark with it.
+        app.split_tab(&ctx, 0);
+        settle_app(&mut app, &ctx);
+        assert_eq!(app.tabs.iter().map(|t| t.title()).collect::<Vec<_>>(), ["a.log", "b.log"]);
+        assert!(app.tabs[1].bookmarks.contains(1));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn files_of_different_kinds_open_as_separate_tabs() {
+        let dir = std::env::temp_dir().join(format!("nerka-gui-mixed-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (a, d) = (dir.join("a.log"), dir.join("d.dlt"));
+        std::fs::write(
+            &a, "text
+",
+        )
+        .unwrap();
+        let mut buf = Vec::new();
+        nerka_core::input::dlt::writer::Msg::log(nerka_core::Level::Info, "E", "A", "C", vec![]).encode(&mut buf);
+        std::fs::write(&d, buf).unwrap();
+        let ctx = egui::Context::default();
+        let mut app = App::default();
+        app.open_files(&ctx, vec![a, d]);
+        settle_app(&mut app, &ctx);
+        settle_app(&mut app, &ctx);
+        assert_eq!(app.tabs.iter().map(|t| t.title()).collect::<Vec<_>>(), ["a.log", "d.dlt"]);
+        let status = &app.tabs[app.active].status;
+        assert!(status.contains("separate tabs") || status.starts_with("Indexed"), "{status}");
         std::fs::remove_dir_all(&dir).ok();
     }
 

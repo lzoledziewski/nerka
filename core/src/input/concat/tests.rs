@@ -1,0 +1,137 @@
+use super::*;
+use crate::engine::search::tests::run_on;
+use crate::input::dlt::writer::{Msg, Value};
+use crate::{DltFile, Filter, Matcher, MatcherOptions, Query, SearchSet, TextFile};
+
+fn text(name: &str, s: &str) -> Box<dyn LogSource> {
+    Box::new(TextFile::from_bytes(name, s.as_bytes().to_vec()))
+}
+
+fn q(s: &str) -> Filter {
+    Filter::Query(Query::compile(s).unwrap_or_else(|e| panic!("{s}: {e}")))
+}
+
+fn re(s: &str) -> Filter {
+    Filter::Regex(Matcher::new(s, MatcherOptions::default()).unwrap())
+}
+
+fn texts() -> Concat {
+    Concat::new(vec![
+        text("logs/a.log", "[INFO] a one\n[ERROR] a two timeout\n[WARN] a three\n"),
+        text("b.log", ""),
+        // No final newline: the boundary to c must not glue lines.
+        text("other/b2.log", "[ERROR] b timeout\n[INFO] b end"),
+        text("c.log", "start of c\n[ERROR] c timeout\n"),
+    ])
+    .unwrap()
+}
+
+#[test]
+fn lines_follow_each_other() {
+    let c = texts();
+    assert_eq!(c.line_count(), 7);
+    let all: Vec<String> = (0..7).map(|l| c.line_text(l).unwrap().into_owned()).collect();
+    assert_eq!(
+        all,
+        [
+            "[INFO] a one",
+            "[ERROR] a two timeout",
+            "[WARN] a three",
+            "[ERROR] b timeout",
+            "[INFO] b end",
+            "start of c",
+            "[ERROR] c timeout"
+        ]
+    );
+    assert_eq!(c.line_text(7), None);
+    assert_eq!(c.part_files(), [(0, 3), (3, 0), (3, 2), (5, 2)]);
+    assert_eq!(c.name(), "logs/a.log + b.log + other/b2.log + c.log");
+    assert_eq!(c.field(4, c.file_id()), Some(FieldValue::Str(b"b2.log".as_slice().into())));
+}
+
+/// Every filter finds the same lines on the fast path (part by part) and
+/// the naive per-line path, and the same as each part on its own.
+#[test]
+fn filters_run_part_by_part_and_match_naive_evaluation() {
+    let c = texts();
+    assert_eq!(run_on(&c, &re("timeout")), [1, 3, 6]);
+    // `$` / `^` at the boundary between b2 (no final newline) and c.
+    assert_eq!(run_on(&c, &re("end$")), [4]);
+    assert_eq!(run_on(&c, &re("^start")), [5]);
+    // A regex reaching over a line end never joins two files.
+    assert!(run_on(&c, &re(r"end\nstart")).is_empty());
+    assert_eq!(run_on(&c, &q("level >= ERROR")), [1, 3, 6]);
+    assert_eq!(run_on(&c, &q("file == b2.log")), [3, 4]);
+    assert_eq!(run_on(&c, &q(r#"file ~ /^[ac]\./ AND raw ~ "timeout""#)), [1, 6]);
+    assert_eq!(run_on(&c, &q("NOT file == a.log")), [3, 4, 5, 6]);
+    // search_within on both of its paths.
+    let set = SearchSet { include: vec![re("timeout"), q("level == WARN")], exclude: vec![q("file == c.log")] };
+    for path in [crate::engine::within::Path::Scan, crate::engine::within::Path::PerLine] {
+        let hits = crate::engine::within::search_within_path(&c, None, &set, &crate::Progress::new(), path).unwrap();
+        assert_eq!(hits.lines, [1, 2, 3]);
+    }
+}
+
+fn dlt_bytes(apids: &[&str]) -> Vec<u8> {
+    let mut buf = Vec::new();
+    for (i, a) in apids.iter().enumerate() {
+        let mut m = Msg::log(crate::Level::Warn, "ECU1", a, "CTX", vec![Value::Str(format!("msg {i}")).into()]);
+        m.secs = 100 + i as u32;
+        m.encode(&mut buf);
+    }
+    buf
+}
+
+#[test]
+fn dlt_files_and_captures_are_one_kind() {
+    let a: Box<dyn LogSource> = Box::new(DltFile::from_bytes("a.dlt", dlt_bytes(&["NAV", "SYS"])));
+    // The same kind of messages inside a pcap (via the capture reader).
+    let mut pcap = 0xA1B2_C3D4u32.to_le_bytes().to_vec();
+    pcap.extend_from_slice(&[2, 0, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 0, 0, 1, 0, 0, 0]);
+    let msgs = dlt_bytes(&["NAV"]);
+    let payload = &msgs[16..];
+    let mut udp = vec![0xc3, 0x50, 0x0d, 0xa2];
+    udp.extend_from_slice(&((8 + payload.len()) as u16).to_be_bytes());
+    udp.extend_from_slice(&[0, 0]);
+    udp.extend_from_slice(payload);
+    let mut ip = vec![0x45, 0];
+    ip.extend_from_slice(&((20 + udp.len()) as u16).to_be_bytes());
+    ip.extend_from_slice(&[0, 1, 0, 0, 64, 17, 0, 0, 10, 0, 0, 1, 10, 0, 0, 2]);
+    ip.extend_from_slice(&udp);
+    let mut frame = vec![2; 12];
+    frame.extend_from_slice(&[0x08, 0x00]);
+    frame.extend_from_slice(&ip);
+    for x in [7u32, 0, frame.len() as u32, frame.len() as u32] {
+        pcap.extend_from_slice(&x.to_le_bytes());
+    }
+    pcap.extend_from_slice(&frame);
+    let (b, _) = crate::input::capture::from_bytes("b.pcap", pcap, &Default::default()).unwrap();
+    let c = Concat::new(vec![a, Box::new(b)]).unwrap();
+    assert_eq!(c.line_count(), 3);
+    assert_eq!(c.columns().len(), 7);
+    assert_eq!(run_on(&c, &q("apid == NAV")), [0, 2]);
+    assert_eq!(run_on(&c, &q("apid == NAV AND file == b.pcap")), [2]);
+    assert_eq!(run_on(&c, &q("level >= WARN AND raw ~ /msg 1/")), [1]);
+
+    // Plain text and DLT don't mix.
+    let d: Box<dyn LogSource> = Box::new(DltFile::from_bytes("d.dlt", dlt_bytes(&["NAV"])));
+    let Err(e) = Concat::new(vec![text("x/app.log", "a\n"), d]) else { panic!("mixed kinds") };
+    assert_eq!(e.to_string(), "app.log is plain text but d.dlt is DLT: only files of one kind open as one view");
+}
+
+#[test]
+fn open_many_reads_files_in_order() {
+    let dir = std::env::temp_dir().join(format!("nerka-concat-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let (a, b, d) = (dir.join("a.log"), dir.join("b.log"), dir.join("c.dlt"));
+    std::fs::write(&a, "one\ntwo\n").unwrap();
+    std::fs::write(&b, "three\n").unwrap();
+    std::fs::write(&d, dlt_bytes(&["NAV"])).unwrap();
+    let p = crate::Progress::new();
+    let o = crate::OpenOptions::default();
+    let s = open_many(&[b.clone(), a.clone()], &o, &p).unwrap();
+    assert_eq!((0..3).map(|l| s.line_text(l).unwrap().into_owned()).collect::<Vec<_>>(), ["three", "one", "two"]);
+    assert_eq!(open_many(std::slice::from_ref(&a), &o, &p).unwrap().part_files(), [(0, 2)]);
+    assert!(open_many(&[a, d], &o, &p).is_err());
+    std::fs::remove_dir_all(&dir).ok();
+}
