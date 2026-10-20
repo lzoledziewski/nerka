@@ -1773,6 +1773,10 @@ fn search_history_path() -> Option<PathBuf> {
 }
 
 fn prefs_path() -> Option<PathBuf> {
+    // Tests never touch the user's settings.
+    if cfg!(test) {
+        return None;
+    }
     nerka_core::config_dir().map(|d| d.join("prefs"))
 }
 
@@ -2275,6 +2279,13 @@ impl App {
 
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        self.frame(ui);
+    }
+}
+
+impl App {
+    /// One frame of the whole window (also driven by tests).
+    fn frame(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
         self.poll_instance(&ctx);
         self.poll_jobs(&ctx);
@@ -2375,10 +2386,11 @@ impl eframe::App for App {
             return;
         };
 
+        // Both boxes' settings, compared after the frame (the Search box is
+        // drawn last) to remember changes.
         let before = tab.search_prefs();
         let searched =
             egui::Panel::top("filter").show(ui, |ui| tab.filter_bar(ui, &mut focus_search, &self.history)).inner;
-        let after = tab.search_prefs();
         if self.show_library {
             let lit = |t: &Tab| t.picks.nodes.iter().map(|n| (n.key, n.lit)).collect::<Vec<_>>();
             let lit_before = lit(tab);
@@ -2439,6 +2451,7 @@ impl eframe::App for App {
             .show(ui, |ui| tab.search_panel(ui, &*file, search_history))
             .inner;
         egui::CentralPanel::default().show(ui, |ui| tab.main_panel(ui, &*file));
+        let after = tab.search_prefs();
         if after != before {
             self.save_prefs_from(after);
         }
@@ -2595,6 +2608,74 @@ query timeouts  labels: vision
             Preview::AutoText { why, .. } => why.clone(),
             _ => None,
         }
+    }
+
+    /// Bug: ticking the Search box's Regex / Ignore case wasn't saved, as
+    /// the settings were compared before the Search box was drawn.
+    #[test]
+    fn ticking_the_search_box_checkboxes_is_remembered() {
+        let dir = std::env::temp_dir().join(format!("nerka-gui-searchprefs-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("app.log");
+        std::fs::write(&log, LOG).unwrap();
+        let ctx = egui::Context::default();
+        let mut app = App::default();
+        app.open(&ctx, log);
+        settle(&mut app.tabs[0], &ctx);
+        let mut t = 0.0;
+        let mut frame = |app: &mut App, events: Vec<egui::Event>| {
+            t += 1.0 / 60.0;
+            let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1200.0, 800.0));
+            let input = egui::RawInput { screen_rect: Some(screen), time: Some(t), events, ..Default::default() };
+            let mut out = ctx.run_ui(input, |ui| app.frame(ui));
+            out.textures_delta.clear();
+            out.shapes
+        };
+        // The lowest "Regex" / "Ignore case" labels are the Search box's.
+        let lowest = |shapes: &[egui::epaint::ClippedShape], label: &str| {
+            shapes
+                .iter()
+                .filter_map(|s| match &s.shape {
+                    egui::Shape::Text(t) if t.galley.text() == label => Some(t.pos + t.galley.size() / 2.0),
+                    _ => None,
+                })
+                .max_by(|a, b| a.y.total_cmp(&b.y))
+        };
+        let click = |p: egui::Pos2| {
+            vec![
+                egui::Event::PointerMoved(p),
+                egui::Event::PointerButton {
+                    pos: p,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+                egui::Event::PointerButton {
+                    pos: p,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ]
+        };
+        let mut shapes = Vec::new();
+        for _ in 0..3 {
+            shapes = frame(&mut app, vec![]);
+        }
+        assert!(!app.prefs.search_regex && !app.prefs.search_ignore_case);
+        let regex = lowest(&shapes, "Regex").expect("the Search box's Regex");
+        frame(&mut app, click(regex));
+        let shapes = frame(&mut app, vec![]);
+        assert!(app.tabs[0].search.regex, "the click ticked it");
+        assert!(app.prefs.search_regex, "and it is remembered");
+        let ci = lowest(&shapes, "Ignore case").expect("the Search box's Ignore case");
+        frame(&mut app, click(ci));
+        frame(&mut app, vec![]);
+        assert!(app.prefs.search_ignore_case);
+        // A new tab starts with them.
+        let tab = Tab::open(&ctx, dir.join("app.log"), &app.prefs);
+        assert!(tab.search.regex && tab.search.ignore_case);
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
