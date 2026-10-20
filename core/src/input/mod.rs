@@ -4,6 +4,7 @@
 //! Binary formats decode records into displayable text lines; the search
 //! engine and UIs only ever see this trait.
 
+pub mod capture;
 pub mod dlt;
 
 use crate::event::{FieldDef, FieldId, FieldValue, Level};
@@ -14,14 +15,31 @@ use std::fs::File;
 use std::io::Read;
 use std::path::Path;
 
-/// Open `path` with the reader its content calls for: DLT if it starts
-/// with a DLT storage header, plain text otherwise.
+/// How files are opened.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct OpenOptions {
+    /// How DLT is found in captures (pcap, pcapng, MF4).
+    pub capture: capture::CaptureOptions,
+}
+
+/// Open `path` with the reader its content calls for (default
+/// [`OpenOptions`]): see [`open_with`].
 pub fn open(path: impl AsRef<Path>, progress: &Progress) -> Result<Box<dyn LogSource>> {
+    open_with(path, &OpenOptions::default(), progress)
+}
+
+/// Open `path` with the reader its content calls for: DLT if it starts
+/// with a DLT storage header, the DLT inside a pcap / pcapng / MF4 capture,
+/// plain text otherwise.
+pub fn open_with(path: impl AsRef<Path>, options: &OpenOptions, progress: &Progress) -> Result<Box<dyn LogSource>> {
     let path = path.as_ref();
-    let mut head = [0u8; 4];
+    let mut head = [0u8; 16];
     let n = File::open(path)?.read(&mut head)?;
-    Ok(if dlt::is_dlt(&head[..n]) {
+    let head = &head[..n];
+    Ok(if dlt::is_dlt(head) {
         Box::new(dlt::DltFile::open(path, progress)?)
+    } else if capture::is_capture(head) {
+        Box::new(capture::open(path, &options.capture, progress)?.0)
     } else {
         Box::new(text::TextFile::open(path, progress)?)
     })

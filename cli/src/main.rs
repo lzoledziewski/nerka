@@ -27,6 +27,10 @@ struct Cli {
     /// (repeatable), besides the per-user pack directory.
     #[arg(long, global = true, value_name = "DIR|FILE")]
     pack: Vec<PathBuf>,
+    /// UDP destination port that carries DLT in captures (pcap, pcapng,
+    /// MF4; repeatable). Default: 3490.
+    #[arg(long = "dlt-port", global = true, value_name = "PORT")]
+    dlt_port: Vec<u16>,
     #[command(subcommand)]
     cmd: Cmd,
 }
@@ -249,9 +253,14 @@ fn run_search_within(
     Ok(())
 }
 
+/// How files are opened (`--dlt-port`), set once in `main`.
+static OPEN_OPTIONS: std::sync::OnceLock<nerka_core::OpenOptions> = std::sync::OnceLock::new();
+
 fn open(path: &PathBuf) -> Result<(Box<dyn LogSource>, std::time::Duration)> {
     let t = Instant::now();
-    let f = nerka_core::open(path, &Progress::new()).with_context(|| format!("opening {}", path.display()))?;
+    let options = OPEN_OPTIONS.get_or_init(Default::default);
+    let f = nerka_core::open_with(path, options, &Progress::new())
+        .with_context(|| format!("opening {}", path.display()))?;
     Ok((f, t.elapsed()))
 }
 
@@ -275,6 +284,11 @@ fn main() -> std::process::ExitCode {
 
 fn run() -> Result<()> {
     let cli = Cli::parse();
+    let mut options = nerka_core::OpenOptions::default();
+    if !cli.dlt_port.is_empty() {
+        options.capture.dlt_udp_ports = cli.dlt_port.clone();
+    }
+    OPEN_OPTIONS.set(options).expect("set once");
     let stdout = std::io::stdout().lock();
     let mut out = BufWriter::with_capacity(1 << 16, stdout);
 

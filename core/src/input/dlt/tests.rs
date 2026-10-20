@@ -273,6 +273,56 @@ fn engine_queries_match_naive_evaluation() {
     assert!(!run_on(&f, &Filter::Regex(Matcher::new("ok", inv).unwrap())).is_empty());
 }
 
+/// `f`'s messages without their storage headers, as a capture holds them:
+/// odd ones in the side buffer, junk between the others in the file; the
+/// storage ECU becomes the channel's.
+fn framed_copy(f: &DltFile) -> DltFile {
+    let Index::Stored(offsets) = &f.index else { panic!("a .dlt file") };
+    let (mut data, mut side, mut msgs) = (b"capture header".to_vec(), Vec::new(), Vec::new());
+    let mut channel_ecus: Vec<[u8; 4]> = Vec::new();
+    for (i, &off) in offsets.iter().enumerate() {
+        let buf = &f.data.bytes()[off as usize..];
+        let s = format::Storage::parse(buf).unwrap();
+        let m = Message::parse(buf).unwrap();
+        let bytes = &buf[format::STORAGE_LEN..format::STORAGE_LEN + m.len()];
+        let ch = channel_ecus.iter().position(|e| e == s.ecu).unwrap_or_else(|| {
+            channel_ecus.push(*s.ecu);
+            channel_ecus.len() - 1
+        });
+        let in_side = i % 2 == 1;
+        let target = if in_side { &mut side } else { &mut data };
+        target.extend_from_slice(b"\xffjunk");
+        msgs.push(Framed::new(target.len() as u64, in_side, ch, s.secs, s.usecs).unwrap());
+        target.extend_from_slice(bytes);
+    }
+    DltFile::from_frames("t.pcap".into(), None, crate::input::Bytes::Owned(data), msgs, side, channel_ecus, 0)
+}
+
+#[test]
+fn messages_read_in_place_match_the_dlt_file() {
+    let f = mixed();
+    let g = framed_copy(&f);
+    assert_eq!(g.line_count(), f.line_count());
+    for l in 0..f.line_count() {
+        assert_eq!(g.line_text(l), f.line_text(l), "line {l}");
+        assert_eq!(g.line_detail(l), f.line_detail(l), "line {l}");
+        assert_eq!(g.supplied_level(l), f.supplied_level(l), "line {l}");
+        for (id, def) in SCHEMA.iter().enumerate() {
+            assert_eq!(g.field(l, id), f.field(l, id), "line {l} field {}", def.name);
+        }
+    }
+    // Same lines through the engine (fast path against naive, both).
+    let q = |s: &str| Filter::Query(Query::compile(s).unwrap());
+    for s in ["ecu == ECU1", "ecu == GW AND apid == NAV", "level >= ERROR AND raw ~ /failed/", "mode == non-verbose"] {
+        assert_eq!(run_on(&g, &q(s)), run_on(&f, &q(s)), "{s}");
+    }
+    // Out-of-range offsets and channels are refused.
+    assert!(Framed::new(1 << 48, false, 0, 0, 0).is_none());
+    assert!(Framed::new(0, false, MAX_CHANNELS, 0, 0).is_none());
+    let x = Framed::new((1 << 48) - 1, true, MAX_CHANNELS - 1, 1, 2).unwrap();
+    assert_eq!((x.offset(), x.in_side(), x.channel()), ((1 << 48) - 1, true, MAX_CHANNELS - 1));
+}
+
 #[test]
 fn open_picks_reader_from_content() {
     let dir = std::env::temp_dir().join(format!("nerka-dlt-test-{}", std::process::id()));

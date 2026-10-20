@@ -22,6 +22,9 @@ cargo run --release -p nerka-core --example gen_log -- big.log 1024   # 1 GiB te
 cargo run --release -p nerka-cli -- search -c --stats ERROR big.log  # benchmark
 cargo run --release -p nerka-core --example gen_dlt -- big.dlt 1024   # 1 GiB DLT test file
 cargo run --release -p nerka-cli -- filter -c --stats 'apid == NAV AND level >= WARN' big.dlt
+cargo run --release -p nerka-core --example dlt_to_pcap -- big.dlt big.pcap   # the same DLT as a pcap (VLAN, UDP, fragments)
+cargo run --release -p nerka-cli -- filter -c --stats 'apid == NAV AND level >= WARN' big.pcap
+cargo run --release -p nerka-core --example probe_capture -- trace.pcapng log.mf4   # structure of real captures, no payload
 powershell -ExecutionPolicy Bypass -File tools/screenshot.ps1 -Out shot.png -AppArgs app.log  # GUI screenshot (Windows)
 ```
 
