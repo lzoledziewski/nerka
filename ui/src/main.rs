@@ -32,6 +32,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod icon;
+mod icon_art;
 mod instance;
 mod job;
 mod library;

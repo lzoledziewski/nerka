@@ -17,5 +17,9 @@ nerka-core.workspace = true
 eframe.workspace = true
 rfd.workspace = true
 
+# Embeds the icon in the .exe (build.rs); Windows only.
+[target.'cfg(windows)'.build-dependencies]
+winresource.workspace = true
+
 [lints]
 workspace = true
