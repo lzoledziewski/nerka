@@ -43,6 +43,27 @@ impl Bookmarks {
         std::fs::write(path, self.serialize())
     }
 
+    /// Bookmarks of a view of several files, one after another: each
+    /// file's sidecar, its lines shifted to where the file starts in the
+    /// view. `files` is `(log, first line)` per file.
+    pub fn load_for_parts(files: &[(&Path, LineNo)]) -> std::io::Result<Self> {
+        let mut marks = BTreeMap::new();
+        for (log, first) in files {
+            marks.extend(Self::load_for(log)?.marks.into_iter().map(|(l, n)| (l + first, n)));
+        }
+        Ok(Self { marks })
+    }
+
+    /// Save a view of several files back to each file's sidecar, its lines
+    /// as that file numbers them. `files` is `(log, first line, line count)`.
+    pub fn save_for_parts(&self, files: &[(&Path, LineNo, LineNo)]) -> std::io::Result<()> {
+        for (log, first, count) in files {
+            let marks = self.marks.range(first..&(first + count)).map(|(l, n)| (l - first, n.clone())).collect();
+            Self { marks }.save_for(log)?;
+        }
+        Ok(())
+    }
+
     pub fn parse(s: &str) -> Self {
         let marks = s
             .lines()
@@ -105,6 +126,37 @@ impl Bookmarks {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn several_files_keep_their_own_sidecars() {
+        let dir = std::env::temp_dir().join(format!("nerka-marks-parts-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (a, b) = (dir.join("a.log"), dir.join("b.log"));
+        let mut m = Bookmarks::default();
+        m.toggle(1);
+        m.set_note(1, "in a");
+        m.toggle(10);
+        m.toggle(12);
+        m.set_note(12, "in b");
+        // a has lines 0..10, b 10..20 in the view.
+        m.save_for_parts(&[(&a, 0, 10), (&b, 10, 10)]).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(Bookmarks::sidecar_path(&a)).unwrap(),
+            "2	in a
+"
+        );
+        assert_eq!(
+            std::fs::read_to_string(Bookmarks::sidecar_path(&b)).unwrap(),
+            "1	
+3	in b
+"
+        );
+        let back = Bookmarks::load_for_parts(&[(&a, 0), (&b, 10)]).unwrap();
+        assert_eq!(back, m);
+        // Each file alone sees its own.
+        assert_eq!(Bookmarks::load_for(&b).unwrap().iter().map(|(l, _)| l).collect::<Vec<_>>(), [0, 2]);
+        std::fs::remove_dir_all(&dir).ok();
+    }
 
     #[test]
     fn roundtrip_and_navigation() {

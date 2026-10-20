@@ -5,6 +5,7 @@
 //! engine and UIs only ever see this trait.
 
 pub mod capture;
+pub mod concat;
 pub mod dlt;
 
 use crate::event::{FieldDef, FieldId, FieldValue, Level};
@@ -166,6 +167,27 @@ pub trait LogSource: Send + Sync {
     fn line_start(&self, _line: LineNo) -> u64 {
         0
     }
+
+    /// For a source made of several ([`concat::Concat`]): its parts, each
+    /// with its first line in the whole. The engine searches them one by
+    /// one, so each keeps its own fast path.
+    fn parts(&self) -> Option<Vec<Part<'_>>> {
+        None
+    }
+
+    /// `(first line, line count)` of each file the source shows: one for a
+    /// plain file, one per part for [`concat::Concat`] (bookmarks are kept
+    /// per file).
+    fn part_files(&self) -> Vec<(LineNo, LineNo)> {
+        vec![(0, self.line_count())]
+    }
+}
+
+/// One part of a source made of several.
+pub struct Part<'a> {
+    /// Its first line in the whole.
+    pub first: LineNo,
+    pub source: Box<dyn LogSource + 'a>,
 }
 pub mod text;
 

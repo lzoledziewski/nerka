@@ -177,13 +177,20 @@ pub fn search(source: &dyn LogSource, filter: &Filter, progress: &Progress) -> R
     Ok(SearchResult { lines: scan(source, filter, progress)? })
 }
 
-/// Can `filter` (bound) take the buffer-scan fast path on `source`?
+/// Can `filter` (bound) take the buffer-scan fast path on `source` (on
+/// every part, for a source made of several)?
 pub(crate) fn has_fast_path(source: &dyn LogSource, filter: &Filter) -> bool {
+    if let Some(parts) = source.parts() {
+        return parts.iter().all(|p| has_fast_path(p.source.as_ref(), filter));
+    }
     source.contiguous().is_some() && filter.prefilter().is_some()
 }
 
 /// Progress units [`scan`] reports: bytes on the fast path, else lines.
 pub(crate) fn work(source: &dyn LogSource, filter: &Filter) -> u64 {
+    if let Some(parts) = source.parts() {
+        return parts.iter().map(|p| work(p.source.as_ref(), filter)).sum();
+    }
     match source.contiguous() {
         Some(buf) if filter.prefilter().is_some() => buf.len() as u64,
         _ => source.line_count(),
@@ -193,6 +200,14 @@ pub(crate) fn work(source: &dyn LogSource, filter: &Filter) -> u64 {
 /// All lines matching a bound filter. Adds to `progress` but leaves its
 /// total to the caller.
 pub(crate) fn scan(source: &dyn LogSource, filter: &Filter, progress: &Progress) -> Result<Vec<LineNo>> {
+    // Several sources in one: each part on its own path, lines shifted.
+    if let Some(parts) = source.parts() {
+        let mut out = Vec::new();
+        for p in parts {
+            out.extend(scan(p.source.as_ref(), filter, progress)?.into_iter().map(|l| l + p.first));
+        }
+        return Ok(out);
+    }
     match (source.contiguous(), filter.prefilter()) {
         (Some(buf), Some(pre)) => {
             // A plain regex only needs re-checking for hits that reach past
