@@ -4,6 +4,11 @@
 //! `(root) AND (…) AND (query)`. Included queries are OR'ed, excluded ones
 //! are added as `AND NOT`. The result is one line of NFD that compiles on
 //! its own, plus provenance: the byte range each query occupies.
+//!
+//! A pick whose ancestor is picked in the same role adds nothing
+//! (`P OR P AND C` is `P`, `NOT P AND NOT (P AND C)` is `NOT P`), so it is
+//! left out of the NFD. It is still a [`Part`], [`covered`](Part::covered)
+//! by that ancestor, with its own text kept aside.
 
 use super::{Ctx, Library, render};
 use crate::dsl::DslError;
@@ -78,12 +83,17 @@ pub struct Part {
     /// Qualified id of the picked query.
     pub query: String,
     pub role: Role,
-    /// The query's full meaning (parent chain AND own text). `nfd[range]`
-    /// is valid NFD on its own.
+    /// The query's full meaning (parent chain AND own text), valid NFD on
+    /// its own: a range of [`Expansion::nfd`], or of
+    /// [`Expansion::aside`] when the part is covered.
     pub range: Range<usize>,
     /// The parent chain from the root down to the query itself: qualified
-    /// id and the range of that query's own (parenthesized) text.
+    /// id and the range of that query's own (parenthesized) text, in the
+    /// same string as `range`.
     pub chain: Vec<(String, Range<usize>)>,
+    /// The picked ancestor (same role) that makes this pick redundant: the
+    /// part isn't in `nfd`.
+    pub covered: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -92,12 +102,15 @@ pub struct Expansion {
     pub nfd: String,
     /// Included parts first, in pick order, then excluded ones.
     pub parts: Vec<Part>,
+    /// The texts of covered parts, which `nfd` leaves out.
+    pub aside: String,
 }
 
 impl Expansion {
     /// The standalone NFD of a part.
     pub fn part_nfd(&self, part: &Part) -> &str {
-        &self.nfd[part.range.clone()]
+        let text = if part.covered.is_some() { &self.aside } else { &self.nfd };
+        &text[part.range.clone()]
     }
 
     pub fn parts_with(&self, role: Role) -> impl Iterator<Item = &Part> {
@@ -162,26 +175,41 @@ pub fn expand(sel: &Selection, lib: &Library, params: &Params) -> Result<Expansi
     if include.is_empty() && exclude.is_empty() {
         return Err(ExpandError::Empty);
     }
-    let mut nfd = String::new();
+    let include_cov = covers(lib, &include)?;
+    let exclude_cov = covers(lib, &exclude)?;
+    let (mut nfd, mut aside) = (String::new(), String::new());
     let mut parts = Vec::new();
-    let group = include.len() > 1 && !exclude.is_empty();
+    let shown = include_cov.iter().filter(|c| c.is_none()).count();
+    let group = shown > 1 && exclude_cov.iter().any(|c| c.is_none());
     if group {
         nfd.push('(');
     }
-    for (i, id) in include.iter().enumerate() {
-        if i > 0 {
+    let mut first = true;
+    for (id, covered) in include.iter().zip(include_cov) {
+        if covered.is_some() {
+            parts.push(Part { covered, ..part(lib, id, Role::Include, params, &mut aside)? });
+            continue;
+        }
+        if !first {
             nfd.push_str(" OR ");
         }
+        first = false;
         // AND binds tighter than OR, so a chain needs no parentheses here.
         parts.push(part(lib, id, Role::Include, params, &mut nfd)?);
     }
     if group {
         nfd.push(')');
     }
-    for (i, id) in exclude.iter().enumerate() {
-        if i > 0 || !include.is_empty() {
+    let mut first = shown == 0;
+    for (id, covered) in exclude.iter().zip(exclude_cov) {
+        if covered.is_some() {
+            parts.push(Part { covered, ..part(lib, id, Role::Exclude, params, &mut aside)? });
+            continue;
+        }
+        if !first {
             nfd.push_str(" AND ");
         }
+        first = false;
         nfd.push_str("NOT ");
         let chain = chain_len(lib, id)?;
         if chain > 1 {
@@ -192,7 +220,17 @@ pub fn expand(sel: &Selection, lib: &Library, params: &Params) -> Result<Expansi
             nfd.push(')');
         }
     }
-    Ok(Expansion { nfd, parts })
+    Ok(Expansion { nfd, parts, aside })
+}
+
+/// For each id: the nearest ancestor of it that is also in `ids`.
+fn covers(lib: &Library, ids: &[String]) -> Result<Vec<Option<String>>, ExpandError> {
+    ids.iter()
+        .map(|id| {
+            let chain = chain_of(lib, id)?;
+            Ok(chain[..chain.len() - 1].iter().rev().find(|a| ids.contains(a)).cloned())
+        })
+        .collect()
 }
 
 impl Library {
@@ -307,7 +345,7 @@ fn part(lib: &Library, id: &str, role: Role, params: &Params, nfd: &mut String) 
         }
         chain.push((qid, s..nfd.len()));
     }
-    Ok(Part { query: id.to_owned(), role, range: start..nfd.len(), chain })
+    Ok(Part { query: id.to_owned(), role, range: start..nfd.len(), chain, covered: None })
 }
 
 /// A parameter value as NFD text for its context.
