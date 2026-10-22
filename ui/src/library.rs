@@ -23,7 +23,7 @@
 use eframe::egui::{self, Color32, RichText};
 use nerka_core::FieldDef;
 use nerka_core::pack::{
-    self, Expansion, Library, Pack, PackQuery, ParamValue, Params, Pick, Role, Selection, format_query, is_query_name,
+    self, Expansion, Library, Pack, PackQuery, ParamValue, Params, Pick, Selection, format_query, is_query_name,
     params_in, parse_pack, upsert_query,
 };
 use nerka_core::preset::{NodeSource, Preset, PresetNode, PresetParam};
@@ -73,6 +73,10 @@ pub struct Node {
     pub labels: String,
     /// A colour name or `#rrggbb`; empty for none.
     pub color: String,
+    /// The palette entry for its colour when it has none of its own,
+    /// picked when it joins the selection: reordering or removing other
+    /// nodes doesn't change it.
+    pub slot: usize,
     pub role: Use,
     /// Colour the lines it keeps (included filter queries only).
     pub lit: bool,
@@ -96,6 +100,7 @@ impl Node {
             parent: None,
             labels: String::new(),
             color: String::new(),
+            slot: 0,
             role,
             lit: false,
             edited: true,
@@ -119,6 +124,12 @@ impl Node {
             open: false,
             ..Node::blank(key, role)
         })
+    }
+
+    /// Its colour: its own, else its palette entry. The swatch, the chip,
+    /// the line colour and its search hits all use this one.
+    pub fn color(&self) -> Color32 {
+        parse_color(self.color.trim()).unwrap_or(palette(self.slot))
     }
 
     /// The expansion id: the library query, unless edited or detached
@@ -244,6 +255,7 @@ impl Picks {
             n.detached = true;
             n.parent = None;
         }
+        n.slot = self.free_slot();
         let at = at.unwrap_or(self.nodes.len()).min(self.nodes.len());
         self.nodes.insert(at, n);
         true
@@ -252,8 +264,19 @@ impl Picks {
     /// A new, empty node at the end, with its editor open.
     pub fn add_new(&mut self, role: Use) -> u64 {
         let key = self.next_key();
-        self.nodes.push(Node::blank(key, role));
+        let slot = self.free_slot();
+        self.nodes.push(Node { slot, ..Node::blank(key, role) });
         key
+    }
+
+    /// The palette entry for a node joining the selection: the first one
+    /// no node without its own colour uses, else the least used.
+    fn free_slot(&self) -> usize {
+        let mut used = [0usize; PALETTE.len()];
+        for n in self.nodes.iter().filter(|n| parse_color(n.color.trim()).is_none()) {
+            used[n.slot % PALETTE.len()] += 1;
+        }
+        (0..PALETTE.len()).min_by_key(|&i| used[i]).unwrap_or(0)
     }
 
     pub fn remove(&mut self, key: u64) {
@@ -358,16 +381,11 @@ impl Picks {
         }
         let exp = pack::expand(&sel, &full, &self.params()).map_err(|e| e.to_string())?;
         let (mut keys, mut names, mut colors) = (Vec::new(), Vec::new(), Vec::new());
-        let mut includes = 0;
         for p in &exp.parts {
             let n = by_id.iter().find(|(id, _)| *id == p.query).map(|(_, n)| *n).expect("expanded from these nodes");
             keys.push(n.key);
             names.push(n.display_name());
-            let slot = if p.role == Role::Include { includes } else { 0 };
-            colors.push(node_color(n, slot));
-            if p.role == Role::Include {
-                includes += 1;
-            }
+            colors.push(n.color());
         }
         Ok(Applied { exp, keys, names, colors })
     }
@@ -379,11 +397,17 @@ impl Picks {
         let (id, name, color) = match target {
             Target::Library(id) => {
                 let (_, q) = lib.get(id).ok_or_else(|| format!("unknown query '{id}'"))?;
-                (id.clone(), q.id.clone(), q.color.as_deref().and_then(parse_color).unwrap_or(palette(slot)))
+                // Selected as it is in the library: the node's colour.
+                let node = self.nodes.iter().find(|n| n.source.as_deref() == Some(id) && !n.edited);
+                let color = match node {
+                    Some(n) => n.color(),
+                    None => q.color.as_deref().and_then(parse_color).unwrap_or(palette(slot)),
+                };
+                (id.clone(), q.id.clone(), color)
             }
             Target::Node(key) => {
                 let n = self.nodes.iter().find(|n| n.key == *key).ok_or("the query was removed")?;
-                (n.expand_id(), n.display_name(), node_color(n, slot))
+                (n.expand_id(), n.display_name(), n.color())
             }
         };
         let sel = Selection { include: vec![Pick::Query(id)], exclude: vec![] };
@@ -446,6 +470,7 @@ impl Picks {
                 n.detached = true;
                 n.parent = None;
             }
+            n.slot = self.free_slot();
             self.nodes.push(n);
         }
         self.params = preset.params.iter().map(|p| (p.name.clone(), (p.value.clone(), p.raw))).collect();
@@ -550,11 +575,6 @@ pub fn parse_color(s: &str) -> Option<Color32> {
 /// The colour of the `index`-th query when it has none of its own.
 pub fn palette(index: usize) -> Color32 {
     PALETTE[index % PALETTE.len()]
-}
-
-/// A node's colour: its own, else the palette entry for `slot`.
-fn node_color(n: &Node, slot: usize) -> Color32 {
-    parse_color(n.color.trim()).unwrap_or(palette(slot))
 }
 
 /// A small coloured name tag; `strong` fills it with the colour.
@@ -1189,7 +1209,7 @@ fn node_row(ui: &mut egui::Ui, n: &mut Node, remove: &mut Option<u64>, action: &
             }
         });
         // Swatch: switches the line colour of an included filter query.
-        let color = node_color(n, 0);
+        let color = n.color();
         let (rect, r) = ui.allocate_exact_size(egui::vec2(12.0, 14.0), egui::Sense::click());
         let sw = egui::Rect::from_center_size(rect.center(), egui::vec2(10.0, 12.0));
         if n.role == Use::Include {
@@ -1950,6 +1970,47 @@ query swup  parent: soc
         assert_eq!(p.nodes.len(), 2);
     }
 
+    /// A node keeps one colour: the swatch, the chip and the line colour
+    /// read it, and moving, removing or switching other nodes doesn't
+    /// change it.
+    #[test]
+    fn a_node_keeps_its_colour() {
+        let lib = lib();
+        let mut p = Picks::default();
+        p.add(&lib, "v.slow", Use::Include, None);
+        p.add(&lib, "v.drops", Use::Include, None);
+        let new = p.add_new(Use::Include);
+        p.node_mut(new).unwrap().text = "/x/".into();
+        p.params.insert("ecu".into(), ("E1".into(), false));
+        let colors = |p: &Picks| p.nodes.iter().map(|n| (n.key, n.color())).collect::<Vec<_>>();
+        let before = colors(&p);
+        // Own colour (drops: violet) wins; the others take free entries.
+        assert_eq!(
+            before.iter().map(|c| c.1).collect::<Vec<_>>(),
+            [palette(0), parse_color("violet").unwrap(), palette(1)]
+        );
+        let check = |p: &Picks| {
+            let a = p.expand(&lib).unwrap();
+            for (k, c) in a.keys.iter().zip(&a.colors) {
+                assert_eq!(Some(c), before.iter().find(|b| b.0 == *k).map(|b| &b.1), "chip and lines = swatch");
+            }
+        };
+        check(&p);
+        // Reordered, the first one excluded: nothing changes colour.
+        let first = p.nodes[0].key;
+        p.move_node(new, 0);
+        p.node_mut(first).unwrap().role = Use::Exclude;
+        check(&p);
+        // Search hits of a selected library query use its node's colour.
+        let t = p.search_term(&lib, &Target::Library("v.slow".into()), 5).unwrap();
+        assert_eq!(t.color, palette(0));
+        // Removed: its entry is free again for the next node.
+        p.remove(first);
+        check(&p);
+        p.add(&lib, "v.slow", Use::Include, None);
+        assert_eq!(p.nodes.last().unwrap().color(), palette(0));
+    }
+
     #[test]
     fn expansion_follows_the_order_and_local_nodes_expand_too() {
         let lib = lib();
@@ -1988,7 +2049,8 @@ query swup  parent: soc
             }
         );
         let t = p.search_term(&lib, &Target::Node(new), 2).unwrap();
-        assert_eq!((t.nfd.as_str(), t.color), ("(level <= DEBUG)", palette(2)));
+        // Its own palette entry: slow has the first, drops its own colour.
+        assert_eq!((t.nfd.as_str(), t.color), ("(level <= DEBUG)", palette(1)));
 
         // Invalid local text is reported with the node's name.
         p.node_mut(new).unwrap().text = "level >= LOUD".into();
