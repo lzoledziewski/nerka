@@ -985,6 +985,13 @@ impl Tab {
         }
     }
 
+    /// Issue #16: the Clear button. Empties the Filter box, so the main
+    /// view shows every line again (↑ in the box brings the text back).
+    fn clear_filter(&mut self, ctx: &egui::Context) {
+        self.pattern.clear();
+        self.start_search(ctx);
+    }
+
     fn clear_search(&mut self) {
         if let Some((_, j)) = self.search.job.take() {
             j.cancel();
@@ -1322,7 +1329,7 @@ impl Tab {
     ) -> Option<(&'static str, String)> {
         let mut searched = None;
         ui.horizontal(|ui| {
-            let mut go = false;
+            let (mut go, mut clear) = (false, false);
             ui.add_enabled_ui(!history.is_empty(), |ui| {
                 ui.menu_button("🕘", |ui| {
                     egui::ScrollArea::vertical().max_height(400.0).show(ui, |ui| {
@@ -1355,6 +1362,11 @@ impl Tab {
             // so the row never grows wider than the panel.
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 go |= ui.button("Filter").on_hover_text("Show only the matching lines in the main view").clicked();
+                let on = self.result.is_some() || self.searching.is_some();
+                clear = ui
+                    .add_enabled(on, egui::Button::new("Clear"))
+                    .on_hover_text("Show every line again (↑ in the box brings the filter back)")
+                    .clicked();
                 if self.mode != Mode::Query {
                     ui.checkbox(&mut self.options.invert, "Invert");
                     ui.checkbox(&mut self.options.case_insensitive, "Ignore case")
@@ -1382,7 +1394,9 @@ impl Tab {
                 }
                 go |= r.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
             });
-            if go && self.start_search(ui.ctx()) {
+            if clear {
+                self.clear_filter(ui.ctx());
+            } else if go && self.start_search(ui.ctx()) {
                 searched = Some((self.filter_tag(), self.pattern.clone()));
             }
         });
@@ -3258,9 +3272,9 @@ query timeouts  labels: vision
         assert_eq!(tab.search.hits.as_ref().unwrap().1.lines, [1, 5]);
 
         // Without a filter the main view and the search cover the whole
-        // file; the cursor stays on its line.
-        tab.pattern.clear();
-        tab.start_search(&ctx);
+        // file; the cursor stays on its line. Clear removes the filter.
+        tab.clear_filter(&ctx);
+        assert!(tab.pattern.is_empty());
         settle(&mut tab, &ctx);
         assert_eq!(tab.main_rows(), 6);
         assert_eq!(tab.current_line(), 5);
