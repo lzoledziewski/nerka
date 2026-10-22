@@ -1,5 +1,7 @@
 # Nerka — Architecture & Implementation Spec (v0.1)
 
+> The original requirements, kept as written. Where the code deviates (egui instead of Tauri, memory-mapped index instead of pure streaming, …) and why: `architecture-analysis.md`.
+
 ## Purpose
 This document defines the initial architecture, constraints, and implementation plan for **Nerka**, a lightweight, modular log analysis tool focused on fast troubleshooting and root-cause analysis.
 

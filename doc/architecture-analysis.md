@@ -4,7 +4,7 @@ Companion to `nerka_architecture_implementation_spec_v_0.md`. This records
 what the scaffold implements, the decisions taken on the spec's open
 questions, where it deliberately deviates, and what comes next.
 
-Date: 2026-10-17
+Date: 2026-10-17 (layout and roadmap updated 2026-10-22)
 
 ---
 
@@ -113,6 +113,9 @@ fields or wrong operators with their position. `Event` is lazy over
 
 ## 5. Measured performance
 
+Measured for the scaffold (2026-10-17) on a 2-core cloud VM. Current numbers
+on Windows, for text and DLT, are in `status.md` and the commit messages.
+
 1 GiB synthetic log, 12.0 M lines, 2-core cloud VM, release build, warm page cache:
 
 | Operation | Time | Throughput |
@@ -135,27 +138,34 @@ below.
 | Log data | Read-only memory map; never copied or modified. DLT lines are rendered on demand from the mapped messages (no materialized text) | Revisit only if regex search over decoded formats proves too slow |
 | Line index | In memory | Optional on-disk index cache for multi-GB files |
 | Bookmarks + notes | Sidecar `<log>.nerka-marks`, plain text `line<TAB>note` | Same model synced via `nerka-server` for collaboration |
-| Saved filters, settings | — | `%APPDATA%\nerka` / XDG config dir (eframe persistence) |
+| Search histories, prefs, query packs, presets | Own plain-text files in `%APPDATA%\nerka` / XDG config dir (not eframe persistence) | Packs stored with a project (open question) |
 
 The sidecar is human-readable and diff-able, so people can already share
 annotations by sending it alongside the log.
 
 ## 7. Repository layout (spec §10)
 
+As of 2026-10-22:
+
 ```
 nerka/
   Cargo.toml            workspace, shared deps, lints, release profile
   core/                 nerka-core  — UI-free engine (library)
-    src/input/          LogSource trait, open() by content, TextFile (mmap), dlt/ (DLT reader + writer)
-    src/engine/         LineIndex, search/Filter/Highlighter
-    src/dsl/            NFD parser + evaluator
-    src/event.rs        lazy field normalization (level)
+    src/input/          LogSource trait, open() by content, TextFile (mmap), dlt/ (DLT reader + writer),
+                        capture/ (pcap, pcapng, MF4, network layers), concat (several files as one), mem (tests)
+    src/engine/         LineIndex, search/Filter/Highlighter, within (search inside a filter result)
+    src/dsl/            NFD parser + evaluator, auto (Auto mode: plain words + NFD)
+    src/pack/           query packs: parser, Library, expand, write
+    src/event.rs        lazy fields (level, source-supplied fields)
     src/bookmarks.rs    bookmarks + sidecar persistence
-    examples/gen_log.rs synthetic log generator for benchmarks
-  cli/                  nerka       — open | search | filter | marks | lines
-  ui/                   nerka-gui   — egui desktop viewer
-  doc/                  spec + this analysis
-  .github/workflows/    CI: fmt, clippy -D warnings, test, release build on Win/Linux/macOS
+    src/history.rs      search history; src/preset.rs: presets
+    examples/           gen_log, gen_dlt, gen_multiline_dlt, dlt_to_pcap (test data), probe_capture
+  cli/                  nerka       — open | search | filter | expand | packs | marks | lines
+  ui/                   nerka-gui   — egui desktop viewer (view, library/selection, presets, prefs, instances)
+  tools/screenshot.ps1  GUI screenshot for visual checks (Windows)
+  doc/                  spec, this analysis, status and designs
+  .github/workflows/    ci.yml: fmt, clippy -D warnings, tests on Linux + Windows;
+                        release.yml: Linux + Windows archives, pre-release on a v* tag
 ```
 
 ## 8. Roadmap
@@ -165,15 +175,15 @@ indexing, regex and DSL filtering, highlighting, bookmarks with notes, CLI.
 
 **Phase 1.5 — klogg parity** (owner is happy with the base as of 2026-10-18; remaining items are on hold)
 - Follow/tail mode: remap on growth and extend the index incrementally.
-- Multiple highlight rules with colours (klogg's "highlighters"), saved filters.
+- Highlight rules and saved filters: **done differently** — query packs with colours, line colours per selected query, and presets (`search-manager.md`), instead of klogg's lists.
 - Encoding detection (UTF-16, Latin-1).
 - Block-compressed index (§3).
-- Selection and copy of ranges; search history.
-- Rotated logs (`app.log`, `app.log.1`, …) presented as one source.
+- Selection and copy of ranges; search history: **done**.
+- Rotated logs (`app.log`, `app.log.1`, …) presented as one source: several files can be opened as one view, one after another (2026-10-20); recognising rotation by name isn't done.
 
 **Phase 2 — formats, normalization & signals** (design: `sources-and-signals.md`)
-- DLT from `.dlt` files: **done** (2026-10-18), shown as a table. Next: the owner's search manager / highlighters (`status.md`).
-- DLT from pcap and MF4 via container/decoder layers; SOME/IP signals from FIBEX/ARXML.
+- DLT from `.dlt` files: **done** (2026-10-18), shown as a table.
+- DLT from pcap / pcapng and MF4: **done** (2026-10-20, own readers). Next: SOME/IP signals from FIBEX/ARXML.
 - `timestamp` / `service` fields, with time-range filters (`timestamp >= 10:42:00`).
 - stdin source (`tail -f x | nerka-gui -`).
 
@@ -182,8 +192,6 @@ indexing, regex and DSL filtering, highlighting, bookmarks with notes, CLI.
 - egui UI compiled to wasm, or a thin web UI, against the server.
 - Shared bookmarks/notes/markers, with the sidecar model as the wire format.
 
-## 9. Open questions for you
+## 9. Open questions
 
-1. Is egui instead of Tauri acceptable, or should the UI follow the spec literally?
-2. Level detection only recognises upper-case tokens. Do your real logs use other conventions (`E/`, `<3>`, lower-case)? A few sample lines would let me tune the normalizer.
-3. Should the sidecar live next to the log (current behaviour), or in a central app-data folder when the log directory is read-only?
+Kept in one place: `status.md` → "Decisions pending with the owner".

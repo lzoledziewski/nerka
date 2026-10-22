@@ -2,14 +2,14 @@
 
 Snapshot of where the project stands. Update this file whenever the state changes.
 
-_Last update: 2026-10-19 (GitHub issues #3–#6 on branch `claude/issues-3-6`: unnamed selection entries, pack names with spaces, search history with ↑ / ↓, long lines; #2 closed as invalid by the owner)._
+_Last update: 2026-10-22 (issues #2 and #16 fixed: a child picked with its parent isn't repeated, Clear on the Filter bar; one stable colour per selected query; README and docs refreshed)._
 
 ## State
 
-- Builds and runs on **Windows** (MSVC, debug and release). Clippy `-D warnings`, fmt and all tests pass (75 core, 32 GUI). The 1 GiB benchmarks have been run on Windows (numbers below and in the commit messages).
-- Committed on `main`, **not pushed** since `5b632c3` (don't push until the owner says so).
-- Only built for Windows so far. Linux/macOS builds and releases are open questions (see "Decisions pending").
-- **CI and releases (owner, 2026-10-18):** `.github/workflows/ci.yml` runs fmt, clippy and the tests on Linux and Windows for pushes to `main` and every PR (macOS left out: its runner minutes count 10x on a private repo). `release.yml` builds `nerka` + `nerka-gui` for Linux (Ubuntu 22.04, glibc 2.35+, `.tar.gz`) and Windows (`.zip`) on a `v*` tag and publishes them as a GitHub pre-release (tags with `-`, e.g. `v0.1.0-alpha.1`); run by hand it only builds artifacts. Version is `0.1.0-alpha.3`. `.vscode/extensions.json` is still not on disk (appendix).
+- Builds and runs on **Windows** (MSVC, debug and release). Clippy `-D warnings`, fmt and all tests pass. The 1 GiB benchmarks have been run on Windows (numbers below and in the commit messages).
+- Work goes through branches; `main` is pushed to GitHub when the owner says so (never push unasked). Open GitHub issues are the owner's to-do list.
+- Developed and used on Windows; Linux builds and tests run in CI and ship in the releases, but the GUI hasn't been tried on Linux. macOS is an open question (see "Decisions pending").
+- **CI and releases (owner, 2026-10-18):** `.github/workflows/ci.yml` runs fmt, clippy and the tests on Linux and Windows for pushes to `main` and every PR (macOS left out: its runner minutes count 10x on a private repo). `release.yml` builds `nerka` + `nerka-gui` for Linux (Ubuntu 22.04, glibc 2.35+, `.tar.gz`) and Windows (`.zip`) on a `v*` tag and publishes them as a GitHub pre-release (tags with `-`, e.g. `v0.1.0-alpha.1`); run by hand it only builds artifacts. Version is `0.1.0-alpha.3`.
 
 ## GUI as of now (`ui/`)
 
@@ -42,22 +42,22 @@ Owner feedback is driving this; these are deliberate choices, keep them:
 ## Next steps
 
 1. Owner runs `cargo run --release -p nerka-core --example probe_capture -- <files>` on real pcap / pcapng / MF4 captures and shares the report (structure only, no payload or addresses); it decides the pcap dependencies (own reader + `etherparse` proposed) and the MF4 approach. Plan agreed: DLT is extracted into a temporary `.dlt` (cleaned up on tab close and at startup), shown under the capture's name.
-2. Next GUI items (owner, 2026-10-19): single instance (new files open in the last focused window), move a tab to a new window, named sessions in the title. Later: several source files in one view (first: concatenated). Backsync from the box text into the selection is parked (needs a more interactive design).
+2. GUI: single instance, move a tab to a new window, named windows and several files in one view (concatenated) are done (2026-10-20). Parked: merging files by time ("time" across files must be defined first) and backsync from the box text into the selection (needs a more interactive design).
 3. Owner tries the DLT table on real use; settle the open DLT questions below.
 4. **Search manager** POC: all five steps are built; the owner tries it and answers the GUI choices 7–12 in `search-manager.md` → "POC status".
-5. Releases: `v0.1.0-alpha.1` (2026-10-18) and `v0.1.0-alpha.2` (2026-10-20: Auto / Text / NFD modes, presets, line colours following the selection, chip row, long-line window, search history) are tagged and published.
+5. Releases: `v0.1.0-alpha.1` (2026-10-18), `v0.1.0-alpha.2` (2026-10-20: Auto / Text / NFD modes, presets, line colours following the selection, chip row, long-line window, search history) and `v0.1.0-alpha.3` (2026-10-20) are tagged and published.
 
 Text-log benchmark on Windows (1 GiB, 12M lines, release): index ~90 ms, `search ERROR` ~30 ms, `level >= ERROR` ~31 ms, `level >= WARN AND raw ~ /timeout/` ~30 ms, `search -v ERROR` ~100 ms.
 
-## Current focus
+## DLT and captures (built)
 
-**DLT import** (owner, 2026-10-18), then a search manager / highlighters of the owner's own design (not a klogg clone; don't start it yet). Design: `sources-and-signals.md`.
+DLT import was the focus from 2026-10-18 (owner); `.dlt` files, pcap / pcapng and MF4 are read now. The search manager came next and is built too (below). Design of the layers: `sources-and-signals.md`.
 
 Decided for DLT: own zero-copy parser in `core/src/input/dlt/` (no crate, no dependency); synthetic test data only (a DLT writer + `gen_dlt` example); shown as a **table with aligned, resizable columns** in our own view (no column sorting; each row is still one tab-separated text line, so search, highlight and copy keep working).
 
 Done (step 1): `LogSource::line_bytes` returns `Cow`; sources can supply a field schema, per-line field values and levels; `Event` is lazy over `(source, line)`, so header-only filters never render a line; the DSL accepts source fields (`apid == NAV`, `mcnt >= 0x10`), resolved by `Query::bind` / `compile_for`. Text-log benchmark unchanged (1 GiB: `search ERROR` ~30 ms, `level >= ERROR` ~31 ms).
 
-Done (step 2): own DLT reader in `core/src/input/dlt/` (no new dependencies). `nerka_core::open` picks DLT or text by content; the CLI uses it, the **GUI still opens everything as text** (switching it comes with the table view).
+Done (step 2): own DLT reader in `core/src/input/dlt/` (no new dependencies). `nerka_core::open` picks DLT or text by content (the GUI too, since step 3).
 - Index = one `u64` offset per message (~8 B/msg). Headers are read in place, so header-only filters never decode payloads.
 - Fields: `ecu apid ctid type mcnt tmsp seid mid mode payload`; `payload` is the decoded payload column only (unlike `raw`, which spans every column), e.g. `payload ~ "timeout"`, and is checked after the header conditions; `mode` is `verbose` / `non-verbose` (`mid` stays empty on verbose messages, since 0 is a valid message id); `level` comes from the header (`VERBOSE` is accepted as an alias for `TRACE`).
 - Line = tab-separated columns `time tmsp ecu apid ctid type payload` (time is the storage time in **UTC**; `type` is the level for log messages, e.g. `error`).
@@ -70,7 +70,7 @@ Done (step 3): the GUI opens files via `nerka_core::open`; sources with columns 
 
 Done (step 4, 2026-10-20): **DLT in pcap / pcapng captures**, read in place (no temporary `.dlt`): `core/src/input/capture/` (container `pcap.rs`: pcap µs/ns both byte orders, pcapng sections / interfaces / `if_tsresol` / `if_tsoffset`; transport `net.rs`: Ethernet, stacked VLAN tags, Linux SLL / SLL2, raw IP, loopback, IPv4 / IPv6 with **fragment reassembly** in any order (30 s capture-time timeout, at most 4096 pending); router: UDP destination ports, default **3490** only (the DLT protocol's port; owner, 2026-10-20), configurable: CLI `--dlt-port` (repeatable), GUI ⚙ → UDP ports (saved in `prefs` as `dlt_ports`, used for captures opened afterwards), core `OpenOptions` / `CaptureOptions`). The DLT reader was generalised: a message takes its storage time and ECU from its index entry (`Framed`, 16 B: offset with a side-buffer bit and a 15-bit capture channel, time), so a `.dlt` file is the simplest case; reassembled datagrams live in a side buffer. A message gets the time of the frame that completed its datagram; its ECU is its own (WEID). `nerka_core::open` recognises captures by content; the GUI's Open dialog lists `.pcap` / `.pcapng`. No new dependency. Benchmark: `big.dlt` → `big.pcap` with `examples/dlt_to_pcap` (870 MB, 12.5 M messages, VLAN, several messages per datagram, every 400th datagram fragmented): index ~300 ms (`.dlt`: ~255 ms), the same match counts and search times as the `.dlt`; the `.dlt` numbers are unchanged by the refactor. **MF4** (2026-10-20, `capture/mf4.rs`, own reader, no dependency): block tree over the mapped file; unsorted (1/2/4/8-byte record ids) and sorted data; DT / DL / HL (records spanning data blocks are copied to the side buffer); VLSD channel groups (paired with their frame group by order) and SD blocks (by offset); DZ refused for now. Groups by channel names (`ETH_Frame.*` → Ethernet frames into the same transport and port router as pcap; `DLT_Frame.*` → DLT directly, its `ECU_ID` the fallback ECU), else by shape (an Ethernet bus-event group, as the owner's X2E files). Time = header start + master channel through its linear conversion (none: the raw value in seconds, as the spec says). Not yet tried on the owner's real files. Design and next steps (pluggable layers): `capture-import.md` (local draft).
 
-Open with the owner: save column widths? Sorting stays out (decided). Next after DLT: the search manager / highlighters (owner's own design).
+Open with the owner: save column widths? Sorting stays out (decided).
 
 ### DLT decisions (owner, 2026-10-18)
 
@@ -105,7 +105,7 @@ Design agreed with the owner on 2026-10-18 after mockups: **`search-manager.md`*
 
 Nothing is stored in the cloud.
 
-- **Nerka:** search history and prefs in `%APPDATA%\nerka\` (Linux: `~/.config/nerka/`); bookmarks as `<log>.nerka-marks` next to the log. Copy those files to move them to another machine.
+- **Nerka:** search histories, prefs, query packs (`packs\`) and presets (`presets\`) in `%APPDATA%\nerka\` (Linux: `~/.config/nerka/`); bookmarks as `<log>.nerka-marks` next to the log. Copy those files to move them to another machine.
 - **Agent sessions** (Claude Code) are local to the machine they ran on. The project's decisions and state belong in this repo (`CLAUDE.md`, this file, `sources-and-signals.md`, `architecture-analysis.md`), so a new session on any machine starts from the repo.
 
 ## Decisions pending with the owner
@@ -117,7 +117,7 @@ Don't settle these silently: ask.
 3. **Bookmark storage:** currently a sidecar `<log>.nerka-marks` next to the log. The alternative is a central app-data folder when the log's directory is read-only.
 4. **DLT column widths:** resizable per tab but not saved. Save them (globally or per file)?
 5. **Releases / downloads:** `release.yml` (Linux + Windows pre-releases on `v*` tags, archives with the README and both licence files) is in place; open: macOS builds (unsigned binaries warn; 10x runner minutes).
-6. **Linux builds from this Windows PC:** no WSL, Docker or zig installed. Options: cross-compile with `cargo zigbuild --target x86_64-unknown-linux-gnu.2.17` (user-level installs; build only, untested), WSL (can also run the GUI), or GitHub Actions. `Cargo.lock` has no GTK (the file dialog uses D-Bus via `zbus`), so a cross build is expected to link; not verified.
+6. **Trying Linux locally:** CI builds and tests Linux, but this Windows PC has no WSL, Docker or zig, so the Linux GUI is untried. WSL would also run it.
 7. **Copying multi-line messages (owner, 2026-10-19: action item, rethink later):** a decoded message's own line breaks and tabs show as spaces in the views and are kept only in the line window (Enter). Ctrl+C / Copy in the views copy the display text (formatting dropped); the line window's Copy message / Copy line keep it. The owner isn't fully happy with this, but neither single rule is good: always copying with the original formatting breaks the one-row-per-line, tab-separated paste (spreadsheets, grep), while always copying the display text loses stack traces and JSON. Revisit (e.g. a copy mode, or a second shortcut).
 
 ## Known limitations
@@ -127,13 +127,3 @@ Don't settle these silently: ask.
 - Only UTF-8/ASCII text is handled; invalid bytes are shown as U+FFFD.
 - The GUI binary is ~19 MB on Linux. The size on Windows hasn't been measured.
 - DLT: only files with storage headers; no FIBEX (non-verbose payloads stay hex); arrays/structs/fixed-point arguments shown as hex; time in UTC only; the message index is built single-threaded (~280 ms per GiB).
-
-## Appendix: files to recreate
-
-### `.vscode/extensions.json`
-
-```json
-{
-  "recommendations": ["rust-lang.rust-analyzer", "tamasfe.even-better-toml", "vadimcn.vscode-lldb"]
-}
-```
