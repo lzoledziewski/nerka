@@ -1,6 +1,6 @@
 # Sources & Signals — design
 
-_Status: agreed direction. Written 2026-10-17. Updated 2026-10-18: **DLT from `.dlt` files is implemented** (source-supplied fields, DSL field predicates, own reader, table view); everything else here is still design. Current state and DLT decisions: `status.md`._
+_Status: agreed direction. Written 2026-10-17. Implemented so far: **DLT from `.dlt` files** (2026-10-18: source-supplied fields, DSL field predicates, own reader, table view) and **DLT inside pcap / pcapng and MF4** (2026-10-20: own readers in `core/src/input/capture/`, no dependency). Signals, SOME/IP, the time model and the plugin crates are still design. Current state and decisions: `status.md`._
 
 ## Goal
 
@@ -91,12 +91,12 @@ All checked on crates.io on 2026-10-17. All MIT and/or Apache-2.0.
 | Purpose | Crate | Notes |
 |---|---|---|
 | DLT | ~~`dlt-core` 0.20~~, ~~`dlt_parse` 0.10~~ | **Not used**: own reader (owner, 2026-10-18). |
-| pcap/pcapng | `pcap-parser` 0.17 | |
-| Ethernet/IP/UDP | `etherparse` 0.21 | |
+| pcap/pcapng | ~~`pcap-parser` 0.17~~ | **Not used**: own reader (`capture/pcap.rs`, 2026-10-20). |
+| Ethernet/IP/UDP | ~~`etherparse` 0.21~~ | **Not used**: own parsing with fragment reassembly (`capture/net.rs`). |
 | SOME/IP headers | `someip_parse` 0.7 | Doesn't interpret payloads: that is `SignalDb`'s job. |
 | ARXML | `autosar-data` 0.23 | |
 | FIBEX | `roxmltree` 0.21 + own mapping | |
-| MF4 | **open**: `mdf4-rs` 0.6, `mf4-rs` 3.6, `falcon_mdf` 0.7, `mdflib` (C++ bindings), `mdfr` (GitHub only, license unchecked) | All are young. Evaluate them on real files, especially their support for bus-logging channels. |
+| MF4 | ~~`mdf4-rs`, `mf4-rs`, `falcon_mdf`, `mdflib`, `mdfr`~~ | **Not used**: own reader for bus-logging channels (`capture/mf4.rs`, 2026-10-20; compressed DZ blocks not yet). |
 | Signal plots (GUI) | `egui_plot` 0.37 | Matches the current egui version. |
 
 Each one must be justified in its PR (spec §3.1).
@@ -111,8 +111,8 @@ Each one must be justified in its PR (spec §3.1).
 
 1. Time model and source-supplied fields in `Event`, with DSL field predicates. Use plain-text timestamps as the first user. — **Fields and predicates done** (`LogSource::schema` / `field` / `supplied_level`, `Query::bind`); the `Timestamp` / clock model is **not** done (DLT exposes `tmsp` as a number, `time` is display-only).
 2. DLT from `.dlt` files, with the header-only index fast path. — **Done** in `core/src/input/dlt/` (index = message offsets; headers read in place).
-3. `nerka-pcap`: DLT over UDP.
+3. DLT over UDP in pcap / pcapng. — **Done** in `core/src/input/capture/` (not a separate crate yet).
 4. `SignalStore`, `egui_plot` panel, regex extractor in the DSL (the first signal producer, with no database needed).
 5. `SignalDb`: ARXML, then FIBEX. `nerka-someip` with subscriptions.
-6. `nerka-mf4` once a crate has been chosen. State machines in the DSL.
+6. MF4 bus-logging channels. — **Done** for Ethernet and DLT channels with an own reader. State machines in the DSL: open.
 7. Later: live capture, external plugin ABI.

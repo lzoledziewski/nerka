@@ -1,6 +1,6 @@
 # Search manager — design
 
-Agreed with the owner on 2026-10-18 after a brainstorm with mockups. Nothing is built yet; the POC scope is at the end.
+Agreed with the owner on 2026-10-18 after a brainstorm with mockups. The POC is built (core, CLI, GUI): see "POC status" at the end.
 
 ## Goal
 
@@ -81,8 +81,7 @@ query frame_drops(cam)  parent: cam_scope  labels: system/vision, perf  color: v
 - The parser checks the body's NFD syntax (with placeholder parameter values) and reports every error as `file:line:column: message`. Field names are checked only when a query runs on a source.
 - Parents are resolved at expansion time, so a child can refine a query from another pack. A missing parent is an expansion error, not a parse error (the parent's pack may simply not be loaded).
 
-Where packs are loaded from: `%APPDATA%
-erka\packs\` (Linux: `~/.config/nerka/packs/`), plus `--pack <dir|file>` on the CLI (a directory loads its `*.nerka-pack` files, not recursively, in name order). Pack names must be unique across everything loaded. Packs stored with a project are an open question.
+Where packs are loaded from: `%APPDATA%\nerka\packs\` (Linux: `~/.config/nerka/packs/`), plus `--pack <dir|file>` on the CLI (a directory loads its `*.nerka-pack` files, not recursively, in name order). Pack names must be unique across everything loaded. Packs stored with a project are an open question.
 
 ## Later (not in the POC)
 
@@ -130,7 +129,7 @@ GUI (step 5), as built (`ui/src/library.rs`, `ui/src/main.rs`):
 - **Line colours:** an included filter query can colour the whole lines it keeps (off by default; click its swatch in the selection or its chip under the Filter bar, filled = on). A later node wins where lines overlap. Core reuses `search_within` over the filter result for it; the hit masks are indexed in selection order, and the view takes the last one that matched. Startup: `--highlight ID`.
 - **Search box** under the Filter box: the same modes as the Filter box (Auto, Text with Regex, NFD; Ignore case; `search-modes.md`), Enter or Find runs it, Clear removes it. It looks only inside the filter result (the whole file without a filter) and runs again by itself when the filter result changes. Hits are listed in the bottom pane; clicking one moves the main view there. n / N jump between search hits.
 - **Grouped display:** while a box holds an expansion unchanged, its picked queries appear under it as **one row of name chips** (owner, 2026-10-19; NFD on hover); ▸ unfolds one line per picked query: how it joins (`OR`, `AND NOT`), a chip with the short name in the query's colour (qualified name on hover, or shown when two picks share a short name), and that query's NFD. Up to 8 lines; the full text stays in the box. Editing the text turns it into a plain query (no chips).
-- **Colours:** a search query's hits are highlighted in its pack colour (named colours or `#rrggbb`), otherwise in a palette colour by position; a typed search uses the first palette colour. Hit lines also get one thin stripe per matched query in the gutter, so queries without regex spans (`level >= ERROR`) show too. The filter's yellow stays; search colours win where they overlap.
+- **Colours:** a search query's hits are highlighted in its pack colour (named colours or `#rrggbb`), otherwise in a palette colour by position; a typed search uses the first palette colour. Hit lines also get one thin stripe per matched query in the gutter, so queries without regex spans (`level >= ERROR`) show too. A query that is in the selection uses its selection colour (`status.md`, "One colour per query").
 - **Command line** (also used for screenshots): `--pack <dir|file>`, `--pick ID`, `--exclude ID`, `--search-pick ID`, `--param NAME=VALUE`, `--library`.
 - Status line: hits and time, plus hits per query when there are several.
 
@@ -148,6 +147,5 @@ Choices made for the GUI (open questions below answered provisionally; confirm o
 ## Open questions
 
 - Packs stored with a project (next to the logs or in a repo), besides the app-data folder?
-- Search box: the same Text / Regex / Query modes as the filter box?
-- Colours: set in the pack, chosen in the UI, or both?
-- Parameter values: remembered per parameter name, per pack, or not at all?
+- Colours: set in the pack, chosen in the UI, or both? (Now: pack or editor colour, else a palette entry kept per selected query; no picker.)
+- Parameter values: remembered per parameter name, per pack, or not at all? (Now: per tab, and in presets.)
