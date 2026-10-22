@@ -274,3 +274,49 @@ fn params_needed_follow_parent_chains() {
     assert_eq!(lib.params_needed(["vision.cam_scope", "nope.x"]), ["ecu", "cam"]);
     assert!(lib.params_needed(["nav.slow"; 0]).is_empty());
 }
+
+/// Issue #2: a picked parent and child gave `(P) OR (P) AND (C)`.
+#[test]
+fn a_pick_covered_by_a_picked_ancestor_is_left_out() {
+    let lib = lib();
+    let p = params(&[("app", "NAV")]);
+    // The child after or before its parent, a grandchild, a label covering both.
+    for s in [sel(&["nav.all", "nav.slow"], &[]), sel(&["nav.big", "nav.all"], &[]), sel(&["@sys"], &[])] {
+        let e = expand(&s, &lib, &p).unwrap();
+        assert_eq!(e.nfd, r#"(apid == "NAV")"#, "{s:?}");
+        assert_eq!(e.parts.len(), 2);
+        let c = e.parts.iter().find(|p| p.covered.is_some()).unwrap();
+        assert_eq!(c.covered.as_deref(), Some("nav.all"));
+        // Its text is kept for colours and search hits.
+        assert!(e.part_nfd(c).starts_with(r#"(apid == "NAV") AND ("#), "{}", e.part_nfd(c));
+        let chain: Vec<&str> = c.chain.iter().map(|(_, r)| &e.aside[r.clone()]).collect();
+        assert_eq!(chain[0], r#"(apid == "NAV")"#);
+        assert_eq!(e.search_set().unwrap().include.len(), 2);
+    }
+    // The nearest picked ancestor covers it.
+    let e = expand(&sel(&["nav.big", "nav.slow", "nav.all"], &[]), &lib, &p).unwrap();
+    let cov: Vec<Option<&str>> = e.parts.iter().map(|p| p.covered.as_deref()).collect();
+    assert_eq!(cov, [Some("nav.slow"), Some("nav.all"), None]);
+
+    // Excludes likewise; the group parentheses count only what is shown.
+    let e = expand(
+        &sel(&["nav.errs", "txt.cam"], &["nav.slow", "nav.big"]),
+        &lib,
+        &params(&[("app", "NAV"), ("cam", "c")]),
+    )
+    .unwrap();
+    assert_eq!(
+        e.nfd,
+        r#"((apid == "NAV") AND (level >= ERROR OR /error/) OR (raw ~ /c frame drop/)) AND NOT ((apid == "NAV") AND (/slow/))"#
+    );
+    assert_eq!(e.parts[3].covered.as_deref(), Some("nav.slow"));
+    let e =
+        expand(&sel(&["nav.all", "nav.slow"], &["txt.cam"]), &lib, &params(&[("app", "NAV"), ("cam", "c")])).unwrap();
+    assert_eq!(e.nfd, r#"(apid == "NAV") AND NOT (raw ~ /c frame drop/)"#);
+    let e = expand(&sel(&[], &["nav.slow", "nav.big"]), &lib, &p).unwrap();
+    assert_eq!(e.nfd, r#"NOT ((apid == "NAV") AND (/slow/))"#);
+    assert_eq!(same_lines(&mem(), &e.nfd, "NOT (apid == NAV AND /slow/)"), [0, 2, 3, 4, 6]);
+    // A parent excluded doesn't cover its child included.
+    let e = expand(&sel(&["nav.slow"], &["nav.all"]), &lib, &p).unwrap();
+    assert!(e.parts.iter().all(|p| p.covered.is_none()));
+}

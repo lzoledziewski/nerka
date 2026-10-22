@@ -52,6 +52,7 @@ use nerka_core::{
     SearchHits, SearchResult, SearchSet, text_to_nfd,
 };
 use prefs::SearchPrefs;
+use std::borrow::Cow;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -1607,7 +1608,7 @@ struct ChipLine<'a> {
     name: &'a str,
     color: Color32,
     nfd: &'a str,
-    origin: &'a str,
+    origin: Cow<'a, str>,
     lit: Option<(u64, bool)>,
 }
 
@@ -1689,7 +1690,25 @@ fn expansion_lines<'a>(a: &'a Applied, lit: &dyn Fn(u64) -> bool) -> Vec<ChipLin
             if p.role == Role::Include {
                 includes += 1;
             }
-            let origin = if p.query.starts_with("_sel.") { "local query (not in a pack)" } else { p.query.as_str() };
+            let mut origin: Cow<'_, str> = if p.query.starts_with("_sel.") {
+                "local query (not in a pack)".into()
+            } else {
+                p.query.as_str().into()
+            };
+            // Issue #2: picked with an ancestor, it adds nothing to the box.
+            if let Some(by) = &p.covered {
+                let by = a
+                    .exp
+                    .parts
+                    .iter()
+                    .position(|q| q.query == *by && q.role == p.role)
+                    .map_or(by.as_str(), |j| &a.names[j]);
+                origin = format!(
+                    "{origin}
+In '{by}', which is picked too: not repeated in the box"
+                )
+                .into();
+            }
             ChipLine {
                 joiner,
                 name: &a.names[i],
@@ -1712,7 +1731,7 @@ fn term_lines(terms: &[Term]) -> Vec<ChipLine<'_>> {
             name: &t.name,
             color: t.color,
             nfd: &t.nfd,
-            origin: "search query",
+            origin: "search query".into(),
             lit: None,
         })
         .collect()
@@ -2581,6 +2600,26 @@ query timeouts  labels: vision
     /timeout/
 ";
 
+    /// Issue #2: a parent and its child picked together. The box holds the
+    /// parent once; the child keeps its chip, which says why.
+    #[test]
+    fn a_child_picked_with_its_parent_keeps_its_chip() {
+        let mut lib = Library::new();
+        lib.add(pack::parse_pack("vision.nerka-pack", PACK).unwrap()).unwrap();
+        let mut p = Picks::default();
+        p.add(&lib, "vision.errors", Use::Include, None);
+        p.add(&lib, "vision.cam", Use::Include, None);
+        p.params.insert("cam".into(), ("cam1".into(), false));
+        let a = p.expand(&lib).unwrap();
+        assert_eq!(a.exp.nfd, "(level >= ERROR)");
+        let lines = expansion_lines(&a, &|_| false);
+        let names: Vec<&str> = lines.iter().map(|l| l.name).collect();
+        assert_eq!(names, ["errors", "cam"]);
+        assert_eq!(lines[1].nfd, "(level >= ERROR) AND (raw ~ /cam1 /)");
+        assert!(lines[1].origin.contains("In 'errors', which is picked too"), "{}", lines[1].origin);
+        assert!(lines[1].lit.is_some(), "its lines can still be coloured");
+    }
+
     /// Poll the tab's jobs until none is running.
     fn settle(tab: &mut Tab, ctx: &egui::Context) {
         for _ in 0..500 {
@@ -2642,7 +2681,7 @@ query timeouts  labels: vision
                 name: "ssl",
                 color: Color32::RED,
                 nfd: "(/SSL/)",
-                origin: "demo.ssl",
+                origin: "demo.ssl".into(),
                 lit: Some((1, true)),
             },
             ChipLine {
@@ -2650,7 +2689,7 @@ query timeouts  labels: vision
                 name: "disk",
                 color: Color32::BLUE,
                 nfd: "(/disk/)",
-                origin: "demo.disk",
+                origin: "demo.disk".into(),
                 lit: Some((2, false)),
             },
             ChipLine {
@@ -2658,7 +2697,7 @@ query timeouts  labels: vision
                 name: "noise",
                 color: Color32::GRAY,
                 nfd: "(/nav/)",
-                origin: "demo.noise",
+                origin: "demo.noise".into(),
                 lit: None,
             },
         ];

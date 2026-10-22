@@ -343,7 +343,8 @@ fn run() -> Result<()> {
             if parts {
                 for p in &e.parts {
                     let role = if p.role == Role::Include { "include" } else { "exclude" };
-                    writeln!(out, "{role} {}: {}", p.query, e.part_nfd(p))?;
+                    let note = p.covered.as_ref().map(|by| format!(" (in {by}, not repeated)")).unwrap_or_default();
+                    writeln!(out, "{role} {}{note}: {}", p.query, e.part_nfd(p))?;
                 }
             }
         }
