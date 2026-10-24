@@ -451,7 +451,7 @@ impl SignalDef {
     }
 
     /// A signal whose value is argument `index` of the messages `query`
-    /// matches (e.g. `mid == 11 AND ecu == "TCB"`): a FIBEX-described
+    /// matches (e.g. `mid == 11 AND ecu == "ECU1"`): a FIBEX-described
     /// message's argument, no regex. `from` says where it comes from (for
     /// a UI).
     pub fn argument(

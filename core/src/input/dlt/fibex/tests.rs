@@ -1,6 +1,6 @@
 use super::*;
 
-/// Written for these tests in the convention of the COVESA examples: one
+/// Written for these tests in the common convention: one
 /// ECU, codings and signals for most arguments, conventional names for the
 /// rest, text with entities.
 const NAV: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
@@ -136,8 +136,7 @@ fn malformed_documents_say_where() {
     assert!(e.to_string().starts_with("bad.xml: ill-formed document: expected `</fx:FRAME>`"), "{e}");
     let e = f.add("ent.xml", "<a>&nope;</a>").unwrap_err();
     assert!(e.to_string().contains("unknown entity '&nope;'"), "{e}");
-    // Empty texts and codings nothing refers to are fine (as in dlt-core's
-    // robustness test).
+    // Empty texts and codings nothing refers to are fine.
     f.add("ok.xml", "<fx:FIBEX><fx:ELEMENTS><fx:PDUS><fx:PDU ID=\"a\"><ho:DESC></ho:DESC></fx:PDU></fx:PDUS></fx:ELEMENTS></fx:FIBEX>")
         .unwrap();
     assert!(f.is_empty());
@@ -151,8 +150,8 @@ fn half_floats() {
     assert!(half(0x7c00).is_infinite());
 }
 
-/// The open examples (COVESA dlt-daemon / dlt-viewer, esrlabs dlt-core),
-/// downloaded into `NERKA_FIBEX_REF`: they all load, and describe messages.
+/// Reference FIBEX files (not in the repo) in a folder named by
+/// `NERKA_FIBEX_REF`: they all load, and describe messages.
 #[test]
 #[ignore = "needs NERKA_FIBEX_REF, a folder of reference FIBEX files"]
 fn reference_files_load() {
@@ -238,8 +237,8 @@ fn arguments_as_values_and_names() {
     let n: Vec<String> = two.arguments().iter().filter(|a| a.label == "speed").map(|a| a.name.clone()).collect();
     // Both are message 10, of two ECUs: the ECU tells them apart.
     assert_eq!(n, ["gw_speed_m10_0", "nav1_speed_m10_0"]);
-    assert_eq!(snake("Free size:"), "free_size");
-    assert_eq!(last_phrase("Buffer near limit. Free size: "), "Free size");
+    assert_eq!(snake("Free slots:"), "free_slots");
+    assert_eq!(last_phrase("Queue almost full. Free slots: "), "Free slots");
     assert_eq!(last_phrase("a, b; temp ="), "temp");
     assert_eq!(last_phrase("."), "");
     assert_eq!(snake("3 phases"), "_3_phases");

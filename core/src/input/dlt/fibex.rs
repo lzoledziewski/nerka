@@ -2,7 +2,7 @@
 //! non-verbose payload (message id + raw argument bytes) into text, and
 //! supplies the APID, CTID, type and level such a message doesn't carry.
 //!
-//! The convention (COVESA dlt-daemon / dlt-viewer examples, FIBEX 3.x):
+//! The common convention for DLT non-verbose messages (FIBEX 3.x):
 //!
 //! ```text
 //! FRAME ID="ID_<message id>"                  one message
@@ -114,7 +114,7 @@ impl Frame {
     }
 
     /// The message as a template: its texts, and each argument as its
-    /// type (`Free size: <u16>`).
+    /// type (`Free slots: <u16>`).
     pub fn template(&self) -> String {
         let mut out = String::new();
         for p in &self.pieces {
@@ -346,7 +346,7 @@ impl Fibex {
         let mut out: Vec<Argument> = Vec::new();
         for (mid, f) in frames {
             // The text before an argument, else the label of the one before
-            // it (`Temperature measurement <u8> <f32>`: both are about it).
+            // it (`Oil pressure reading <u8> <f32>`: both are about it).
             let (mut label, mut last) = (String::new(), String::new());
             let mut index = 0;
             for p in &f.pieces {
@@ -376,8 +376,8 @@ impl Fibex {
                 }
             }
         }
-        // Names from the text before the argument (`Free size:` ->
-        // `free_size`), else from the message; made unique.
+        // Names from the text before the argument (`Free slots:` ->
+        // `free_slots`), else from the message; made unique.
         let base: Vec<String> = out
             .iter()
             .map(|a| match snake(&a.label) {
@@ -443,9 +443,9 @@ pub struct Argument {
     pub ctid: Option<String>,
     /// Its place among the message's arguments.
     pub index: usize,
-    /// The text before it in the message (`Free size`).
+    /// The text before it in the message (`Free slots`).
     pub label: String,
-    /// A signal name, unique among all arguments (`free_size`).
+    /// A signal name, unique among all arguments (`free_slots`).
     pub name: String,
     pub ty: ArgType,
     /// The whole message as a template ([`Frame::template`]).
@@ -453,13 +453,13 @@ pub struct Argument {
 }
 
 /// The text that names an argument: the last phrase before it, without a
-/// final `:` / `=` (`Buffer near limit. Free size:` -> `Free size`).
+/// final `:` / `=` (`Queue almost full. Free slots:` -> `Free slots`).
 fn last_phrase(text: &str) -> String {
     let t = text.trim().trim_end_matches([':', '=']).trim();
     t.rsplit(['.', ';', ',']).find(|p| !p.trim().is_empty()).unwrap_or("").trim().to_owned()
 }
 
-/// `Free size` -> `free_size`; empty if nothing of it is a name.
+/// `Free slots` -> `free_slots`; empty if nothing of it is a name.
 fn snake(label: &str) -> String {
     let mut out = String::new();
     for c in label.chars() {

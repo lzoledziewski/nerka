@@ -3184,27 +3184,27 @@ query timeouts  labels: vision
             let m = Msg {
                 ext: None,
                 payload: Payload::NonVerbose { id: 11, data: size.to_le_bytes().to_vec() },
-                ..Msg::log(nerka_core::Level::Info, "TCB", "", "", vec![])
+                ..Msg::log(nerka_core::Level::Info, "ECU1", "", "", vec![])
             };
             m.encode(&mut buf);
         }
         std::fs::write(&dlt, &buf).unwrap();
         std::fs::write(
             &xml,
-            r#"<fx:FIBEX xmlns:fx="f" xmlns:ho="h"><fx:ELEMENTS><fx:ECUS><fx:ECU ID="TCB"/></fx:ECUS><fx:PDUS>
-              <fx:PDU ID="t"><ho:DESC>Buffer near limit. Free size:</ho:DESC></fx:PDU>
+            r#"<fx:FIBEX xmlns:fx="f" xmlns:ho="h"><fx:ELEMENTS><fx:ECUS><fx:ECU ID="ECU1"/></fx:ECUS><fx:PDUS>
+              <fx:PDU ID="t"><ho:DESC>Queue almost full. Free slots:</ho:DESC></fx:PDU>
               <fx:PDU ID="v"><fx:SIGNAL-INSTANCES><fx:SIGNAL-INSTANCE ID="s"><fx:SEQUENCE-NUMBER>0</fx:SEQUENCE-NUMBER>
                 <fx:SIGNAL-REF ID-REF="S_UINT16"/></fx:SIGNAL-INSTANCE></fx:SIGNAL-INSTANCES></fx:PDU>
             </fx:PDUS><fx:FRAMES><fx:FRAME ID="ID_11"><fx:PDU-INSTANCES>
               <fx:PDU-INSTANCE ID="1"><fx:PDU-REF ID-REF="t"/><fx:SEQUENCE-NUMBER>0</fx:SEQUENCE-NUMBER></fx:PDU-INSTANCE>
               <fx:PDU-INSTANCE ID="2"><fx:PDU-REF ID-REF="v"/><fx:SEQUENCE-NUMBER>1</fx:SEQUENCE-NUMBER></fx:PDU-INSTANCE>
-            </fx:PDU-INSTANCES><fx:MANUFACTURER-EXTENSION><APPLICATION_ID>APP1</APPLICATION_ID></fx:MANUFACTURER-EXTENSION>
+            </fx:PDU-INSTANCES><fx:MANUFACTURER-EXTENSION><APPLICATION_ID>QUE</APPLICATION_ID></fx:MANUFACTURER-EXTENSION>
             </fx:FRAME></fx:FRAMES></fx:ELEMENTS></fx:FIBEX>"#,
         )
         .unwrap();
         let fibex = Arc::new(nerka_core::Fibex::load(&[&xml]).unwrap());
         let args = fibex.arguments();
-        assert_eq!(args.iter().map(|a| a.name.as_str()).collect::<Vec<_>>(), ["free_size"]);
+        assert_eq!(args.iter().map(|a| a.name.as_str()).collect::<Vec<_>>(), ["free_slots"]);
         let ctx = egui::Context::default();
         let mut tab = Tab::open_many(&ctx, vec![dlt], &SearchPrefs::default(), Some(fibex));
         settle(&mut tab, &ctx);
@@ -3212,10 +3212,10 @@ query timeouts  labels: vision
         tab.choices_gen += 1;
         tab.refresh_signals(&ctx, &Library::new(), &Signals::default(), 0);
         settle(&mut tab, &ctx);
-        let d = tab.signals.get("free_size").expect("a signal");
+        let d = tab.signals.get("free_slots").expect("a signal");
         assert_eq!((d.kind(), d.argument_index()), (SignalKind::Num, Some(0)));
         tab.mode = Mode::Query;
-        tab.pattern = "@free_size < 100".into();
+        tab.pattern = "@free_slots < 100".into();
         tab.start_search(&ctx);
         settle(&mut tab, &ctx);
         assert_eq!(tab.result.as_ref().unwrap().lines, [1, 3]);

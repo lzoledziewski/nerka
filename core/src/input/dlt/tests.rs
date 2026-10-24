@@ -362,7 +362,7 @@ fn receive_time_is_the_built_in_time_signal() {
     assert!(matches!(crate::Clock::of(&f, &sig), crate::Clock::Source));
 }
 
-/// A small FIBEX in the COVESA convention: message 10 is a warning from
+/// A small FIBEX in the common convention: message 10 is a warning from
 /// NAV/SPD, "speed: <u16> km/h".
 const SPEED_FIBEX: &str = r#"<fx:FIBEX xmlns:fx="http://www.asam.net/xml/fbx" xmlns:ho="http://www.asam.net/xml">
   <fx:ELEMENTS>
