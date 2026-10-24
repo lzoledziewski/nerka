@@ -45,7 +45,10 @@ Owner feedback is driving this; these are deliberate choices, keep them:
 2. GUI: single instance, move a tab to a new window, named windows and several files in one view (concatenated) are done (2026-10-20). Parked: merging files by time ("time" across files must be defined first) and backsync from the box text into the selection (needs a more interactive design).
 3. Owner tries the DLT table on real use; settle the open DLT questions below.
 4. **Search manager** POC: all five steps are built; the owner tries it and answers the GUI choices 7–12 in `search-manager.md` → "POC status".
-5. Releases: `v0.1.0-alpha.1` (2026-10-18), `v0.1.0-alpha.2` (2026-10-20: Auto / Text / NFD modes, presets, line colours following the selection, chip row, long-line window, search history), `v0.1.0-alpha.3` (2026-10-20) and `v0.1.0-alpha.4` (2026-10-24: issues #2 and #16, one stable colour per selected query, refreshed README; the first release built in the new repo) are tagged.
+5. **Queued by the owner (2026-10-25), for the next session:**
+   - *Bookmarks by name:* the id shown for a bookmark is its line number, which is off (e.g. in the plot's tags and the cursor summary). Let bookmarks be renamed, and show them by name.
+   - *Screenshots to the clipboard:* a way to take a screenshot (of the window / plot) straight to the clipboard.
+6. Releases: `v0.1.0-alpha.1` (2026-10-18), `v0.1.0-alpha.2` (2026-10-20: Auto / Text / NFD modes, presets, line colours following the selection, chip row, long-line window, search history), `v0.1.0-alpha.3` (2026-10-20) and `v0.1.0-alpha.4` (2026-10-24: issues #2 and #16, one stable colour per selected query, refreshed README; the first release built in the new repo) are tagged.
 
 Text-log benchmark on Windows (1 GiB, 12M lines, release): index ~90 ms, `search ERROR` ~30 ms, `level >= ERROR` ~31 ms, `level >= WARN AND raw ~ /timeout/` ~30 ms, `search -v ERROR` ~100 ms.
 
