@@ -7,7 +7,9 @@
 //! and its markers (horizontal lines at chosen values: limits, thresholds).
 //! Time cursors (owner: like a logic analyzer) are vertical lines placed
 //! with a right-click in the plot and dragged; the time between neighbours
-//! is shown (Δt).
+//! is shown (Δt). Bookmarks are cursors too (owner): a line at their line's
+//! time with their note, measured like the others; the plot's right-click
+//! menu bookmarks the nearest event's line with a note.
 //! The plot can move to a window of its own and back.
 //!
 //! Drawn with egui's painter (no plot crate): lanes are decimated to one
@@ -51,6 +53,7 @@ pub struct WindowInput {
     pub file: Arc<dyn LogSource>,
     pub cursor: LineNo,
     pub kept: Option<Arc<nerka_core::SearchResult>>,
+    pub bookmarks: Vec<(LineNo, String)>,
 }
 
 /// Paint the plot's own window (the deferred viewport's callback).
@@ -67,14 +70,16 @@ pub fn window_ui(ui: &mut egui::Ui, shared: &Mutex<Detached>) {
         kept: i.kept.as_ref().map_or(0, |r| Arc::as_ptr(r) as usize),
         series_of: &mut series_of,
         in_window: true,
+        bookmarks: &i.bookmarks,
     };
     let mut plot = lock(&i.plot);
     let o = egui::CentralPanel::default().show(ui, |ui| plot_panel(ui, &mut plot, src)).inner;
     drop(plot);
     out.goto = o.goto.or(out.goto);
     out.toggle_window |= o.toggle_window;
+    out.bookmark = o.bookmark.or(out.bookmark.take());
     *closed |= ui.input(|i| i.viewport().close_requested());
-    if out.goto.is_some() || out.toggle_window || *closed {
+    if out.goto.is_some() || out.toggle_window || out.bookmark.is_some() || *closed {
         ui.ctx().request_repaint_of(egui::ViewportId::ROOT);
     }
 }
@@ -108,6 +113,12 @@ pub struct PlotState {
     /// The cursor being dragged, and where the context menu was opened.
     drag_cursor: Option<usize>,
     menu_x: Option<f64>,
+    /// The event nearest to where the menu was opened: its line and lane.
+    menu_row: Option<(LineNo, String)>,
+    /// The note typed in the menu for a new bookmark.
+    bookmark_note: String,
+    /// Bookmarks aren't drawn.
+    pub hide_bookmarks: bool,
     /// Lanes, built for (signals generation, the filter result).
     data: Option<((u64, usize), PlotData)>,
 }
@@ -174,6 +185,8 @@ pub struct Output {
     pub goto: Option<LineNo>,
     /// Move the plot to its own window, or back.
     pub toggle_window: bool,
+    /// Bookmark this line with this note (added, or its note replaced).
+    pub bookmark: Option<(LineNo, String)>,
 }
 
 const GUTTER: f32 = 120.0;
@@ -255,10 +268,12 @@ pub struct Source<'a> {
     pub series_of: &'a mut dyn FnMut(&SignalDef) -> Option<Arc<SignalSeries>>,
     /// Drawn in a window of its own.
     pub in_window: bool,
+    /// The tab's bookmarks: line and note.
+    pub bookmarks: &'a [(LineNo, String)],
 }
 
 pub fn plot_panel(ui: &mut egui::Ui, state: &mut PlotState, src: Source<'_>) -> Output {
-    let Source { signals, generation, file, cursor, kept, series_of, in_window } = src;
+    let Source { signals, generation, file, cursor, kept, series_of, in_window, bookmarks } = src;
     let mut out = Output::default();
     ui.horizontal(|ui| {
         let label = if in_window { "⧉ Back into the main window" } else { "⧉ Own window" };
@@ -267,6 +282,10 @@ pub fn plot_panel(ui: &mut egui::Ui, state: &mut PlotState, src: Source<'_>) -> 
             "The file's own time, else the first signal of kind time that has events, else line numbers",
         );
         // The help is a hover, so the row never gets wider than the panel.
+        let mut show = !state.hide_bookmarks;
+        if ui.checkbox(&mut show, "🔖").on_hover_text("Show the bookmarks (with their notes) as cursors").changed() {
+            state.hide_bookmarks = !show;
+        }
         ui.weak("ℹ").on_hover_text(
             "Wheel: zoom. Drag: pan (drag a time cursor to move it). Double-click: everything. Click: go to the \
              nearest event. Right-click: place or remove time cursors (Δt between them). Right-click a lane's \
@@ -274,8 +293,27 @@ pub fn plot_panel(ui: &mut egui::Ui, state: &mut PlotState, src: Source<'_>) -> 
         );
     });
     let clock = Clock::of(file, signals);
-    if !state.cursors.is_empty() {
-        ui.horizontal_wrapped(|ui| ui.monospace(cursor_summary(&state.cursors, clock.is_time())));
+    let clock_series = match &clock {
+        Clock::Signal(d) => d.cached_series(file),
+        _ => None,
+    };
+    // Bookmarks as cursors: their line's x, name and note.
+    let marks: Vec<BookmarkCursor> = if state.hide_bookmarks {
+        Vec::new()
+    } else {
+        bookmarks
+            .iter()
+            .filter_map(|(line, note)| {
+                Some(BookmarkCursor {
+                    line: *line,
+                    note: note.clone(),
+                    x: clock.at(file, clock_series.as_ref(), *line)?,
+                })
+            })
+            .collect()
+    };
+    if !state.cursors.is_empty() || !marks.is_empty() {
+        ui.horizontal_wrapped(|ui| ui.monospace(cursor_summary(&state.cursors, &marks, clock.is_time())));
     }
     let key = (generation, kept);
     if state.data.as_ref().is_none_or(|(k, _)| *k != key) {
@@ -338,10 +376,35 @@ pub fn plot_panel(ui: &mut egui::Ui, state: &mut PlotState, src: Source<'_>) -> 
     if response.secondary_clicked()
         && let Some(p) = response.interact_pointer_pos()
     {
-        state.menu_x = Some(x0 + (p.x - plot.min.x).clamp(0.0, plot.width()) as f64 / w * (x1 - x0));
+        let mx = x0 + (p.x - plot.min.x).clamp(0.0, plot.width()) as f64 / w * (x1 - x0);
+        state.menu_x = Some(mx);
+        // The event nearest to it in any lane: what a bookmark goes on.
+        state.menu_row = data
+            .lanes
+            .iter()
+            .filter_map(|l| {
+                let j = l.xs.partition_point(|&v| v < mx);
+                let near = [j.checked_sub(1), (j < l.xs.len()).then_some(j)]
+                    .into_iter()
+                    .flatten()
+                    .min_by(|&a, &b| (l.xs[a] - mx).abs().total_cmp(&(l.xs[b] - mx).abs()))?;
+                Some(((l.xs[near] - mx).abs(), l.rows[near], l.name.clone()))
+            })
+            .min_by(|a, b| a.0.total_cmp(&b.0))
+            .map(|(_, row, lane)| (row, lane));
+        state.bookmark_note = state
+            .menu_row
+            .as_ref()
+            .and_then(|(row, _)| bookmarks.iter().find(|(l, _)| l == row))
+            .map(|(_, n)| n.clone())
+            .unwrap_or_default();
     }
-    let menu_x = state.menu_x;
-    response.context_menu(|ui| cursor_menu(ui, &mut state.cursors, menu_x));
+    let (menu_x, menu_row) = (state.menu_x, state.menu_row.clone());
+    let mut bookmark = None;
+    response.context_menu(|ui| {
+        bookmark = cursor_menu(ui, &mut state.cursors, menu_x, menu_row, &mut state.bookmark_note);
+    });
+    out.bookmark = bookmark;
     if let Some(p) = response.hover_pos().filter(|_| response.hovered()) {
         let notches = ui.input_mut(|i| {
             i.smooth_scroll_delta = egui::Vec2::ZERO;
@@ -487,11 +550,13 @@ pub fn plot_panel(ui: &mut egui::Ui, state: &mut PlotState, src: Source<'_>) -> 
         t += step;
     }
 
-    // ----- time cursors: lines, names, and Δt between neighbours -----
+    // ----- time cursors and bookmarks: lines, names, Δt between neighbours -----
     let amber = Color32::from_rgb(230, 150, 20);
-    let mut placed: Vec<(usize, f64)> = state.cursors.iter().copied().enumerate().collect();
+    let red = Color32::from_rgb(220, 60, 60);
+    let mut placed: Vec<(String, f64)> = state.cursors.iter().enumerate().map(|(i, &c)| (cursor_name(i), c)).collect();
+    placed.extend(marks.iter().map(|m| (m.name(), m.x)));
     placed.sort_by(|a, b| a.1.total_cmp(&b.1));
-    for &(i, c) in &placed {
+    for (i, &c) in state.cursors.iter().enumerate() {
         if !(x0..=x1).contains(&c) {
             continue;
         }
@@ -506,8 +571,29 @@ pub fn plot_panel(ui: &mut egui::Ui, state: &mut PlotState, src: Source<'_>) -> 
         painter.rect_filled(tag, 2.0, amber);
         painter.text(tag.center(), Align2::CENTER_CENTER, cursor_name(i), font.clone(), Color32::BLACK);
     }
+    for m in marks.iter().filter(|m| (x0..=x1).contains(&m.x)) {
+        let px = to_px(m.x, x0, x1);
+        painter.line_segment([pos2(px, plot.min.y), pos2(px, axis_y)], Stroke::new(1.5, red));
+        // The note (shortened) on a tag at the bottom; hover: all of it,
+        // click: go to the line.
+        let label = match m.note.char_indices().nth(18) {
+            Some((i, _)) => format!("🔖 {}…", &m.note[..i]),
+            None if m.note.is_empty() => format!("🔖 {}", m.line + 1),
+            None => format!("🔖 {}", m.note),
+        };
+        let galley = painter.layout_no_wrap(label, font.clone(), Color32::WHITE);
+        let tag = Rect::from_min_size(pos2(px + 1.0, axis_y - galley.size().y - 3.0), galley.size()).expand(1.5);
+        painter.rect_filled(tag, 2.0, red);
+        painter.galley(tag.min + vec2(1.5, 1.5), galley, Color32::WHITE);
+        let r = ui.interact(tag, ui.scope_id().with(("bookmark", m.line)), Sense::click());
+        let tip =
+            if m.note.is_empty() { format!("Line {}", m.line + 1) } else { format!("Line {}: {}", m.line + 1, m.note) };
+        if r.on_hover_text(format!("{tip}\nClick: go to the line")).clicked() {
+            out.goto = Some(m.line);
+        }
+    }
     for pair in placed.windows(2) {
-        let ((i, a), (j, b)) = (pair[0], pair[1]);
+        let ((ni, a), (nj, b)) = ((&pair[0].0, pair[0].1), (&pair[1].0, pair[1].1));
         let (pa, pb) = (to_px(a, x0, x1).max(plot.min.x), to_px(b, x0, x1).min(plot.max.x));
         if pb <= pa {
             continue;
@@ -517,7 +603,7 @@ pub fn plot_panel(ui: &mut egui::Ui, state: &mut PlotState, src: Source<'_>) -> 
         painter.line_segment([pos2(pa, y), pos2(pb, y)], stroke);
         painter.line_segment([pos2(pa, y - 4.0), pos2(pa, y + 4.0)], stroke);
         painter.line_segment([pos2(pb, y - 4.0), pos2(pb, y + 4.0)], stroke);
-        let text = format!("{}→{} {}", cursor_name(i), cursor_name(j), duration(b - a, data.is_time));
+        let text = format!("{ni}→{nj} {}", duration(b - a, data.is_time));
         let galley = painter.layout_no_wrap(text, font.clone(), amber);
         let at = pos2((pa + pb) / 2.0 - galley.size().x / 2.0, y - galley.size().y - 2.0);
         painter.rect_filled(Rect::from_min_size(at, galley.size()).expand(2.0), 2.0, ui.visuals().panel_fill);
@@ -525,10 +611,6 @@ pub fn plot_panel(ui: &mut egui::Ui, state: &mut PlotState, src: Source<'_>) -> 
     }
 
     // ----- cursor -----
-    let clock_series = match &clock {
-        Clock::Signal(d) => d.cached_series(file),
-        _ => None,
-    };
     if let Some(cx) = clock.at(file, clock_series.as_ref(), cursor).filter(|x| (x0..=x1).contains(x)) {
         let px = to_px(cx, x0, x1);
         painter.line_segment([pos2(px, plot.min.y), pos2(px, axis_y)], Stroke::new(1.5, text_color));
@@ -597,23 +679,57 @@ fn duration(dt: f64, is_time: bool) -> String {
 }
 
 /// The header line: each cursor's place, and Δt between neighbours.
-fn cursor_summary(cursors: &[f64], is_time: bool) -> String {
+fn cursor_summary(cursors: &[f64], marks: &[BookmarkCursor], is_time: bool) -> String {
     let at = |x: f64| if is_time { format_time(x, 6) } else { format!("line {}", x.round() as i64 + 1) };
     let mut parts: Vec<String> =
         cursors.iter().enumerate().map(|(i, &c)| format!("{} {}", cursor_name(i), at(c))).collect();
-    let mut placed: Vec<(usize, f64)> = cursors.iter().copied().enumerate().collect();
+    parts.extend(marks.iter().map(|m| format!("{} {}", m.name(), at(m.x))));
+    let mut placed: Vec<(String, f64)> = cursors.iter().enumerate().map(|(i, &c)| (cursor_name(i), c)).collect();
+    placed.extend(marks.iter().map(|m| (m.name(), m.x)));
     placed.sort_by(|a, b| a.1.total_cmp(&b.1));
     for pair in placed.windows(2) {
-        let ((i, a), (j, b)) = (pair[0], pair[1]);
-        parts.push(format!("Δ {}→{} {}", cursor_name(i), cursor_name(j), duration(b - a, is_time)));
+        parts.push(format!("Δ {}→{} {}", pair[0].0, pair[1].0, duration(pair[1].1 - pair[0].1, is_time)));
     }
     parts.join("   ")
 }
 
-/// The plot's right-click menu: time cursors (`x`: where it was opened).
-fn cursor_menu(ui: &mut egui::Ui, cursors: &mut Vec<f64>, x: Option<f64>) {
+/// A bookmark drawn as a cursor.
+struct BookmarkCursor {
+    line: LineNo,
+    note: String,
+    x: f64,
+}
+
+impl BookmarkCursor {
+    /// Its name in Δt and the summary: 🔖 and its line number.
+    fn name(&self) -> String {
+        format!("🔖{}", self.line + 1)
+    }
+}
+
+/// The plot's right-click menu: time cursors (`x`: where it was opened),
+/// and a bookmark (with `note`) on `row`, the nearest event's line (in
+/// that lane). Returns the bookmark to set.
+fn cursor_menu(
+    ui: &mut egui::Ui,
+    cursors: &mut Vec<f64>,
+    x: Option<f64>,
+    row: Option<(LineNo, String)>,
+    note: &mut String,
+) -> Option<(LineNo, String)> {
+    let mut bookmark = None;
+    if let Some((line, lane)) = row {
+        ui.label(egui::RichText::new("Bookmark").strong());
+        ui.add(egui::TextEdit::singleline(note).hint_text("note").desired_width(200.0));
+        let r = ui.button(format!("🔖 Bookmark line {}", line + 1));
+        if r.on_hover_text(format!("The event of @{lane} nearest to where you clicked")).clicked() {
+            bookmark = Some((line, note.trim().to_owned()));
+            ui.close();
+        }
+        ui.separator();
+    }
     ui.label(egui::RichText::new("Time cursors").strong());
-    let Some(x) = x else { return };
+    let Some(x) = x else { return bookmark };
     if ui.button(format!("Place cursor {} here", cursor_name(cursors.len()))).clicked() {
         cursors.push(x);
         ui.close();
@@ -629,6 +745,7 @@ fn cursor_menu(ui: &mut egui::Ui, cursors: &mut Vec<f64>, x: Option<f64>) {
         cursors.clear();
         ui.close();
     }
+    bookmark
 }
 
 /// The y-axis menu of a number lane; `all` is the range of all its values.
@@ -856,6 +973,7 @@ mod tests {
                     kept: 0,
                     series_of: &mut series_of,
                     in_window: false,
+                    bookmarks: &[],
                 };
                 out = plot_panel(ui, st, src);
             });
@@ -997,9 +1115,12 @@ mod tests {
         assert_eq!((cursor_name(0), cursor_name(25), cursor_name(26)), ("A".into(), "Z".into(), "C27".into()));
         // In placing order; Δ between neighbours in time.
         assert_eq!(
-            cursor_summary(&[10.0, 4.0, 12.5], false),
+            cursor_summary(&[10.0, 4.0, 12.5], &[], false),
             "A line 11   B line 5   C line 14   Δ B→A 6 lines   Δ A→C 3 lines"
         );
+        // Bookmarks are cursors too.
+        let m = BookmarkCursor { line: 7, note: "boot".into(), x: 7.0 };
+        assert_eq!(cursor_summary(&[10.0], &[m], false), "A line 11   🔖8 line 8   Δ 🔖8→A 3 lines");
     }
 
     #[test]

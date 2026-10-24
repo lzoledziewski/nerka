@@ -1464,6 +1464,16 @@ impl Tab {
         self.save_bookmarks();
     }
 
+    /// Bookmark `line` with `note` (a bookmark already there gets the note).
+    fn set_bookmark(&mut self, line: LineNo, note: String) {
+        if !self.bookmarks.contains(line) {
+            self.bookmarks.toggle(line);
+        }
+        self.bookmarks.set_note(line, note);
+        self.status = format!("Bookmark on line {}", line + 1);
+        self.save_bookmarks();
+    }
+
     /// Each file keeps its own sidecar; a view of several maps lines.
     fn load_bookmarks(&self) -> std::io::Result<Bookmarks> {
         if self.paths.len() == 1 {
@@ -3008,8 +3018,12 @@ impl App {
                     file: file.clone(),
                     cursor: line,
                     kept: tab.result.clone(),
+                    bookmarks: tab.bookmarks.iter().map(|(l, n)| (l, n.to_owned())).collect(),
                 });
                 let out = std::mem::take(&mut d.out);
+                if let Some((l, note)) = out.bookmark {
+                    tab.set_bookmark(l, note);
+                }
                 (out.goto, out.toggle_window, std::mem::take(&mut d.closed))
             };
             let shared = self.plot_win.clone();
@@ -3032,6 +3046,7 @@ impl App {
             let kept = tab.result.clone();
             let (views, generation) = (&mut tab.views, tab.signals_gen);
             let mut series_of = |d: &nerka_core::SignalDef| views.series(d, &*file, kept.as_ref(), generation);
+            let marks: Vec<(LineNo, String)> = tab.bookmarks.iter().map(|(l, n)| (l, n.to_owned())).collect();
             let src = plot::Source {
                 signals: &tab.signals,
                 generation,
@@ -3040,6 +3055,7 @@ impl App {
                 kept: kept.as_ref().map_or(0, |r| Arc::as_ptr(r) as usize),
                 series_of: &mut series_of,
                 in_window,
+                bookmarks: &marks,
             };
             let shared = tab.plot.clone();
             let out = egui::Panel::bottom("plot")
@@ -3050,6 +3066,9 @@ impl App {
                 .inner;
             if out.toggle_window {
                 self.plot_window = !self.plot_window;
+            }
+            if let Some((l, note)) = out.bookmark {
+                tab.set_bookmark(l, note);
             }
             if let Some(line) = out.goto {
                 tab.goto_line(line);
