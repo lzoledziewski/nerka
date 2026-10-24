@@ -868,13 +868,32 @@ pub enum Clock {
 impl Clock {
     /// The source's own time if it has one, else the tab's first `time`
     /// signal, else line numbers.
+    ///
+    /// A `time` signal known to have no events in `source` (its events are
+    /// collected and there are none: its regex doesn't fit the file) is
+    /// skipped, so it can't leave every line without a time.
     pub fn of(source: &dyn LogSource, signals: &Signals) -> Clock {
         if source.line_count() > 0 && source.time(0).is_some() {
             return Clock::Source;
         }
-        match signals.iter().find(|d| d.kind() == SignalKind::Time && !d.is_from_source()) {
+        let usable = |d: &&Arc<SignalDef>| {
+            d.kind() == SignalKind::Time
+                && !d.is_from_source()
+                && !d.cached_series(source).is_some_and(|s| s.is_empty())
+        };
+        match signals.iter().find(usable) {
             Some(d) => Clock::Signal(d.clone()),
             None => Clock::Lines,
+        }
+    }
+
+    /// What the lines are timed by, for a UI: "@t", "the file's time" or
+    /// "line numbers".
+    pub fn describe(&self) -> String {
+        match self {
+            Clock::Source => "the file's time".into(),
+            Clock::Signal(d) => format!("@{}", d.name()),
+            Clock::Lines => "line numbers".into(),
         }
     }
 

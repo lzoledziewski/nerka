@@ -598,6 +598,15 @@ last
         assert!(matches!(&clock, crate::Clock::Signal(d) if d.name() == "t"));
         assert_eq!(clock.at(&text, Some(&series), 4), Some(86_401.0));
         assert!(matches!(crate::Clock::of(&text, &crate::Signals::default()), crate::Clock::Lines));
+        // A time signal without events (its regex doesn't fit) isn't the clock.
+        let mut both = signals(&[r"bad:time=/^\[(?<bad>[^\]]+)\]/"]);
+        both.set(sig.get("t").unwrap().as_ref().clone());
+        assert!(
+            matches!(crate::Clock::of(&text, &both), crate::Clock::Signal(d) if d.name() == "bad"),
+            "not known yet"
+        );
+        both.get("bad").unwrap().series(&text, &Progress::new()).unwrap();
+        assert!(matches!(crate::Clock::of(&text, &both), crate::Clock::Signal(d) if d.name() == "t"));
     }
 
     #[test]

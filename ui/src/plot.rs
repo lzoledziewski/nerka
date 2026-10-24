@@ -12,7 +12,68 @@
 use eframe::egui::{self, Align2, Color32, FontId, Pos2, Rect, Sense, Stroke, pos2, vec2};
 use nerka_core::{Clock, LineNo, LogSource, SignalDef, SignalKind, SignalSeries, Signals, ValueRef, time::format_time};
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard};
+
+/// A tab's plot state, shared with the plot's own window (which paints in a
+/// pass of its own).
+pub type SharedPlot = Arc<Mutex<PlotState>>;
+
+/// The plot state, also after a panic while it was held.
+pub fn lock(p: &SharedPlot) -> MutexGuard<'_, PlotState> {
+    p.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// What the plot's own window draws, set by the main window every frame,
+/// and what it asks back (read by the main window's next frame).
+///
+/// The window is a *deferred* egui viewport: it paints in its own pass.
+/// An immediate one (painted inside the main window's frame, switching the
+/// shared OpenGL context back and forth) crashed NVIDIA's OpenGL driver
+/// when it was maximized (owner, 2026-10-24).
+#[derive(Default)]
+pub struct Detached {
+    pub input: Option<WindowInput>,
+    /// The window's own cache of filtered events.
+    views: crate::signals::Views,
+    pub out: Output,
+    /// The window was closed (its ✖).
+    pub closed: bool,
+}
+
+pub struct WindowInput {
+    pub plot: SharedPlot,
+    pub signals: Signals,
+    pub generation: u64,
+    pub file: Arc<dyn LogSource>,
+    pub cursor: LineNo,
+    pub kept: Option<Arc<nerka_core::SearchResult>>,
+}
+
+/// Paint the plot's own window (the deferred viewport's callback).
+pub fn window_ui(ui: &mut egui::Ui, shared: &Mutex<Detached>) {
+    let mut d = shared.lock().unwrap_or_else(|e| e.into_inner());
+    let Detached { input, views, out, closed } = &mut *d;
+    let Some(i) = input else { return };
+    let mut series_of = |def: &SignalDef| views.series(def, &*i.file, i.kept.as_ref(), i.generation);
+    let src = Source {
+        signals: &i.signals,
+        generation: i.generation,
+        file: &*i.file,
+        cursor: i.cursor,
+        kept: i.kept.as_ref().map_or(0, |r| Arc::as_ptr(r) as usize),
+        series_of: &mut series_of,
+        in_window: true,
+    };
+    let mut plot = lock(&i.plot);
+    let o = egui::CentralPanel::default().show(ui, |ui| plot_panel(ui, &mut plot, src)).inner;
+    drop(plot);
+    out.goto = o.goto.or(out.goto);
+    out.toggle_window |= o.toggle_window;
+    *closed |= ui.input(|i| i.viewport().close_requested());
+    if out.goto.is_some() || out.toggle_window || *closed {
+        ui.ctx().request_repaint_of(egui::ViewportId::ROOT);
+    }
+}
 
 /// A number lane's y axis.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -91,7 +152,6 @@ pub struct Output {
 
 const GUTTER: f32 = 120.0;
 const AXIS_H: f32 = 18.0;
-const LANE_MIN: f32 = 36.0;
 const LANE_MAX: f32 = 110.0;
 
 /// Build the lanes, or say why they can't be built yet.
@@ -177,7 +237,10 @@ pub fn plot_panel(ui: &mut egui::Ui, state: &mut PlotState, src: Source<'_>) -> 
     ui.horizontal(|ui| {
         let label = if in_window { "⧉ Back into the main window" } else { "⧉ Own window" };
         out.toggle_window = ui.small_button(label).clicked();
-        ui.weak("wheel: zoom · drag: pan · double-click: all · click: go to the event · right-click a name: y axis");
+        ui.weak(format!("x: {}", Clock::of(file, signals).describe())).on_hover_text(
+            "The file's own time, else the first signal of kind time that has events, else line numbers",
+        );
+        ui.weak("· wheel: zoom · drag: pan · double-click: all · click: go to the event · right-click a name: y axis");
     });
     let clock = Clock::of(file, signals);
     let key = (generation, kept);
@@ -248,12 +311,13 @@ pub fn plot_panel(ui: &mut egui::Ui, state: &mut PlotState, src: Source<'_>) -> 
     let weak = vis.weak_text_color();
     let grid = vis.widgets.noninteractive.bg_stroke.color;
     let n = data.lanes.len().max(1) as f32;
-    let lane_h = (plot.height() / n).clamp(LANE_MIN, LANE_MAX);
+    // Lanes shrink to fit a small panel rather than disappear.
+    let lane_h = (plot.height() / n).min(LANE_MAX);
     let font = FontId::monospace(11.0);
     let mut hovered_lane = None;
     for (k, lane) in data.lanes.iter().enumerate() {
         let top = plot.min.y + k as f32 * lane_h;
-        if top + lane_h > plot.max.y + 1.0 {
+        if top + lane_h > plot.max.y + 1.0 || lane_h < 8.0 {
             break;
         }
         let area = Rect::from_min_max(pos2(plot.min.x, top + 3.0), pos2(plot.max.x, top + lane_h - 3.0));

@@ -76,6 +76,8 @@ fn main() -> eframe::Result {
     let mut signals = Signals::default();
     // `--plot NAME`: plot these signals.
     let mut plotted: Vec<String> = Vec::new();
+    // `--plot-window`: the plot starts in a window of its own.
+    let mut plot_window = false;
     let (mut new_window, mut window_name, mut preset_file) = (false, None, None);
     let mut args = std::env::args_os().skip(1);
     while let Some(a) = args.next() {
@@ -120,6 +122,10 @@ fn main() -> eframe::Result {
             }
             Some("--plot") => {
                 plotted.push(value());
+                continue;
+            }
+            Some("--plot-window") => {
+                plot_window = true;
                 continue;
             }
             Some("--signal") => {
@@ -171,6 +177,7 @@ fn main() -> eframe::Result {
             .with_inner_size([1280.0, 800.0])
             .with_title("nerka")
             .with_icon(icon::icon()),
+        wgpu_options: wgpu_options(),
         ..Default::default()
     };
     eframe::run_native(
@@ -178,7 +185,8 @@ fn main() -> eframe::Result {
         options,
         Box::new(move |cc| {
             let show_signals = !signals.is_empty();
-            let mut app = App { pack_paths: packs, show_library, show_signals, window_name, ..Default::default() };
+            let mut app =
+                App { pack_paths: packs, show_library, show_signals, window_name, plot_window, ..Default::default() };
             let ctx = cc.egui_ctx.clone();
             app.server = instance::Server::start(move || ctx.request_repaint());
             app.load_history();
@@ -207,7 +215,7 @@ fn main() -> eframe::Result {
             if !initial.is_empty() {
                 app.open_files(&cc.egui_ctx, initial);
                 if let Some(tab) = app.tabs.last_mut() {
-                    plotted.iter().for_each(|n| tab.plot.toggle(n));
+                    plotted.iter().for_each(|n| plot::lock(&tab.plot).toggle(n));
                 }
                 if let (Some(p), Some(tab)) = (&moved, app.tabs.last_mut()) {
                     tab.use_preset(&cc.egui_ctx, &app.library, p);
@@ -232,6 +240,23 @@ fn main() -> eframe::Result {
             Ok(Box::new(app))
         }),
     )
+}
+
+/// The graphics setup: wgpu's own, except that on Windows it draws with
+/// DirectX 12. wgpu picked Vulkan there, and NVIDIA's Vulkan driver
+/// (`nvoglv64.dll`) crashed when a window was maximized while the plot had
+/// a window of its own (owner, 2026-10-24); DirectX 12 didn't. Linux and
+/// macOS keep wgpu's choice; `WGPU_BACKEND` (e.g. `vulkan`) still decides
+/// when set.
+fn wgpu_options() -> eframe::WgpuConfiguration {
+    let mut options = eframe::WgpuConfiguration::default();
+    if cfg!(windows)
+        && std::env::var_os("WGPU_BACKEND").is_none()
+        && let eframe::egui_wgpu::WgpuSetup::CreateNew(setup) = &mut options.wgpu_setup
+    {
+        setup.instance_descriptor.backends = eframe::wgpu::Backends::DX12;
+    }
+    options
 }
 
 /// How a Filter or Search box reads its text (`doc/search-modes.md`).
@@ -482,7 +507,8 @@ struct Tab {
     /// Collects the signals' events for the panel (the engine keeps them
     /// with each definition).
     signals_job: Option<Job<()>>,
-    plot: plot::PlotState,
+    /// Shared with the plot's own window.
+    plot: plot::SharedPlot,
     /// What `signals` was built from: (saved signals' generation, choices'
     /// generation, the selection's fingerprint); none: build again.
     signals_key: Option<(u64, u64, String)>,
@@ -735,7 +761,7 @@ impl Tab {
             signals_gen: 0,
             signals_ui: signals::SignalsUi::default(),
             signals_job: None,
-            plot: plot::PlotState::default(),
+            plot: Default::default(),
             signals_key: None,
             query_kind: Default::default(),
             query_scope: Default::default(),
@@ -824,7 +850,7 @@ impl Tab {
     /// The tab's signals were edited: queries that use them run again.
     fn signals_changed(&mut self, ctx: &egui::Context) {
         self.signals_gen += 1;
-        self.plot.retain(&self.signals);
+        plot::lock(&self.plot).retain(&self.signals);
         self.collect_signals(ctx);
         if self.pattern.contains('@') {
             self.start_search(ctx);
@@ -1963,8 +1989,9 @@ struct App {
     /// `<config>/nerka/signals`. The generation changes with them.
     saved_signals: Signals,
     saved_gen: u64,
-    /// The plot is in a window of its own.
+    /// The plot is in a window of its own, and what that window shares.
     plot_window: bool,
+    plot_win: Arc<std::sync::Mutex<plot::Detached>>,
 }
 
 /// The Settings window's fields: this window's name and the DLT ports
@@ -2797,7 +2824,7 @@ impl App {
                         saved,
                         file: &*file,
                         line,
-                        plot: &mut tab.plot,
+                        plot: &mut plot::lock(&tab.plot),
                         views: &mut tab.views,
                         kept: tab.result.as_ref(),
                     };
@@ -2838,10 +2865,40 @@ impl App {
             .min_size(120.0)
             .show(ui, |ui| tab.search_panel(ui, &*file, search_history))
             .inner;
-        if !tab.plot.plotted.is_empty() {
+        let plotted = !plot::lock(&tab.plot).plotted.is_empty();
+        if plotted && self.plot_window {
+            // The plot's own window: what it draws now, and what it asked.
             let line = tab.current_line();
-            let in_window = self.plot_window;
-            let title = tab.title();
+            let (goto, toggle, closed) = {
+                let mut d = self.plot_win.lock().unwrap_or_else(|e| e.into_inner());
+                d.input = Some(plot::WindowInput {
+                    plot: tab.plot.clone(),
+                    signals: tab.signals.clone(),
+                    generation: tab.signals_gen,
+                    file: file.clone(),
+                    cursor: line,
+                    kept: tab.result.clone(),
+                });
+                let out = std::mem::take(&mut d.out);
+                (out.goto, out.toggle_window, std::mem::take(&mut d.closed))
+            };
+            let shared = self.plot_win.clone();
+            let builder = egui::ViewportBuilder::default()
+                .with_title(format!("Plot — {} — nerka", tab.title()))
+                .with_inner_size([1100.0, 460.0]);
+            let id = egui::ViewportId::from_hash_of("nerka-plot");
+            ctx.show_viewport_deferred(id, builder, move |ui, _| plot::window_ui(ui, &shared));
+            // The cursor or the data may have changed.
+            ctx.request_repaint_of(id);
+            if toggle || closed {
+                self.plot_window = false;
+            }
+            if let Some(line) = goto {
+                tab.goto_line(line);
+            }
+        } else if plotted {
+            let line = tab.current_line();
+            let in_window = false;
             let kept = tab.result.clone();
             let (views, generation) = (&mut tab.views, tab.signals_gen);
             let mut series_of = |d: &nerka_core::SignalDef| views.series(d, &*file, kept.as_ref(), generation);
@@ -2854,34 +2911,13 @@ impl App {
                 series_of: &mut series_of,
                 in_window,
             };
-            let plot = &mut tab.plot;
-            let out = if in_window {
-                let builder = egui::ViewportBuilder::default()
-                    .with_title(format!("Plot — {title} — nerka"))
-                    .with_inner_size([1100.0, 460.0]);
-                let id = egui::ViewportId::from_hash_of("nerka-plot");
-                // Drawn once per frame: the callback takes the source.
-                let mut src = Some(src);
-                let (out, closed) = ctx.show_viewport_immediate(id, builder, |ui, _| {
-                    let src = src.take();
-                    let plot = &mut *plot;
-                    let out = egui::CentralPanel::default()
-                        .show(ui, |ui| src.map(|s| plot::plot_panel(ui, plot, s)).unwrap_or_default())
-                        .inner;
-                    (out, ui.input(|i| i.viewport().close_requested()))
-                });
-                if closed {
-                    self.plot_window = false;
-                }
-                out
-            } else {
-                egui::Panel::bottom("plot")
-                    .resizable(true)
-                    .default_size(220.0)
-                    .min_size(80.0)
-                    .show(ui, |ui| plot::plot_panel(ui, plot, src))
-                    .inner
-            };
+            let shared = tab.plot.clone();
+            let out = egui::Panel::bottom("plot")
+                .resizable(true)
+                .default_size(220.0)
+                .min_size(80.0)
+                .show(ui, |ui| plot::plot_panel(ui, &mut plot::lock(&shared), src))
+                .inner;
             if out.toggle_window {
                 self.plot_window = !self.plot_window;
             }
