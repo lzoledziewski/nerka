@@ -9,7 +9,7 @@ _Last update: 2026-10-22 (issues #2 and #16 fixed: a child picked with its paren
 - Builds and runs on **Windows** (MSVC, debug and release). Clippy `-D warnings`, fmt and all tests pass. The 1 GiB benchmarks have been run on Windows (numbers below and in the commit messages).
 - Work goes through branches; `main` is pushed to GitHub when the owner says so (never push unasked). Open GitHub issues are the owner's to-do list.
 - Developed and used on Windows; Linux builds and tests run in CI and ship in the releases, but the GUI hasn't been tried on Linux. macOS is an open question (see "Decisions pending").
-- **CI and releases (owner, 2026-10-18):** `.github/workflows/ci.yml` runs fmt, clippy and the tests on Linux and Windows for pushes to `main` and every PR (macOS left out: its runner minutes count 10x on a private repo). `release.yml` builds `nerka` + `nerka-gui` for Linux (Ubuntu 22.04, glibc 2.35+, `.tar.gz`) and Windows (`.zip`) on a `v*` tag and publishes them as a GitHub pre-release (tags with `-`, e.g. `v0.1.0-alpha.1`); run by hand it only builds artifacts. Version is `0.1.0-alpha.3`.
+- **CI and releases (owner, 2026-10-18):** `.github/workflows/ci.yml` runs fmt, clippy and the tests on Linux and Windows for pushes to `main` and every PR (macOS left out: its runner minutes count 10x on a private repo). `release.yml` builds `nerka` + `nerka-gui` for Linux (Ubuntu 22.04, glibc 2.35+, `.tar.gz`) and Windows (`.zip`) on a `v*` tag and publishes them as a GitHub pre-release (tags with `-`, e.g. `v0.1.0-alpha.1`); run by hand it only builds artifacts. Version is `0.1.0-alpha.4`.
 
 ## GUI as of now (`ui/`)
 
@@ -45,7 +45,7 @@ Owner feedback is driving this; these are deliberate choices, keep them:
 2. GUI: single instance, move a tab to a new window, named windows and several files in one view (concatenated) are done (2026-10-20). Parked: merging files by time ("time" across files must be defined first) and backsync from the box text into the selection (needs a more interactive design).
 3. Owner tries the DLT table on real use; settle the open DLT questions below.
 4. **Search manager** POC: all five steps are built; the owner tries it and answers the GUI choices 7–12 in `search-manager.md` → "POC status".
-5. Releases: `v0.1.0-alpha.1` (2026-10-18), `v0.1.0-alpha.2` (2026-10-20: Auto / Text / NFD modes, presets, line colours following the selection, chip row, long-line window, search history) and `v0.1.0-alpha.3` (2026-10-20) are tagged and published.
+5. Releases: `v0.1.0-alpha.1` (2026-10-18), `v0.1.0-alpha.2` (2026-10-20: Auto / Text / NFD modes, presets, line colours following the selection, chip row, long-line window, search history), `v0.1.0-alpha.3` (2026-10-20) and `v0.1.0-alpha.4` (2026-10-24: issues #2 and #16, one stable colour per selected query, refreshed README; the first release built in the new repo) are tagged.
 
 Text-log benchmark on Windows (1 GiB, 12M lines, release): index ~90 ms, `search ERROR` ~30 ms, `level >= ERROR` ~31 ms, `level >= WARN AND raw ~ /timeout/` ~30 ms, `search -v ERROR` ~100 ms.
 
