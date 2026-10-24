@@ -599,46 +599,62 @@ struct LineSignal {
     from: Option<LineNo>,
 }
 
-/// The line window's Signals section: the signals the line carries
-/// (events), then the others' state on it with the line that set it.
-/// Returns a line to go to (one of those was clicked).
+/// The line window's Signals section: the signals the line carries (its
+/// events); the others' state on it, with the line that set it, folded
+/// away below. Returns a line to go to (one of those was clicked).
 fn signals_section(ui: &mut egui::Ui, line: LineNo, signals: &[LineSignal]) -> Option<LineNo> {
-    let events = signals.iter().filter(|s| s.from == Some(line)).count();
+    let (events, held): (Vec<&LineSignal>, Vec<&LineSignal>) =
+        signals.iter().filter(|s| s.from.is_some()).partition(|s| s.from == Some(line));
+    let pending = signals.iter().filter(|s| s.from.is_none() && s.value.is_some()).count();
     let mut goto = None;
-    egui::CollapsingHeader::new(
-        RichText::new(format!("Signals ({events} on this line, {} in all)", signals.len())).strong(),
-    )
-    .id_salt("line-detail-signals")
-    .default_open(true)
-    .show(ui, |ui| {
-        egui::Grid::new("line-detail-signals-grid").num_columns(4).spacing([12.0, 2.0]).striped(true).show(ui, |ui| {
-            for s in signals {
-                let event = s.from == Some(line);
-                let name = RichText::new(format!("@{}", s.name)).monospace();
-                ui.label(if event { name.strong() } else { name });
-                ui.monospace(s.value.as_deref().unwrap_or("—"));
-                match s.from {
-                    _ if event => {
-                        ui.label("• event").on_hover_text("This line carries the value");
-                    }
-                    Some(from) => {
-                        let r = ui.link(format!("↑ line {}", from + 1));
-                        if r.on_hover_text("The state: set by the event on that line. Click to go there.").clicked() {
-                            goto = Some(from);
-                        }
-                    }
-                    None if s.value.is_none() => {
-                        ui.weak("no event before");
-                    }
-                    None => {
-                        ui.label("");
-                    }
-                }
-                ui.weak(format!("{} · {}", s.kind, s.origin));
-                ui.end_row();
+    egui::CollapsingHeader::new(RichText::new(format!("Signals on this line ({})", events.len())).strong())
+        .id_salt("line-detail-signals")
+        .default_open(true)
+        .show(ui, |ui| {
+            if events.is_empty() {
+                ui.weak("None: this line carries no signal's value.");
             }
+            egui::Grid::new("line-detail-signals-grid").num_columns(3).spacing([12.0, 2.0]).striped(true).show(
+                ui,
+                |ui| {
+                    for s in &events {
+                        ui.label(RichText::new(format!("@{}", s.name)).monospace().strong());
+                        ui.monospace(s.value.as_deref().unwrap_or("—"));
+                        ui.weak(format!("{} · {}", s.kind, s.origin));
+                        ui.end_row();
+                    }
+                },
+            );
+            if pending > 0 {
+                ui.weak(format!("{pending} more still being collected…"));
+            }
+            if held.is_empty() {
+                return;
+            }
+            egui::CollapsingHeader::new(format!("Held from earlier lines ({})", held.len()))
+                .id_salt("line-detail-held")
+                .default_open(false)
+                .show(ui, |ui| {
+                    egui::Grid::new("line-detail-held-grid").num_columns(4).spacing([12.0, 2.0]).striped(true).show(
+                        ui,
+                        |ui| {
+                            for s in &held {
+                                ui.monospace(format!("@{}", s.name));
+                                ui.monospace(s.value.as_deref().unwrap_or("—"));
+                                let from = s.from.expect("held");
+                                let r = ui.link(format!("↑ line {}", from + 1));
+                                if r.on_hover_text("The state: set by the event on that line. Click to go there.")
+                                    .clicked()
+                                {
+                                    goto = Some(from);
+                                }
+                                ui.weak(format!("{} · {}", s.kind, s.origin));
+                                ui.end_row();
+                            }
+                        },
+                    );
+                });
         });
-    });
     goto
 }
 

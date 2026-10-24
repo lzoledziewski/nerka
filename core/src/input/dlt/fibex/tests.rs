@@ -249,3 +249,42 @@ fn arguments_as_values_and_names() {
     assert_eq!(snake("3 phases"), "_3_phases");
     assert_eq!(snake(" : "), "");
 }
+
+#[test]
+fn short_names_name_arguments() {
+    // The signal's short name, else the PDU's (it holds one argument);
+    // type names, generated ones and shared signals don't count.
+    let xml = r#"<fx:FIBEX xmlns:fx="f" xmlns:ho="h"><fx:ELEMENTS>
+      <fx:PDUS>
+        <fx:PDU ID="P1"><ho:SHORT-NAME>P1</ho:SHORT-NAME><ho:DESC>Temp: </ho:DESC><fx:SIGNAL-INSTANCES>
+          <fx:SIGNAL-INSTANCE ID="a"><fx:SEQUENCE-NUMBER>0</fx:SEQUENCE-NUMBER><fx:SIGNAL-REF ID-REF="S1"/></fx:SIGNAL-INSTANCE>
+        </fx:SIGNAL-INSTANCES></fx:PDU>
+        <fx:PDU ID="P2"><ho:SHORT-NAME>engineRpm</ho:SHORT-NAME><fx:SIGNAL-INSTANCES>
+          <fx:SIGNAL-INSTANCE ID="b"><fx:SEQUENCE-NUMBER>0</fx:SEQUENCE-NUMBER><fx:SIGNAL-REF ID-REF="S_UINT16"/></fx:SIGNAL-INSTANCE>
+        </fx:SIGNAL-INSTANCES></fx:PDU>
+        <fx:PDU ID="P3"><ho:SHORT-NAME>PDU_3</ho:SHORT-NAME><ho:DESC>Gear </ho:DESC><fx:SIGNAL-INSTANCES>
+          <fx:SIGNAL-INSTANCE ID="c"><fx:SEQUENCE-NUMBER>0</fx:SEQUENCE-NUMBER><fx:SIGNAL-REF ID-REF="S_UINT16"/></fx:SIGNAL-INSTANCE>
+        </fx:SIGNAL-INSTANCES></fx:PDU>
+      </fx:PDUS>
+      <fx:FRAMES>
+        <fx:FRAME ID="ID_1"><fx:PDU-INSTANCES>
+          <fx:PDU-INSTANCE ID="x"><fx:PDU-REF ID-REF="P1"/><fx:SEQUENCE-NUMBER>0</fx:SEQUENCE-NUMBER></fx:PDU-INSTANCE>
+          <fx:PDU-INSTANCE ID="y"><fx:PDU-REF ID-REF="P2"/><fx:SEQUENCE-NUMBER>1</fx:SEQUENCE-NUMBER></fx:PDU-INSTANCE>
+          <fx:PDU-INSTANCE ID="z"><fx:PDU-REF ID-REF="P3"/><fx:SEQUENCE-NUMBER>2</fx:SEQUENCE-NUMBER></fx:PDU-INSTANCE>
+        </fx:PDU-INSTANCES></fx:FRAME>
+      </fx:FRAMES>
+      <fx:SIGNALS>
+        <fx:SIGNAL ID="S1"><ho:SHORT-NAME>coolantTemp</ho:SHORT-NAME><fx:CODING-REF ID-REF="U8"/></fx:SIGNAL>
+        <fx:SIGNAL ID="S_UINT16"><ho:SHORT-NAME>S_UINT16</ho:SHORT-NAME></fx:SIGNAL>
+      </fx:SIGNALS>
+    </fx:ELEMENTS><fx:PROCESSING-INFORMATION><fx:CODINGS>
+      <fx:CODING ID="U8"><ho:CODED-TYPE ho:BASE-DATA-TYPE="A_UINT8" CATEGORY="STANDARD-LENGTH-TYPE"/></fx:CODING>
+    </fx:CODINGS></fx:PROCESSING-INFORMATION></fx:FIBEX>"#;
+    let mut f = Fibex::default();
+    f.add("n.xml", xml).unwrap();
+    let args = f.arguments();
+    let names: Vec<(&str, &str)> = args.iter().map(|a| (a.name.as_str(), a.label.as_str())).collect();
+    assert_eq!(names, [("coolant_temp", "coolantTemp"), ("engine_rpm", "engineRpm"), ("gear", "Gear")]);
+    assert!(generated("PDU_11_1") && generated("ID_12") && generated("") && !generated("speed"));
+    assert!(type_like("S_U16") && type_like("INT32") && !type_like("speed"));
+}

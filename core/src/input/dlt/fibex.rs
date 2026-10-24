@@ -23,6 +23,12 @@
 //! bytes in the message's byte order, strings and raw data a 16-bit length
 //! and then the bytes (a string's final NUL dropped).
 //!
+//! An argument's name is the `ho:SHORT-NAME` of its SIGNAL, else of the PDU
+//! that holds it (owner: prefer short names), unless that name only says a
+//! type (`S_UINT16`, or a signal several PDUs share), looks generated
+//! (`PDU_11_1`, `ID_12`) or the PDU holds several arguments; else the text
+//! before it in the message.
+//!
 //! A message id is unique per ECU. A file that names exactly one ECU binds
 //! its frames to it; looking a message up prefers its ECU, then frames
 //! bound to none, then any (ECU names in FIBEX and in logs don't always
@@ -72,6 +78,9 @@ pub struct Frame {
     /// Where it is logged: file and line.
     pub source: Option<(String, u32)>,
     pub pieces: Vec<Piece>,
+    /// Per argument (in order), the `ho:SHORT-NAME` that names it, if one
+    /// does (module docs).
+    pub arg_names: Vec<Option<String>>,
 }
 
 impl Frame {
@@ -360,19 +369,19 @@ impl Fibex {
                 match p {
                     Piece::Text(t) => label = t.clone(),
                     Piece::Arg(ty) => {
+                        let short_name = f.arg_names.get(index).cloned().flatten();
+                        let text = last_phrase(&std::mem::take(&mut label));
+                        if !text.is_empty() {
+                            last = text;
+                        }
                         out.push(Argument {
+                            label: short_name.clone().unwrap_or_else(|| last.clone()),
+                            short_name,
                             mid,
                             ecu: f.ecu.clone(),
                             apid: f.apid.clone(),
                             ctid: f.ctid.clone(),
                             index,
-                            label: {
-                                let l = last_phrase(&std::mem::take(&mut label));
-                                if !l.is_empty() {
-                                    last = l;
-                                }
-                                last.clone()
-                            },
                             name: String::new(),
                             ty: *ty,
                             message: f.template(),
@@ -383,8 +392,8 @@ impl Fibex {
                 }
             }
         }
-        // Names from the text before the argument (`Free slots:` ->
-        // `free_slots`), else from the message; made unique.
+        // Names from the short name, else the text before the argument
+        // (`Free slots:` -> `free_slots`), else the message; made unique.
         let base: Vec<String> = out
             .iter()
             .map(|a| match snake(&a.label) {
@@ -452,6 +461,8 @@ pub struct Argument {
     pub index: usize,
     /// The text before it in the message (`Free slots`).
     pub label: String,
+    /// Its `ho:SHORT-NAME`, if one names it (module docs).
+    pub short_name: Option<String>,
     /// A signal name, unique among all arguments (`free_slots`).
     pub name: String,
     pub ty: ArgType,
@@ -469,7 +480,13 @@ fn last_phrase(text: &str) -> String {
 /// `Free slots` -> `free_slots`; empty if nothing of it is a name.
 fn snake(label: &str) -> String {
     let mut out = String::new();
+    let mut lower = false;
     for c in label.chars() {
+        // `vehicleSpeed` -> `vehicle_speed`.
+        if c.is_ascii_uppercase() && lower {
+            out.push('_');
+        }
+        lower = c.is_ascii_lowercase() || c.is_ascii_digit();
         if c.is_ascii_alphanumeric() {
             out.push(c.to_ascii_lowercase());
         } else if !out.ends_with('_') && !out.is_empty() {
@@ -491,6 +508,8 @@ struct Raw {
     pdus: HashMap<String, RawPdu>,
     /// Signal id -> coding id.
     signals: HashMap<String, String>,
+    /// Signal id -> its `ho:SHORT-NAME`.
+    signal_names: HashMap<String, String>,
     codings: HashMap<String, RawCoding>,
 }
 
@@ -505,6 +524,7 @@ struct RawFrame {
 
 #[derive(Default)]
 struct RawPdu {
+    short_name: String,
     desc: String,
     /// (sequence number, signal id).
     signals: Vec<(u32, String)>,
@@ -525,6 +545,7 @@ impl Raw {
             let Some(mid) = message_id(&f.id).or_else(|| message_id(&f.short_name)) else { continue };
             f.pdus.sort_by_key(|p| p.0);
             let mut pieces = Vec::new();
+            let mut arg_names = Vec::new();
             for (_, pdu_id) in &f.pdus {
                 let Some(pdu) = self.pdus.get(pdu_id) else { continue };
                 if !pdu.desc.is_empty() {
@@ -532,11 +553,17 @@ impl Raw {
                 }
                 let mut sigs = pdu.signals.clone();
                 sigs.sort_by_key(|s| s.0);
+                let single = sigs.len() == 1;
                 for (_, sig) in sigs {
-                    pieces.push(match self.arg_type(&sig) {
-                        Some(t) => Piece::Arg(t),
-                        None => Piece::Unknown(sig),
-                    });
+                    match self.arg_type(&sig) {
+                        Some(t) => {
+                            pieces.push(Piece::Arg(t));
+                            let own = self.signal_names.get(&sig).filter(|n| self.names_one(&sig, n));
+                            let of_pdu = Some(&pdu.short_name).filter(|n| single && !generated(n));
+                            arg_names.push(own.or(of_pdu).cloned());
+                        }
+                        None => pieces.push(Piece::Unknown(sig)),
+                    }
                 }
             }
             let ext = |k: &str| f.ext.get(k).filter(|v| !v.is_empty()).cloned();
@@ -570,10 +597,18 @@ impl Raw {
                     mtin,
                     source,
                     pieces,
+                    arg_names,
                 },
             ));
         }
         out
+    }
+
+    /// Whether signal `id`'s short name `name` names one argument: not a
+    /// type (conventional, or a signal several PDUs share), not generated.
+    fn names_one(&self, id: &str, name: &str) -> bool {
+        let users = self.pdus.values().filter(|p| p.signals.iter().any(|(_, s)| s == id)).count();
+        users <= 1 && !type_like(name) && !generated(name)
     }
 
     /// A signal's type: from its coding, else from its conventional name.
@@ -608,6 +643,25 @@ impl Raw {
         }
         conventional(signal)
     }
+}
+
+/// A name a tool made up: empty, or `ID_12`, `PDU_11_1`, `P10_0`, `S_3`.
+fn generated(name: &str) -> bool {
+    let n = name.trim().to_ascii_uppercase();
+    let rest = ["SIGNAL", "SIG", "PDU", "ID", "P", "S"].iter().find_map(|p| n.strip_prefix(p)).unwrap_or(&n);
+    n.is_empty() || (!rest.is_empty() && rest.chars().all(|c| c.is_ascii_digit() || c == '_'))
+}
+
+/// A name that only says a type: `S_UINT16`, `S_U16`, `INT32`, `FLOAT`,
+/// `BOOL`, `STRING`.
+fn type_like(name: &str) -> bool {
+    let n = name.trim().to_ascii_uppercase();
+    let n = n.strip_prefix("S_").unwrap_or(&n);
+    let word = n.trim_end_matches(|c: char| c.is_ascii_digit() || c == '_');
+    let types = ["U", "S", "I", "F", "UINT", "SINT", "INT", "FLOA", "FLOAT", "DOUBLE", "BOOL", "BOOLEAN", "CHAR"];
+    conventional(name).is_some()
+        || types.contains(&word)
+        || ["STRG_ASCII", "STRG_UTF8", "STRING", "STR", "RAWD", "RAW"].contains(&n)
 }
 
 /// `S_UINT32` and the like.
@@ -814,6 +868,16 @@ impl State {
             "SHORT-NAME" => match (parent, self.frame.as_mut(), self.coding.as_mut()) {
                 (Some("FRAME"), Some(f), _) => f.short_name = text.trim().to_owned(),
                 (Some("CODING"), _, Some((_, c))) => c.short_name = text.trim().to_owned(),
+                (Some("PDU"), _, _) => {
+                    if let Some((_, p)) = &mut self.pdu {
+                        p.short_name = text.trim().to_owned();
+                    }
+                }
+                (Some("SIGNAL"), _, _) => {
+                    if let Some(s) = &self.signal {
+                        self.raw.signal_names.insert(s.clone(), text.trim().to_owned());
+                    }
+                }
                 _ => {}
             },
             "BIT-LENGTH" => {

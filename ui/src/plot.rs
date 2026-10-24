@@ -119,6 +119,10 @@ pub struct PlotState {
     bookmark_note: String,
     /// Bookmarks aren't drawn.
     pub hide_bookmarks: bool,
+    /// How far the lanes are scrolled down, in points (more lanes than fit).
+    scroll: f32,
+    /// The scrollbar is being dragged.
+    drag_scroll: bool,
     /// Lanes, built for (signals generation, the filter result).
     data: Option<((u64, usize), PlotData)>,
 }
@@ -192,6 +196,10 @@ pub struct Output {
 const GUTTER: f32 = 120.0;
 const AXIS_H: f32 = 18.0;
 const LANE_MAX: f32 = 110.0;
+/// Lanes are never lower than this (name, events and y labels fit); more
+/// lanes than fit scroll.
+const LANE_MIN: f32 = 52.0;
+const SCROLLBAR_W: f32 = 6.0;
 
 /// Build the lanes, or say why they can't be built yet.
 fn build(
@@ -278,6 +286,10 @@ pub fn plot_panel(ui: &mut egui::Ui, state: &mut PlotState, src: Source<'_>) -> 
     ui.horizontal(|ui| {
         let label = if in_window { "⧉ Back into the main window" } else { "⧉ Own window" };
         out.toggle_window = ui.small_button(label).clicked();
+        let fit = ui.add_enabled(state.range.is_some(), egui::Button::new("↔ Fit").small());
+        if fit.on_hover_text("Show the whole x range (also: double-click the plot)").clicked() {
+            state.range = None;
+        }
         ui.weak(format!("x: {}", Clock::of(file, signals).describe())).on_hover_text(
             "The file's own time, else the first signal of kind time that has events, else line numbers",
         );
@@ -338,6 +350,35 @@ pub fn plot_panel(ui: &mut egui::Ui, state: &mut PlotState, src: Source<'_>) -> 
     if plot.width() < 20.0 || plot.height() < 10.0 {
         return out;
     }
+    // Lanes share the height, between LANE_MIN and LANE_MAX; more than fit
+    // scroll (wheel over the names, or the scrollbar).
+    let n = data.lanes.len().max(1) as f32;
+    let lane_h = (plot.height() / n).clamp(LANE_MIN, LANE_MAX);
+    let max_scroll = (n * lane_h - plot.height()).max(0.0);
+    let bar = Rect::from_min_max(pos2(rect.max.x - SCROLLBAR_W - 1.0, plot.min.y), pos2(rect.max.x - 1.0, plot.max.y));
+    let thumb = (max_scroll > 0.0).then(|| {
+        let h = (plot.height() * plot.height() / (n * lane_h)).max(20.0);
+        let top = bar.min.y + (bar.height() - h) * state.scroll.min(max_scroll) / max_scroll;
+        Rect::from_min_size(pos2(bar.min.x, top), vec2(SCROLLBAR_W, h))
+    });
+    if let Some(thumb) = thumb {
+        let r = ui.interact(bar, ui.scope_id().with("lanes-scrollbar"), Sense::click_and_drag());
+        if r.drag_started() {
+            state.drag_scroll = true;
+        }
+        if r.dragged() && state.drag_scroll {
+            state.scroll += r.drag_delta().y * max_scroll / (bar.height() - thumb.height()).max(1.0);
+        } else if r.clicked()
+            && let Some(p) = r.interact_pointer_pos()
+        {
+            // A page up or down.
+            state.scroll += if p.y < thumb.min.y { -plot.height() } else { plot.height() };
+        }
+        if r.drag_stopped() {
+            state.drag_scroll = false;
+        }
+    }
+    state.scroll = state.scroll.clamp(0.0, max_scroll);
     let (mut x0, mut x1) = state.range.unwrap_or(data.full);
     let w = plot.width() as f64;
     let to_px = |x: f64, x0: f64, x1: f64| plot.min.x + ((x - x0) / (x1 - x0) * w) as f32;
@@ -419,7 +460,9 @@ pub fn plot_panel(ui: &mut egui::Ui, state: &mut PlotState, src: Source<'_>) -> 
                 })
                 .sum::<f32>()
         });
-        if notches != 0.0 {
+        if notches != 0.0 && p.x < plot.min.x {
+            state.scroll = (state.scroll - notches * lane_h / 2.0).clamp(0.0, max_scroll);
+        } else if notches != 0.0 {
             let at = x0 + (p.x - plot.min.x).clamp(0.0, plot.width()) as f64 / w * (x1 - x0);
             let f = 0.8f64.powf(notches as f64);
             (x0, x1) = (at - (at - x0) * f, at + (x1 - at) * f);
@@ -435,16 +478,21 @@ pub fn plot_panel(ui: &mut egui::Ui, state: &mut PlotState, src: Source<'_>) -> 
     let text_color = vis.text_color();
     let weak = vis.weak_text_color();
     let grid = vis.widgets.noninteractive.bg_stroke.color;
-    let n = data.lanes.len().max(1) as f32;
-    // Lanes shrink to fit a small panel rather than disappear.
-    let lane_h = (plot.height() / n).min(LANE_MAX);
     let font = FontId::monospace(11.0);
     let mut hovered_lane = None;
+    // The lanes' own drawing stays above the axis (scrolled lanes are cut).
+    let lanes_clip = Rect::from_min_max(pos2(rect.min.x, plot.min.y), pos2(rect.max.x, plot.max.y));
+    let painter = painter.with_clip_rect(lanes_clip);
     for (k, lane) in data.lanes.iter().enumerate() {
-        let top = plot.min.y + k as f32 * lane_h;
-        if top + lane_h > plot.max.y + 1.0 || lane_h < 8.0 {
+        let top = plot.min.y + k as f32 * lane_h - state.scroll;
+        if top + lane_h < plot.min.y {
+            continue;
+        }
+        if top > plot.max.y {
             break;
         }
+        // Widgets only where they're in view.
+        let shown = |r: Rect| r.min.y >= plot.min.y - 0.5 && r.max.y <= plot.max.y + 0.5;
         let area = Rect::from_min_max(pos2(plot.min.x, top + 3.0), pos2(plot.max.x, top + lane_h - 3.0));
         let color = crate::library::palette(k);
         painter.line_segment([pos2(rect.min.x, top + lane_h), pos2(plot.max.x, top + lane_h)], Stroke::new(1.0, grid));
@@ -458,7 +506,10 @@ pub fn plot_panel(ui: &mut egui::Ui, state: &mut PlotState, src: Source<'_>) -> 
         painter.text(pos2(rect.min.x + 4.0, top + 4.0), Align2::LEFT_TOP, short, font.clone(), color);
         // Right-click the name: the y axis.
         let name_rect = Rect::from_min_size(pos2(rect.min.x, top), vec2(GUTTER - 4.0, 18.0));
-        let name_r = ui.interact(name_rect, ui.scope_id().with(("lane", &lane.name)), Sense::click());
+        // Clipped to the lanes, so a lane scrolled half out of view doesn't
+        // take the pointer from the rows above.
+        let name_r =
+            ui.interact(name_rect.intersect(lanes_clip), ui.scope_id().with(("lane", &lane.name)), Sense::click());
         if lane.kind != SignalKind::Enum {
             let y = state.y.entry(lane.name.clone()).or_insert(YAxis::All);
             let markers = state.markers.entry(lane.name.clone()).or_default();
@@ -472,15 +523,19 @@ pub fn plot_panel(ui: &mut egui::Ui, state: &mut PlotState, src: Source<'_>) -> 
         }
         let cb = Rect::from_min_size(pos2(rect.min.x + 4.0, top + 20.0), vec2(GUTTER - 10.0, 16.0));
         let mut show = state.events.contains(&lane.name);
-        let r = ui.put(cb, egui::Checkbox::new(&mut show, egui::RichText::new("events").small()));
-        if r.on_hover_text("Mark the events: the lines where the value was received").changed() {
+        if shown(cb)
+            && ui
+                .put(cb, egui::Checkbox::new(&mut show, egui::RichText::new("events").small()))
+                .on_hover_text("Mark the events: the lines where the value was received")
+                .changed()
+        {
             if show {
                 state.events.insert(lane.name.clone());
             } else {
                 state.events.remove(&lane.name);
             }
         }
-        if response.hover_pos().is_some_and(|p| p.y >= top && p.y < top + lane_h) {
+        if response.hover_pos().is_some_and(|p| p.y >= top.max(plot.min.y) && p.y < top + lane_h) {
             hovered_lane = Some((k, area));
         }
         if lane.xs.is_empty() {
@@ -536,6 +591,13 @@ pub fn plot_panel(ui: &mut egui::Ui, state: &mut PlotState, src: Source<'_>) -> 
         if show {
             draw_ticks(&painter, lane, area, i0, i1, |x| to_px(x, x0, x1), color);
         }
+    }
+
+    let painter = painter.with_clip_rect(rect);
+    if let Some(thumb) = thumb {
+        painter.rect_filled(bar, 3.0, grid.gamma_multiply(0.4));
+        let c = if state.drag_scroll { text_color } else { weak };
+        painter.rect_filled(thumb, 3.0, c.gamma_multiply(0.8));
     }
 
     // ----- axis -----
@@ -1053,6 +1115,64 @@ mod tests {
         step(vec![press(to, false)], &mut st);
         let (y0, y1) = st.range.unwrap();
         assert!(y0 < x0 && (y1 - y0 - (x1 - x0)).abs() < 1e-9, "{y0} {y1}");
+    }
+
+    #[test]
+    fn many_lanes_keep_their_height_and_scroll() {
+        let text: String = (0..50)
+            .map(|i| {
+                format!(
+                    "00:00:{i:02} {}
+",
+                    (0..12).map(|k| format!("v{k}={i}")).collect::<Vec<_>>().join(" ")
+                )
+            })
+            .collect();
+        let file = nerka_core::TextFile::from_bytes("t", text.into_bytes());
+        let mut sig = Signals::default();
+        sig.set(nerka_core::SignalDef::parse_spec(r"t:time=/^(?<t>\S+)/").unwrap());
+        let mut st = PlotState::default();
+        for k in 0..12 {
+            sig.set(nerka_core::SignalDef::parse_spec(&format!(r"v{k}=/v{k}=(?<v{k}>\d+)/")).unwrap());
+            st.toggle(&format!("v{k}"));
+        }
+        for d in sig.iter() {
+            d.series(&file, &nerka_core::Progress::new()).unwrap();
+        }
+        let ctx = egui::Context::default();
+        let mut t = 0.0;
+        let mut step = |events, st: &mut PlotState| {
+            t += 1.0 / 60.0;
+            frame(&ctx, t, events, st, &sig, &file)
+        };
+        step(vec![], &mut st);
+        assert_eq!(st.data.as_ref().map(|(_, d)| d.lanes.len()), Some(12));
+        assert!(st.data.as_ref().unwrap().1.lanes.iter().all(|l| l.xs.len() == 50), "every lane has its events");
+        let wheel = |y| egui::Event::MouseWheel {
+            unit: egui::MouseWheelUnit::Line,
+            delta: vec2(0.0, y),
+            phase: egui::TouchPhase::Move,
+            source: egui::MouseWheelSource::Wheel,
+            modifiers: egui::Modifiers::NONE,
+        };
+        // The wheel over the names scrolls the lanes, not the x axis.
+        let names = pos2(40.0, 120.0);
+        step(vec![egui::Event::PointerMoved(names)], &mut st);
+        step(vec![wheel(-3.0)], &mut st);
+        assert!(st.range.is_none(), "no zoom");
+        assert_eq!(st.scroll, 3.0 * LANE_MIN / 2.0, "lanes are at their least height");
+        // Not past the last lane.
+        for _ in 0..20 {
+            step(vec![wheel(-3.0)], &mut st);
+        }
+        let plot_h = st.scroll;
+        assert!(plot_h > 0.0 && plot_h < 12.0 * LANE_MIN, "{plot_h}");
+        step(vec![wheel(30.0)], &mut st);
+        assert_eq!(st.scroll, 0.0);
+        // Over the plot, the wheel still zooms.
+        step(vec![egui::Event::PointerMoved(pos2(GUTTER + 200.0, 120.0))], &mut st);
+        step(vec![wheel(1.0)], &mut st);
+        assert!(st.range.is_some() && st.scroll == 0.0);
     }
 
     #[test]
