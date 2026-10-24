@@ -168,6 +168,7 @@ fn hit_bg(c: Color32, dark: bool) -> Color32 {
     Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), if dark { 110 } else { 150 })
 }
 
+#[derive(Default)]
 pub struct ViewOutput {
     pub clicked: Option<u64>,
     pub has_focus: bool,
@@ -177,6 +178,8 @@ pub struct ViewOutput {
     pub toggle_bookmark: Option<u64>,
     /// The whole line was asked for (Enter or the context menu), for this row.
     pub detail: Option<u64>,
+    /// The selection moved to this row in this frame (a click, the keys).
+    pub moved_to: Option<u64>,
 }
 
 /// Draw `rows` rows; `line_of_row` maps a view row to a file line.
@@ -191,6 +194,7 @@ pub fn log_view(
     columns: &mut Columns,
     hl: &Highlight<'_>,
 ) -> ViewOutput {
+    let selected_before = state.selected;
     let table = !columns.names.is_empty();
     let font = FontId::monospace(13.0);
     // Whole physical pixels per row and per text origin keep glyphs crisp.
@@ -712,7 +716,8 @@ pub fn log_view(
         painter.rect_stroke(outer.shrink(0.5), 0.0, Stroke::new(1.0, vis.selection.stroke.color), StrokeKind::Inside);
     }
 
-    ViewOutput { clicked, has_focus, copied, toggle_bookmark, detail }
+    let moved_to = state.selected.filter(|_| state.selected != selected_before);
+    ViewOutput { clicked, has_focus, copied, toggle_bookmark, detail, moved_to }
 }
 
 /// How a line's characters map to display columns. In plain text a tab is

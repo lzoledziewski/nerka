@@ -187,6 +187,11 @@ fn arguments_as_values_and_names() {
         ]
     );
     assert_eq!(m.arg(&d[..3], false, 2), None, "too short");
+    // A 32-bit float keeps its own digits.
+    let mut x = vec![0, 0, 0];
+    x.extend(20.79659f32.to_le_bytes());
+    let float = Frame { pieces: vec![Piece::Arg(ArgType::Float(4))], ..m.clone() };
+    assert_eq!(float.arg(&x[3..], false, 0), Some(SignalValue::Num(20.79659)));
     assert_eq!(f.frame(10, b"NAV1", None, None).unwrap().template(), "speed: <u16> km/h & <ok>!");
     let args = f.arguments();
     let names: Vec<(u32, usize, &str, &str)> =

@@ -578,6 +578,68 @@ struct LineDetail {
     /// Column names of a table source; empty for plain text.
     names: Vec<&'static str>,
     wrap: bool,
+    /// The tab's signals on this line (filled by the tab every frame:
+    /// values appear once their events are collected).
+    signals: Vec<LineSignal>,
+    /// A line the window asks to go to (an event that set a state).
+    goto: Option<LineNo>,
+}
+
+/// One signal in the line window: its value on the line, and whether the
+/// line itself carries it (an event) or it holds from an earlier one.
+#[derive(Debug, Clone, PartialEq)]
+struct LineSignal {
+    name: String,
+    kind: &'static str,
+    /// Where it comes from: built in, saved, query, FIBEX.
+    origin: &'static str,
+    /// The value, or none (no event yet, or still collecting).
+    value: Option<String>,
+    /// The line of the event that set the value; this line for an event.
+    from: Option<LineNo>,
+}
+
+/// The line window's Signals section: the signals the line carries
+/// (events), then the others' state on it with the line that set it.
+/// Returns a line to go to (one of those was clicked).
+fn signals_section(ui: &mut egui::Ui, line: LineNo, signals: &[LineSignal]) -> Option<LineNo> {
+    let events = signals.iter().filter(|s| s.from == Some(line)).count();
+    let mut goto = None;
+    egui::CollapsingHeader::new(
+        RichText::new(format!("Signals ({events} on this line, {} in all)", signals.len())).strong(),
+    )
+    .id_salt("line-detail-signals")
+    .default_open(true)
+    .show(ui, |ui| {
+        egui::Grid::new("line-detail-signals-grid").num_columns(4).spacing([12.0, 2.0]).striped(true).show(ui, |ui| {
+            for s in signals {
+                let event = s.from == Some(line);
+                let name = RichText::new(format!("@{}", s.name)).monospace();
+                ui.label(if event { name.strong() } else { name });
+                ui.monospace(s.value.as_deref().unwrap_or("—"));
+                match s.from {
+                    _ if event => {
+                        ui.label("• event").on_hover_text("This line carries the value");
+                    }
+                    Some(from) => {
+                        let r = ui.link(format!("↑ line {}", from + 1));
+                        if r.on_hover_text("The state: set by the event on that line. Click to go there.").clicked() {
+                            goto = Some(from);
+                        }
+                    }
+                    None if s.value.is_none() => {
+                        ui.weak("no event before");
+                    }
+                    None => {
+                        ui.label("");
+                    }
+                }
+                ui.weak(format!("{} · {}", s.kind, s.origin));
+                ui.end_row();
+            }
+        });
+    });
+    goto
 }
 
 /// Text shown in the line window at most; Copy still copies all of it.
@@ -587,7 +649,7 @@ impl LineDetail {
     fn of(file: &dyn LogSource, line: LineNo) -> Option<Self> {
         let cells = file.line_detail(line)?;
         let names = file.columns().iter().map(|c| c.name).collect();
-        Some(LineDetail { line, cells, names, wrap: true })
+        Some(LineDetail { line, cells, names, wrap: true, signals: Vec::new(), goto: None })
     }
 
     /// The window: the cells before the message as a name / value grid,
@@ -630,6 +692,9 @@ impl LineDetail {
                             ui.end_row();
                         }
                     });
+                }
+                if !self.signals.is_empty() {
+                    self.goto = signals_section(ui, self.line, &self.signals).or(self.goto);
                 }
                 ui.separator();
                 let mut shown = msg;
@@ -1464,6 +1529,72 @@ impl Tab {
         self.save_bookmarks();
     }
 
+    /// The tab's signals on `line` for the line window: events (the line
+    /// carries them) first, then the others' state there.
+    ///
+    /// `args` are the FIBEX catalog's arguments: a non-verbose message it
+    /// describes lists all of its own arguments with their values, also
+    /// those not used as signals.
+    fn line_signals(&mut self, line: LineNo, args: &[nerka_core::Argument]) -> Vec<LineSignal> {
+        let Some(file) = self.file.clone() else { return Vec::new() };
+        let kept = self.result.clone();
+        let mut out: Vec<LineSignal> = Vec::new();
+        for d in self.signals.iter() {
+            let origin = if d.is_from_source() {
+                "built in"
+            } else if d.argument_index().is_some() {
+                "FIBEX"
+            } else if !d.queries().is_empty() {
+                "query"
+            } else {
+                "saved"
+            };
+            let base =
+                LineSignal { name: d.name().to_owned(), kind: d.kind().as_str(), origin, value: None, from: None };
+            if d.is_from_source() {
+                let value = file.time(line).map(|t| nerka_core::time::format_time(t, 6));
+                out.push(LineSignal { from: value.as_ref().map(|_| line), value, ..base });
+                continue;
+            }
+            let Some(series) = self.views.series(d, &*file, kept.as_ref(), self.signals_gen) else {
+                out.push(LineSignal { value: Some("…".into()), ..base });
+                continue;
+            };
+            match series.state(line) {
+                Some((row, v)) => out.push(LineSignal { value: Some(d.format(v)), from: Some(row), ..base }),
+                None => out.push(base),
+            }
+        }
+        // The message's own FIBEX arguments that aren't signals of the tab.
+        let mid = file.schema().iter().position(|f| f.name == "mid").and_then(|id| match file.field(line, id) {
+            Some(nerka_core::FieldValue::U64(m)) => u32::try_from(m).ok(),
+            _ => None,
+        });
+        let ecu = file.schema().iter().position(|f| f.name == "ecu").and_then(|id| match file.field(line, id) {
+            Some(nerka_core::FieldValue::Str(e)) => Some(String::from_utf8_lossy(&e).into_owned()),
+            _ => None,
+        });
+        if let Some(mid) = mid {
+            let own = args
+                .iter()
+                .filter(|a| a.mid == mid && a.ecu.as_ref().is_none_or(|e| Some(e) == ecu.as_ref()))
+                .filter(|a| self.signals.get(&a.name).is_none());
+            for a in own {
+                let value = file.argument(line, a.index).map(|v| v.to_string());
+                out.push(LineSignal {
+                    name: a.name.clone(),
+                    kind: a.ty.kind().as_str(),
+                    origin: "FIBEX, not used",
+                    from: value.as_ref().map(|_| line),
+                    value,
+                });
+            }
+        }
+        // Events first; otherwise the tab's order.
+        out.sort_by_key(|s| s.from != Some(line));
+        out
+    }
+
     /// Bookmark `line` with `note` (a bookmark already there gets the note).
     fn set_bookmark(&mut self, line: LineNo, note: String) {
         if !self.bookmarks.contains(line) {
@@ -1513,6 +1644,16 @@ impl Tab {
             && let Some(file) = &self.file
         {
             self.detail = LineDetail::of(&**file, line_of_row(row));
+        }
+        // An open line window follows the line selected in either view
+        // (owner, 2026-10-24), keeping its Wrap setting.
+        if let (Some(row), Some(d), Some(file)) = (out.moved_to, &self.detail, &self.file)
+            && out.detail.is_none()
+            && line_of_row(row) != d.line
+            && let Some(mut next) = LineDetail::of(&**file, line_of_row(row))
+        {
+            next.wrap = d.wrap;
+            self.detail = Some(next);
         }
     }
 
@@ -2092,6 +2233,8 @@ struct App {
     /// one catalog that every DLT tab is opened with.
     fibex: Option<Arc<nerka_core::Fibex>>,
     fibex_paths: Vec<PathBuf>,
+    /// The catalog's arguments (for the line window), by catalog.
+    fibex_args: Option<(usize, Arc<Vec<nerka_core::Argument>>)>,
     /// The plot is in a window of its own, and what that window shares.
     plot_window: bool,
     plot_win: Arc<std::sync::Mutex<plot::Detached>>,
@@ -2786,10 +2929,30 @@ impl App {
         if let Some(t) = self.tabs.get_mut(self.active)
             && let Some(d) = &mut t.detail
         {
+            let line = d.line;
+            // The FIBEX arguments, worked out once per catalog.
+            let key = self.fibex.as_ref().map_or(0, |f| Arc::as_ptr(f) as usize);
+            if self.fibex_args.as_ref().is_none_or(|(k, _)| *k != key) {
+                let args = self.fibex.as_ref().map(|f| f.arguments()).unwrap_or_default();
+                self.fibex_args = Some((key, Arc::new(args)));
+            }
+            let args = self.fibex_args.as_ref().map(|(_, a)| a.clone()).unwrap_or_default();
+            let t = self.tabs.get_mut(self.active).expect("checked");
+            let signals = t.line_signals(line, &args);
+            let d = t.detail.as_mut().expect("still there");
+            d.signals = signals;
             let (open, copied) = d.show(&ctx);
             if let Some(text) = copied {
                 ctx.copy_text(text);
                 t.status = "Copied".into();
+            }
+            if let Some(l) = t.detail.as_mut().and_then(|d| d.goto.take()) {
+                t.goto_line(l);
+                // The window goes along to that line.
+                let wrap = t.detail.as_ref().is_some_and(|d| d.wrap);
+                if let Some(file) = &t.file {
+                    t.detail = LineDetail::of(&**file, l).map(|d| LineDetail { wrap, ..d });
+                }
             }
             if !open {
                 t.detail = None;
@@ -3258,7 +3421,12 @@ query timeouts  labels: vision
         let ctx = egui::Context::default();
         let mut tab = Tab::open_many(&ctx, vec![dlt], &SearchPrefs::default(), Some(fibex));
         settle(&mut tab, &ctx);
-        tab.arg_picks = args;
+        // Not picked yet: the line window still lists the message's argument.
+        let own = tab.line_signals(0, &args);
+        let free: Vec<(&str, Option<&str>, &str)> =
+            own.iter().map(|s| (s.name.as_str(), s.value.as_deref(), s.origin)).collect();
+        assert_eq!(free, [("free_slots", Some("512"), "FIBEX, not used")]);
+        tab.arg_picks = args.clone();
         tab.choices_gen += 1;
         tab.refresh_signals(&ctx, &Library::new(), &Signals::default(), 0);
         settle(&mut tab, &ctx);
@@ -3269,6 +3437,51 @@ query timeouts  labels: vision
         tab.start_search(&ctx);
         settle(&mut tab, &ctx);
         assert_eq!(tab.result.as_ref().unwrap().lines, [1, 3]);
+        // Picked, it is listed once, as the tab's signal.
+        let own = tab.line_signals(1, &args);
+        // (with the file's built-in @time, an event on every DLT line).
+        assert_eq!(
+            own.iter().map(|s| (s.name.as_str(), s.origin)).collect::<Vec<_>>(),
+            [("time", "built in"), ("free_slots", "FIBEX")]
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn the_line_window_lists_signals_and_follows_the_selection() {
+        let dir = std::env::temp_dir().join(format!("nerka-gui-detail-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("app.log");
+        std::fs::write(
+            &log,
+            "v=10 gear=P
+boot
+v=60
+gear=D
+",
+        )
+        .unwrap();
+        let ctx = egui::Context::default();
+        let mut tab = Tab::open(&ctx, log, &SearchPrefs::default());
+        settle(&mut tab, &ctx);
+        tab.signals.set(nerka_core::SignalDef::parse_spec(r"v=/v=(?<v>\d+)/").unwrap());
+        tab.signals.set(nerka_core::SignalDef::parse_spec(r"gear:enum=/gear=(?<gear>\w)/").unwrap());
+        tab.signals_changed(&ctx);
+        settle(&mut tab, &ctx);
+        // Line 3 carries v; gear holds P from line 1.
+        let s = tab.line_signals(2, &[]);
+        let rows: Vec<(&str, Option<&str>, Option<LineNo>)> =
+            s.iter().map(|s| (s.name.as_str(), s.value.as_deref(), s.from)).collect();
+        assert_eq!(rows, [("v", Some("60"), Some(2)), ("gear", Some("P"), Some(0))], "events first");
+        assert_eq!(tab.line_signals(1, &[])[0].from, Some(0), "a state");
+        // The window follows the line selected in a view.
+        let file = tab.file.clone().unwrap();
+        tab.detail = LineDetail::of(&*file, 0);
+        tab.detail.as_mut().unwrap().wrap = false;
+        tab.view_output(&view::ViewOutput { moved_to: Some(3), ..Default::default() }, |r| r);
+        let d = tab.detail.as_ref().unwrap();
+        assert_eq!((d.line, d.wrap), (3, false), "keeps Wrap");
+        assert_eq!(d.cells.last().map(String::as_str), Some("gear=D"));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

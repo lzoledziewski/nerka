@@ -205,8 +205,10 @@ impl<'a> Reader<'a> {
                     let shift = 128 - 8 * u32::from(n);
                     (((u << shift) as i128) >> shift) as f64
                 }
-                ArgType::Float(2) => f64::from(half(u as u16)),
-                ArgType::Float(4) => f64::from(f32::from_bits(u as u32)),
+                // Through the f32's shortest decimal: 20.79659, not the
+                // widened 20.79659080505371.
+                ArgType::Float(2) => short_f64(half(u as u16)),
+                ArgType::Float(4) => short_f64(f32::from_bits(u as u32)),
                 ArgType::Float(_) => f64::from_bits(u as u64),
                 _ => u as f64,
             }
@@ -275,6 +277,11 @@ impl<'a> Reader<'a> {
         }
         Some(())
     }
+}
+
+/// An f32 as the f64 of its shortest decimal form.
+fn short_f64(f: f32) -> f64 {
+    f.to_string().parse().unwrap_or(f64::from(f))
 }
 
 /// An IEEE half-precision float.
