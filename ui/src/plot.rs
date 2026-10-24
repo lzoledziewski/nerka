@@ -324,19 +324,26 @@ pub fn plot_panel(ui: &mut egui::Ui, state: &mut PlotState, src: Source<'_>) -> 
         let color = crate::library::palette(k);
         painter.line_segment([pos2(rect.min.x, top + lane_h), pos2(plot.max.x, top + lane_h)], Stroke::new(1.0, grid));
         // The lane's name, and a checkbox for its events, in the gutter.
-        painter.text(
-            pos2(rect.min.x + 4.0, top + 4.0),
-            Align2::LEFT_TOP,
-            format!("@{}", lane.name),
-            font.clone(),
-            color,
-        );
+        // Long names are shortened to fit beside the y labels (hover: all).
+        let name = format!("@{}", lane.name);
+        let short = match name.char_indices().nth(12) {
+            Some((i, _)) if name.chars().count() > 13 => format!("{}…", &name[..i]),
+            _ => name.clone(),
+        };
+        painter.text(pos2(rect.min.x + 4.0, top + 4.0), Align2::LEFT_TOP, short, font.clone(), color);
         // Right-click the name: the y axis.
         let name_rect = Rect::from_min_size(pos2(rect.min.x, top), vec2(GUTTER - 4.0, 18.0));
         let name_r = ui.interact(name_rect, ui.scope_id().with(("lane", &lane.name)), Sense::click());
         if lane.kind != SignalKind::Enum {
             let y = state.y.entry(lane.name.clone()).or_insert(YAxis::All);
-            name_r.on_hover_text("Right-click: y axis").context_menu(|ui| y_axis_menu(ui, y, lane.y_range));
+            name_r
+                .on_hover_text(format!(
+                    "{name}
+Right-click: y axis"
+                ))
+                .context_menu(|ui| y_axis_menu(ui, y, lane.y_range));
+        } else {
+            name_r.on_hover_text(name.as_str());
         }
         let cb = Rect::from_min_size(pos2(rect.min.x + 4.0, top + 20.0), vec2(GUTTER - 10.0, 16.0));
         let mut show = state.events.contains(&lane.name);

@@ -165,3 +165,83 @@ fn reference_files_load() {
         eprintln!("{}: {} messages, {unknown} unknown arguments", p.display(), f.len());
     }
 }
+
+#[test]
+fn arguments_as_values_and_names() {
+    let f = nav();
+    let m = f.frame(11, b"NAV1", None, None).unwrap();
+    let mut d = vec![4, 0, b'a', b'b', b'c', 0, 1];
+    d.extend(1.5f32.to_le_bytes());
+    d.extend((-7i32).to_le_bytes());
+    d.extend([200, 2, 0, 0xde, 0xad]);
+    let v: Vec<Option<SignalValue>> = (0..7).map(|i| m.arg(&d, false, i)).collect();
+    assert_eq!(
+        v,
+        [
+            Some(SignalValue::Enum(b"abc".to_vec())),
+            Some(SignalValue::Enum(b"true".to_vec())),
+            Some(SignalValue::Num(1.5)),
+            Some(SignalValue::Num(-7.0)),
+            Some(SignalValue::Num(200.0)),
+            Some(SignalValue::Enum(b"de ad".to_vec())),
+            None,
+        ]
+    );
+    assert_eq!(m.arg(&d[..3], false, 2), None, "too short");
+    assert_eq!(f.frame(10, b"NAV1", None, None).unwrap().template(), "speed: <u16> km/h & <ok>!");
+    let args = f.arguments();
+    let names: Vec<(u32, usize, &str, &str)> =
+        args.iter().map(|a| (a.mid, a.index, a.name.as_str(), a.label.as_str())).collect();
+    assert_eq!(
+        names,
+        // By ECU, APID, CTID, message id: 11 has no APID. Message 12 stops
+        // at its unknown argument.
+        [
+            (11, 0, "m11_0", ""),
+            (11, 1, "m11_1", ""),
+            (11, 2, "m11_2", ""),
+            (11, 3, "m11_3", ""),
+            (11, 4, "m11_4", ""),
+            (11, 5, "m11_5", ""),
+            (10, 0, "speed", "speed")
+        ]
+    );
+    assert_eq!((args[6].ty.name(), args[6].ty.kind()), ("u16".to_owned(), SignalKind::Num));
+    assert_eq!(args[6].message, "speed: <u16> km/h & <ok>!");
+    // An argument without text of its own takes the label before it: 12
+    // becomes "odd <u8> speed: <u16> …", so its <u16> is "speed" (shared
+    // with 10: the message id tells them apart) and its <u8> "odd".
+    let mut t = Fibex::default();
+    t.add("t.xml", &NAV.replace(r#"ID-REF="S_WEIRD""#, r#"ID-REF="S_UINT8""#).replace(
+        r#"<fx:PDU-INSTANCE ID="z2"><fx:PDU-REF ID-REF="P10_1"/>"#,
+        r#"<fx:PDU-INSTANCE ID="z2"><fx:PDU-REF ID-REF="P10_0"/></fx:PDU-INSTANCE><fx:PDU-INSTANCE ID="z3"><fx:PDU-REF ID-REF="P10_1"/>"#,
+    ))
+    .unwrap();
+    let a12: Vec<(String, String)> =
+        t.arguments().into_iter().filter(|a| a.mid == 12).map(|a| (a.name, a.label)).collect();
+    assert_eq!(a12, [("odd".to_owned(), "odd".to_owned()), ("speed_m12_1".to_owned(), "speed".to_owned())]);
+    let mut carry = Fibex::default();
+    carry
+        .add(
+            "c.xml",
+            &NAV.replace(r#"ID-REF="S_WEIRD""#, r#"ID-REF="S_UINT8""#).replace(
+                r#"<fx:PDU-INSTANCE ID="z2"><fx:PDU-REF ID-REF="P10_1"/>"#,
+                r#"<fx:PDU-INSTANCE ID="z2"><fx:PDU-REF ID-REF="P11_0"/>"#,
+            ),
+        )
+        .unwrap();
+    let c12: Vec<String> = carry.arguments().into_iter().filter(|a| a.mid == 12).map(|a| a.label).collect();
+    assert_eq!(c12[..3], ["odd", "odd", "odd"], "12's arguments after 'odd' have no text of their own");
+    // The same label in two messages: both names say which message.
+    let mut two = nav();
+    two.add("gw.xml", &NAV.replace("NAV1", "GW")).unwrap();
+    let n: Vec<String> = two.arguments().iter().filter(|a| a.label == "speed").map(|a| a.name.clone()).collect();
+    // Both are message 10, of two ECUs: the ECU tells them apart.
+    assert_eq!(n, ["gw_speed_m10_0", "nav1_speed_m10_0"]);
+    assert_eq!(snake("Free size:"), "free_size");
+    assert_eq!(last_phrase("Buffer near limit. Free size: "), "Free size");
+    assert_eq!(last_phrase("a, b; temp ="), "temp");
+    assert_eq!(last_phrase("."), "");
+    assert_eq!(snake("3 phases"), "_3_phases");
+    assert_eq!(snake(" : "), "");
+}

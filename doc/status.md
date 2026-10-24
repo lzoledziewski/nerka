@@ -2,7 +2,7 @@
 
 Snapshot of where the project stands. Update this file whenever the state changes.
 
-_Last update: 2026-10-24 (FIBEX: DLT non-verbose messages decoded from FIBEX files given for the session — text, and APID / CTID / type / level; `quick-xml` added. Before: signals, the plot. Design in `sources-and-signals.md`)._
+_Last update: 2026-10-24 (FIBEX arguments as signals: a tree in the Signals panel lists every typed argument of the described messages; tick or plot one, no regex. Before: FIBEX decoding, signals, the plot. Design in `sources-and-signals.md`)._
 
 ## State
 
@@ -120,7 +120,8 @@ Owner, 2026-10-24: FIBEX first (SOME/IP, if it comes, from ARXML); `quick-xml` a
 - **CLI:** `--fibex FILE` (global, repeatable). **GUI:** a **FIBEX** section in the Signals panel (owner, 2026-10-24: FIBEX belongs with signals; it was a toolbar menu first): add files, see how many messages they describe and which files, forget them; for every tab, this session. DLT tabs read their files again with them, keeping filter, search, selection and the current line; `nerka-gui --fibex FILE` at startup.
 - **Tried on dlt-daemon's `src/examples/dlt-example-non-verbose.xml`** (owner's request): a `.dlt` written to match its four messages (ECU `TCB`, no extended header, little and big endian) decodes as dlt-daemon describes them — `[11] 00 02` becomes `APP1 CON1 warn Buffer near limit. Free size: 512`, `Buffer size exceeded. Requested size: 4096 Free size: 1024 Process terminated.`, `Temperature measurement 4 22.25`; an id it doesn't describe stays hex; `apid == APP1 AND level >= WARN` and a signal captured from the decoded text work.
 - **Benchmark** (1 GiB `gen_dlt`, 12.5 M messages, release): `apid == NAV AND level >= WARN` ~29 ms with or without FIBEX; payload regexes 200–330 ms either way (run-to-run noise; 5 % of the messages are non-verbose there).
-- **Next:** typed arguments as signals without a regex; the `nerka-db` intermediate format (import once, library or session); try it on the owner's real FIBEX files (variants: FIBEX 4.x, value tables, other ECU naming).
+- **Arguments as signals (owner, 2026-10-24: list the embedded signals as a tree and plot them):** the FIBEX section of the Signals panel lists every typed argument of the described messages as a tree — ECU → APID / CTID → message (its template, `Free size: <u16>`) → argument — with a filter box (small catalogs start unfolded). Tick an argument to make it a signal of the tab, or 📈 to plot it (which ticks it); it is then a signal like the others (`@free_size_m11_0 > 1000`, events and states, kind and scope), tagged FIBEX. Its value is the argument itself (`SignalDef::argument`: the messages `mid == N AND ecu == "E"` match, `LogSource::argument` decodes argument *n* of each), no regex. Names come from the last phrase before the argument (`Buffer near limit. Free size:` → `free_size`), else the label of the argument before it in the message, else `m<id>_<n>`; made unique with the message id and argument place, and the ECU when two ECUs describe the same id (`Fibex::arguments`). `nerka-gui --plot NAME` picks a FIBEX argument of that name at startup. Forgetting the FIBEX files drops the picks.
+- **Next:** verbose DLT arguments as signals the same way (`LogSource::argument` for verbose messages); the `nerka-db` intermediate format (import once, library or session); try it on the owner's real FIBEX files (variants: FIBEX 4.x, value tables, other ECU naming).
 
 ## Search manager (POC built: core, CLI, GUI)
 

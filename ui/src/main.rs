@@ -226,6 +226,10 @@ fn main() -> eframe::Result {
                 app.open_files(&cc.egui_ctx, initial);
                 if let Some(tab) = app.tabs.last_mut() {
                     plotted.iter().for_each(|n| plot::lock(&tab.plot).toggle(n));
+                    // A plotted name can be a FIBEX argument: it becomes a signal.
+                    if let Some(f) = &app.fibex {
+                        tab.arg_picks = f.arguments().into_iter().filter(|a| plotted.contains(&a.name)).collect();
+                    }
                 }
                 if let (Some(p), Some(tab)) = (&moved, app.tabs.last_mut()) {
                     tab.use_preset(&cc.egui_ctx, &app.library, p);
@@ -530,6 +534,8 @@ struct Tab {
     views: signals::Views,
     /// Read again: the line to show once it is loaded.
     reopen_at: Option<LineNo>,
+    /// FIBEX arguments used as signals (picked in the Signals panel).
+    arg_picks: Vec<nerka_core::Argument>,
     status: String,
 }
 
@@ -787,6 +793,7 @@ impl Tab {
             choices_gen: 0,
             views: signals::Views::default(),
             reopen_at: None,
+            arg_picks: Vec::new(),
             status: String::new(),
         }
     }
@@ -916,6 +923,20 @@ impl Tab {
         let mut s = Signals::default().for_source(&*file);
         for d in saved.iter() {
             s.set((**d).clone());
+        }
+        // FIBEX arguments picked in the Signals panel.
+        for a in &self.arg_picks {
+            let query = match &a.ecu {
+                Some(ecu) => format!("mid == {} AND ecu == \"{ecu}\"", a.mid),
+                None => format!("mid == {}", a.mid),
+            };
+            let from = format!("FIBEX message {}: {}", a.mid, a.message);
+            let kind = self.query_kind.get(&a.name).copied().unwrap_or(a.ty.kind());
+            if s.get(&a.name).is_none()
+                && let Ok(d) = nerka_core::SignalDef::argument(&a.name, kind, &query, a.index, &from)
+            {
+                s.set(d.with_scope(self.query_scope.get(&a.name).copied().unwrap_or_default()));
+            }
         }
         if let Ok(a) = self.picks.expand(lib) {
             let parts: Vec<nerka_core::QueryPart<'_>> = a
@@ -2900,6 +2921,7 @@ impl App {
                         views: &mut tab.views,
                         kept: tab.result.as_ref(),
                         fibex: fibex.as_deref(),
+                        arg_picks: &mut tab.arg_picks,
                     };
                     signals::signals_panel(ui, &mut tab.signals_ui, input)
                 })
@@ -2928,6 +2950,9 @@ impl App {
                 save_signals = true;
             }
             fibex_action = out.fibex;
+            if out.args_changed {
+                tab.choices_gen += 1;
+            }
             if let Some(line) = out.goto {
                 tab.goto_line(line);
             }
@@ -3025,7 +3050,14 @@ impl App {
                     self.set_fibex(&ctx, all);
                 }
             }
-            Some(signals::FibexAction::Forget) => self.set_fibex(&ctx, Vec::new()),
+            Some(signals::FibexAction::Forget) => {
+                self.set_fibex(&ctx, Vec::new());
+                // Without FIBEX the messages have no arguments.
+                for t in &mut self.tabs {
+                    t.arg_picks.clear();
+                    t.choices_gen += 1;
+                }
+            }
             None => {}
         }
     }
@@ -3138,6 +3170,55 @@ query timeouts  labels: vision
         // The filter ran again on the decoded text; the current line stayed.
         assert_eq!(tab.result.as_ref().unwrap().lines, [2, 3, 4]);
         assert_eq!(tab.current_line(), 3);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn fibex_arguments_become_signals_of_a_tab() {
+        use nerka_core::input::dlt::writer::{Msg, Payload};
+        let dir = std::env::temp_dir().join(format!("nerka-gui-fibex-args-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (dlt, xml) = (dir.join("t.dlt"), dir.join("t.xml"));
+        let mut buf = Vec::new();
+        for size in [512u16, 64, 900, 32] {
+            let m = Msg {
+                ext: None,
+                payload: Payload::NonVerbose { id: 11, data: size.to_le_bytes().to_vec() },
+                ..Msg::log(nerka_core::Level::Info, "TCB", "", "", vec![])
+            };
+            m.encode(&mut buf);
+        }
+        std::fs::write(&dlt, &buf).unwrap();
+        std::fs::write(
+            &xml,
+            r#"<fx:FIBEX xmlns:fx="f" xmlns:ho="h"><fx:ELEMENTS><fx:ECUS><fx:ECU ID="TCB"/></fx:ECUS><fx:PDUS>
+              <fx:PDU ID="t"><ho:DESC>Buffer near limit. Free size:</ho:DESC></fx:PDU>
+              <fx:PDU ID="v"><fx:SIGNAL-INSTANCES><fx:SIGNAL-INSTANCE ID="s"><fx:SEQUENCE-NUMBER>0</fx:SEQUENCE-NUMBER>
+                <fx:SIGNAL-REF ID-REF="S_UINT16"/></fx:SIGNAL-INSTANCE></fx:SIGNAL-INSTANCES></fx:PDU>
+            </fx:PDUS><fx:FRAMES><fx:FRAME ID="ID_11"><fx:PDU-INSTANCES>
+              <fx:PDU-INSTANCE ID="1"><fx:PDU-REF ID-REF="t"/><fx:SEQUENCE-NUMBER>0</fx:SEQUENCE-NUMBER></fx:PDU-INSTANCE>
+              <fx:PDU-INSTANCE ID="2"><fx:PDU-REF ID-REF="v"/><fx:SEQUENCE-NUMBER>1</fx:SEQUENCE-NUMBER></fx:PDU-INSTANCE>
+            </fx:PDU-INSTANCES><fx:MANUFACTURER-EXTENSION><APPLICATION_ID>APP1</APPLICATION_ID></fx:MANUFACTURER-EXTENSION>
+            </fx:FRAME></fx:FRAMES></fx:ELEMENTS></fx:FIBEX>"#,
+        )
+        .unwrap();
+        let fibex = Arc::new(nerka_core::Fibex::load(&[&xml]).unwrap());
+        let args = fibex.arguments();
+        assert_eq!(args.iter().map(|a| a.name.as_str()).collect::<Vec<_>>(), ["free_size"]);
+        let ctx = egui::Context::default();
+        let mut tab = Tab::open_many(&ctx, vec![dlt], &SearchPrefs::default(), Some(fibex));
+        settle(&mut tab, &ctx);
+        tab.arg_picks = args;
+        tab.choices_gen += 1;
+        tab.refresh_signals(&ctx, &Library::new(), &Signals::default(), 0);
+        settle(&mut tab, &ctx);
+        let d = tab.signals.get("free_size").expect("a signal");
+        assert_eq!((d.kind(), d.argument_index()), (SignalKind::Num, Some(0)));
+        tab.mode = Mode::Query;
+        tab.pattern = "@free_size < 100".into();
+        tab.start_search(&ctx);
+        settle(&mut tab, &ctx);
+        assert_eq!(tab.result.as_ref().unwrap().lines, [1, 3]);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

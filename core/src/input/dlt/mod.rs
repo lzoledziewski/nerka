@@ -447,6 +447,12 @@ impl LogSource for DltFile {
         let (secs, usecs) = self.msg(line)?.storage_time();
         Some(f64::from(secs) + f64::from(usecs) / 1e6)
     }
+
+    fn argument(&self, line: LineNo, index: usize) -> Option<crate::signal::SignalValue> {
+        let m = self.msg(line)?;
+        let frame = self.frame(&m)?;
+        frame.arg(m.payload().get(4..)?, m.big_endian(), index)
+    }
 }
 
 #[cfg(test)]

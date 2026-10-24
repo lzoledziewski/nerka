@@ -37,7 +37,7 @@ pub use event::{Event, FieldDef, FieldId, FieldKind, FieldValue, Level};
 pub use history::SearchHistory;
 pub use input::concat::open_many;
 pub use input::dlt::DltFile;
-pub use input::dlt::fibex::{Fibex, FibexError};
+pub use input::dlt::fibex::{ArgType, Argument, Fibex, FibexError};
 pub use input::text::TextFile;
 pub use input::{ColumnDef, LogSource, OpenOptions, open, open_with};
 pub use pack::{Library, Pack, PackError, PackQuery};

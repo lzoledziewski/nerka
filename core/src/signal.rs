@@ -407,6 +407,9 @@ pub struct SignalDef {
     /// The selection queries it comes from (their names); empty for one
     /// the user defined.
     queries: Vec<String>,
+    /// The value is this argument of the matching lines' messages
+    /// ([`LogSource::argument`]), not a capture.
+    argument: Option<usize>,
 }
 
 impl SignalDef {
@@ -443,7 +446,40 @@ impl SignalDef {
             from_source: false,
             scope: SignalScope::All,
             queries: Vec::new(),
+            argument: None,
         })
+    }
+
+    /// A signal whose value is argument `index` of the messages `query`
+    /// matches (e.g. `mid == 11 AND ecu == "TCB"`): a FIBEX-described
+    /// message's argument, no regex. `from` says where it comes from (for
+    /// a UI).
+    pub fn argument(
+        name: &str,
+        kind: SignalKind,
+        query: &str,
+        index: usize,
+        from: &str,
+    ) -> Result<SignalDef, SignalError> {
+        if !is_name(name) {
+            return Err(SignalError::Name(format!("'{name}' isn't a name (letters, digits and _, not first a digit)")));
+        }
+        Ok(SignalDef {
+            name: name.to_ascii_lowercase(),
+            kind,
+            group: name.to_owned(),
+            query: Query::compile(query).map_err(SignalError::Query)?,
+            cache: Cache::default(),
+            from_source: false,
+            scope: SignalScope::All,
+            queries: vec![from.to_owned()],
+            argument: Some(index),
+        })
+    }
+
+    /// The message argument it takes, for one made by [`Self::argument`].
+    pub fn argument_index(&self) -> Option<usize> {
+        self.argument
     }
 
     /// The same signal with its events from `scope`.
@@ -499,6 +535,7 @@ impl SignalDef {
             from_source: true,
             scope: SignalScope::All,
             queries: Vec::new(),
+            argument: None,
         }
     }
 
@@ -540,6 +577,9 @@ impl SignalDef {
         if self.from_source {
             return "time:time (the file's own time)".into();
         }
+        if let Some(i) = self.argument {
+            return format!("{}:{} = argument {i} of {}", self.name, self.kind.as_str(), self.query.source());
+        }
         let group = if self.group == self.name { String::new() } else { format!("({})", self.group) };
         let scope = if self.scope == SignalScope::Filtered { ":filtered" } else { "" };
         format!("{}{group}:{}{scope}={}", self.name, self.kind.as_str(), self.query.source())
@@ -570,6 +610,16 @@ impl SignalDef {
     pub fn value(&self, ev: &mut Event<'_>) -> Option<SignalValue> {
         if self.from_source {
             return ev.source()?.time(ev.line()).map(SignalValue::Num);
+        }
+        if let Some(index) = self.argument {
+            if !self.query.matches_event(ev) {
+                return None;
+            }
+            return match (ev.source()?.argument(ev.line(), index)?, self.kind) {
+                (SignalValue::Num(n), SignalKind::Enum) => Some(SignalValue::Enum(n.to_string().into_bytes())),
+                (SignalValue::Enum(t), SignalKind::Num | SignalKind::Time) => self.read(&t),
+                (v, _) => Some(v),
+            };
         }
         // A query that is only the capturing regex matches when it captures.
         let only_regex = matches!(self.query.expr(), Expr::Cond(Cond::RawMatch(_)));

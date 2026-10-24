@@ -22,6 +22,10 @@ pub struct SignalsUi {
     /// The definitions bound to the tab's source, by generation.
     bound: Vec<(String, Result<SignalDef, String>)>,
     bound_gen: Option<u64>,
+    /// The FIBEX catalog's arguments, worked out once per catalog (its
+    /// address), and the tree's filter text.
+    args: Option<(usize, Vec<nerka_core::Argument>)>,
+    arg_filter: String,
 }
 
 struct Draft {
@@ -51,6 +55,8 @@ pub struct Output {
     /// Go to this line (the event that set a state was clicked).
     pub goto: Option<LineNo>,
     pub fibex: Option<FibexAction>,
+    /// The picked FIBEX arguments changed.
+    pub args_changed: bool,
 }
 
 /// What to do with the FIBEX files.
@@ -107,10 +113,12 @@ pub struct Input<'a> {
     pub kept: Option<&'a Arc<SearchResult>>,
     /// The FIBEX files in use (every tab, this session).
     pub fibex: Option<&'a nerka_core::Fibex>,
+    /// The FIBEX arguments this tab uses as signals.
+    pub arg_picks: &'a mut Vec<nerka_core::Argument>,
 }
 
 pub fn signals_panel(ui: &mut egui::Ui, st: &mut SignalsUi, input: Input<'_>) -> Output {
-    let Input { signals, generation, saved, file, line, plot, views, kept, fibex } = input;
+    let Input { signals, generation, saved, file, line, plot, views, kept, fibex, arg_picks } = input;
     let mut out = Output::default();
     ui.horizontal(|ui| {
         ui.heading("Signals");
@@ -212,6 +220,9 @@ pub fn signals_panel(ui: &mut egui::Ui, st: &mut SignalsUi, input: Input<'_>) ->
                         remove = Some(d.name().to_owned());
                     }
                 });
+            } else if d.argument_index().is_some() {
+                ui.weak("FIBEX")
+                    .on_hover_text(format!("{}\nUntick it in the FIBEX tree below to remove it.", d.queries()[0]));
             } else {
                 ui.weak("query").on_hover_text(format!(
                     "From the named group (?<{}>…) of: {}\nIt goes away with the query; pin its kind in the pack \
@@ -245,6 +256,9 @@ pub fn signals_panel(ui: &mut egui::Ui, st: &mut SignalsUi, input: Input<'_>) ->
 
     ui.separator();
     out.fibex = fibex_ui(ui, fibex);
+    if let Some(f) = fibex {
+        out.args_changed = arg_tree(ui, st, f, arg_picks, plot);
+    }
 
     ui.separator();
     ui.label(RichText::new(if st.editing.is_some() { "Edit signal" } else { "New signal" }).strong())
@@ -337,6 +351,149 @@ fn fibex_ui(ui: &mut egui::Ui, fibex: Option<&nerka_core::Fibex>) -> Option<Fibe
         }
     }
     action
+}
+
+/// The arguments FIBEX describes, as a tree: ECU, APID / CTID, message,
+/// argument. Ticking an argument makes it a signal of the tab; plotting
+/// one ticks it too. Returns whether the picks changed.
+fn arg_tree(
+    ui: &mut egui::Ui,
+    st: &mut SignalsUi,
+    fibex: &nerka_core::Fibex,
+    picks: &mut Vec<nerka_core::Argument>,
+    plot: &mut PlotState,
+) -> bool {
+    let key = fibex as *const nerka_core::Fibex as usize;
+    if st.args.as_ref().is_none_or(|(k, _)| *k != key) {
+        st.args = Some((key, fibex.arguments()));
+    }
+    let Some((_, args)) = &st.args else { return false };
+    if args.is_empty() {
+        ui.weak("No message has typed arguments.");
+        return false;
+    }
+    ui.horizontal(|ui| {
+        ui.label("Arguments");
+        ui.add(
+            egui::TextEdit::singleline(&mut st.arg_filter).hint_text("filter: name, text, APID…").desired_width(160.0),
+        );
+    });
+    let filter = st.arg_filter.trim().to_lowercase();
+    let shown = |a: &nerka_core::Argument| {
+        filter.is_empty()
+            || [&a.name, &a.label, &a.message, a.apid.as_deref().unwrap_or(""), a.ctid.as_deref().unwrap_or("")]
+                .iter()
+                .any(|t| t.to_lowercase().contains(&filter))
+    };
+    let mut changed = false;
+    let open = (!filter.is_empty()).then_some(true);
+    // A small catalog starts unfolded; a big one waits for the filter.
+    let small = args.len() <= 50;
+    egui::ScrollArea::vertical().id_salt("fibex_args").max_height(280.0).show(ui, |ui| {
+        // Group consecutive arguments (the list is sorted) by ECU, then
+        // APID / CTID, then message.
+        let mut i = 0;
+        while i < args.len() {
+            let ecu = &args[i].ecu;
+            let end = i + args[i..].iter().take_while(|a| &a.ecu == ecu).count();
+            let group = &args[i..end];
+            i = end;
+            if !group.iter().any(shown) {
+                continue;
+            }
+            let title = ecu.clone().unwrap_or_else(|| "(any ECU)".into());
+            egui::CollapsingHeader::new(RichText::new(title).strong())
+                .id_salt(("ecu", ecu))
+                .default_open(small)
+                .open(open)
+                .show(ui, |ui| {
+                    let mut j = 0;
+                    while j < group.len() {
+                        let app = (&group[j].apid, &group[j].ctid);
+                        let end = j + group[j..].iter().take_while(|a| (&a.apid, &a.ctid) == app).count();
+                        let apps = &group[j..end];
+                        j = end;
+                        if !apps.iter().any(shown) {
+                            continue;
+                        }
+                        let title =
+                            format!("{} / {}", app.0.as_deref().unwrap_or("-"), app.1.as_deref().unwrap_or("-"));
+                        egui::CollapsingHeader::new(title)
+                            .id_salt(("app", ecu, app))
+                            .default_open(small)
+                            .open(open)
+                            .show(ui, |ui| {
+                                let mut k = 0;
+                                while k < apps.len() {
+                                    let mid = apps[k].mid;
+                                    let end = k + apps[k..].iter().take_while(|a| a.mid == mid).count();
+                                    let msg = &apps[k..end];
+                                    k = end;
+                                    if !msg.iter().any(shown) {
+                                        continue;
+                                    }
+                                    // Long templates are cut: the panel stays narrow.
+                                    let text = &msg[0].message;
+                                    let title = match text.char_indices().nth(44) {
+                                        Some((i, _)) => format!("[{mid}] {}…", &text[..i]),
+                                        None => format!("[{mid}] {text}"),
+                                    };
+                                    egui::CollapsingHeader::new(RichText::new(title).monospace())
+                                        .id_salt(("msg", ecu, mid))
+                                        .default_open(small)
+                                        .open(open)
+                                        .show(ui, |ui| {
+                                            for a in msg.iter().filter(|a| shown(a)) {
+                                                changed |= arg_row(ui, a, picks, plot);
+                                            }
+                                        });
+                                }
+                            });
+                    }
+                });
+        }
+    });
+    changed
+}
+
+/// One argument: whether it is a signal, whether it is plotted.
+fn arg_row(
+    ui: &mut egui::Ui,
+    a: &nerka_core::Argument,
+    picks: &mut Vec<nerka_core::Argument>,
+    plot: &mut PlotState,
+) -> bool {
+    let mut changed = false;
+    ui.horizontal(|ui| {
+        let picked = picks.iter().any(|p| p.name == a.name);
+        let mut on = picked;
+        if ui.checkbox(&mut on, "").on_hover_text("Use it as a signal of this tab").changed() {
+            if on {
+                picks.push(a.clone());
+            } else {
+                picks.retain(|p| p.name != a.name);
+                if plot.is_plotted(&a.name) {
+                    plot.toggle(&a.name);
+                }
+            }
+            changed = true;
+        }
+        let mut plotted = plot.is_plotted(&a.name);
+        if ui.small_button(if plotted { "📈✓" } else { "📈" }).on_hover_text("Plot it").clicked() {
+            plotted = !plotted;
+            plot.toggle(&a.name);
+            if plotted && !picked {
+                picks.push(a.clone());
+                changed = true;
+            }
+        }
+        ui.label(RichText::new(format!("@{}", a.name)).monospace());
+        ui.weak(a.ty.name());
+        if !a.label.is_empty() {
+            ui.weak(format!("\"{}\"", a.label));
+        }
+    });
+    changed
 }
 
 /// The kind: a choice for a query signal (inferred from its values until

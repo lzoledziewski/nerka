@@ -29,6 +29,7 @@
 //! agree), and among those the one whose APID / CTID match the message's.
 
 use crate::event::Level;
+use crate::signal::{SignalKind, SignalValue};
 use quick_xml::events::Event as Xml;
 use std::collections::HashMap;
 use std::io::Write;
@@ -90,6 +91,45 @@ impl Frame {
         })
     }
 
+    /// The value of argument `index` (counting arguments only) in a payload
+    /// (`data`: after the message id): numbers as numbers, the rest as
+    /// text.
+    pub fn arg(&self, data: &[u8], big_endian: bool, index: usize) -> Option<SignalValue> {
+        let mut r = Reader { b: data, be: big_endian };
+        let mut n = 0;
+        for p in &self.pieces {
+            let ty = match p {
+                Piece::Text(_) => continue,
+                Piece::Arg(ty) => *ty,
+                Piece::Unknown(_) => return None,
+            };
+            if n == index {
+                return r.value(ty);
+            }
+            // Skip it: its text isn't needed.
+            r.arg(ty, &mut Vec::new())?;
+            n += 1;
+        }
+        None
+    }
+
+    /// The message as a template: its texts, and each argument as its
+    /// type (`Free size: <u16>`).
+    pub fn template(&self) -> String {
+        let mut out = String::new();
+        for p in &self.pieces {
+            if !out.is_empty() && !out.ends_with(char::is_whitespace) {
+                out.push(' ');
+            }
+            match p {
+                Piece::Text(t) => out.push_str(t),
+                Piece::Arg(ty) => out.push_str(&format!("<{}>", ty.name())),
+                Piece::Unknown(s) => out.push_str(&format!("<{s}?>")),
+            }
+        }
+        out
+    }
+
     /// Append the text of a payload (`data`: after the message id) to
     /// `out`. Pieces are separated by a space unless the text before ends
     /// in one; what can't be read is shown as hex after `<undecoded>`.
@@ -134,7 +174,53 @@ struct Reader<'a> {
     be: bool,
 }
 
+impl ArgType {
+    /// `u16`, `i32`, `f32`, `bool`, `string`, `raw`.
+    pub fn name(self) -> String {
+        match self {
+            ArgType::Bool => "bool".into(),
+            ArgType::Uint(n) => format!("u{}", u32::from(n) * 8),
+            ArgType::Sint(n) => format!("i{}", u32::from(n) * 8),
+            ArgType::Float(n) => format!("f{}", u32::from(n) * 8),
+            ArgType::Str => "string".into(),
+            ArgType::Raw => "raw".into(),
+        }
+    }
+
+    /// The kind of signal it makes: numbers are `num`, the rest `enum`.
+    pub fn kind(self) -> SignalKind {
+        match self {
+            ArgType::Uint(_) | ArgType::Sint(_) | ArgType::Float(_) => SignalKind::Num,
+            _ => SignalKind::Enum,
+        }
+    }
+}
+
 impl<'a> Reader<'a> {
+    /// One argument as a value.
+    fn value(&mut self, ty: ArgType) -> Option<SignalValue> {
+        let num = |u: u128, ty| -> f64 {
+            match ty {
+                ArgType::Sint(n) => {
+                    let shift = 128 - 8 * u32::from(n);
+                    (((u << shift) as i128) >> shift) as f64
+                }
+                ArgType::Float(2) => f64::from(half(u as u16)),
+                ArgType::Float(4) => f64::from(f32::from_bits(u as u32)),
+                ArgType::Float(_) => f64::from_bits(u as u64),
+                _ => u as f64,
+            }
+        };
+        Some(match ty {
+            ArgType::Uint(n) | ArgType::Sint(n) | ArgType::Float(n) => SignalValue::Num(num(self.number(n)?, ty)),
+            _ => {
+                let mut out = Vec::new();
+                self.arg(ty, &mut out)?;
+                SignalValue::Enum(out)
+            }
+        })
+    }
+
     fn take(&mut self, n: usize) -> Option<&'a [u8]> {
         if self.b.len() < n {
             return None;
@@ -251,6 +337,80 @@ impl Fibex {
         self.frames.is_empty()
     }
 
+    /// Every argument of every message, sorted by ECU, APID, CTID and
+    /// message id, each with a signal name that is unique in the list.
+    pub fn arguments(&self) -> Vec<Argument> {
+        let mut frames: Vec<(u32, &Frame)> =
+            self.frames.iter().flat_map(|(mid, fs)| fs.iter().map(move |f| (*mid, f))).collect();
+        frames.sort_by(|a, b| (&a.1.ecu, &a.1.apid, &a.1.ctid, a.0).cmp(&(&b.1.ecu, &b.1.apid, &b.1.ctid, b.0)));
+        let mut out: Vec<Argument> = Vec::new();
+        for (mid, f) in frames {
+            // The text before an argument, else the label of the one before
+            // it (`Temperature measurement <u8> <f32>`: both are about it).
+            let (mut label, mut last) = (String::new(), String::new());
+            let mut index = 0;
+            for p in &f.pieces {
+                match p {
+                    Piece::Text(t) => label = t.clone(),
+                    Piece::Arg(ty) => {
+                        out.push(Argument {
+                            mid,
+                            ecu: f.ecu.clone(),
+                            apid: f.apid.clone(),
+                            ctid: f.ctid.clone(),
+                            index,
+                            label: {
+                                let l = last_phrase(&std::mem::take(&mut label));
+                                if !l.is_empty() {
+                                    last = l;
+                                }
+                                last.clone()
+                            },
+                            name: String::new(),
+                            ty: *ty,
+                            message: f.template(),
+                        });
+                        index += 1;
+                    }
+                    Piece::Unknown(_) => break,
+                }
+            }
+        }
+        // Names from the text before the argument (`Free size:` ->
+        // `free_size`), else from the message; made unique.
+        let base: Vec<String> = out
+            .iter()
+            .map(|a| match snake(&a.label) {
+                s if s.is_empty() => format!("m{}_{}", a.mid, a.index),
+                s => s,
+            })
+            .collect();
+        // A label used once is the name; else the message id and the
+        // argument's place say which, and the ECU if that's not enough.
+        let count = |n: &str| base.iter().filter(|b| *b == n).count();
+        let with_mids: Vec<String> =
+            out.iter().zip(&base).map(|(a, b)| format!("{b}_m{}_{}", a.mid, a.index)).collect();
+        let count_mid = |n: &str| with_mids.iter().filter(|b| *b == n).count();
+        let mut used = std::collections::HashSet::new();
+        for (i, a) in out.iter_mut().enumerate() {
+            let with_mid = with_mids[i].clone();
+            let mut candidates = Vec::new();
+            if count(&base[i]) == 1 {
+                candidates.push(base[i].clone());
+            }
+            if count_mid(&with_mid) == 1 {
+                candidates.push(with_mid.clone());
+            }
+            candidates.push(format!("{}_{with_mid}", snake(a.ecu.as_deref().unwrap_or("any"))));
+            let name = candidates.into_iter().find(|c| !used.contains(c)).unwrap_or_else(|| {
+                (2..).map(|k| format!("{with_mid}_{k}")).find(|c| !used.contains(c)).expect("a free name")
+            });
+            used.insert(name.clone());
+            a.name = name;
+        }
+        out
+    }
+
     /// The description of message `mid` from `ecu` (module docs: the best
     /// match), given the message's own APID / CTID if it has them.
     pub fn frame(&self, mid: u32, ecu: &[u8], apid: Option<&[u8]>, ctid: Option<&[u8]>) -> Option<&Frame> {
@@ -271,6 +431,48 @@ impl Fibex {
             (ecu_rank, !(same(&f.apid, apid) && same(&f.ctid, ctid)))
         };
         all.iter().min_by_key(|f| rank(f))
+    }
+}
+
+/// One argument of a described message, as a possible signal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Argument {
+    pub mid: u32,
+    pub ecu: Option<String>,
+    pub apid: Option<String>,
+    pub ctid: Option<String>,
+    /// Its place among the message's arguments.
+    pub index: usize,
+    /// The text before it in the message (`Free size`).
+    pub label: String,
+    /// A signal name, unique among all arguments (`free_size`).
+    pub name: String,
+    pub ty: ArgType,
+    /// The whole message as a template ([`Frame::template`]).
+    pub message: String,
+}
+
+/// The text that names an argument: the last phrase before it, without a
+/// final `:` / `=` (`Buffer near limit. Free size:` -> `Free size`).
+fn last_phrase(text: &str) -> String {
+    let t = text.trim().trim_end_matches([':', '=']).trim();
+    t.rsplit(['.', ';', ',']).find(|p| !p.trim().is_empty()).unwrap_or("").trim().to_owned()
+}
+
+/// `Free size` -> `free_size`; empty if nothing of it is a name.
+fn snake(label: &str) -> String {
+    let mut out = String::new();
+    for c in label.chars() {
+        if c.is_ascii_alphanumeric() {
+            out.push(c.to_ascii_lowercase());
+        } else if !out.ends_with('_') && !out.is_empty() {
+            out.push('_');
+        }
+    }
+    let out = out.trim_end_matches('_').to_owned();
+    match out.chars().next() {
+        Some(c) if c.is_ascii_digit() => format!("_{out}"),
+        _ => out,
     }
 }
 

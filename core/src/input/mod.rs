@@ -191,6 +191,13 @@ pub trait LogSource: Send + Sync {
         None
     }
 
+    /// Argument `index` of `line`'s message, if the source knows the
+    /// message's arguments (DLT non-verbose messages described by FIBEX):
+    /// a value without a regex, for signals.
+    fn argument(&self, _line: LineNo, _index: usize) -> Option<crate::signal::SignalValue> {
+        None
+    }
+
     /// Identifies the data the source reads, for caches (signal events): a
     /// part of a [`concat::Concat`] answers its file's, so the part made
     /// for each scan is the same one.

@@ -447,3 +447,24 @@ fn fibex_fields_filter_on_both_paths() {
     assert_eq!(q(r"/km\/h/ AND ctid == SPD"), [0, 2]);
     assert_eq!(q("mid == 10 AND apid != NAV"), [4]);
 }
+
+#[test]
+fn fibex_arguments_are_signals() {
+    let f = speed_file(true);
+    let mut sig = crate::Signals::default();
+    sig.set(
+        crate::SignalDef::argument("speed", crate::SignalKind::Num, r#"mid == 10 AND ecu == "ECU1""#, 0, "m10")
+            .unwrap(),
+    );
+    let q = |s: &str| run_on(&f, &Filter::Query(Query::compile(s).unwrap().with_signals(&sig).unwrap()));
+    assert_eq!(q("@speed.event"), [0, 2, 4]);
+    assert_eq!(q("@speed.event > 100"), [2]);
+    // The state holds over line 3 (another message).
+    assert_eq!(q("@speed > 100"), [2, 3]);
+    assert_eq!(q("@speed.changed AND @speed < 50"), [0, 4]);
+    // Without FIBEX the messages have no arguments.
+    let raw = speed_file(false);
+    assert!(
+        run_on(&raw, &Filter::Query(Query::compile("@speed.event").unwrap().with_signals(&sig).unwrap())).is_empty()
+    );
+}
