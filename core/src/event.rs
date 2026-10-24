@@ -164,6 +164,15 @@ impl<'a> Event<'a> {
         l
     }
 
+    /// The source the line is from (none for a bare line).
+    pub fn source(&self) -> Option<&'a dyn LogSource> {
+        self.source
+    }
+
+    pub fn line(&self) -> LineNo {
+        self.line
+    }
+
     pub fn field(&self, id: FieldId) -> Option<FieldValue<'a>> {
         self.source.and_then(|s| s.field(self.line, id))
     }

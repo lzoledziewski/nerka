@@ -3,7 +3,7 @@
 //! does the capturing; the panel only edits definitions and shows values.
 
 use eframe::egui::{self, RichText};
-use nerka_core::{Event, LineNo, LogSource, SignalDef, SignalKind, Signals};
+use nerka_core::{LineNo, LogSource, SignalDef, SignalKind, Signals};
 
 /// The panel's state in one tab.
 pub struct SignalsUi {
@@ -46,6 +46,8 @@ pub struct Output {
     pub close: bool,
     /// A definition was added, changed or removed.
     pub changed: bool,
+    /// Go to this line (the event that set a state was clicked).
+    pub goto: Option<LineNo>,
 }
 
 /// `generation` changes whenever `signals` does, so bound definitions are made
@@ -65,7 +67,10 @@ pub fn signals_panel(
             out.close = crate::close_button(ui).on_hover_text("Close panel").clicked();
         });
     });
-    ui.weak("Values the lines carry, captured by a regex group. Filter with @name, e.g. @speed > 100.");
+    ui.weak(
+        "Values captured by a regex group. An event is a line that carries one; the state holds it until the \
+         next. Filter with @name (the state), @name.event or @name.changed.",
+    );
     ui.separator();
 
     if st.bound_gen != Some(generation) {
@@ -90,11 +95,38 @@ pub fn signals_panel(
             ui.weak(d.kind().as_str());
             let bound = st.bound.iter().find(|(n, _)| n == d.name()).map(|(_, b)| b);
             match bound {
-                Some(Ok(b)) => {
-                    let v = b.value(&mut Event::from_source(file, line));
-                    let text = v.map_or_else(|| "—".to_owned(), |v| v.to_string());
-                    ui.label(RichText::new(text).monospace()).on_hover_text(format!("On line {}", line + 1));
-                }
+                Some(Ok(_)) => match d.cached_series(file) {
+                    // The state on the cursor line, and the event that set it.
+                    Some(series) => match series.state(line) {
+                        Some((row, v)) => {
+                            let v = v.to_value().to_string();
+                            let events = series.len();
+                            if row == line {
+                                ui.label(RichText::new(format!("{v}  • event")).monospace())
+                                    .on_hover_text(format!("Received on line {} ({events} events in all)", line + 1));
+                            } else {
+                                let r = ui.link(RichText::new(format!("{v}  ↑ {}", row + 1)).monospace());
+                                if r.on_hover_text(format!(
+                                    "State on line {}, set by the event on line {} ({events} events in all). \
+                                     Click to go there.",
+                                    line + 1,
+                                    row + 1
+                                ))
+                                .clicked()
+                                {
+                                    out.goto = Some(row);
+                                }
+                            }
+                        }
+                        None => {
+                            ui.label(RichText::new("—").monospace())
+                                .on_hover_text(format!("No event before line {}", line + 1));
+                        }
+                    },
+                    None => {
+                        ui.weak("…").on_hover_text("Collecting events");
+                    }
+                },
                 Some(Err(e)) => {
                     ui.colored_label(ui.visuals().error_fg_color, "error").on_hover_text(e);
                 }

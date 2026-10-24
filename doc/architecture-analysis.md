@@ -184,7 +184,7 @@ indexing, regex and DSL filtering, highlighting, bookmarks with notes, CLI.
 **Phase 2 — formats, normalization & signals** (design: `sources-and-signals.md`)
 - DLT from `.dlt` files: **done** (2026-10-18), shown as a table.
 - DLT from pcap / pcapng and MF4: **done** (2026-10-20, own readers).
-- Signals v1: **done** (2026-10-24): per-tab signals from explicit regex captures, `@name` in NFD (`core/src/signal.rs`). Next: held values, time as a signal, plotting, FIBEX.
+- Signals: **done** (2026-10-24): per-tab signals from explicit regex captures, events and states (`@x`, `@x.event`, `@x.changed`) in NFD (`core/src/signal.rs`). Next: time as a signal, plotting, FIBEX.
 - `timestamp` / `service` fields, with time-range filters (`timestamp >= 10:42:00`).
 - stdin source (`tail -f x | nerka-gui -`).
 

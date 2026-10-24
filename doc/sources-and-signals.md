@@ -1,6 +1,6 @@
 # Sources & Signals — design
 
-_Status: agreed direction. Written 2026-10-17. **Signals v1** (2026-10-24): per-tab signals from explicit captures, `@name` in NFD; see "What a signal is" and `status.md` → "Signals". Implemented so far: **DLT from `.dlt` files** (2026-10-18: source-supplied fields, DSL field predicates, own reader, table view) and **DLT inside pcap / pcapng and MF4** (2026-10-20: own readers in `core/src/input/capture/`, no dependency). Signals, SOME/IP, the time model and the plugin crates are still design. Current state and decisions: `status.md`._
+_Status: agreed direction. Written 2026-10-17. **Signals** (2026-10-24): per-tab signals from explicit captures, events and states in NFD (`@x`, `@x.event`, `@x.changed`); see "What a signal is" and `status.md` → "Signals". Implemented so far: **DLT from `.dlt` files** (2026-10-18: source-supplied fields, DSL field predicates, own reader, table view) and **DLT inside pcap / pcapng and MF4** (2026-10-20: own readers in `core/src/input/capture/`, no dependency). Signals, SOME/IP, the time model and the plugin crates are still design. Current state and decisions: `status.md`._
 
 ## Goal
 
@@ -19,9 +19,18 @@ A **signal** is a named value that some rows of a log carry, defined **per tab**
 - **Definition:** name, kind, an NFD query, and the regex group to take the value from (by default the signal's name). A row carries the value when the query matches it and the group captured something.
 - **Kinds:** `num` (the capture read as a number: decimal, float or `0x` hex) and `enum` (the captured text). A capture that doesn't read as a number gives the row no value.
 - **First use: filtering.** In NFD a signal is written with `@`, so it can't be mistaken for a source field: `@speed > 100`, `@gear == D`, `@gear ~ /D|N/`. Like a field, a row without a value only satisfies `!=` and `!~`. A query that names a signal works only in a tab that defines it; elsewhere `@speed` is a bind error ("unknown signal"), the same way `apid` is on a plain-text file.
-- **Row values vs held values.** v1 compares the value **the row itself carries**. "Every line *while* `@gear == D`" (the value holds until the next sample) needs one sequential pass and is a later, opt-in step.
+- **Events and states (owner, 2026-10-24).** A row that carries a value is an **event** (a data event: the value was received there). The **state** is the value the signal holds: each event updates it, and it holds until the next event. On the event row itself the state is already the new value. Both can be queried:
+
+  | NFD | Meaning |
+  |---|---|
+  | `@gear == D` | the state (a bare `@gear` is the state) |
+  | `@gear.state == D` | the same, spelled out |
+  | `@gear.event == D` | an event with value D on this row; `@gear.event` alone: any event |
+  | `@gear.changed` | an event that changed the state (the first event too); with a comparison, on the new value |
+
+  Before the first event a row has no state. In a view of several files the state doesn't carry over from one file into the next. Engine: one pass per signal and file collects its events (row, value), cached with the signal's definition; the state at a row is the last event at or before it (binary search), so every condition stays per row and parallel.
 - **Time** will be a signal too: the receive time on DLT, a `time` capture on plain text (the user has to define it). Not in v1.
-- **Plotting** is a separate feature built on top: values over time, with search and filter hits as markers on the same time axis.
+- **Plotting** is a separate feature built on top: the state over time (a step line, enum as bands), with a per-signal checkbox to show its events (when the value was received), and search and filter hits as markers on the same time axis.
 - **Not now:** export, comparing signals across files, derived signals (rates, state machines), signals defined from other signals.
 
 ## Decisions taken with the owner
@@ -127,7 +136,7 @@ Each one must be justified in its PR (spec §3.1).
 1. Time model and source-supplied fields in `Event`, with DSL field predicates. Use plain-text timestamps as the first user. — **Fields and predicates done** (`LogSource::schema` / `field` / `supplied_level`, `Query::bind`); the `Timestamp` / clock model is **not** done (DLT exposes `tmsp` as a number, `time` is display-only).
 2. DLT from `.dlt` files, with the header-only index fast path. — **Done** in `core/src/input/dlt/` (index = message offsets; headers read in place).
 3. DLT over UDP in pcap / pcapng. — **Done** in `core/src/input/capture/` (not a separate crate yet).
-4. `SignalStore`, `egui_plot` panel, regex extractor in the DSL (the first signal producer, with no database needed). — **Regex captures done** as per-tab signal definitions with `@name` in NFD (2026-10-24); no store or plot yet: values are read per row when a query needs them.
+4. `SignalStore`, `egui_plot` panel, regex extractor in the DSL (the first signal producer, with no database needed). — **Regex captures done** as per-tab signal definitions with events and states in NFD (2026-10-24); the store is the per-file event list cached with each definition (`SignalDef::series`); no plot yet.
 5. `SignalDb`: ARXML, then FIBEX. `nerka-someip` with subscriptions.
 6. MF4 bus-logging channels. — **Done** for Ethernet and DLT channels with an own reader. State machines in the DSL: open.
 7. Later: live capture, external plugin ABI.

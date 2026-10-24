@@ -181,6 +181,13 @@ pub trait LogSource: Send + Sync {
     fn part_files(&self) -> Vec<(LineNo, LineNo)> {
         vec![(0, self.line_count())]
     }
+
+    /// Identifies the data the source reads, for caches (signal events): a
+    /// part of a [`concat::Concat`] answers its file's, so the part made
+    /// for each scan is the same one.
+    fn data_id(&self) -> usize {
+        self as *const Self as *const () as usize
+    }
 }
 
 /// One part of a source made of several.

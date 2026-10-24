@@ -112,6 +112,23 @@ impl Filter {
         })
     }
 
+    /// Collect the events of the signals a bound query uses in `source`
+    /// (see [`Query::prepare`]).
+    pub fn prepare(self, source: &dyn LogSource, progress: &Progress) -> Result<Filter> {
+        Ok(match self {
+            Filter::Query(q) => Filter::Query(q.prepare(source, progress)?),
+            f => f,
+        })
+    }
+
+    /// Progress units [`Self::prepare`] has to do.
+    pub(crate) fn prepare_work(&self, source: &dyn LogSource) -> u64 {
+        match self {
+            Filter::Query(q) => q.prepare_work(source),
+            Filter::Regex(_) => 0,
+        }
+    }
+
     fn prefilter(&self) -> Option<&Regex> {
         match self {
             Filter::Regex(m) if !m.options.invert => Some(&m.regex),
@@ -172,8 +189,9 @@ impl SearchResult {
 }
 
 pub fn search(source: &dyn LogSource, filter: &Filter, progress: &Progress) -> Result<SearchResult> {
-    let filter = &filter.bind(source.schema())?;
-    progress.set_total(work(source, filter));
+    let filter = filter.bind(source.schema())?;
+    progress.set_total(work(source, &filter) + filter.prepare_work(source));
+    let filter = &filter.prepare(source, progress)?;
     Ok(SearchResult { lines: scan(source, filter, progress)? })
 }
 
@@ -311,7 +329,7 @@ pub(crate) mod tests {
     /// Naive reference: render every line and evaluate it on its own,
     /// sequentially, with fields read straight from the source.
     pub(crate) fn naive(source: &dyn LogSource, f: &Filter) -> Vec<LineNo> {
-        let f = f.bind(source.schema()).unwrap();
+        let f = f.bind(source.schema()).unwrap().prepare(source, &Progress::new()).unwrap();
         (0..source.line_count())
             .filter(|&l| {
                 let raw = source.line_bytes(l).unwrap();
@@ -506,22 +524,61 @@ pub(crate) mod tests {
         Filter::Query(Query::compile(s).unwrap().with_signals(sig).unwrap())
     }
 
+    // Events: v at 0 (10), 2 (55), 4 (0x40), 5 (70), 6 (70 again); row 3's
+    // "fast" isn't a number. gear at 0 (P), 2 (D), 3 (D again), 4 (N), 6 (N again).
+    const SIGNAL_LOG: &str = "v=10 gear=P\nboot\nv=55 gear=D\nv=fast gear=D\nv=0x40 gear=N\nWARN v=70\nv=70 gear=N\n";
+
     #[test]
-    fn signals_on_text_both_paths() {
-        let log = "v=10 gear=P\nboot\nv=55 gear=D\nv=fast gear=D\nv=0x40 gear=N\nWARN v=70\n";
+    fn signal_states_hold_until_the_next_event() {
         let sig = signals(&[r"v=/v=(?<v>\S+)/", r"gear:enum=/gear=(?<gear>\w+)/"]);
-        let run = |s: &str| run_filter(log, &sq(s, &sig));
-        assert_eq!(run("@v > 50"), [2, 4, 5]);
-        assert_eq!(run("@v >= 50 AND @v < 0x46"), [2, 4]);
-        // Rows without a value (no capture, or not a number) only satisfy != and !~.
-        assert_eq!(run("@v != 10"), [1, 2, 3, 4, 5]);
+        let run = |s: &str| run_filter(SIGNAL_LOG, &sq(s, &sig));
+        assert_eq!(run("@v > 50"), [2, 3, 4, 5, 6]);
+        assert_eq!(run("@v.state >= 50 AND @v.state < 0x46"), [2, 3, 4]);
+        assert_eq!(run("@v != 10"), [2, 3, 4, 5, 6]);
         assert_eq!(run("@gear == D"), [2, 3]);
-        assert_eq!(run("@gear ~ /D|N/"), [2, 3, 4]);
-        assert_eq!(run("@gear !~ /D/"), [0, 1, 4, 5]);
-        // With a raw regex in the top-level AND the fast path takes it.
-        assert_eq!(run("/WARN/ AND @v > 50"), [5]);
+        assert_eq!(run("@gear ~ /D|N/"), [2, 3, 4, 5, 6]);
+        assert_eq!(run("@gear !~ /D/"), [0, 1, 4, 5, 6]);
+        // The state on lines that don't mention it.
+        assert_eq!(run("/boot/ AND @gear == P"), [1]);
+        assert_eq!(run("/WARN/ AND @v > 50 AND @gear == N"), [5]);
         assert_eq!(run("@gear == D OR level >= WARN"), [2, 3, 5]);
-        assert_eq!(run("NOT @v > 1"), [1, 3]);
+        assert_eq!(run("NOT @v > 10"), [0, 1]);
+        // Before the first event there is no state.
+        let late = signals(&[r"g:enum=/gear=(?<g>D)/"]);
+        assert_eq!(run_filter(SIGNAL_LOG, &sq("@g != D", &late)), [0, 1]);
+    }
+
+    #[test]
+    fn signal_events_and_changes() {
+        let sig = signals(&[r"v=/v=(?<v>\S+)/", r"gear:enum=/gear=(?<gear>\w+)/"]);
+        let run = |s: &str| run_filter(SIGNAL_LOG, &sq(s, &sig));
+        assert_eq!(run("@v.event > 50"), [2, 4, 5, 6]);
+        // Rows without an event (no capture, or not a number) only satisfy != and !~.
+        assert_eq!(run("@v.event != 10"), [1, 2, 3, 4, 5, 6]);
+        assert_eq!(run("@v.event"), [0, 2, 4, 5, 6]);
+        assert_eq!(run("NOT @v.event"), [1, 3]);
+        assert_eq!(run("@gear.event == D"), [2, 3]);
+        assert_eq!(run("@gear.event !~ /D/"), [0, 1, 4, 5, 6]);
+        // The first event changes the state; a repeated value doesn't.
+        assert_eq!(run("@gear.changed"), [0, 2, 4]);
+        assert_eq!(run("@v.changed"), [0, 2, 4, 5]);
+        assert_eq!(run("@gear.changed == D"), [2]);
+        assert_eq!(run("@gear.event AND NOT @gear.changed"), [3, 6]);
+        // Events and states together: warnings that report v while in N.
+        assert_eq!(run("level >= WARN AND @v.event AND @gear == N"), [5]);
+    }
+
+    #[test]
+    fn a_state_stays_in_its_file() {
+        let part =
+            |name, text: &str| -> Box<dyn LogSource> { Box::new(TextFile::from_bytes(name, text.as_bytes().to_vec())) };
+        let both =
+            crate::input::concat::Concat::new(vec![part("a", "gear=D\nx\n"), part("b", "y\ngear=P\nz\n")]).unwrap();
+        let sig = signals(&[r"gear:enum=/gear=(?<gear>\w)/"]);
+        assert_eq!(run_on(&both, &sq("@gear == D", &sig)), [0, 1]);
+        assert_eq!(run_on(&both, &sq("@gear != D", &sig)), [2, 3, 4]);
+        assert_eq!(run_on(&both, &sq("/gear/ AND @gear.changed", &sig)), [0, 3]);
+        assert_eq!(run_on(&both, &sq("@gear.event", &sig)), [0, 3]);
     }
 
     #[test]
@@ -529,9 +586,11 @@ pub(crate) mod tests {
         // Captured from a field, and limited by a field condition.
         let sig = signals(&[r"a(x):enum=apid ~ /^(?<x>.)/", r"n:enum=apid == NAV AND /(?<n>\w+)$/"]);
         let src = mem();
-        assert_eq!(run_on(&src, &sq("@a == S", &sig)), [2]);
+        assert_eq!(run_on(&src, &sq("@a == S", &sig)), [2, 3]);
+        assert_eq!(run_on(&src, &sq("@a.event == S", &sig)), [2]);
         assert_eq!(run_on(&src, &sq("@a != N", &sig)), [2, 3]);
         assert_eq!(run_on(&src, &sq("@n ~ /start|slow/", &sig)), [0, 4]);
+        assert_eq!(run_on(&src, &sq("@n == error AND NOT @n.event", &sig)), [2, 3]);
     }
 
     #[test]

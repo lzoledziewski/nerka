@@ -18,7 +18,9 @@
 //!          | FIELD OP VALUE
 //!          | SIGNAL OP VALUE
 //! FIELD   := raw | level | WORD         -- WORD: a field the source supplies
-//! SIGNAL  := "@" NAME                   -- a signal the tab defines
+//! SIGNAL  := "@" NAME [ "." VIEW ]      -- a signal the tab defines
+//! VIEW    := state | event | changed    -- default state; event and
+//!                                          changed may stand alone
 //! OP      := == | != | >= | <= | > | < | ~ | !~
 //! VALUE   := REGEX | STRING | WORD      -- numbers are WORDs: 42, 0x2a
 //! REGEX   := /pattern/flags             -- flags: i (ignore case)
@@ -36,10 +38,13 @@
 //!
 //! Signals (`@speed > 100`, `crate::signal`) are values that rows carry,
 //! defined outside the language, per tab; the `@` keeps them apart from
-//! source fields. [`Query::with_signals`] resolves them and types the
-//! comparison by the signal's kind: `num` takes every comparison, `enum`
-//! takes `==`, `!=`, `~`, `!~`. As with fields, a row without a value only
-//! satisfies `!=` and `!~`, and an unknown signal is an error.
+//! source fields. `@x` is the signal's state (the value it holds at the
+//! row), `@x.event` a value received on the row, `@x.changed` an event
+//! that changed the state; the last two also stand alone (any event).
+//! [`Query::with_signals`] resolves them and types the comparison by the
+//! signal's kind: `num` takes every comparison, `enum` takes `==`, `!=`,
+//! `~`, `!~`. As with fields, a row without a value only satisfies `!=`
+//! and `!~`, and an unknown signal is an error.
 //!
 //! The search boxes' Auto mode (`auto.rs`, `doc/search-modes.md`) reads plain
 //! words as text and rewrites them into this grammar; NFD itself has no
@@ -52,7 +57,8 @@ mod auto;
 mod parser;
 
 use crate::event::{Event, FieldDef, FieldId, FieldKind, FieldValue, Level};
-use crate::signal::{SignalDef, SignalKind, SignalValue, Signals};
+use crate::signal::{SignalDef, SignalKind, SignalSeries, SignalView, Signals, ValueRef, source_key, view_at};
+use crate::{LogSource, Progress};
 use regex::bytes::Regex;
 use std::sync::Arc;
 
@@ -111,14 +117,18 @@ pub enum Cond {
 pub struct SignalCond {
     /// Lower-case name, without the `@`.
     pub name: String,
+    pub view: SignalView,
     /// Byte offsets of the `@` and the operator in the query.
     pub pos: usize,
     pub op_pos: usize,
     /// Set by [`Query::with_signals`]; its query is bound with the rest.
     pub def: Option<Arc<SignalDef>>,
     /// Typed by [`Query::with_signals`]: `Float` for `num`, `Str` /
-    /// `Match` for `enum`.
+    /// `Match` for `enum`; `Any` when the view stands alone.
     pub test: FieldTest,
+    /// The signal's events in the source searched, set by
+    /// [`Query::prepare`]; without them rows look them up in the cache.
+    pub series: Option<Arc<SignalSeries>>,
 }
 
 #[derive(Debug, Clone)]
@@ -144,6 +154,8 @@ pub enum FieldTest {
     Num(CmpOp, u64),
     /// A `num` signal.
     Float(CmpOp, f64),
+    /// No comparison: the signal has a value (`@x.event`).
+    Any,
     /// `~` (`!~` is `NOT ~`).
     Match(Regex),
 }
@@ -175,13 +187,7 @@ impl Expr {
                 (None, FieldTest::Str(op, _) | FieldTest::Num(op, _)) => *op == CmpOp::Ne,
                 _ => false,
             },
-            Expr::Cond(Cond::Signal(s)) => match (s.def.as_ref().and_then(|d| d.value(ev)), &s.test) {
-                (Some(SignalValue::Num(v)), FieldTest::Float(op, want)) => op.test_f64(v, *want),
-                (Some(SignalValue::Enum(v)), FieldTest::Str(op, want)) => op.test(v.as_slice(), want.as_slice()),
-                (Some(SignalValue::Enum(v)), FieldTest::Match(re)) => re.is_match(&v),
-                (None, FieldTest::Str(op, _) | FieldTest::Float(op, _)) => *op == CmpOp::Ne,
-                _ => false,
-            },
+            Expr::Cond(Cond::Signal(s)) => s.eval(ev),
         }
     }
 
@@ -246,7 +252,8 @@ impl Expr {
             Expr::Cond(Cond::Level(..)) => 2,
             Expr::Cond(Cond::RawMatch(_)) => 10,
             // Runs the signal's whole query, then its capture.
-            Expr::Cond(Cond::Signal(s)) => 10 + s.def.as_ref().map_or(10, |d| d.query().expr().cost()),
+            // A lookup in the signal's events (collected beforehand).
+            Expr::Cond(Cond::Signal(_)) => 3,
             Expr::Not(x) => x.cost(),
             Expr::And(xs) | Expr::Or(xs) => xs.iter().map(Expr::cost).sum(),
         }
@@ -301,14 +308,14 @@ impl FieldCond {
             (FieldTest::Literal(op @ (CmpOp::Eq | CmpOp::Ne), v, _), FieldKind::Str) => {
                 FieldTest::Str(op, v.into_bytes())
             }
-            (FieldTest::Literal(..) | FieldTest::Num(..) | FieldTest::Float(..), FieldKind::Str) => {
+            (FieldTest::Literal(..) | FieldTest::Num(..) | FieldTest::Float(..) | FieldTest::Any, FieldKind::Str) => {
                 return fail(format!("'{name}' is text: use ==, !=, ~ or !~"), self.op_pos);
             }
             (FieldTest::Literal(op, v, pos), FieldKind::U64) => match parse_u64(&v) {
                 Some(n) => FieldTest::Num(op, n),
                 None => return fail(format!("'{name}' is a number but '{v}' isn't"), pos),
             },
-            (FieldTest::Match(_) | FieldTest::Str(..) | FieldTest::Float(..), FieldKind::U64) => {
+            (FieldTest::Match(_) | FieldTest::Str(..) | FieldTest::Float(..) | FieldTest::Any, FieldKind::U64) => {
                 return fail(format!("'{name}' is a number: use ==, !=, >=, <=, >, <"), self.op_pos);
             }
         };
@@ -334,7 +341,8 @@ impl SignalCond {
         let test = std::mem::replace(&mut self.test, FieldTest::Num(CmpOp::Eq, 0));
         self.test = match (test, def.kind()) {
             (t @ (FieldTest::Match(_) | FieldTest::Str(..)), SignalKind::Enum)
-            | (t @ FieldTest::Float(..), SignalKind::Num) => t,
+            | (t @ FieldTest::Float(..), SignalKind::Num)
+            | (t @ FieldTest::Any, _) => t,
             (FieldTest::Literal(op @ (CmpOp::Eq | CmpOp::Ne), v, _), SignalKind::Enum) => {
                 FieldTest::Str(op, v.into_bytes())
             }
@@ -351,6 +359,43 @@ impl SignalCond {
         };
         self.def = Some(def.clone());
         Ok(())
+    }
+
+    fn eval(&self, ev: &mut Event<'_>) -> bool {
+        let Some(def) = &self.def else { return false };
+        let line = ev.line();
+        match ev.source() {
+            Some(src) => {
+                let key = source_key(src);
+                if let Some((events, row)) = self.series.as_ref().and_then(|s| s.locate(key, line)) {
+                    return self.test(view_at(events, row, self.view));
+                }
+                // Not prepared for this source: the definition's cache.
+                match def.series(src, &Progress::new()) {
+                    Ok(series) => match series.locate(key, line) {
+                        Some((events, row)) => self.test(view_at(events, row, self.view)),
+                        None => self.test(None),
+                    },
+                    Err(_) => false,
+                }
+            }
+            // A bare line: its own value is both its event and its state.
+            None => {
+                let v = def.value(ev);
+                self.test(v.as_ref().map(|v| v.as_ref()))
+            }
+        }
+    }
+
+    fn test(&self, v: Option<ValueRef<'_>>) -> bool {
+        match (v, &self.test) {
+            (Some(_), FieldTest::Any) => true,
+            (Some(ValueRef::Num(v)), FieldTest::Float(op, want)) => op.test_f64(v, *want),
+            (Some(ValueRef::Enum(v)), FieldTest::Str(op, want)) => op.test(v, want.as_slice()),
+            (Some(ValueRef::Enum(v)), FieldTest::Match(re)) => re.is_match(v),
+            (None, FieldTest::Str(op, _) | FieldTest::Float(op, _)) => *op == CmpOp::Ne,
+            _ => false,
+        }
     }
 }
 
@@ -401,6 +446,43 @@ impl Query {
         Ok(self)
     }
 
+    /// Collect the events of the signals the query uses in `source` (a
+    /// pass per signal and file, unless cached), so rows only look them
+    /// up. Comes after [`bind`](Self::bind).
+    pub fn prepare(mut self, source: &dyn LogSource, progress: &Progress) -> crate::Result<Query> {
+        fn walk(e: &mut Expr, source: &dyn LogSource, progress: &Progress) -> crate::Result<()> {
+            match e {
+                Expr::And(xs) | Expr::Or(xs) => xs.iter_mut().try_for_each(|x| walk(x, source, progress)),
+                Expr::Not(x) => walk(x, source, progress),
+                Expr::Cond(Cond::Signal(s)) => {
+                    if let Some(def) = &s.def {
+                        s.series = Some(Arc::new(def.series(source, progress)?));
+                    }
+                    Ok(())
+                }
+                Expr::Cond(_) => Ok(()),
+            }
+        }
+        walk(&mut self.expr, source, progress)?;
+        Ok(self)
+    }
+
+    /// Progress units [`Self::prepare`] has to do on `source`.
+    pub(crate) fn prepare_work(&self, source: &dyn LogSource) -> u64 {
+        fn walk(e: &Expr, source: &dyn LogSource, seen: &mut Vec<String>) -> u64 {
+            match e {
+                Expr::And(xs) | Expr::Or(xs) => xs.iter().map(|x| walk(x, source, seen)).sum(),
+                Expr::Not(x) => walk(x, source, seen),
+                Expr::Cond(Cond::Signal(s)) if !seen.contains(&s.name) => {
+                    seen.push(s.name.clone());
+                    s.def.as_ref().map_or(0, |d| d.series_work(source))
+                }
+                Expr::Cond(_) => 0,
+            }
+        }
+        walk(&self.expr, source, &mut Vec::new())
+    }
+
     /// Signals the query uses (lower-case, each once, in order).
     pub fn signal_names(&self) -> Vec<String> {
         fn walk(e: &Expr, out: &mut Vec<String>) {
@@ -448,13 +530,14 @@ impl Query {
     /// uses it to scan the raw buffer and only evaluates the full query on
     /// candidate lines.
     pub fn prefilter(&self) -> Option<&Regex> {
-        // A signal condition that rows without a value fail (not `!=`)
+        // An event condition that rows without an event fail (not `!=`)
         // needs its signal's query to match: its prefilter will do.
         fn of(e: &Expr) -> Option<&Regex> {
             match e {
                 Expr::Cond(Cond::RawMatch(re)) => Some(re),
-                Expr::Cond(Cond::Signal(s)) => match s.test {
-                    FieldTest::Float(CmpOp::Ne, _) | FieldTest::Str(CmpOp::Ne, _) => None,
+                // A state holds on rows without an event: no prefilter.
+                Expr::Cond(Cond::Signal(s)) => match (s.view, &s.test) {
+                    (SignalView::State, _) | (_, FieldTest::Float(CmpOp::Ne, _) | FieldTest::Str(CmpOp::Ne, _)) => None,
                     _ => s.def.as_ref()?.query().prefilter(),
                 },
                 _ => None,
@@ -656,5 +739,23 @@ mod tests {
         assert_eq!(e.pos, 9);
         let e = Query::compile("@gear ~ D").unwrap_err();
         assert_eq!(e.pos, 8);
+        // Views.
+        let e = Query::compile("@gear.now == D").unwrap_err();
+        assert_eq!((e.pos, e.msg.as_str()), (6, "unknown signal view '.now' (state, event, changed)"));
+        let e = Query::compile("@gear AND /x/").unwrap_err();
+        assert_eq!(e.pos, 6);
+        assert!(e.msg.contains("or @gear.event"), "{e}");
+        let e = Query::compile("@gear.state").unwrap_err();
+        assert_eq!(e.pos, 11);
+        assert!(Query::compile("@gear.event AND NOT @gear.changed AND @gear.Changed == D").is_ok());
+    }
+
+    #[test]
+    fn views_on_a_bare_line() {
+        // Without a source a line's own value is its event and its state.
+        let q = Query::compile_in("@gear.event AND @gear.changed AND @gear == N", &[], &tab_signals()).unwrap();
+        assert!(q.matches(b"gear=N"));
+        assert!(!q.matches(b"gear=D"));
+        assert!(!q.matches(b"no gear"));
     }
 }

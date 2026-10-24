@@ -202,6 +202,10 @@ impl LogSource for View<'_> {
     fn line_start(&self, line: LineNo) -> u64 {
         self.part().line_start(line)
     }
+
+    fn data_id(&self) -> usize {
+        self.part().data_id()
+    }
 }
 
 /// Open `paths` as one source: one file as itself, several one after

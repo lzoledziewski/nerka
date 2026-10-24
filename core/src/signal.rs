@@ -7,6 +7,14 @@
 //! signals as `@name` ([`crate::dsl`]); definitions live outside the
 //! language, per tab.
 //!
+//! A row that carries a value is an **event**; the **state** is the value
+//! the signal holds, set by each event until the next one (on the event
+//! row itself it is already the new value). [`SignalDef::series`] collects
+//! a signal's events in one pass per file and caches them with the
+//! definition; the state at a row is then the last event at or before it.
+//! In a view of several files each file has its own events, so a state
+//! never carries over into the next file.
+//!
 //! Spec text (CLI `--signal`, one line):
 //!
 //! ```text
@@ -18,9 +26,221 @@
 //! e.g. `speed=/speed=(?<speed>\d+)/` or `gear(g):enum=apid == NAV AND payload ~ /gear (?<g>\w)/`.
 
 use crate::dsl::{Cond, DslError, Expr, FieldTest, Query};
+use crate::engine::search::{Filter, scan};
 use crate::event::{Event, FieldDef, FieldValue};
+use crate::{LineNo, LogSource, Progress};
+use rayon::prelude::*;
 use regex::bytes::Regex;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+
+/// Which side of a signal a condition looks at (`@x`, `@x.event`, …).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SignalView {
+    /// The value the signal holds at the row (`@x`, `@x.state`).
+    State,
+    /// A value received on the row (`@x.event`).
+    Event,
+    /// An event that changed the state (`@x.changed`).
+    Changed,
+}
+
+impl SignalView {
+    pub fn parse(s: &str) -> Option<SignalView> {
+        match s.to_ascii_lowercase().as_str() {
+            "state" => Some(SignalView::State),
+            "event" => Some(SignalView::Event),
+            "changed" => Some(SignalView::Changed),
+            _ => None,
+        }
+    }
+}
+
+/// A value borrowed from a series or a row.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ValueRef<'a> {
+    Num(f64),
+    Enum(&'a [u8]),
+}
+
+impl ValueRef<'_> {
+    pub fn to_value(self) -> SignalValue {
+        match self {
+            ValueRef::Num(n) => SignalValue::Num(n),
+            ValueRef::Enum(t) => SignalValue::Enum(t.to_vec()),
+        }
+    }
+}
+
+impl SignalValue {
+    pub fn as_ref(&self) -> ValueRef<'_> {
+        match self {
+            SignalValue::Num(n) => ValueRef::Num(*n),
+            SignalValue::Enum(t) => ValueRef::Enum(t),
+        }
+    }
+}
+
+/// The events of one signal in one file: rows ascending, one value each.
+#[derive(Debug)]
+pub struct Events {
+    rows: Vec<LineNo>,
+    values: Values,
+}
+
+#[derive(Debug)]
+enum Values {
+    Num(Vec<f64>),
+    /// Interned: an id per event into `table`.
+    Enum {
+        ids: Vec<u32>,
+        table: Vec<Vec<u8>>,
+    },
+}
+
+impl Events {
+    fn build(found: Vec<(LineNo, SignalValue)>, kind: SignalKind) -> Events {
+        let rows = found.iter().map(|(r, _)| *r).collect();
+        let values = match kind {
+            SignalKind::Num => Values::Num(
+                found.iter().map(|(_, v)| if let SignalValue::Num(n) = v { *n } else { f64::NAN }).collect(),
+            ),
+            SignalKind::Enum => {
+                let mut index = std::collections::HashMap::new();
+                let mut table = Vec::new();
+                let ids = found
+                    .into_iter()
+                    .map(|(_, v)| {
+                        let text = match v {
+                            SignalValue::Enum(t) => t,
+                            SignalValue::Num(n) => n.to_string().into_bytes(),
+                        };
+                        *index.entry(text).or_insert_with_key(|t: &Vec<u8>| {
+                            table.push(t.clone());
+                            (table.len() - 1) as u32
+                        })
+                    })
+                    .collect();
+                Values::Enum { ids, table }
+            }
+        };
+        Events { rows, values }
+    }
+
+    pub fn len(&self) -> usize {
+        self.rows.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.rows.is_empty()
+    }
+
+    /// Row and value of the `i`-th event.
+    pub fn get(&self, i: usize) -> (LineNo, ValueRef<'_>) {
+        let v = match &self.values {
+            Values::Num(v) => ValueRef::Num(v[i]),
+            Values::Enum { ids, table } => ValueRef::Enum(&table[ids[i] as usize]),
+        };
+        (self.rows[i], v)
+    }
+
+    /// Index of the event on `row`.
+    fn event(&self, row: LineNo) -> Option<usize> {
+        self.rows.binary_search(&row).ok()
+    }
+
+    /// Index of the event that set the state at `row`.
+    fn state(&self, row: LineNo) -> Option<usize> {
+        self.rows.partition_point(|&r| r <= row).checked_sub(1)
+    }
+
+    /// The `i`-th event changed the state (the first one always does).
+    fn changed(&self, i: usize) -> bool {
+        i == 0
+            || match &self.values {
+                Values::Num(v) => v[i] != v[i - 1],
+                Values::Enum { ids, .. } => ids[i] != ids[i - 1],
+            }
+    }
+}
+
+/// Identity of a source for the cache: its address and line count.
+pub(crate) fn source_key(source: &dyn LogSource) -> (usize, LineNo) {
+    (source.data_id(), source.line_count())
+}
+
+/// A signal's events in a source: one [`Events`] per file.
+#[derive(Debug, Clone)]
+pub struct SignalSeries {
+    key: (usize, LineNo),
+    /// (first line in the source, key of the file's own source, events).
+    parts: Vec<(LineNo, (usize, LineNo), Arc<Events>)>,
+}
+
+impl SignalSeries {
+    /// The events and the file-local row for `row` of the source `key`
+    /// (the whole source, or one of its files, as the engine scans them).
+    pub(crate) fn locate(&self, key: (usize, LineNo), row: LineNo) -> Option<(&Events, LineNo)> {
+        if key == self.key {
+            let i = self.parts.partition_point(|p| p.0 <= row).checked_sub(1)?;
+            let (first, _, ev) = &self.parts[i];
+            return Some((ev, row - first));
+        }
+        self.parts.iter().find(|p| p.1 == key).map(|(_, _, ev)| (&**ev, row))
+    }
+
+    fn whole(&self, row: LineNo) -> Option<(&Events, LineNo, LineNo)> {
+        let i = self.parts.partition_point(|p| p.0 <= row).checked_sub(1)?;
+        let (first, _, ev) = &self.parts[i];
+        Some((ev, row - first, *first))
+    }
+
+    /// The state at `row`: the event that set it (its row) and its value.
+    pub fn state(&self, row: LineNo) -> Option<(LineNo, ValueRef<'_>)> {
+        let (ev, local, first) = self.whole(row)?;
+        ev.state(local).map(|i| ev.get(i)).map(|(r, v)| (r + first, v))
+    }
+
+    /// The value received on `row`, if it is an event.
+    pub fn event(&self, row: LineNo) -> Option<ValueRef<'_>> {
+        let (ev, local, _) = self.whole(row)?;
+        ev.event(local).map(|i| ev.get(i).1)
+    }
+
+    /// Whether the event on `row` (if any) changed the state.
+    pub fn changed(&self, row: LineNo) -> bool {
+        self.whole(row).is_some_and(|(ev, local, _)| ev.event(local).is_some_and(|i| ev.changed(i)))
+    }
+
+    /// Every event, in row order: (row in the source, value).
+    pub fn iter(&self) -> impl Iterator<Item = (LineNo, ValueRef<'_>)> {
+        self.parts
+            .iter()
+            .flat_map(|(first, _, ev)| (0..ev.len()).map(move |i| ev.get(i)).map(move |(r, v)| (r + first, v)))
+    }
+
+    pub fn len(&self) -> usize {
+        self.parts.iter().map(|p| p.2.len()).sum()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+/// Look up `row` of the source `key` in `events`: the value of `view`.
+pub(crate) fn view_at(events: &Events, row: LineNo, view: SignalView) -> Option<ValueRef<'_>> {
+    match view {
+        SignalView::State => events.state(row).map(|i| events.get(i).1),
+        SignalView::Event => events.event(row).map(|i| events.get(i).1),
+        SignalView::Changed => events.event(row).filter(|&i| events.changed(i)).map(|i| events.get(i).1),
+    }
+}
+
+/// Files' events built so far, shared by every copy of a definition.
+type Cache = Arc<Mutex<Vec<((usize, LineNo), Arc<Events>)>>>;
+
+/// Files kept in a definition's cache at most.
+const CACHED_FILES: usize = 64;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SignalKind {
@@ -83,6 +303,7 @@ pub struct SignalDef {
     kind: SignalKind,
     group: String,
     query: Query,
+    cache: Cache,
 }
 
 impl SignalDef {
@@ -110,7 +331,7 @@ impl SignalDef {
             };
             return Err(SignalError::Group(format!("no regex captures '{group}' ({have})")));
         }
-        Ok(SignalDef { name: name.to_ascii_lowercase(), kind, group: group.to_owned(), query })
+        Ok(SignalDef { name: name.to_ascii_lowercase(), kind, group: group.to_owned(), query, cache: Cache::default() })
     }
 
     /// Parse one spec line (module docs).
@@ -171,6 +392,74 @@ impl SignalDef {
             SignalKind::Num => parse_num(&text).map(SignalValue::Num),
             SignalKind::Enum => Some(SignalValue::Enum(text)),
         }
+    }
+
+    /// The signal's events in `source`, one pass per file on first use,
+    /// then from the cache this definition (and every copy of it) keeps.
+    pub fn series(&self, source: &dyn LogSource, progress: &Progress) -> crate::Result<SignalSeries> {
+        let mut parts = Vec::new();
+        match source.parts() {
+            Some(ps) => {
+                for p in ps {
+                    let src = p.source.as_ref();
+                    parts.push((p.first, source_key(src), self.events(src, progress)?));
+                }
+            }
+            None => parts.push((0, source_key(source), self.events(source, progress)?)),
+        }
+        Ok(SignalSeries { key: source_key(source), parts })
+    }
+
+    /// The series if every file's events are cached already (a UI can
+    /// show values without waiting).
+    pub fn cached_series(&self, source: &dyn LogSource) -> Option<SignalSeries> {
+        let leaves: Vec<(LineNo, (usize, LineNo))> = match source.parts() {
+            Some(ps) => ps.iter().map(|p| (p.first, source_key(p.source.as_ref()))).collect(),
+            None => vec![(0, source_key(source))],
+        };
+        let parts = leaves
+            .into_iter()
+            .map(|(first, key)| self.cached(key).map(|ev| (first, key, ev)))
+            .collect::<Option<Vec<_>>>()?;
+        Some(SignalSeries { key: source_key(source), parts })
+    }
+
+    /// Progress units [`Self::series`] still has to do on `source`.
+    pub(crate) fn series_work(&self, source: &dyn LogSource) -> u64 {
+        match source.parts() {
+            Some(ps) => ps.iter().map(|p| self.series_work(p.source.as_ref())).sum(),
+            None if self.cached(source_key(source)).is_some() => 0,
+            None => {
+                self.bind(source.schema()).map_or(0, |d| crate::engine::search::work(source, &Filter::Query(d.query)))
+            }
+        }
+    }
+
+    fn cached(&self, key: (usize, LineNo)) -> Option<Arc<Events>> {
+        let cache = self.cache.lock().unwrap_or_else(|e| e.into_inner());
+        cache.iter().find(|(k, _)| *k == key).map(|(_, ev)| ev.clone())
+    }
+
+    /// One file's events (a source without parts).
+    fn events(&self, source: &dyn LogSource, progress: &Progress) -> crate::Result<Arc<Events>> {
+        let key = source_key(source);
+        if let Some(ev) = self.cached(key) {
+            return Ok(ev);
+        }
+        // Built without holding the lock: a scan runs on the thread pool.
+        let def = self.bind(source.schema())?;
+        let rows = scan(source, &Filter::Query(def.query.clone()), progress)?;
+        let found: Vec<(LineNo, SignalValue)> =
+            rows.par_iter().filter_map(|&r| def.value(&mut Event::from_source(source, r)).map(|v| (r, v))).collect();
+        let ev = Arc::new(Events::build(found, self.kind));
+        let mut cache = self.cache.lock().unwrap_or_else(|e| e.into_inner());
+        if !cache.iter().any(|(k, _)| *k == key) {
+            if cache.len() >= CACHED_FILES {
+                cache.remove(0);
+            }
+            cache.push((key, ev.clone()));
+        }
+        Ok(ev)
     }
 }
 

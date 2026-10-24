@@ -462,6 +462,9 @@ struct Tab {
     signals: Signals,
     signals_gen: u64,
     signals_ui: signals::SignalsUi,
+    /// Collects the signals' events for the panel (the engine keeps them
+    /// with each definition).
+    signals_job: Option<Job<()>>,
     status: String,
 }
 
@@ -704,6 +707,7 @@ impl Tab {
             signals: Signals::default(),
             signals_gen: 0,
             signals_ui: signals::SignalsUi::default(),
+            signals_job: None,
             status: String::new(),
         }
     }
@@ -723,7 +727,11 @@ impl Tab {
     }
 
     fn is_busy(&self) -> bool {
-        self.loading.is_some() || self.searching.is_some() || self.search.job.is_some() || self.colors_job.is_some()
+        self.loading.is_some()
+            || self.searching.is_some()
+            || self.search.job.is_some()
+            || self.colors_job.is_some()
+            || self.signals_job.is_some()
     }
 
     fn cancel_jobs(&mut self) {
@@ -737,6 +745,9 @@ impl Tab {
             j.cancel();
         }
         if let Some((_, j)) = self.colors_job.take() {
+            j.cancel();
+        }
+        if let Some(j) = self.signals_job.take() {
             j.cancel();
         }
     }
@@ -780,11 +791,32 @@ impl Tab {
     /// The tab's signals were edited: queries that use them run again.
     fn signals_changed(&mut self, ctx: &egui::Context) {
         self.signals_gen += 1;
+        self.collect_signals(ctx);
         if self.pattern.contains('@') {
             self.start_search(ctx);
         } else if self.search.pattern.contains('@') {
             self.rerun_search(ctx);
         }
+    }
+
+    /// Collect the events of every signal in the background, so the panel
+    /// shows states without waiting for a filter to need them.
+    fn collect_signals(&mut self, ctx: &egui::Context) {
+        if let Some(j) = self.signals_job.take() {
+            j.cancel();
+        }
+        let Some(file) = self.file.clone() else { return };
+        if self.signals.is_empty() {
+            return;
+        }
+        let defs: Vec<_> = self.signals.iter().cloned().collect();
+        self.signals_job = Some(Job::spawn(ctx, move |prog| {
+            for d in defs {
+                // A definition that doesn't fit the file says so in the panel.
+                let _ = d.series(&*file, prog);
+            }
+            Ok(())
+        }));
     }
 
     fn build_filter(&self) -> Result<Filter, String> {
@@ -829,6 +861,12 @@ impl Tab {
     /// Advance background jobs. Returns `false` if the file failed to open
     /// (the tab should then be closed; `status` holds the reason).
     fn poll_jobs(&mut self, ctx: &egui::Context) -> bool {
+        if let Some(job) = &self.signals_job {
+            match job.poll() {
+                Poll::Running => ctx.request_repaint_after(Duration::from_millis(50)),
+                Poll::Done(..) => self.signals_job = None,
+            }
+        }
         if let Some(job) = &self.loading {
             match job.poll() {
                 Poll::Running => ctx.request_repaint_after(Duration::from_millis(50)),
@@ -847,6 +885,7 @@ impl Tab {
                             });
                             self.columns = Columns::from_defs(f.columns());
                             self.file = Some(Arc::from(f));
+                            self.collect_signals(ctx);
                             if !self.pattern.trim().is_empty() {
                                 self.start_search(ctx);
                             } else {
@@ -2635,6 +2674,9 @@ impl App {
             if out.changed {
                 tab.signals_changed(&ctx);
             }
+            if let Some(line) = out.goto {
+                tab.goto_line(line);
+            }
         }
         let search_history = &self.search_history;
         let found = egui::Panel::bottom("search")
@@ -3440,7 +3482,19 @@ query timeouts  labels: vision
         tab.signals.set(nerka_core::SignalDef::parse_spec(r"v=/v=(?<v>\d+)/").unwrap());
         tab.signals_changed(&ctx);
         settle(&mut tab, &ctx);
-        assert_eq!(tab.result.as_ref().unwrap().lines, [1, 3]);
+        // The state holds on "boot" too.
+        assert_eq!(tab.result.as_ref().unwrap().lines, [1, 2, 3]);
+        // The panel's events were collected in the background.
+        let file = tab.file.clone().unwrap();
+        let series = tab.signals.get("v").unwrap().cached_series(&*file).expect("collected");
+        assert_eq!(series.state(2).map(|(row, v)| (row, v.to_value().to_string())), Some((1, "60".into())));
+        tab.pattern = "@v.event".into();
+        tab.start_search(&ctx);
+        settle(&mut tab, &ctx);
+        assert_eq!(tab.result.as_ref().unwrap().lines, [0, 1, 3]);
+        tab.pattern = "@v > 50".into();
+        tab.start_search(&ctx);
+        settle(&mut tab, &ctx);
         let sig = (&tab.signals, tab.signals_gen);
         let p = tab.filter_preview.get(tab.mode, &tab.pattern, &tab.options, &[], sig);
         assert!(matches!(&p, Preview::AutoQuery(q) if q == "@v > 50"), "{p:?}");

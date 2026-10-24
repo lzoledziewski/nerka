@@ -136,7 +136,9 @@ pub(crate) fn search_within_path(
     path: Path,
 ) -> Result<SearchHits> {
     let within = within.map_or(Within::All(source.line_count()), Within::Lines);
-    let bind = |fs: &[Filter]| fs.iter().map(|f| f.bind(source.schema())).collect::<std::result::Result<Vec<_>, _>>();
+    let bind = |fs: &[Filter]| -> Result<Vec<Filter>> {
+        fs.iter().map(|f| f.bind(source.schema())?.prepare(source, progress)).collect()
+    };
     let set = SearchSet { include: bind(&set.include)?, exclude: bind(&set.exclude)? };
     let can_scan = !set.include.is_empty() && set.include.iter().all(|f| has_fast_path(source, f));
     let scan_it = match path {
