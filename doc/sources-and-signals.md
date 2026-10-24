@@ -44,6 +44,7 @@ A **signal** is a named value that some rows of a log carry, defined **per tab**
 | Plugins | In-tree crates behind cargo features first. External plugins (WASM or a C ABI) later. |
 | DLT parser (2026-10-18) | **Own zero-copy reader, no crate** (not `dlt-core` / `dlt_parse`). Lives in `core/src/input/dlt/` for now; becomes `nerka-dlt` when the `Container` / `Decoder` traits exist. |
 | DLT display (2026-10-18) | A table with aligned, resizable columns in nerka's own view; no column sorting. |
+| FIBEX (2026-10-24) | FIBEX first (SOME/IP, if it comes, from ARXML). `quick-xml` (MIT, needs only `memchr`) for FIBEX and later ARXML, not `roxmltree` / `autosar-data`. First step: decode DLT non-verbose messages from files given for the session; the `nerka-db` intermediate format (import once, library or session) after that. Built: `status.md` → "FIBEX". |
 
 ## Layered model
 
@@ -120,7 +121,7 @@ All checked on crates.io on 2026-10-17. All MIT and/or Apache-2.0.
 | Ethernet/IP/UDP | ~~`etherparse` 0.21~~ | **Not used**: own parsing with fragment reassembly (`capture/net.rs`). |
 | SOME/IP headers | `someip_parse` 0.7 | Doesn't interpret payloads: that is `SignalDb`'s job. |
 | ARXML | `autosar-data` 0.23 | |
-| FIBEX | `roxmltree` 0.21 + own mapping | |
+| FIBEX | ~~`roxmltree` 0.21~~ `quick-xml` 0.42 + own mapping | **Used** (2026-10-24): streaming, needs only `memchr`. |
 | MF4 | ~~`mdf4-rs`, `mf4-rs`, `falcon_mdf`, `mdflib`, `mdfr`~~ | **Not used**: own reader for bus-logging channels (`capture/mf4.rs`, 2026-10-20; compressed DZ blocks not yet). |
 | Signal plots (GUI) | `egui_plot` 0.37 | Matches the current egui version. |
 

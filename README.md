@@ -92,6 +92,7 @@ nerka filter 'apid == NAV AND level >= WARN' trace.dlt
 nerka lines app.log 100 120
 nerka --pack packs/ expand -l ota -p cam=CAM1            # pack picks -> NFD
 nerka --signal 'gear:enum=/gear=(?<gear>\w+)/' filter '@gear == D' app.log   # signals
+nerka --fibex ecu1.xml filter 'apid == NAV' trace.dlt     # DLT non-verbose messages decoded
 ```
 
 `nerka help <command>` lists every option.

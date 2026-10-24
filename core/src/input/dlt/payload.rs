@@ -1,6 +1,8 @@
 //! Rendering a message's payload as text: verbose arguments, non-verbose
-//! message id + hex, control messages.
+//! messages (as their FIBEX description says, else message id + hex),
+//! control messages.
 
+use super::fibex::Frame;
 use super::format::{MSTP_CONTROL, Message};
 use std::io::Write;
 
@@ -21,18 +23,19 @@ const UNSUPPORTED: u32 = 0x100 | 0x4000;
 /// Append the payload text of `msg` to `out`. Never fails: whatever can't
 /// be decoded is shown as hex. Control characters become spaces so the
 /// text stays on one line and in one column.
-pub(crate) fn render(msg: &Message<'_>, out: &mut Vec<u8>) {
-    render_as(msg, out, false);
+pub(crate) fn render(msg: &Message<'_>, frame: Option<&Frame>, out: &mut Vec<u8>) {
+    render_as(msg, frame, out, false);
 }
 
 /// Like [`render`], but the payload's own line breaks (`\n`, `\r\n`, a
 /// lone `\r`, all as `\n`) and tabs are kept, as the logging code wrote
 /// them. Other control characters still become spaces.
-pub(crate) fn render_formatted(msg: &Message<'_>, out: &mut Vec<u8>) {
-    render_as(msg, out, true);
+pub(crate) fn render_formatted(msg: &Message<'_>, frame: Option<&Frame>, out: &mut Vec<u8>) {
+    render_as(msg, frame, out, true);
 }
 
-fn render_as(msg: &Message<'_>, out: &mut Vec<u8>, keep_breaks: bool) {
+/// `frame`: the FIBEX description of a non-verbose message.
+fn render_as(msg: &Message<'_>, frame: Option<&Frame>, out: &mut Vec<u8>, keep_breaks: bool) {
     let start = out.len();
     let mut r = Rd { b: msg.payload(), be: msg.big_endian() };
     if msg.mstp() == Some(MSTP_CONTROL) {
@@ -57,8 +60,9 @@ fn render_as(msg: &Message<'_>, out: &mut Vec<u8>, keep_breaks: bool) {
             hex(r.b, out);
         }
     } else {
-        // Non-verbose: message id, then data described by FIBEX (later).
+        // Non-verbose: as FIBEX describes it, else the message id and hex.
         match r.u32() {
+            Some(_) if frame.is_some() => frame.expect("checked").render(r.b, r.be, out),
             Some(id) => {
                 let _ = write!(out, "[{id}]");
                 if !r.b.is_empty() {

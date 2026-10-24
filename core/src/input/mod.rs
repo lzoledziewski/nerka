@@ -21,6 +21,8 @@ use std::path::Path;
 pub struct OpenOptions {
     /// How DLT is found in captures (pcap, pcapng, MF4).
     pub capture: capture::CaptureOptions,
+    /// Descriptions of DLT non-verbose messages (FIBEX).
+    pub fibex: Option<std::sync::Arc<dlt::fibex::Fibex>>,
 }
 
 /// Open `path` with the reader its content calls for (default
@@ -38,9 +40,9 @@ pub fn open_with(path: impl AsRef<Path>, options: &OpenOptions, progress: &Progr
     let n = File::open(path)?.read(&mut head)?;
     let head = &head[..n];
     Ok(if dlt::is_dlt(head) {
-        Box::new(dlt::DltFile::open(path, progress)?)
+        Box::new(dlt::DltFile::open(path, progress)?.with_fibex(options.fibex.clone()))
     } else if capture::is_capture(head) {
-        Box::new(capture::open(path, &options.capture, progress)?.0)
+        Box::new(capture::open(path, &options.capture, progress)?.0.with_fibex(options.fibex.clone()))
     } else {
         Box::new(text::TextFile::open(path, progress)?)
     })

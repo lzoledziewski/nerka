@@ -10,6 +10,7 @@
 //!     nerka search --in 'level >= WARN' timeout app.log (search inside a filter)
 //!     nerka search --in 'ecu == SOCB' -l ota app.log     (per pack query)
 //!     nerka --signal 'v=/v=(?<v>\d+)/' filter '@v > 100' app.log   (signals)
+//!     nerka --fibex ecu1.xml filter 'apid == NAV' trace.dlt         (non-verbose DLT)
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -33,6 +34,10 @@ struct Cli {
     /// MF4; repeatable). Default: 3490.
     #[arg(long = "dlt-port", global = true, value_name = "PORT")]
     dlt_port: Vec<u16>,
+    /// FIBEX file describing DLT non-verbose messages (repeatable): their
+    /// payload is shown as text, and their APID / CTID / level come from it.
+    #[arg(long, global = true, value_name = "FILE")]
+    fibex: Vec<PathBuf>,
     /// Define a signal for `@name` in queries (repeatable):
     /// NAME[(GROUP)][:num|enum]=QUERY, e.g. 'speed=/speed=(?<speed>\d+)/'.
     #[arg(long, global = true, value_name = "SPEC")]
@@ -299,6 +304,9 @@ fn run() -> Result<()> {
     let mut options = nerka_core::OpenOptions::default();
     if !cli.dlt_port.is_empty() {
         options.capture.dlt_udp_ports = cli.dlt_port.clone();
+    }
+    if !cli.fibex.is_empty() {
+        options.fibex = Some(std::sync::Arc::new(nerka_core::Fibex::load(&cli.fibex)?));
     }
     OPEN_OPTIONS.set(options).expect("set once");
     let mut signals = Signals::default();

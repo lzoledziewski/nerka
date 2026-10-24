@@ -76,6 +76,8 @@ fn main() -> eframe::Result {
     let mut signals = Signals::default();
     // `--plot NAME`: plot these signals.
     let mut plotted: Vec<String> = Vec::new();
+    // `--fibex FILE`: FIBEX files for DLT non-verbose messages.
+    let mut fibex: Vec<PathBuf> = Vec::new();
     // `--plot-window`: the plot starts in a window of its own.
     let mut plot_window = false;
     let (mut new_window, mut window_name, mut preset_file) = (false, None, None);
@@ -124,6 +126,10 @@ fn main() -> eframe::Result {
                 plotted.push(value());
                 continue;
             }
+            Some("--fibex") => {
+                fibex.push(PathBuf::from(value()));
+                continue;
+            }
             Some("--plot-window") => {
                 plot_window = true;
                 continue;
@@ -166,6 +172,7 @@ fn main() -> eframe::Result {
         && params.is_empty()
         && signals.is_empty()
         && plotted.is_empty()
+        && fibex.is_empty()
         && !show_library
         && preset_file.is_none()
         && window_name.is_none();
@@ -192,6 +199,9 @@ fn main() -> eframe::Result {
             app.load_history();
             app.load_prefs();
             app.load_saved_signals();
+            if !fibex.is_empty() {
+                app.set_fibex(&cc.egui_ctx, fibex);
+            }
             for d in signals.iter() {
                 app.saved_signals.set((**d).clone());
             }
@@ -518,6 +528,8 @@ struct Tab {
     choices_gen: u64,
     /// The events each signal shows (filtered ones per filter result).
     views: signals::Views,
+    /// Read again: the line to show once it is loaded.
+    reopen_at: Option<LineNo>,
     status: String,
 }
 
@@ -716,14 +728,21 @@ impl SearchBox {
 impl Tab {
     #[cfg(test)]
     fn open(ctx: &egui::Context, path: PathBuf, prefs: &SearchPrefs) -> Self {
-        Self::open_many(ctx, vec![path], prefs)
+        Self::open_many(ctx, vec![path], prefs, None)
     }
 
     /// One tab for `paths`: one file, or several of one kind one after
     /// another (nerka_core::open_many checks the kind).
-    fn open_many(ctx: &egui::Context, paths: Vec<PathBuf>, prefs: &SearchPrefs) -> Self {
+    /// `fibex` describes DLT non-verbose messages.
+    fn open_many(
+        ctx: &egui::Context,
+        paths: Vec<PathBuf>,
+        prefs: &SearchPrefs,
+        fibex: Option<Arc<nerka_core::Fibex>>,
+    ) -> Self {
         let ps = paths.clone();
-        let options = prefs.open_options();
+        let mut options = prefs.open_options();
+        options.fibex = fibex;
         Self {
             path: paths[0].clone(),
             paths,
@@ -767,6 +786,7 @@ impl Tab {
             query_scope: Default::default(),
             choices_gen: 0,
             views: signals::Views::default(),
+            reopen_at: None,
             status: String::new(),
         }
     }
@@ -857,6 +877,20 @@ impl Tab {
         } else if self.search.pattern.contains('@') {
             self.rerun_search(ctx);
         }
+    }
+
+    /// Read the tab's files again (other FIBEX files): filter, search and
+    /// selection stay, and so does the current line.
+    fn reopen(&mut self, ctx: &egui::Context, prefs: &SearchPrefs, fibex: Option<Arc<nerka_core::Fibex>>) {
+        let line = self.current_line();
+        self.cancel_jobs();
+        let ps = self.paths.clone();
+        let mut options = prefs.open_options();
+        options.fibex = fibex;
+        self.file = None;
+        self.result = None;
+        self.reopen_at = Some(line);
+        self.loading = Some(Job::spawn(ctx, move |prog| nerka_core::open_many(&ps, &options, prog)));
     }
 
     /// Build the tab's signals again if what they come from changed: the
@@ -994,6 +1028,9 @@ impl Tab {
                             // Built with the next frame (`@time` if the
                             // file knows its lines' times).
                             self.signals_key = None;
+                            if let Some(line) = self.reopen_at.take() {
+                                self.goto_line(line);
+                            }
                             if !self.pattern.trim().is_empty() {
                                 self.start_search(ctx);
                             } else {
@@ -1989,6 +2026,10 @@ struct App {
     /// `<config>/nerka/signals`. The generation changes with them.
     saved_signals: Signals,
     saved_gen: u64,
+    /// FIBEX files for DLT non-verbose messages (this session), read into
+    /// one catalog that every DLT tab is opened with.
+    fibex: Option<Arc<nerka_core::Fibex>>,
+    fibex_paths: Vec<PathBuf>,
     /// The plot is in a window of its own, and what that window shares.
     plot_window: bool,
     plot_win: Arc<std::sync::Mutex<plot::Detached>>,
@@ -2309,7 +2350,7 @@ impl App {
             self.active = i;
             return;
         }
-        self.tabs.push(Tab::open_many(ctx, paths, &self.prefs));
+        self.tabs.push(Tab::open_many(ctx, paths, &self.prefs, self.fibex.clone()));
         self.active = self.tabs.len() - 1;
     }
 
@@ -2428,6 +2469,79 @@ impl App {
             }
             if b {
                 tab.jump_bookmark(!shift);
+            }
+        }
+    }
+
+    /// The FIBEX menu: files describing DLT non-verbose messages.
+    fn fibex_menu(&mut self, ui: &mut egui::Ui) {
+        let n = self.fibex.as_ref().map_or(0, |f| f.files.len());
+        let label = if n == 0 { "FIBEX".to_owned() } else { format!("FIBEX ({n})") };
+        let ctx = ui.ctx().clone();
+        let mut set: Option<Vec<PathBuf>> = None;
+        ui.menu_button(label, |ui| {
+            ui.weak(
+                "Descriptions of DLT non-verbose messages: their payload as text, and their APID, CTID and \
+                     level. For this session.",
+            );
+            match &self.fibex {
+                Some(f) => {
+                    ui.label(format!("{} messages from:", f.len()));
+                    for file in &f.files {
+                        ui.monospace(file);
+                    }
+                }
+                None => {
+                    ui.weak("No FIBEX files loaded.");
+                }
+            }
+            ui.separator();
+            if ui.button("Add FIBEX files…").clicked() {
+                if let Some(paths) = rfd::FileDialog::new()
+                    .add_filter("FIBEX", &["xml", "fibex"])
+                    .add_filter("All files", &["*"])
+                    .pick_files()
+                {
+                    let mut all = self.fibex_paths.clone();
+                    all.extend(paths);
+                    set = Some(all);
+                }
+                ui.close();
+            }
+            if self.fibex.is_some() && ui.button("Forget them").clicked() {
+                set = Some(Vec::new());
+                ui.close();
+            }
+        });
+        if let Some(paths) = set {
+            self.set_fibex(&ctx, paths);
+        }
+    }
+
+    /// Use these FIBEX files (none: decode nothing); DLT tabs read their
+    /// files again with them.
+    fn set_fibex(&mut self, ctx: &egui::Context, paths: Vec<PathBuf>) {
+        if paths.is_empty() {
+            self.fibex = None;
+        } else {
+            match nerka_core::Fibex::load(&paths) {
+                Ok(f) => {
+                    self.status = format!("FIBEX: {} messages from {} files", f.len(), f.files.len());
+                    self.fibex = Some(Arc::new(f));
+                }
+                Err(e) => {
+                    self.status = format!("FIBEX not loaded: {e}");
+                    if let Some(t) = self.tabs.get_mut(self.active) {
+                        t.status = self.status.clone();
+                    }
+                    return;
+                }
+            }
+        }
+        self.fibex_paths = paths;
+        for t in &mut self.tabs {
+            if t.file.as_ref().is_some_and(|f| !f.columns().is_empty()) {
+                t.reopen(ctx, &self.prefs, self.fibex.clone());
             }
         }
     }
@@ -2670,6 +2784,7 @@ impl App {
                 if ui.button("📂 Open…").on_hover_text("Ctrl+O").clicked() {
                     self.pick_files(&ctx);
                 }
+                self.fibex_menu(ui);
                 ui.separator();
                 let marks = self.tabs.get(self.active).map_or(0, |t| t.bookmarks.len());
                 ui.toggle_value(&mut self.show_bookmarks, format!("🔖 Bookmarks ({marks})")).on_hover_text(
@@ -3002,6 +3117,54 @@ query timeouts  labels: vision
     fn hits(tab: &Tab) -> Vec<(LineNo, Vec<&str>)> {
         let (a, h) = tab.search.hits.as_ref().expect("search hits");
         (0..h.len()).map(|i| (h.lines[i], h.matched(i).map(|q| short(&a.names[q])).collect())).collect()
+    }
+
+    #[test]
+    fn a_dlt_tab_reads_its_file_again_with_fibex() {
+        use nerka_core::input::dlt::writer::{Msg, Payload};
+        let dir = std::env::temp_dir().join(format!("nerka-gui-fibex-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (dlt, xml) = (dir.join("t.dlt"), dir.join("t.xml"));
+        let mut buf = Vec::new();
+        for i in 0..5u16 {
+            let data = (40 + i).to_le_bytes().to_vec();
+            let m = Msg {
+                ext: None,
+                payload: Payload::NonVerbose { id: 7, data },
+                ..Msg::log(nerka_core::Level::Info, "E1", "", "", vec![])
+            };
+            m.encode(&mut buf);
+        }
+        std::fs::write(&dlt, &buf).unwrap();
+        std::fs::write(
+            &xml,
+            r#"<fx:FIBEX xmlns:fx="f" xmlns:ho="h"><fx:ELEMENTS><fx:PDUS>
+              <fx:PDU ID="p"><ho:DESC>speed</ho:DESC><fx:SIGNAL-INSTANCES><fx:SIGNAL-INSTANCE ID="s">
+                <fx:SEQUENCE-NUMBER>0</fx:SEQUENCE-NUMBER><fx:SIGNAL-REF ID-REF="S_UINT16"/></fx:SIGNAL-INSTANCE></fx:SIGNAL-INSTANCES></fx:PDU>
+            </fx:PDUS><fx:FRAMES><fx:FRAME ID="ID_7"><fx:PDU-INSTANCES><fx:PDU-INSTANCE ID="i"><fx:PDU-REF ID-REF="p"/>
+              <fx:SEQUENCE-NUMBER>0</fx:SEQUENCE-NUMBER></fx:PDU-INSTANCE></fx:PDU-INSTANCES>
+              <fx:MANUFACTURER-EXTENSION><APPLICATION_ID>NAV</APPLICATION_ID></fx:MANUFACTURER-EXTENSION></fx:FRAME></fx:FRAMES>
+            </fx:ELEMENTS></fx:FIBEX>"#,
+        )
+        .unwrap();
+        let ctx = egui::Context::default();
+        let mut tab = Tab::open(&ctx, dlt, &SearchPrefs::default());
+        settle(&mut tab, &ctx);
+        let text = |tab: &Tab, l| tab.file.as_ref().unwrap().line_text(l).unwrap().into_owned();
+        assert!(text(&tab, 2).ends_with("[7] 2a 00"), "{}", text(&tab, 2));
+        tab.goto_line(3);
+        // A filter in the box (not run yet) runs when the file is read again.
+        tab.mode = Mode::Query;
+        tab.pattern = "payload ~ /speed 4[2-4]/".into();
+
+        let fibex = Arc::new(nerka_core::Fibex::load(&[&xml]).unwrap());
+        tab.reopen(&ctx, &SearchPrefs::default(), Some(fibex));
+        settle(&mut tab, &ctx);
+        assert!(text(&tab, 2).ends_with("	E1	NAV			speed 42"), "{}", text(&tab, 2));
+        // The filter ran again on the decoded text; the current line stayed.
+        assert_eq!(tab.result.as_ref().unwrap().lines, [2, 3, 4]);
+        assert_eq!(tab.current_line(), 3);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

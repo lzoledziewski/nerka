@@ -2,7 +2,7 @@
 
 Snapshot of where the project stands. Update this file whenever the state changes.
 
-_Last update: 2026-10-24 (signals: three sources — the file's `@time`, saved user signals, named groups of picked queries with a new Signal role; scope all / filtered; plot in its own window, y axes. Before: time as a signal, the plot, events and states. Design in `sources-and-signals.md`)._
+_Last update: 2026-10-24 (FIBEX: DLT non-verbose messages decoded from FIBEX files given for the session — text, and APID / CTID / type / level; `quick-xml` added. Before: signals, the plot. Design in `sources-and-signals.md`)._
 
 ## State
 
@@ -110,6 +110,17 @@ What a signal is was agreed with the owner on 2026-10-24: `sources-and-signals.m
 - **Crash on maximize (owner, 2026-10-24; fixed):** with the plot in its own window, maximizing a window crashed nerka (`0xc0000005` in `nvoglv64.dll`, NVIDIA's driver). eframe draws with wgpu, which picked **Vulkan** on Windows; reproduced with a script (maximize / restore while the pointer moves over the window). An immediate viewport crashed when the plot window was maximized; a deferred one fixed that, but maximizing the main window still crashed under Vulkan (2 runs in 3), never under **DirectX 12** (60+ cycles). So on Windows nerka asks wgpu for DirectX 12 (`wgpu_options` in `ui/src/main.rs`; `WGPU_BACKEND` still overrides); Linux and macOS keep wgpu's choice (Vulkan / Metal). No new dependency: wgpu was already eframe's renderer.
 - **Next:** search / filter hits on the plot's axis; FIBEX non-verbose arguments as signals; `.prev` for transitions; the CLI doesn't know signal picks yet.
 
+## FIBEX (built: core, CLI, GUI)
+
+Owner, 2026-10-24: FIBEX first (SOME/IP, if it comes, from ARXML); `quick-xml` approved; the first step decodes non-verbose messages from FIBEX files given for the session (the `nerka-db` intermediate format and a library of imports come later).
+
+- **Reference:** the open examples follow one convention — COVESA dlt-daemon (`src/examples/dlt-example-non-verbose*.xml`, `examples/example2|3`, MPL-2.0), COVESA dlt-viewer (`plugin/examples/nonverboseplugin_configuration.xml`), esrlabs dlt-core (`tests/dlt-messages.xml`, `robustness.xml`, Apache-2.0). They aren't in the repo (our tests use hand-written FIBEX in the same convention); `NERKA_FIBEX_REF=<folder> cargo test -- --include-ignored` loads every file there (all six: 19 messages, every argument type known). Eclipse S-CORE (`logging`, `baselibs`) has no FIBEX.
+- **Core** (`core/src/input/dlt/fibex.rs`, `Fibex`): a streaming read (`quick-xml`) of ECUS, FRAMES (`ID_<message id>`, PDU instances in sequence, `MANUFACTURER-EXTENSION`: type, level, APID, CTID, source file / line), PDUS (`ho:DESC` text, signal instances), SIGNALS → CODINGS (base data type, bit length); signals that aren't defined are read by their conventional names (`S_UINT32` …). Arguments: bool, 8–64-bit integers, 16/32/64-bit floats, length-prefixed strings and raw data, in the message's byte order. A file naming one ECU binds its frames to it; a lookup prefers the message's ECU, then unbound frames, then any, and the APID / CTID that match. Malformed XML is an error with the file and byte position.
+- **DLT reader:** `OpenOptions::fibex` → `DltFile::with_fibex`. A described non-verbose payload is shown as text (pieces joined by a space; what can't be read follows as hex after `<undecoded>`); a message without extended header takes APID, CTID, type and level from its description (columns, `apid` / `ctid` / `type` fields, `level`), so filters and signals work on it. Undescribed messages stay `[id] hex`. Without FIBEX nothing changes.
+- **CLI:** `--fibex FILE` (global, repeatable). **GUI:** a **FIBEX** menu in the toolbar (add files, list them, forget them; for the session) — DLT tabs read their files again with them, keeping filter, search, selection and the current line; `nerka-gui --fibex FILE` at startup.
+- **Benchmark** (1 GiB `gen_dlt`, 12.5 M messages, release): `apid == NAV AND level >= WARN` ~29 ms with or without FIBEX; payload regexes 200–330 ms either way (run-to-run noise; 5 % of the messages are non-verbose there).
+- **Next:** typed arguments as signals without a regex; the `nerka-db` intermediate format (import once, library or session); try it on the owner's real FIBEX files (variants: FIBEX 4.x, value tables, other ECU naming).
+
 ## Search manager (POC built: core, CLI, GUI)
 
 Design agreed with the owner on 2026-10-18 after mockups: **`search-manager.md`** (decisions, model, POC scope, open questions). In short:
@@ -145,4 +156,4 @@ Don't settle these silently: ask.
 - No follow/tail mode: if a file is truncated while it is mapped, reads may fault.
 - Only UTF-8/ASCII text is handled; invalid bytes are shown as U+FFFD.
 - The GUI binary is ~19 MB on Linux. The size on Windows hasn't been measured.
-- DLT: only files with storage headers; no FIBEX (non-verbose payloads stay hex); arrays/structs/fixed-point arguments shown as hex; time in UTC only; the message index is built single-threaded (~280 ms per GiB).
+- DLT: only files with storage headers; FIBEX only in the COVESA convention (non-verbose messages; no value tables, no FIBEX 4.x specifics yet); arrays/structs/fixed-point arguments shown as hex; time in UTC only; the message index is built single-threaded (~280 ms per GiB).
