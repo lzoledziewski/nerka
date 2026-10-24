@@ -133,6 +133,11 @@ impl LogSource for Concat {
         self.parts[k].supplied_level(l)
     }
 
+    fn time(&self, line: LineNo) -> Option<f64> {
+        let (k, l) = self.locate(line)?;
+        self.parts[k].time(l)
+    }
+
     fn parts(&self) -> Option<Vec<super::Part<'_>>> {
         Some(
             (0..self.parts.len())
@@ -189,6 +194,10 @@ impl LogSource for View<'_> {
 
     fn supplied_level(&self, line: LineNo) -> Option<Option<Level>> {
         self.part().supplied_level(line)
+    }
+
+    fn time(&self, line: LineNo) -> Option<f64> {
+        self.part().time(line)
     }
 
     fn contiguous(&self) -> Option<&[u8]> {

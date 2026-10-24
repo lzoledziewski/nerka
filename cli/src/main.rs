@@ -15,8 +15,8 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use nerka_core::pack::{self, Expansion, Library, ParamValue, Params, Pick, Role, Selection};
 use nerka_core::{
-    Bookmarks, FieldDef, Filter, LogSource, Matcher, MatcherOptions, Progress, Query, SearchSet, SignalDef, Signals,
-    search, search_within,
+    Bookmarks, Filter, LogSource, Matcher, MatcherOptions, Progress, Query, SearchSet, SignalDef, Signals, search,
+    search_within,
 };
 use std::io::{BufWriter, Write};
 use std::path::PathBuf;
@@ -164,23 +164,24 @@ fn library(extra: &[PathBuf]) -> Result<Library> {
 }
 
 /// Compile an NFD query for a source, with a caret under the error.
-fn compile(query: &str, schema: &[FieldDef]) -> Result<Query> {
-    let signals = SIGNALS.get_or_init(Default::default);
-    Query::compile_in(query, schema, signals).map_err(|e| {
+fn compile(query: &str, source: &dyn LogSource) -> Result<Query> {
+    // `--signal` definitions, and `@time` on files that know their time.
+    let signals = SIGNALS.get_or_init(Default::default).for_source(source);
+    Query::compile_in(query, source.schema(), &signals).map_err(|e| {
         anyhow::anyhow!("{e}\n  {query}\n  {}^", " ".repeat(query[..e.pos.min(query.len())].chars().count()))
     })
 }
 
-/// `build` gets the opened source's field schema, so query errors about
+/// `build` gets the opened source (its fields, its time), so query errors about
 /// unknown fields point into the query like syntax errors do.
 fn run_filter(
     file: &PathBuf,
-    build: impl FnOnce(&[FieldDef]) -> Result<Filter>,
+    build: impl FnOnce(&dyn LogSource) -> Result<Filter>,
     o: &OutputArgs,
     out: &mut impl Write,
 ) -> Result<()> {
     let (f, t_index) = open(file)?;
-    let filter = build(f.schema())?;
+    let filter = build(&*f)?;
     let t = Instant::now();
     let res = search(&*f, &filter, &Progress::new())?;
     let t_search = t.elapsed();
@@ -218,7 +219,7 @@ fn run_search_within(
     out: &mut impl Write,
 ) -> Result<()> {
     let (f, t_index) = open(file)?;
-    let filter = within.map(|q| compile(q, f.schema())).transpose()?;
+    let filter = within.map(|q| compile(q, &*f)).transpose()?;
     let t = Instant::now();
     let lines = match filter {
         Some(q) => Some(search(&*f, &Filter::Query(q), &Progress::new())?.lines),
@@ -347,7 +348,7 @@ fn run() -> Result<()> {
             }
         }
         Cmd::Filter { query, file, out: o } => {
-            run_filter(&file, |schema| Ok(Filter::Query(compile(&query, schema)?)), &o, &mut out)?;
+            run_filter(&file, |source| Ok(Filter::Query(compile(&query, source)?)), &o, &mut out)?;
         }
         Cmd::Expand { picks, parts } => {
             if picks.is_empty() {

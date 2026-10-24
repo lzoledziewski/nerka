@@ -397,6 +397,11 @@ impl LogSource for DltFile {
     fn supplied_level(&self, line: LineNo) -> Option<Option<Level>> {
         Some(self.msg(line).as_ref().and_then(level_of))
     }
+
+    fn time(&self, line: LineNo) -> Option<f64> {
+        let (secs, usecs) = self.msg(line)?.storage_time();
+        Some(f64::from(secs) + f64::from(usecs) / 1e6)
+    }
 }
 
 #[cfg(test)]

@@ -59,6 +59,7 @@ pub fn signals_panel(
     generation: u64,
     file: &dyn LogSource,
     line: LineNo,
+    plot: &mut crate::plot::PlotState,
 ) -> Output {
     let mut out = Output::default();
     ui.horizontal(|ui| {
@@ -84,22 +85,38 @@ pub fn signals_panel(
     }
     let mut remove = None;
     let mut edit = None;
-    egui::Grid::new("signals").num_columns(4).striped(true).show(ui, |ui| {
+    egui::Grid::new("signals").num_columns(5).striped(true).show(ui, |ui| {
         for d in signals.iter() {
-            ui.label(RichText::new(format!("@{}", d.name())).monospace().strong()).on_hover_text(format!(
-                "{}\ngroup: {}\n{}",
-                d.kind().as_str(),
-                d.group(),
-                d.query().source()
-            ));
+            // Plotting a time against time says nothing.
+            if d.kind() == SignalKind::Time {
+                ui.label("");
+            } else {
+                let mut on = plot.is_plotted(d.name());
+                if ui.checkbox(&mut on, "").on_hover_text("Plot it (its state over time)").changed() {
+                    plot.toggle(d.name());
+                }
+            }
+            let hover = if d.is_from_source() {
+                "time\nThe file's own time of each line (DLT: when the logger received it)".to_owned()
+            } else {
+                format!("{}\ngroup: {}\n{}", d.kind().as_str(), d.group(), d.query().source())
+            };
+            ui.label(RichText::new(format!("@{}", d.name())).monospace().strong()).on_hover_text(hover);
             ui.weak(d.kind().as_str());
+            if d.is_from_source() {
+                let t = file.time(line).map_or_else(|| "—".to_owned(), |t| nerka_core::time::format_time(t, 6));
+                ui.label(RichText::new(t).monospace()).on_hover_text("Every line is an event");
+                ui.weak("built in");
+                ui.end_row();
+                continue;
+            }
             let bound = st.bound.iter().find(|(n, _)| n == d.name()).map(|(_, b)| b);
             match bound {
                 Some(Ok(_)) => match d.cached_series(file) {
                     // The state on the cursor line, and the event that set it.
                     Some(series) => match series.state(line) {
                         Some((row, v)) => {
-                            let v = v.to_value().to_string();
+                            let v = d.format(v);
                             let events = series.len();
                             if row == line {
                                 ui.label(RichText::new(format!("{v}  • event")).monospace())
@@ -174,6 +191,10 @@ pub fn signals_panel(
         ui.horizontal(|ui| {
             ui.radio_value(&mut d.kind, SignalKind::Num, "num").on_hover_text("The capture read as a number");
             ui.radio_value(&mut d.kind, SignalKind::Enum, "enum").on_hover_text("The captured text");
+            ui.radio_value(&mut d.kind, SignalKind::Time, "time").on_hover_text(
+                "The capture read as a time: 2026-10-17 10:00:01.5, 10:00:01.5 (a time of day) or seconds. \
+                 The first time signal is the tab's clock for plots.",
+            );
         });
         ui.end_row();
         ui.label("Group");

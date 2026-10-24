@@ -43,7 +43,9 @@
 //! that changed the state; the last two also stand alone (any event).
 //! [`Query::with_signals`] resolves them and types the comparison by the
 //! signal's kind: `num` takes every comparison, `enum` takes `==`, `!=`,
-//! `~`, `!~`. As with fields, a row without a value only satisfies `!=`
+//! `~`, `!~`, `time` takes every comparison with a quoted date-time
+//! (`@time >= "2026-10-17 10:00:01.5"`) or time of day (`"10:00:00"`:
+//! compared with the value's time of day). As with fields, a row without a value only satisfies `!=`
 //! and `!~`, and an unknown signal is an error.
 //!
 //! The search boxes' Auto mode (`auto.rs`, `doc/search-modes.md`) reads plain
@@ -58,6 +60,7 @@ mod parser;
 
 use crate::event::{Event, FieldDef, FieldId, FieldKind, FieldValue, Level};
 use crate::signal::{SignalDef, SignalKind, SignalSeries, SignalView, Signals, ValueRef, source_key, view_at};
+use crate::time::{TIME_OF_DAY_END, parse_time};
 use crate::{LogSource, Progress};
 use regex::bytes::Regex;
 use std::sync::Arc;
@@ -156,6 +159,8 @@ pub enum FieldTest {
     Float(CmpOp, f64),
     /// No comparison: the signal has a value (`@x.event`).
     Any,
+    /// A `time` signal: seconds, and whether only the time of day counts.
+    Time(CmpOp, f64, bool),
     /// `~` (`!~` is `NOT ~`).
     Match(Regex),
 }
@@ -308,14 +313,24 @@ impl FieldCond {
             (FieldTest::Literal(op @ (CmpOp::Eq | CmpOp::Ne), v, _), FieldKind::Str) => {
                 FieldTest::Str(op, v.into_bytes())
             }
-            (FieldTest::Literal(..) | FieldTest::Num(..) | FieldTest::Float(..) | FieldTest::Any, FieldKind::Str) => {
+            (
+                FieldTest::Literal(..)
+                | FieldTest::Num(..)
+                | FieldTest::Float(..)
+                | FieldTest::Any
+                | FieldTest::Time(..),
+                FieldKind::Str,
+            ) => {
                 return fail(format!("'{name}' is text: use ==, !=, ~ or !~"), self.op_pos);
             }
             (FieldTest::Literal(op, v, pos), FieldKind::U64) => match parse_u64(&v) {
                 Some(n) => FieldTest::Num(op, n),
                 None => return fail(format!("'{name}' is a number but '{v}' isn't"), pos),
             },
-            (FieldTest::Match(_) | FieldTest::Str(..) | FieldTest::Float(..) | FieldTest::Any, FieldKind::U64) => {
+            (
+                FieldTest::Match(_) | FieldTest::Str(..) | FieldTest::Float(..) | FieldTest::Any | FieldTest::Time(..),
+                FieldKind::U64,
+            ) => {
                 return fail(format!("'{name}' is a number: use ==, !=, >=, <=, >, <"), self.op_pos);
             }
         };
@@ -342,19 +357,38 @@ impl SignalCond {
         self.test = match (test, def.kind()) {
             (t @ (FieldTest::Match(_) | FieldTest::Str(..)), SignalKind::Enum)
             | (t @ FieldTest::Float(..), SignalKind::Num)
+            | (t @ FieldTest::Time(..), SignalKind::Time)
             | (t @ FieldTest::Any, _) => t,
             (FieldTest::Literal(op @ (CmpOp::Eq | CmpOp::Ne), v, _), SignalKind::Enum) => {
                 FieldTest::Str(op, v.into_bytes())
             }
-            (FieldTest::Literal(..) | FieldTest::Float(..) | FieldTest::Num(..), SignalKind::Enum) => {
+            (
+                FieldTest::Literal(..) | FieldTest::Float(..) | FieldTest::Num(..) | FieldTest::Time(..),
+                SignalKind::Enum,
+            ) => {
                 return fail(format!("'@{name}' is an enum: use ==, !=, ~ or !~"), self.op_pos);
             }
             (FieldTest::Literal(op, v, pos), SignalKind::Num) => match parse_f64(&v) {
                 Some(n) => FieldTest::Float(op, n),
                 None => return fail(format!("'@{name}' is a number but '{v}' isn't"), pos),
             },
-            (FieldTest::Match(_) | FieldTest::Str(..) | FieldTest::Num(..), SignalKind::Num) => {
+            (FieldTest::Match(_) | FieldTest::Str(..) | FieldTest::Num(..) | FieldTest::Time(..), SignalKind::Num) => {
                 return fail(format!("'@{name}' is a number: use ==, !=, >=, <=, >, <"), self.op_pos);
+            }
+            (FieldTest::Literal(op, v, pos), SignalKind::Time) => match parse_time(&v) {
+                Some(t) => FieldTest::Time(op, t, t < TIME_OF_DAY_END),
+                None => {
+                    return fail(
+                        format!("'@{name}' is a time but '{v}' isn't (\"2026-10-17 10:00:01.5\" or \"10:00:00\")"),
+                        pos,
+                    );
+                }
+            },
+            (
+                FieldTest::Match(_) | FieldTest::Str(..) | FieldTest::Num(..) | FieldTest::Float(..),
+                SignalKind::Time,
+            ) => {
+                return fail(format!("'@{name}' is a time: use ==, !=, >=, <=, >, < with a quoted time"), self.op_pos);
             }
         };
         self.def = Some(def.clone());
@@ -365,6 +399,15 @@ impl SignalCond {
         let Some(def) = &self.def else { return false };
         let line = ev.line();
         match ev.source() {
+            // The source's own time: every line is an event.
+            Some(src) if def.is_from_source() => {
+                let t = src.time(line);
+                let v = match self.view {
+                    SignalView::Changed if line > 0 && src.time(line - 1) == t => None,
+                    _ => t,
+                };
+                self.test(v.map(ValueRef::Num))
+            }
             Some(src) => {
                 let key = source_key(src);
                 if let Some((events, row)) = self.series.as_ref().and_then(|s| s.locate(key, line)) {
@@ -391,9 +434,12 @@ impl SignalCond {
         match (v, &self.test) {
             (Some(_), FieldTest::Any) => true,
             (Some(ValueRef::Num(v)), FieldTest::Float(op, want)) => op.test_f64(v, *want),
+            (Some(ValueRef::Num(v)), FieldTest::Time(op, want, of_day)) => {
+                op.test_f64(if *of_day { v.rem_euclid(TIME_OF_DAY_END) } else { v }, *want)
+            }
             (Some(ValueRef::Enum(v)), FieldTest::Str(op, want)) => op.test(v, want.as_slice()),
             (Some(ValueRef::Enum(v)), FieldTest::Match(re)) => re.is_match(v),
-            (None, FieldTest::Str(op, _) | FieldTest::Float(op, _)) => *op == CmpOp::Ne,
+            (None, FieldTest::Str(op, _) | FieldTest::Float(op, _) | FieldTest::Time(op, ..)) => *op == CmpOp::Ne,
             _ => false,
         }
     }
@@ -537,8 +583,12 @@ impl Query {
                 Expr::Cond(Cond::RawMatch(re)) => Some(re),
                 // A state holds on rows without an event: no prefilter.
                 Expr::Cond(Cond::Signal(s)) => match (s.view, &s.test) {
-                    (SignalView::State, _) | (_, FieldTest::Float(CmpOp::Ne, _) | FieldTest::Str(CmpOp::Ne, _)) => None,
-                    _ => s.def.as_ref()?.query().prefilter(),
+                    (SignalView::State, _)
+                    | (
+                        _,
+                        FieldTest::Float(CmpOp::Ne, _) | FieldTest::Str(CmpOp::Ne, _) | FieldTest::Time(CmpOp::Ne, ..),
+                    ) => None,
+                    _ => s.def.as_ref().filter(|d| !d.is_from_source())?.query().prefilter(),
                 },
                 _ => None,
             }
@@ -748,6 +798,23 @@ mod tests {
         let e = Query::compile("@gear.state").unwrap_err();
         assert_eq!(e.pos, 11);
         assert!(Query::compile("@gear.event AND NOT @gear.changed AND @gear.Changed == D").is_ok());
+    }
+
+    #[test]
+    fn time_signal_errors() {
+        let mut sig = Signals::default();
+        sig.set(SignalDef::parse_spec(r"t:time=/^(?<t>\S+)/").unwrap());
+        let c = |s: &str| Query::compile_in(s, &[], &sig);
+        assert!(c(r#"@t >= "2026-10-17 10:00:01.5" AND @t < "10:30:00""#).is_ok());
+        let e = c("@t > soon").unwrap_err();
+        assert_eq!(e.pos, 5);
+        assert!(e.msg.contains("is a time but 'soon' isn't"), "{e}");
+        let e = c("@t ~ /10/").unwrap_err();
+        assert_eq!(e.pos, 3);
+        assert!(e.msg.contains("is a time"), "{e}");
+        assert!(c("@t > 1729771200").is_ok(), "seconds since the epoch");
+        // On a bare line a time of day is itself.
+        assert!(c(r#"@t >= "10:00:00""#).unwrap().matches(b"10:00:01 x"));
     }
 
     #[test]

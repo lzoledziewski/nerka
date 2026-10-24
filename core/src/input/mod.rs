@@ -182,6 +182,13 @@ pub trait LogSource: Send + Sync {
         vec![(0, self.line_count())]
     }
 
+    /// The time of `line` as the source knows it, in seconds since the Unix
+    /// epoch (UTC): DLT's storage (receive) time. Plain text has none: a
+    /// tab captures it with a `time` signal instead.
+    fn time(&self, _line: LineNo) -> Option<f64> {
+        None
+    }
+
     /// Identifies the data the source reads, for caches (signal events): a
     /// part of a [`concat::Concat`] answers its file's, so the part made
     /// for each scan is the same one.

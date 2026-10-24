@@ -339,3 +339,24 @@ fn open_picks_reader_from_content() {
     drop((a, b));
     let _ = std::fs::remove_dir_all(dir);
 }
+
+#[test]
+fn receive_time_is_the_built_in_time_signal() {
+    let msg = |secs, usecs, text: &str| {
+        let mut m = Msg::log(Level::Info, "E", "A", "C", vec![Value::Str(text.into()).into()]);
+        (m.secs, m.usecs) = (secs, usecs);
+        m
+    };
+    // 2025-10-18 00:00:00, +0.5 s, +0.5 s again, +2 s.
+    let t0 = 1_760_745_600;
+    let f = file(&[msg(t0, 0, "a"), msg(t0, 500_000, "b"), msg(t0, 500_000, "c"), msg(t0 + 2, 0, "d")]);
+    assert_eq!(f.time(1), Some(f64::from(t0) + 0.5));
+    let mut sig = crate::Signals::default();
+    sig.set(crate::SignalDef::source_time());
+    let run = |s: &str| run_on(&f, &Filter::Query(Query::compile(s).unwrap().with_signals(&sig).unwrap()));
+    assert_eq!(run(r#"@time >= "2025-10-18 00:00:00.5""#), [1, 2, 3]);
+    assert_eq!(run(r#"@time < "00:00:01" AND /b|c|d/"#), [1, 2]);
+    assert_eq!(run("@time.event"), [0, 1, 2, 3]);
+    assert_eq!(run("@time.changed"), [0, 1, 3]);
+    assert!(matches!(crate::Clock::of(&f, &sig), crate::Clock::Source));
+}

@@ -52,6 +52,11 @@ impl Matcher {
         Ok(Self { regex, options })
     }
 
+    /// A plain search for a compiled regex (an NFD `raw ~ /…/`).
+    pub(crate) fn from_regex(regex: Regex) -> Self {
+        Self { regex, options: MatcherOptions::default() }
+    }
+
     pub fn options(&self) -> &MatcherOptions {
         &self.options
     }
@@ -566,6 +571,33 @@ pub(crate) mod tests {
         assert_eq!(run("@gear.event AND NOT @gear.changed"), [3, 6]);
         // Events and states together: warnings that report v while in N.
         assert_eq!(run("level >= WARN AND @v.event AND @gear == N"), [5]);
+    }
+
+    #[test]
+    fn captured_times_roll_over_midnight() {
+        let log = "23:59:58 start
+more
+23:59:59.5 tick
+00:00:01 after midnight
+last
+";
+        let sig = signals(&[r"t:time=/^(?<t>\d\d:\d\d:\d\d(\.\d+)?)/"]);
+        let run = |s: &str| run_filter(log, &sq(s, &sig));
+        // A time of day compares with the value's time of day.
+        assert_eq!(run(r#"@t >= "23:59:59""#), [2]);
+        assert_eq!(run(r#"@t < "00:00:05""#), [3, 4]);
+        assert_eq!(run(r#"@t.event < "00:00:05""#), [3]);
+        // The events know the day: 00:00:01 is after 23:59:59.5.
+        let text = TextFile::from_bytes("t", log.as_bytes().to_vec());
+        let def = sig.get("t").unwrap();
+        let series = def.series(&text, &Progress::new()).unwrap();
+        let times: Vec<String> = series.iter().map(|(r, v)| format!("{r} {}", def.format(v))).collect();
+        assert_eq!(times, ["0 23:59:58.000000", "2 23:59:59.500000", "3 00:00:01.000000 +1d"]);
+        // The tab's clock: the time signal's state at each line.
+        let clock = crate::Clock::of(&text, &sig);
+        assert!(matches!(&clock, crate::Clock::Signal(d) if d.name() == "t"));
+        assert_eq!(clock.at(&text, Some(&series), 4), Some(86_401.0));
+        assert!(matches!(crate::Clock::of(&text, &crate::Signals::default()), crate::Clock::Lines));
     }
 
     #[test]

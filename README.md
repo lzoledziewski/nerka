@@ -65,6 +65,7 @@ nerka-gui app.log                              # open a file (several: one view)
 nerka-gui trace.pcapng --query 'apid == NAV'   # open and filter
 nerka-gui app.log --new-window --name triage   # a separate, named window
 nerka-gui app.log --signal 'lat=/latency_us=(?<lat>\d+)/' --query '@lat > 9000'   # a signal
+nerka-gui app.log --signal 't:time=/^(?<t>\S+ \S+)/' --signal 'lat=/latency_us=(?<lat>\d+)/' --plot lat   # plot it over time
 ```
 
 | Keys | |
@@ -104,7 +105,7 @@ nerka --signal 'gear:enum=/gear=(?<gear>\w+)/' filter '@gear == D' app.log   # s
 | Text | bare `/re/` and `"text"` match the whole line (`raw`) |
 | Logic | `AND OR NOT`, parentheses |
 | Fields | `raw`, `level`; DLT adds `ecu apid ctid type mcnt tmsp seid mid mode payload`; several files add `file` |
-| Signals | `@name`: a value the tab captures with a named regex group (`--signal`, 📈 Signals panel). `@gear == D` is the state (held until the next event), `@gear.event == D` a line that carries it, `@gear.changed` a change |
+| Signals | `@name`: a value the tab captures with a named regex group (`--signal`, 📈 Signals panel). `@gear == D` is the state (held until the next event), `@gear.event == D` a line that carries it, `@gear.changed` a change. Kinds `num`, `enum`, `time`; DLT has `@time` (receive time): `@time >= "2025-10-18 10:00:00"` |
 
 ## Documentation
 

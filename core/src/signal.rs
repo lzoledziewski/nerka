@@ -15,19 +15,26 @@
 //! In a view of several files each file has its own events, so a state
 //! never carries over into the next file.
 //!
+//! **Time** is a signal too ([`SignalKind::Time`], values in seconds since
+//! the epoch, `crate::time`): a source that knows its lines' times (DLT's
+//! receive time) gives the built-in `@time` ([`SignalDef::source_time`]);
+//! plain text captures one. A tab's [`Clock`] is the time its lines are
+//! plotted and compared at.
+//!
 //! Spec text (CLI `--signal`, one line):
 //!
 //! ```text
 //! spec  := NAME [ "(" GROUP ")" ] [ ":" KIND ] "=" QUERY
-//! KIND  := num | enum                  -- default num
+//! KIND  := num | enum | time           -- default num
 //! GROUP := regex group name            -- default NAME
 //! ```
 //!
 //! e.g. `speed=/speed=(?<speed>\d+)/` or `gear(g):enum=apid == NAV AND payload ~ /gear (?<g>\w)/`.
 
 use crate::dsl::{Cond, DslError, Expr, FieldTest, Query};
-use crate::engine::search::{Filter, scan};
+use crate::engine::search::{Filter, Matcher, scan};
 use crate::event::{Event, FieldDef, FieldValue};
+use crate::time::{TIME_OF_DAY_END, format_time, parse_time};
 use crate::{LineNo, LogSource, Progress};
 use rayon::prelude::*;
 use regex::bytes::Regex;
@@ -98,12 +105,30 @@ enum Values {
 }
 
 impl Events {
+    /// A `num` or `time` signal's events.
+    fn numbers(rows: Vec<LineNo>, mut nums: Vec<f64>, kind: SignalKind) -> Events {
+        if kind == SignalKind::Time {
+            // A time of day that goes back by more than 12 hours passed
+            // midnight: it is on the next day.
+            let (mut day, mut prev) = (0.0, f64::NEG_INFINITY);
+            for n in nums.iter_mut().filter(|n| (0.0..TIME_OF_DAY_END).contains(*n)) {
+                if *n + day < prev - TIME_OF_DAY_END / 2.0 {
+                    day += TIME_OF_DAY_END;
+                }
+                *n += day;
+                prev = *n;
+            }
+        }
+        Events { rows, values: Values::Num(nums) }
+    }
+
     fn build(found: Vec<(LineNo, SignalValue)>, kind: SignalKind) -> Events {
         let rows = found.iter().map(|(r, _)| *r).collect();
         let values = match kind {
-            SignalKind::Num => Values::Num(
-                found.iter().map(|(_, v)| if let SignalValue::Num(n) = v { *n } else { f64::NAN }).collect(),
-            ),
+            SignalKind::Num | SignalKind::Time => {
+                let nums = found.iter().map(|(_, v)| if let SignalValue::Num(n) = v { *n } else { f64::NAN }).collect();
+                return Events::numbers(rows, nums, kind);
+            }
             SignalKind::Enum => {
                 let mut index = std::collections::HashMap::new();
                 let mut table = Vec::new();
@@ -248,6 +273,9 @@ pub enum SignalKind {
     Num,
     /// The captured text.
     Enum,
+    /// The capture read as a time (`crate::time::parse_time`): seconds
+    /// since the epoch, or a time of day.
+    Time,
 }
 
 impl SignalKind {
@@ -255,6 +283,7 @@ impl SignalKind {
         match self {
             SignalKind::Num => "num",
             SignalKind::Enum => "enum",
+            SignalKind::Time => "time",
         }
     }
 
@@ -262,6 +291,7 @@ impl SignalKind {
         match s.trim().to_ascii_lowercase().as_str() {
             "num" => Some(SignalKind::Num),
             "enum" => Some(SignalKind::Enum),
+            "time" => Some(SignalKind::Time),
             _ => None,
         }
     }
@@ -304,6 +334,8 @@ pub struct SignalDef {
     group: String,
     query: Query,
     cache: Cache,
+    /// The built-in `@time`: the source's own time of each line.
+    from_source: bool,
 }
 
 impl SignalDef {
@@ -331,7 +363,32 @@ impl SignalDef {
             };
             return Err(SignalError::Group(format!("no regex captures '{group}' ({have})")));
         }
-        Ok(SignalDef { name: name.to_ascii_lowercase(), kind, group: group.to_owned(), query, cache: Cache::default() })
+        Ok(SignalDef {
+            name: name.to_ascii_lowercase(),
+            kind,
+            group: group.to_owned(),
+            query,
+            cache: Cache::default(),
+            from_source: false,
+        })
+    }
+
+    /// The built-in `@time` of a source that knows its lines' times (DLT's
+    /// receive time): every line is an event.
+    pub fn source_time() -> SignalDef {
+        SignalDef {
+            name: "time".into(),
+            kind: SignalKind::Time,
+            group: "time".into(),
+            query: Query::compile("/(?<time>)/").expect("valid"),
+            cache: Cache::default(),
+            from_source: true,
+        }
+    }
+
+    /// Whether this is the built-in `@time` ([`Self::source_time`]).
+    pub fn is_from_source(&self) -> bool {
+        self.from_source
     }
 
     /// Parse one spec line (module docs).
@@ -355,6 +412,9 @@ impl SignalDef {
 
     /// The spec line [`Self::parse_spec`] reads back.
     pub fn spec(&self) -> String {
+        if self.from_source {
+            return "time:time (the file's own time)".into();
+        }
         let group = if self.group == self.name { String::new() } else { format!("({})", self.group) };
         format!("{}{group}:{}={}", self.name, self.kind.as_str(), self.query.source())
     }
@@ -382,15 +442,33 @@ impl SignalDef {
 
     /// The value row `ev` carries, if any.
     pub fn value(&self, ev: &mut Event<'_>) -> Option<SignalValue> {
+        if self.from_source {
+            return ev.source()?.time(ev.line()).map(SignalValue::Num);
+        }
         // A query that is only the capturing regex matches when it captures.
         let only_regex = matches!(self.query.expr(), Expr::Cond(Cond::RawMatch(_)));
         if !only_regex && !self.query.matches_event(ev) {
             return None;
         }
         let text = capture(self.query.expr(), &self.group, ev)?;
+        self.read(&text)
+    }
+
+    /// A captured text as this signal's value.
+    fn read(&self, text: &[u8]) -> Option<SignalValue> {
         match self.kind {
-            SignalKind::Num => parse_num(&text).map(SignalValue::Num),
-            SignalKind::Enum => Some(SignalValue::Enum(text)),
+            SignalKind::Num => parse_num(text).map(SignalValue::Num),
+            SignalKind::Enum => Some(SignalValue::Enum(text.to_vec())),
+            SignalKind::Time => std::str::from_utf8(text).ok().and_then(parse_time).map(SignalValue::Num),
+        }
+    }
+
+    /// A value of this signal for display: times as dates and clock times.
+    pub fn format(&self, v: ValueRef<'_>) -> String {
+        match (v, self.kind) {
+            (ValueRef::Num(t), SignalKind::Time) => format_time(t, 6),
+            (ValueRef::Num(n), _) => n.to_string(),
+            (ValueRef::Enum(t), _) => String::from_utf8_lossy(t).into_owned(),
         }
     }
 
@@ -398,6 +476,10 @@ impl SignalDef {
     /// then from the cache this definition (and every copy of it) keeps.
     pub fn series(&self, source: &dyn LogSource, progress: &Progress) -> crate::Result<SignalSeries> {
         let mut parts = Vec::new();
+        if self.from_source {
+            // Every line is an event: the source answers directly.
+            return Ok(SignalSeries { key: source_key(source), parts });
+        }
         match source.parts() {
             Some(ps) => {
                 for p in ps {
@@ -426,6 +508,9 @@ impl SignalDef {
 
     /// Progress units [`Self::series`] still has to do on `source`.
     pub(crate) fn series_work(&self, source: &dyn LogSource) -> u64 {
+        if self.from_source {
+            return 0;
+        }
         match source.parts() {
             Some(ps) => ps.iter().map(|p| self.series_work(p.source.as_ref())).sum(),
             None if self.cached(source_key(source)).is_some() => 0,
@@ -448,10 +533,46 @@ impl SignalDef {
         }
         // Built without holding the lock: a scan runs on the thread pool.
         let def = self.bind(source.schema())?;
-        let rows = scan(source, &Filter::Query(def.query.clone()), progress)?;
-        let found: Vec<(LineNo, SignalValue)> =
-            rows.par_iter().filter_map(|&r| def.value(&mut Event::from_source(source, r)).map(|v| (r, v))).collect();
-        let ev = Arc::new(Events::build(found, self.kind));
+        // Only the capturing regex (the usual case, a timestamp on every
+        // line): scan for it as a plain regex, then capture once per hit
+        // without allocating.
+        let only = match def.query.expr() {
+            Expr::Cond(Cond::RawMatch(re)) => {
+                Some((re, re.capture_names().position(|n| n == Some(def.group.as_str()))))
+            }
+            _ => None,
+        };
+        let filter = match only {
+            Some((re, _)) => Filter::Regex(Matcher::from_regex(re.clone())),
+            None => Filter::Query(def.query.clone()),
+        };
+        let rows = scan(source, &filter, progress)?;
+        let values = rows.par_iter().map_init(
+            || only.map(|(re, _)| re.capture_locations()),
+            |locs, &r| match (only, locs) {
+                (Some((re, group)), Some(locs)) => {
+                    let line = source.line_bytes(r)?;
+                    re.captures_read(locs, &line)?;
+                    let (s, e) = locs.get(group?)?;
+                    def.read(&line[s..e]).map(|v| (r, v))
+                }
+                _ => def.value(&mut Event::from_source(source, r)).map(|v| (r, v)),
+            },
+        );
+        // Numbers straight into two arrays: millions of events (a timestamp
+        // per line) must not go through a list of enums first. `filter_map`,
+        // not rayon's `flatten`: that makes a parallel iterator per item
+        // (several times slower here).
+        let ev = Arc::new(match self.kind {
+            SignalKind::Enum => Events::build(values.filter_map(|v| v).collect(), self.kind),
+            _ => {
+                let (rows, nums): (Vec<LineNo>, Vec<f64>) = values
+                    .filter_map(|v| v)
+                    .map(|(r, v)| (r, if let SignalValue::Num(n) = v { n } else { f64::NAN }))
+                    .unzip();
+                Events::numbers(rows, nums, self.kind)
+            }
+        });
         let mut cache = self.cache.lock().unwrap_or_else(|e| e.into_inner());
         if !cache.iter().any(|(k, _)| *k == key) {
             if cache.len() >= CACHED_FILES {
@@ -480,6 +601,16 @@ impl Signals {
         }
     }
 
+    /// These signals plus the built-in `@time` when `source` knows its
+    /// lines' times (unless a signal is named `time` already).
+    pub fn for_source(&self, source: &dyn LogSource) -> Signals {
+        let mut s = self.clone();
+        if source.line_count() > 0 && source.time(0).is_some() && s.get("time").is_none() {
+            s.0.insert(0, Arc::new(SignalDef::source_time()));
+        }
+        s
+    }
+
     pub fn remove(&mut self, name: &str) {
         self.0.retain(|d| !d.name.eq_ignore_ascii_case(name));
     }
@@ -494,6 +625,48 @@ impl Signals {
 
     pub fn len(&self) -> usize {
         self.0.len()
+    }
+}
+
+/// What a tab's lines are timed by, for plots and time comparisons.
+#[derive(Debug, Clone)]
+pub enum Clock {
+    /// The source's own time (DLT's receive time).
+    Source,
+    /// A `time` signal the tab captures: its state at each line.
+    Signal(Arc<SignalDef>),
+    /// No time: line numbers.
+    Lines,
+}
+
+impl Clock {
+    /// The source's own time if it has one, else the tab's first `time`
+    /// signal, else line numbers.
+    pub fn of(source: &dyn LogSource, signals: &Signals) -> Clock {
+        if source.line_count() > 0 && source.time(0).is_some() {
+            return Clock::Source;
+        }
+        match signals.iter().find(|d| d.kind() == SignalKind::Time && !d.is_from_source()) {
+            Some(d) => Clock::Signal(d.clone()),
+            None => Clock::Lines,
+        }
+    }
+
+    pub fn is_time(&self) -> bool {
+        !matches!(self, Clock::Lines)
+    }
+
+    /// The x of `row`: its time in seconds, or its line number. `series` is
+    /// the clock signal's (for [`Clock::Signal`]).
+    pub fn at(&self, source: &dyn LogSource, series: Option<&SignalSeries>, row: LineNo) -> Option<f64> {
+        match self {
+            Clock::Source => source.time(row),
+            Clock::Signal(_) => match series?.state(row)?.1 {
+                ValueRef::Num(t) => Some(t),
+                ValueRef::Enum(_) => None,
+            },
+            Clock::Lines => Some(row as f64),
+        }
     }
 }
 

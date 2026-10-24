@@ -36,6 +36,7 @@ mod icon_art;
 mod instance;
 mod job;
 mod library;
+mod plot;
 mod prefs;
 mod presets;
 mod recall;
@@ -72,6 +73,8 @@ fn main() -> eframe::Result {
     let mut params = std::collections::BTreeMap::new();
     // `--signal SPEC` (as for the CLI): signals of the tab opened at startup.
     let mut signals = Signals::default();
+    // `--plot NAME`: plot these signals.
+    let mut plotted: Vec<String> = Vec::new();
     let (mut new_window, mut window_name, mut preset_file) = (false, None, None);
     let mut args = std::env::args_os().skip(1);
     while let Some(a) = args.next() {
@@ -108,6 +111,10 @@ fn main() -> eframe::Result {
             }
             Some("--library") => {
                 show_library = true;
+                continue;
+            }
+            Some("--plot") => {
+                plotted.push(value());
                 continue;
             }
             Some("--signal") => {
@@ -147,6 +154,7 @@ fn main() -> eframe::Result {
         && highlight.is_empty()
         && params.is_empty()
         && signals.is_empty()
+        && plotted.is_empty()
         && !show_library
         && preset_file.is_none()
         && window_name.is_none();
@@ -191,6 +199,7 @@ fn main() -> eframe::Result {
                 app.open_files(&cc.egui_ctx, initial);
                 if let Some(tab) = app.tabs.last_mut() {
                     tab.signals = signals;
+                    plotted.iter().for_each(|n| tab.plot.toggle(n));
                 }
                 if let (Some(p), Some(tab)) = (&moved, app.tabs.last_mut()) {
                     tab.use_preset(&cc.egui_ctx, &app.library, p);
@@ -465,6 +474,7 @@ struct Tab {
     /// Collects the signals' events for the panel (the engine keeps them
     /// with each definition).
     signals_job: Option<Job<()>>,
+    plot: plot::PlotState,
     status: String,
 }
 
@@ -708,6 +718,7 @@ impl Tab {
             signals_gen: 0,
             signals_ui: signals::SignalsUi::default(),
             signals_job: None,
+            plot: plot::PlotState::default(),
             status: String::new(),
         }
     }
@@ -791,6 +802,7 @@ impl Tab {
     /// The tab's signals were edited: queries that use them run again.
     fn signals_changed(&mut self, ctx: &egui::Context) {
         self.signals_gen += 1;
+        self.plot.retain(&self.signals);
         self.collect_signals(ctx);
         if self.pattern.contains('@') {
             self.start_search(ctx);
@@ -884,7 +896,11 @@ impl Tab {
                                 Bookmarks::default()
                             });
                             self.columns = Columns::from_defs(f.columns());
-                            self.file = Some(Arc::from(f));
+                            let file: Arc<dyn LogSource> = Arc::from(f);
+                            // `@time` when the file knows its lines' times.
+                            self.signals = self.signals.for_source(&*file);
+                            self.signals_gen += 1;
+                            self.file = Some(file);
                             self.collect_signals(ctx);
                             if !self.pattern.trim().is_empty() {
                                 self.start_search(ctx);
@@ -2665,7 +2681,15 @@ impl App {
                 .resizable(true)
                 .default_size(320.0)
                 .show(ui, |ui| {
-                    signals::signals_panel(ui, &mut tab.signals_ui, &mut tab.signals, tab.signals_gen, &*file, line)
+                    signals::signals_panel(
+                        ui,
+                        &mut tab.signals_ui,
+                        &mut tab.signals,
+                        tab.signals_gen,
+                        &*file,
+                        line,
+                        &mut tab.plot,
+                    )
                 })
                 .inner;
             if out.close {
@@ -2685,6 +2709,18 @@ impl App {
             .min_size(120.0)
             .show(ui, |ui| tab.search_panel(ui, &*file, search_history))
             .inner;
+        if !tab.plot.plotted.is_empty() {
+            let line = tab.current_line();
+            let out = egui::Panel::bottom("plot")
+                .resizable(true)
+                .default_size(220.0)
+                .min_size(80.0)
+                .show(ui, |ui| plot::plot_panel(ui, &mut tab.plot, &tab.signals, tab.signals_gen, &*file, line))
+                .inner;
+            if let Some(line) = out.goto {
+                tab.goto_line(line);
+            }
+        }
         egui::CentralPanel::default().show(ui, |ui| tab.main_panel(ui, &*file));
         let after = tab.search_prefs();
         if after != before {

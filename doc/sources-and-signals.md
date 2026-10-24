@@ -1,6 +1,6 @@
 # Sources & Signals — design
 
-_Status: agreed direction. Written 2026-10-17. **Signals** (2026-10-24): per-tab signals from explicit captures, events and states in NFD (`@x`, `@x.event`, `@x.changed`); see "What a signal is" and `status.md` → "Signals". Implemented so far: **DLT from `.dlt` files** (2026-10-18: source-supplied fields, DSL field predicates, own reader, table view) and **DLT inside pcap / pcapng and MF4** (2026-10-20: own readers in `core/src/input/capture/`, no dependency). Signals, SOME/IP, the time model and the plugin crates are still design. Current state and decisions: `status.md`._
+_Status: agreed direction. Written 2026-10-17. **Signals** (2026-10-24): per-tab signals from explicit captures, events and states in NFD (`@x`, `@x.event`, `@x.changed`), time as a signal (`@time` on DLT, `time` captures), the signal plot; see "What a signal is" and `status.md` → "Signals". Implemented so far: **DLT from `.dlt` files** (2026-10-18: source-supplied fields, DSL field predicates, own reader, table view) and **DLT inside pcap / pcapng and MF4** (2026-10-20: own readers in `core/src/input/capture/`, no dependency). Signals, SOME/IP, the time model and the plugin crates are still design. Current state and decisions: `status.md`._
 
 ## Goal
 
@@ -29,8 +29,8 @@ A **signal** is a named value that some rows of a log carry, defined **per tab**
   | `@gear.changed` | an event that changed the state (the first event too); with a comparison, on the new value |
 
   Before the first event a row has no state. In a view of several files the state doesn't carry over from one file into the next. Engine: one pass per signal and file collects its events (row, value), cached with the signal's definition; the state at a row is the last event at or before it (binary search), so every condition stays per row and parallel.
-- **Time** will be a signal too: the receive time on DLT, a `time` capture on plain text (the user has to define it). Not in v1.
-- **Plotting** is a separate feature built on top: the state over time (a step line, enum as bands), with a per-signal checkbox to show its events (when the value was received), and search and filter hits as markers on the same time axis.
+- **Time** is a signal too (owner, 2026-10-24): on DLT the receive (storage) time is the built-in `@time`; on plain text the user captures it with a signal of kind `time`. The tab's clock is the source's time, else its first `time` signal's state at each line, else line numbers. Built: `status.md` → "Signals".
+- **Plotting** is a separate feature built on top: the state over time (a step line, enum as bands), with a per-signal checkbox to show its events (when the value was received), and search and filter hits as markers on the same time axis. Built (2026-10-24) except the hit markers.
 - **Not now:** export, comparing signals across files, derived signals (rates, state machines), signals defined from other signals.
 
 ## Decisions taken with the owner
