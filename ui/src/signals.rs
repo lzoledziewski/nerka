@@ -2,8 +2,10 @@
 //! "What a signal is"), each with its state on the current line. They come
 //! from the file (`@time`), from the user's saved definitions (edited
 //! here) and from the named groups of the selection's queries (kind and
-//! scope chosen here). Core does the capturing; the panel only edits
-//! definitions and shows values.
+//! scope chosen here). The FIBEX files that describe DLT non-verbose
+//! messages are chosen here too (owner, 2026-10-24). Core does the
+//! capturing and decoding; the panel only edits definitions and shows
+//! values.
 
 use crate::plot::PlotState;
 use eframe::egui::{self, RichText};
@@ -48,6 +50,16 @@ pub struct Output {
     pub scope: Option<(String, SignalScope)>,
     /// Go to this line (the event that set a state was clicked).
     pub goto: Option<LineNo>,
+    pub fibex: Option<FibexAction>,
+}
+
+/// What to do with the FIBEX files.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FibexAction {
+    /// Pick more files.
+    Add,
+    /// Use none.
+    Forget,
 }
 
 /// The events each signal shows: all of them, or for a
@@ -93,10 +105,12 @@ pub struct Input<'a> {
     pub views: &'a mut Views,
     /// The filter result, if a filter is applied.
     pub kept: Option<&'a Arc<SearchResult>>,
+    /// The FIBEX files in use (every tab, this session).
+    pub fibex: Option<&'a nerka_core::Fibex>,
 }
 
 pub fn signals_panel(ui: &mut egui::Ui, st: &mut SignalsUi, input: Input<'_>) -> Output {
-    let Input { signals, generation, saved, file, line, plot, views, kept } = input;
+    let Input { signals, generation, saved, file, line, plot, views, kept, fibex } = input;
     let mut out = Output::default();
     ui.horizontal(|ui| {
         ui.heading("Signals");
@@ -230,6 +244,9 @@ pub fn signals_panel(ui: &mut egui::Ui, st: &mut SignalsUi, input: Input<'_>) ->
     }
 
     ui.separator();
+    out.fibex = fibex_ui(ui, fibex);
+
+    ui.separator();
     ui.label(RichText::new(if st.editing.is_some() { "Edit signal" } else { "New signal" }).strong())
         .on_hover_text("Saved for every tab and the next start");
     let d = &mut st.draft;
@@ -290,6 +307,36 @@ pub fn signals_panel(ui: &mut egui::Ui, st: &mut SignalsUi, input: Input<'_>) ->
         ui.colored_label(ui.visuals().error_fg_color, e);
     }
     out
+}
+
+/// The FIBEX files: what they describe, and buttons to add or forget them.
+fn fibex_ui(ui: &mut egui::Ui, fibex: Option<&nerka_core::Fibex>) -> Option<FibexAction> {
+    let mut action = None;
+    ui.horizontal(|ui| {
+        ui.label(RichText::new("FIBEX").strong()).on_hover_text(
+            "Descriptions of DLT non-verbose messages: their payload is shown as text, and their APID, CTID and \
+             level come from it (so filters and signals work on them). For every tab, this session.",
+        );
+        if ui.small_button("Add files…").clicked() {
+            action = Some(FibexAction::Add);
+        }
+        if fibex.is_some() && ui.small_button("Forget").on_hover_text("Decode with no FIBEX").clicked() {
+            action = Some(FibexAction::Forget);
+        }
+    });
+    match fibex {
+        Some(f) => {
+            ui.weak(format!("{} messages described", f.len()));
+            for file in &f.files {
+                let short = file.rsplit(['/', '\\']).next().unwrap_or(file);
+                ui.monospace(short).on_hover_text(file);
+            }
+        }
+        None => {
+            ui.weak("None: DLT non-verbose messages show as [id] hex.");
+        }
+    }
+    action
 }
 
 /// The kind: a choice for a query signal (inferred from its values until

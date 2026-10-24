@@ -2473,51 +2473,6 @@ impl App {
         }
     }
 
-    /// The FIBEX menu: files describing DLT non-verbose messages.
-    fn fibex_menu(&mut self, ui: &mut egui::Ui) {
-        let n = self.fibex.as_ref().map_or(0, |f| f.files.len());
-        let label = if n == 0 { "FIBEX".to_owned() } else { format!("FIBEX ({n})") };
-        let ctx = ui.ctx().clone();
-        let mut set: Option<Vec<PathBuf>> = None;
-        ui.menu_button(label, |ui| {
-            ui.weak(
-                "Descriptions of DLT non-verbose messages: their payload as text, and their APID, CTID and \
-                     level. For this session.",
-            );
-            match &self.fibex {
-                Some(f) => {
-                    ui.label(format!("{} messages from:", f.len()));
-                    for file in &f.files {
-                        ui.monospace(file);
-                    }
-                }
-                None => {
-                    ui.weak("No FIBEX files loaded.");
-                }
-            }
-            ui.separator();
-            if ui.button("Add FIBEX files…").clicked() {
-                if let Some(paths) = rfd::FileDialog::new()
-                    .add_filter("FIBEX", &["xml", "fibex"])
-                    .add_filter("All files", &["*"])
-                    .pick_files()
-                {
-                    let mut all = self.fibex_paths.clone();
-                    all.extend(paths);
-                    set = Some(all);
-                }
-                ui.close();
-            }
-            if self.fibex.is_some() && ui.button("Forget them").clicked() {
-                set = Some(Vec::new());
-                ui.close();
-            }
-        });
-        if let Some(paths) = set {
-            self.set_fibex(&ctx, paths);
-        }
-    }
-
     /// Use these FIBEX files (none: decode nothing); DLT tabs read their
     /// files again with them.
     fn set_fibex(&mut self, ctx: &egui::Context, paths: Vec<PathBuf>) {
@@ -2784,7 +2739,6 @@ impl App {
                 if ui.button("📂 Open…").on_hover_text("Ctrl+O").clicked() {
                     self.pick_files(&ctx);
                 }
-                self.fibex_menu(ui);
                 ui.separator();
                 let marks = self.tabs.get(self.active).map_or(0, |t| t.bookmarks.len());
                 ui.toggle_value(&mut self.show_bookmarks, format!("🔖 Bookmarks ({marks})")).on_hover_text(
@@ -2850,8 +2804,10 @@ impl App {
         if let Some(tab) = self.tabs.get_mut(self.active) {
             tab.refresh_signals(&ctx, &self.library, &self.saved_signals, self.saved_gen);
         }
-        // Saved after the tab is done with (the panel changed them).
+        // Saved after the tab is done with (the panel changed them), and
+        // FIBEX files chosen there (every DLT tab reads its file again).
         let mut save_signals = false;
+        let mut fibex_action = None;
         let show_bookmarks = self.show_bookmarks;
         let mut focus_search = std::mem::take(&mut self.focus_search);
         let Some(tab) = self.tabs.get_mut(self.active) else {
@@ -2929,6 +2885,7 @@ impl App {
         if self.show_signals {
             let line = tab.current_line();
             let saved = &mut self.saved_signals;
+            let fibex = self.fibex.clone();
             let out = egui::Panel::right("signals")
                 .resizable(true)
                 .default_size(360.0)
@@ -2942,6 +2899,7 @@ impl App {
                         plot: &mut plot::lock(&tab.plot),
                         views: &mut tab.views,
                         kept: tab.result.as_ref(),
+                        fibex: fibex.as_deref(),
                     };
                     signals::signals_panel(ui, &mut tab.signals_ui, input)
                 })
@@ -2969,6 +2927,7 @@ impl App {
             if out.saved_changed {
                 save_signals = true;
             }
+            fibex_action = out.fibex;
             if let Some(line) = out.goto {
                 tab.goto_line(line);
             }
@@ -3053,6 +3012,21 @@ impl App {
         }
         if save_signals {
             self.save_saved_signals();
+        }
+        match fibex_action {
+            Some(signals::FibexAction::Add) => {
+                if let Some(paths) = rfd::FileDialog::new()
+                    .add_filter("FIBEX", &["xml", "fibex"])
+                    .add_filter("All files", &["*"])
+                    .pick_files()
+                {
+                    let mut all = self.fibex_paths.clone();
+                    all.extend(paths);
+                    self.set_fibex(&ctx, all);
+                }
+            }
+            Some(signals::FibexAction::Forget) => self.set_fibex(&ctx, Vec::new()),
+            None => {}
         }
     }
 }
