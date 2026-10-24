@@ -2,7 +2,7 @@
 
 Snapshot of where the project stands. Update this file whenever the state changes.
 
-_Last update: 2026-10-22 (issues #2 and #16 fixed: a child picked with its parent isn't repeated, Clear on the Filter bar; one stable colour per selected query; README and docs refreshed)._
+_Last update: 2026-10-24 (signals v1: per-tab signals from explicit regex captures, `@name` in NFD, Signals panel; design in `sources-and-signals.md`)._
 
 ## State
 
@@ -90,6 +90,17 @@ Open with the owner: save column widths? Sorting stays out (decided).
 - Code already published under `MIT OR Apache-2.0` stays available under it.
 - The plugin interface is also the licensing boundary: keep it stable and documented.
 - **Licence files** (owner, 2026-10-18): `LICENSE-MIT` (copyright line "Copyright (c) 2026 Łukasz Żołędziewski", as in the About dialog) and `LICENSE-APACHE` (the canonical Apache 2.0 text from apache.org) are in the repo root and ship in the release archives.
+
+## Signals (v1 built: core, CLI, GUI)
+
+What a signal is was agreed with the owner on 2026-10-24: `sources-and-signals.md` → "What a signal is". Built (2026-10-24):
+
+- **Core** (`core/src/signal.rs`): a `SignalDef` is a name, a kind (`num`: the capture read as decimal / float / `0x` hex; `enum`: the captured text), an NFD query and the named regex group to take the value from (default: the signal's name). A row carries the value when the whole query matches and the group captured something (from a raw regex or a field regex such as `payload ~ /…/`). A signal can't use other signals. `Signals` is a tab's set, by unique name. Spec line (CLI): `NAME[(GROUP)][:num|enum]=QUERY`.
+- **NFD** (owner: the syntax keeps signals apart from source fields): `@speed > 100`, `@gear == D`, `@gear ~ /D|N/`. `Query::with_signals` / `compile_in` resolve them; a row without a value only satisfies `!=` and `!~`; unknown signals and operators that don't fit the kind are errors with positions. A signal condition that rows without a value fail gives its signal's regex to the engine as the prefilter, so `@lat > 9000` alone takes the buffer-scan fast path. Fast vs naive path tested as for every engine change.
+- **CLI:** `--signal SPEC` (global, repeatable): `nerka --signal 'lat=/latency_us=(?<lat>\d+)/' filter '@lat > 9000' app.log`.
+- **GUI:** 📈 **Signals** in the toolbar opens a right panel for the active tab: each signal with its kind and its value on the cursor line (— when the line carries none; "error" with the reason on hover when its query doesn't fit the file), ✎ edit, − remove, and a form (name, kind, group, query) to add one. Both boxes (Auto and NFD) and library queries know the tab's signals; editing them re-runs a filter or search that uses `@`. `nerka-gui app.log --signal SPEC` defines them at startup. Signals are per tab and not saved (not in presets, not carried by Move to new window).
+- **Benchmark** (1 GiB text log, release, Windows): existing queries unchanged (`search ERROR` ~30 ms, `level >= ERROR` ~31 ms, `level >= WARN AND raw ~ /timeout/` ~31 ms on both main and the branch). `--signal 'lat=/latency_us=(?<lat>\d+)/'`: `@lat > 9000` ~135 ms (2 M rows carry a value; the capture is the cost; ~190 ms before the prefilter), `@lat != 9000` (every line, slow path) ~185 ms; the plain regex equivalent ~25 ms.
+- **Next (owner decides the order):** held values ("while `@gear == D`"), time as a signal (DLT receive time, a `time` capture on text), plotting, FIBEX non-verbose arguments as signals. Open: saving signals (preset, sidecar or pack).
 
 ## Search manager (POC built: core, CLI, GUI)
 

@@ -495,4 +495,57 @@ pub(crate) mod tests {
         let e = search(&text, &q("apid == NAV"), &Progress::new()).unwrap_err();
         assert!(matches!(e, crate::Error::Query(ref d) if d.msg.contains("unknown field 'apid'")), "{e:?}");
     }
+
+    fn signals(specs: &[&str]) -> crate::Signals {
+        let mut s = crate::Signals::default();
+        specs.iter().for_each(|sp| s.set(crate::SignalDef::parse_spec(sp).unwrap()));
+        s
+    }
+
+    fn sq(s: &str, sig: &crate::Signals) -> Filter {
+        Filter::Query(Query::compile(s).unwrap().with_signals(sig).unwrap())
+    }
+
+    #[test]
+    fn signals_on_text_both_paths() {
+        let log = "v=10 gear=P\nboot\nv=55 gear=D\nv=fast gear=D\nv=0x40 gear=N\nWARN v=70\n";
+        let sig = signals(&[r"v=/v=(?<v>\S+)/", r"gear:enum=/gear=(?<gear>\w+)/"]);
+        let run = |s: &str| run_filter(log, &sq(s, &sig));
+        assert_eq!(run("@v > 50"), [2, 4, 5]);
+        assert_eq!(run("@v >= 50 AND @v < 0x46"), [2, 4]);
+        // Rows without a value (no capture, or not a number) only satisfy != and !~.
+        assert_eq!(run("@v != 10"), [1, 2, 3, 4, 5]);
+        assert_eq!(run("@gear == D"), [2, 3]);
+        assert_eq!(run("@gear ~ /D|N/"), [2, 3, 4]);
+        assert_eq!(run("@gear !~ /D/"), [0, 1, 4, 5]);
+        // With a raw regex in the top-level AND the fast path takes it.
+        assert_eq!(run("/WARN/ AND @v > 50"), [5]);
+        assert_eq!(run("@gear == D OR level >= WARN"), [2, 3, 5]);
+        assert_eq!(run("NOT @v > 1"), [1, 3]);
+    }
+
+    #[test]
+    fn signals_on_source_fields() {
+        // Captured from a field, and limited by a field condition.
+        let sig = signals(&[r"a(x):enum=apid ~ /^(?<x>.)/", r"n:enum=apid == NAV AND /(?<n>\w+)$/"]);
+        let src = mem();
+        assert_eq!(run_on(&src, &sq("@a == S", &sig)), [2]);
+        assert_eq!(run_on(&src, &sq("@a != N", &sig)), [2, 3]);
+        assert_eq!(run_on(&src, &sq("@n ~ /start|slow/", &sig)), [0, 4]);
+    }
+
+    #[test]
+    fn signal_errors_at_search() {
+        let text = TextFile::from_bytes("t", b"a\n".to_vec());
+        // Not resolved against the tab's signals.
+        let e = search(&text, &q("@v > 1"), &Progress::new()).unwrap_err();
+        assert!(matches!(e, crate::Error::Query(ref d) if d.msg.contains("unknown signal '@v'")), "{e:?}");
+        // The signal's own query doesn't fit the source.
+        let sig = signals(&[r"v=apid == NAV AND /(?<v>\d)/"]);
+        let e = search(&text, &sq("/a/ AND @v > 1", &sig), &Progress::new()).unwrap_err();
+        assert!(
+            matches!(e, crate::Error::Query(ref d) if d.pos == 8 && d.msg.starts_with("signal '@v': unknown field 'apid'")),
+            "{e:?}"
+        );
+    }
 }

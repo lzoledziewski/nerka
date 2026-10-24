@@ -16,7 +16,9 @@
 //!          | REGEX                      -- shorthand for  raw ~ REGEX
 //!          | STRING                     -- shorthand for  raw contains STRING
 //!          | FIELD OP VALUE
+//!          | SIGNAL OP VALUE
 //! FIELD   := raw | level | WORD         -- WORD: a field the source supplies
+//! SIGNAL  := "@" NAME                   -- a signal the tab defines
 //! OP      := == | != | >= | <= | > | < | ~ | !~
 //! VALUE   := REGEX | STRING | WORD      -- numbers are WORDs: 42, 0x2a
 //! REGEX   := /pattern/flags             -- flags: i (ignore case)
@@ -32,6 +34,13 @@
 //! [`FieldDef::costly`] (DLT `payload`, which decodes the message) are
 //! evaluated after the cheap conditions.
 //!
+//! Signals (`@speed > 100`, `crate::signal`) are values that rows carry,
+//! defined outside the language, per tab; the `@` keeps them apart from
+//! source fields. [`Query::with_signals`] resolves them and types the
+//! comparison by the signal's kind: `num` takes every comparison, `enum`
+//! takes `==`, `!=`, `~`, `!~`. As with fields, a row without a value only
+//! satisfies `!=` and `!~`, and an unknown signal is an error.
+//!
 //! The search boxes' Auto mode (`auto.rs`, `doc/search-modes.md`) reads plain
 //! words as text and rewrites them into this grammar; NFD itself has no
 //! bare text.
@@ -43,9 +52,11 @@ mod auto;
 mod parser;
 
 use crate::event::{Event, FieldDef, FieldId, FieldKind, FieldValue, Level};
+use crate::signal::{SignalDef, SignalKind, SignalValue, Signals};
 use regex::bytes::Regex;
+use std::sync::Arc;
 
-pub use auto::{AutoRead, Plain, read_auto, read_auto_with};
+pub use auto::{AutoRead, Plain, read_auto, read_auto_in, read_auto_with};
 pub use parser::parse;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -69,6 +80,17 @@ impl CmpOp {
             CmpOp::Lt => a < b,
         }
     }
+
+    fn test_f64(self, a: f64, b: f64) -> bool {
+        match self {
+            CmpOp::Eq => a == b,
+            CmpOp::Ne => a != b,
+            CmpOp::Ge => a >= b,
+            CmpOp::Le => a <= b,
+            CmpOp::Gt => a > b,
+            CmpOp::Lt => a < b,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -81,6 +103,22 @@ pub enum Cond {
     Level(CmpOp, Level),
     /// `FIELD OP VALUE` on a source-supplied field.
     Field(FieldCond),
+    /// `@SIGNAL OP VALUE`.
+    Signal(SignalCond),
+}
+
+#[derive(Debug, Clone)]
+pub struct SignalCond {
+    /// Lower-case name, without the `@`.
+    pub name: String,
+    /// Byte offsets of the `@` and the operator in the query.
+    pub pos: usize,
+    pub op_pos: usize,
+    /// Set by [`Query::with_signals`]; its query is bound with the rest.
+    pub def: Option<Arc<SignalDef>>,
+    /// Typed by [`Query::with_signals`]: `Float` for `num`, `Str` /
+    /// `Match` for `enum`.
+    pub test: FieldTest,
 }
 
 #[derive(Debug, Clone)]
@@ -104,6 +142,8 @@ pub enum FieldTest {
     /// Text field, `==` or `!=`.
     Str(CmpOp, Vec<u8>),
     Num(CmpOp, u64),
+    /// A `num` signal.
+    Float(CmpOp, f64),
     /// `~` (`!~` is `NOT ~`).
     Match(Regex),
 }
@@ -135,6 +175,13 @@ impl Expr {
                 (None, FieldTest::Str(op, _) | FieldTest::Num(op, _)) => *op == CmpOp::Ne,
                 _ => false,
             },
+            Expr::Cond(Cond::Signal(s)) => match (s.def.as_ref().and_then(|d| d.value(ev)), &s.test) {
+                (Some(SignalValue::Num(v)), FieldTest::Float(op, want)) => op.test_f64(v, *want),
+                (Some(SignalValue::Enum(v)), FieldTest::Str(op, want)) => op.test(v.as_slice(), want.as_slice()),
+                (Some(SignalValue::Enum(v)), FieldTest::Match(re)) => re.is_match(&v),
+                (None, FieldTest::Str(op, _) | FieldTest::Float(op, _)) => *op == CmpOp::Ne,
+                _ => false,
+            },
         }
     }
 
@@ -144,6 +191,27 @@ impl Expr {
             Expr::And(xs) | Expr::Or(xs) => xs.iter_mut().try_for_each(|x| x.bind(schema)),
             Expr::Not(x) => x.bind(schema),
             Expr::Cond(Cond::Field(f)) => f.bind(schema),
+            Expr::Cond(Cond::Signal(s)) => {
+                let Some(def) = &s.def else {
+                    return Err(DslError { msg: format!("unknown signal '@{}'", s.name), pos: s.pos });
+                };
+                let bound = def.bind(schema).map_err(|e| DslError {
+                    msg: format!("signal '@{}': {} (at column {} of its query)", s.name, e.msg, e.pos + 1),
+                    pos: s.pos,
+                })?;
+                s.def = Some(Arc::new(bound));
+                Ok(())
+            }
+            Expr::Cond(_) => Ok(()),
+        }
+    }
+
+    /// Resolve `@name` conditions against `signals` and type their values.
+    fn attach(&mut self, signals: &Signals) -> Result<(), DslError> {
+        match self {
+            Expr::And(xs) | Expr::Or(xs) => xs.iter_mut().try_for_each(|x| x.attach(signals)),
+            Expr::Not(x) => x.attach(signals),
+            Expr::Cond(Cond::Signal(s)) => s.attach(signals),
             Expr::Cond(_) => Ok(()),
         }
     }
@@ -177,6 +245,8 @@ impl Expr {
             }
             Expr::Cond(Cond::Level(..)) => 2,
             Expr::Cond(Cond::RawMatch(_)) => 10,
+            // Runs the signal's whole query, then its capture.
+            Expr::Cond(Cond::Signal(s)) => 10 + s.def.as_ref().map_or(10, |d| d.query().expr().cost()),
             Expr::Not(x) => x.cost(),
             Expr::And(xs) | Expr::Or(xs) => xs.iter().map(Expr::cost).sum(),
         }
@@ -231,14 +301,14 @@ impl FieldCond {
             (FieldTest::Literal(op @ (CmpOp::Eq | CmpOp::Ne), v, _), FieldKind::Str) => {
                 FieldTest::Str(op, v.into_bytes())
             }
-            (FieldTest::Literal(..) | FieldTest::Num(..), FieldKind::Str) => {
+            (FieldTest::Literal(..) | FieldTest::Num(..) | FieldTest::Float(..), FieldKind::Str) => {
                 return fail(format!("'{name}' is text: use ==, !=, ~ or !~"), self.op_pos);
             }
             (FieldTest::Literal(op, v, pos), FieldKind::U64) => match parse_u64(&v) {
                 Some(n) => FieldTest::Num(op, n),
                 None => return fail(format!("'{name}' is a number but '{v}' isn't"), pos),
             },
-            (FieldTest::Match(_) | FieldTest::Str(..), FieldKind::U64) => {
+            (FieldTest::Match(_) | FieldTest::Str(..) | FieldTest::Float(..), FieldKind::U64) => {
                 return fail(format!("'{name}' is a number: use ==, !=, >=, <=, >, <"), self.op_pos);
             }
         };
@@ -246,6 +316,47 @@ impl FieldCond {
         self.costly = schema[id].costly;
         Ok(())
     }
+}
+
+impl SignalCond {
+    fn attach(&mut self, signals: &Signals) -> Result<(), DslError> {
+        let Some(def) = signals.get(&self.name) else {
+            let known = if signals.is_empty() {
+                "no signals are defined".to_owned()
+            } else {
+                let names: Vec<String> = signals.iter().map(|d| format!("@{}", d.name())).collect();
+                format!("defined: {}", names.join(", "))
+            };
+            return Err(DslError { msg: format!("unknown signal '@{}' ({known})", self.name), pos: self.pos });
+        };
+        let name = &self.name;
+        let fail = |msg: String, pos| Err(DslError { msg, pos });
+        let test = std::mem::replace(&mut self.test, FieldTest::Num(CmpOp::Eq, 0));
+        self.test = match (test, def.kind()) {
+            (t @ (FieldTest::Match(_) | FieldTest::Str(..)), SignalKind::Enum)
+            | (t @ FieldTest::Float(..), SignalKind::Num) => t,
+            (FieldTest::Literal(op @ (CmpOp::Eq | CmpOp::Ne), v, _), SignalKind::Enum) => {
+                FieldTest::Str(op, v.into_bytes())
+            }
+            (FieldTest::Literal(..) | FieldTest::Float(..) | FieldTest::Num(..), SignalKind::Enum) => {
+                return fail(format!("'@{name}' is an enum: use ==, !=, ~ or !~"), self.op_pos);
+            }
+            (FieldTest::Literal(op, v, pos), SignalKind::Num) => match parse_f64(&v) {
+                Some(n) => FieldTest::Float(op, n),
+                None => return fail(format!("'@{name}' is a number but '{v}' isn't"), pos),
+            },
+            (FieldTest::Match(_) | FieldTest::Str(..) | FieldTest::Num(..), SignalKind::Num) => {
+                return fail(format!("'@{name}' is a number: use ==, !=, >=, <=, >, <"), self.op_pos);
+            }
+        };
+        self.def = Some(def.clone());
+        Ok(())
+    }
+}
+
+/// A number compared with a `num` signal: decimal, float or `0x` hex.
+fn parse_f64(s: &str) -> Option<f64> {
+    parse_u64(s).map(|n| n as f64).or_else(|| s.parse::<f64>().ok().filter(|n| n.is_finite()))
 }
 
 /// Decimal or `0x` hexadecimal.
@@ -270,7 +381,39 @@ impl Query {
 
     /// Compile and [`bind`](Self::bind) in one step.
     pub fn compile_for(src: &str, schema: &[FieldDef]) -> Result<Query, DslError> {
-        Query::compile(src)?.bind(schema)
+        Query::compile_in(src, schema, &Signals::default())
+    }
+
+    /// Compile, resolve signals ([`with_signals`](Self::with_signals)) and
+    /// bind in one step.
+    pub fn compile_in(src: &str, schema: &[FieldDef], signals: &Signals) -> Result<Query, DslError> {
+        Query::compile(src)?.with_signals(signals)?.bind(schema)
+    }
+
+    /// Resolve `@name` conditions against the tab's `signals`. Unknown
+    /// signals and operators that don't fit the signal's kind are errors.
+    /// Comes before [`bind`](Self::bind), which binds the signals' queries
+    /// too and refuses unresolved signals.
+    pub fn with_signals(mut self, signals: &Signals) -> Result<Query, DslError> {
+        self.expr.attach(signals)?;
+        // Costs are known only now.
+        self.expr = self.expr.optimize();
+        Ok(self)
+    }
+
+    /// Signals the query uses (lower-case, each once, in order).
+    pub fn signal_names(&self) -> Vec<String> {
+        fn walk(e: &Expr, out: &mut Vec<String>) {
+            match e {
+                Expr::And(xs) | Expr::Or(xs) => xs.iter().for_each(|x| walk(x, out)),
+                Expr::Not(x) => walk(x, out),
+                Expr::Cond(Cond::Signal(s)) if !out.contains(&s.name) => out.push(s.name.clone()),
+                Expr::Cond(_) => {}
+            }
+        }
+        let mut out = Vec::new();
+        walk(&self.expr, &mut out);
+        out
     }
 
     /// Resolve source-supplied field names (`apid == "NAV"`) against the
@@ -305,13 +448,24 @@ impl Query {
     /// uses it to scan the raw buffer and only evaluates the full query on
     /// candidate lines.
     pub fn prefilter(&self) -> Option<&Regex> {
-        match &self.expr {
-            Expr::Cond(Cond::RawMatch(re)) => Some(re),
-            Expr::And(xs) => xs.iter().find_map(|x| match x {
+        // A signal condition that rows without a value fail (not `!=`)
+        // needs its signal's query to match: its prefilter will do.
+        fn of(e: &Expr) -> Option<&Regex> {
+            match e {
                 Expr::Cond(Cond::RawMatch(re)) => Some(re),
+                Expr::Cond(Cond::Signal(s)) => match s.test {
+                    FieldTest::Float(CmpOp::Ne, _) | FieldTest::Str(CmpOp::Ne, _) => None,
+                    _ => s.def.as_ref()?.query().prefilter(),
+                },
                 _ => None,
-            }),
-            _ => None,
+            }
+        }
+        match &self.expr {
+            Expr::And(xs) => xs
+                .iter()
+                .find_map(|x| matches!(x, Expr::Cond(Cond::RawMatch(_))).then(|| of(x)).flatten())
+                .or_else(|| xs.iter().find_map(of)),
+            e => of(e),
         }
     }
 
@@ -451,5 +605,56 @@ mod tests {
         // A string after ~ is a literal substring, as for raw.
         assert!(matches!(&xs[1], Expr::Cond(Cond::Field(f)) if f.costly
             && matches!(&f.test, FieldTest::Match(re) if re.as_str() == r"a\.b")));
+    }
+
+    fn tab_signals() -> Signals {
+        let mut s = Signals::default();
+        s.set(SignalDef::parse_spec(r"speed=/speed=(?<speed>\d+)/").unwrap());
+        s.set(SignalDef::parse_spec(r"gear:enum=/gear=(?<gear>\w)/").unwrap());
+        s
+    }
+
+    #[test]
+    fn signals_are_apart_from_fields() {
+        let sig = tab_signals();
+        let q = Query::compile_in("@Speed > 50 AND apid == NAV", crate::input::mem::SCHEMA, &sig).unwrap();
+        assert_eq!(q.signal_names(), ["speed"]);
+        assert_eq!(q.expr().field_names(), ["apid"]);
+        // A field named like a signal is still a field.
+        let e = Query::compile_in("speed > 50", crate::input::mem::SCHEMA, &sig).unwrap_err();
+        assert!(e.msg.contains("unknown field 'speed'"), "{e}");
+        let q = Query::compile_in("@speed >= 1.5e1 AND @gear != D", &[], &sig).unwrap();
+        assert!(q.matches(b"speed=20 gear=N"));
+        assert!(!q.matches(b"speed=20 gear=D"));
+        assert!(!q.matches(b"speed=12 gear=N"));
+    }
+
+    #[test]
+    fn signal_errors_point_at_problem() {
+        let sig = tab_signals();
+        let c = |s: &str| Query::compile_in(s, &[], &sig).unwrap_err();
+        let e = c("level >= INFO AND @rpm > 1");
+        assert_eq!((e.pos, e.msg.as_str()), (18, "unknown signal '@rpm' (defined: @speed, @gear)"));
+        let e = Query::compile_for("@rpm > 1", &[]).unwrap_err();
+        assert_eq!((e.pos, e.msg.as_str()), (0, "unknown signal '@rpm' (no signals are defined)"));
+        let e = c("@gear > D");
+        assert_eq!(e.pos, 6);
+        assert!(e.msg.contains("is an enum"), "{e}");
+        let e = c("@speed ~ /1/");
+        assert_eq!(e.pos, 7);
+        assert!(e.msg.contains("is a number"), "{e}");
+        let e = c("@speed == ten");
+        assert_eq!(e.pos, 10);
+        assert!(e.msg.contains("'ten' isn't"), "{e}");
+        // Parse errors.
+        let e = Query::compile("@ > 1").unwrap_err();
+        assert_eq!((e.pos, e.msg.as_str()), (1, "expected a signal name after '@'"));
+        let e = Query::compile("/x/ AND @speed").unwrap_err();
+        assert_eq!(e.pos, 14);
+        assert!(e.msg.contains("expected an operator after '@speed'"), "{e}");
+        let e = Query::compile("@speed > (").unwrap_err();
+        assert_eq!(e.pos, 9);
+        let e = Query::compile("@gear ~ D").unwrap_err();
+        assert_eq!(e.pos, 8);
     }
 }

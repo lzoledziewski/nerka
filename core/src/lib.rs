@@ -25,6 +25,7 @@ pub mod history;
 pub mod input;
 pub mod pack;
 pub mod preset;
+pub mod signal;
 
 pub use bookmarks::Bookmarks;
 pub use dsl::{DslError, Query};
@@ -38,6 +39,7 @@ pub use input::dlt::DltFile;
 pub use input::text::TextFile;
 pub use input::{ColumnDef, LogSource, OpenOptions, open, open_with};
 pub use pack::{Library, Pack, PackError, PackQuery};
+pub use signal::{SignalDef, SignalKind, SignalValue, Signals};
 
 /// Line numbers are 0-based internally; UIs add 1 for display.
 pub type LineNo = u64;

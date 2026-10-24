@@ -39,17 +39,18 @@ mod library;
 mod prefs;
 mod presets;
 mod recall;
+mod signals;
 mod view;
 
 use eframe::egui::{self, Color32, Key, KeyboardShortcut, Modifiers, RichText};
 use job::{Job, Poll};
 use library::{Applied, LibraryView, Picks, Target, Term, Use};
-use nerka_core::dsl::{AutoRead, Plain, read_auto_with};
+use nerka_core::dsl::{AutoRead, Plain, read_auto_in, read_auto_with};
 use nerka_core::pack::{self, Library, Role};
 use nerka_core::preset::{BoxText, Preset};
 use nerka_core::{
     Bookmarks, FieldDef, Filter, Highlighter, LineNo, LogSource, Matcher, MatcherOptions, Query, SearchHistory,
-    SearchHits, SearchResult, SearchSet, text_to_nfd,
+    SearchHits, SearchResult, SearchSet, Signals, text_to_nfd,
 };
 use prefs::SearchPrefs;
 use std::borrow::Cow;
@@ -69,6 +70,8 @@ fn main() -> eframe::Result {
     let mut searches: Vec<String> = Vec::new();
     let mut highlight: Vec<String> = Vec::new();
     let mut params = std::collections::BTreeMap::new();
+    // `--signal SPEC` (as for the CLI): signals of the tab opened at startup.
+    let mut signals = Signals::default();
     let (mut new_window, mut window_name, mut preset_file) = (false, None, None);
     let mut args = std::env::args_os().skip(1);
     while let Some(a) = args.next() {
@@ -107,6 +110,14 @@ fn main() -> eframe::Result {
                 show_library = true;
                 continue;
             }
+            Some("--signal") => {
+                let spec = value();
+                match nerka_core::SignalDef::parse_spec(&spec) {
+                    Ok(d) => signals.set(d),
+                    Err(e) => eprintln!("nerka-gui: --signal {spec}: {e}"),
+                }
+                continue;
+            }
             Some("--new-window") => {
                 new_window = true;
                 continue;
@@ -135,6 +146,7 @@ fn main() -> eframe::Result {
         && searches.is_empty()
         && highlight.is_empty()
         && params.is_empty()
+        && signals.is_empty()
         && !show_library
         && preset_file.is_none()
         && window_name.is_none();
@@ -152,7 +164,8 @@ fn main() -> eframe::Result {
         "nerka",
         options,
         Box::new(move |cc| {
-            let mut app = App { pack_paths: packs, show_library, window_name, ..Default::default() };
+            let show_signals = !signals.is_empty();
+            let mut app = App { pack_paths: packs, show_library, show_signals, window_name, ..Default::default() };
             let ctx = cc.egui_ctx.clone();
             app.server = instance::Server::start(move || ctx.request_repaint());
             app.load_history();
@@ -176,6 +189,9 @@ fn main() -> eframe::Result {
             // kinds differ).
             if !initial.is_empty() {
                 app.open_files(&cc.egui_ctx, initial);
+                if let Some(tab) = app.tabs.last_mut() {
+                    tab.signals = signals;
+                }
                 if let (Some(p), Some(tab)) = (&moved, app.tabs.last_mut()) {
                     tab.use_preset(&cc.egui_ctx, &app.library, p);
                     tab.preset = None;
@@ -270,6 +286,7 @@ fn read_box(
     pattern: &str,
     options: &MatcherOptions,
     schema: &[FieldDef],
+    signals: &Signals,
 ) -> (Result<Filter, String>, Preview) {
     let text = |t: &str, o: MatcherOptions| {
         Matcher::new(t, o).map(Filter::Regex).map_err(|e| {
@@ -279,7 +296,7 @@ fn read_box(
     };
     match mode {
         Mode::Text => (text(pattern, options.clone()), Preview::None),
-        Mode::Query => match Query::compile_for(pattern, schema) {
+        Mode::Query => match Query::compile_in(pattern, schema, signals) {
             Ok(q) => (Ok(Filter::Query(q)), Preview::None),
             Err(e) if pattern.trim().is_empty() => (Err(format!("Query error: {e}")), Preview::None),
             Err(e) => (Err(format!("Query error: {e}")), Preview::QueryError(e.to_string())),
@@ -287,7 +304,7 @@ fn read_box(
         Mode::Auto => {
             // Phrases and plain text are literal, or regexes with Regex ticked.
             let regex = !options.fixed_string;
-            match read_auto_with(pattern, options, schema) {
+            match read_auto_in(pattern, options, schema, signals) {
                 AutoRead::Text(t) => {
                     let preview = if t.is_empty() {
                         Preview::None
@@ -312,7 +329,7 @@ fn read_box(
                     if !options.invert {
                         return (Ok(Filter::Query(query)), preview);
                     }
-                    let not = Query::compile_for(&format!("NOT ({nfd})"), schema).map(Filter::Query);
+                    let not = Query::compile_in(&format!("NOT ({nfd})"), schema, signals).map(Filter::Query);
                     (not.map_err(|e| format!("Query error: {e}")), preview)
                 }
             }
@@ -367,11 +384,21 @@ struct PreviewCache {
 }
 
 impl PreviewCache {
-    fn get(&mut self, mode: Mode, pattern: &str, options: &MatcherOptions, schema: &[FieldDef]) -> Preview {
-        let key =
-            format!("{mode:?}|{}|{}|{}|{pattern}", options.fixed_string, options.case_insensitive, options.invert);
+    /// `signals_gen` changes whenever the tab's signals do.
+    fn get(
+        &mut self,
+        mode: Mode,
+        pattern: &str,
+        options: &MatcherOptions,
+        schema: &[FieldDef],
+        (signals, signals_gen): (&Signals, u64),
+    ) -> Preview {
+        let key = format!(
+            "{mode:?}|{}|{}|{}|{signals_gen}|{pattern}",
+            options.fixed_string, options.case_insensitive, options.invert
+        );
         if self.key != key || self.preview.is_none() {
-            self.preview = Some(read_box(mode, pattern, options, schema).1);
+            self.preview = Some(read_box(mode, pattern, options, schema, signals).1);
             self.key = key;
         }
         self.preview.clone().unwrap_or(Preview::None)
@@ -430,6 +457,11 @@ struct Tab {
     marks_open: std::collections::HashSet<LineNo>,
     /// The line shown whole in the line window (Enter), if open.
     detail: Option<LineDetail>,
+    /// The tab's signals (`@name` in its queries), the generation that
+    /// changes with them, and their panel.
+    signals: Signals,
+    signals_gen: u64,
+    signals_ui: signals::SignalsUi,
     status: String,
 }
 
@@ -669,6 +701,9 @@ impl Tab {
             bookmarks: Bookmarks::default(),
             marks_open: Default::default(),
             detail: None,
+            signals: Signals::default(),
+            signals_gen: 0,
+            signals_ui: signals::SignalsUi::default(),
             status: String::new(),
         }
     }
@@ -742,9 +777,19 @@ impl Tab {
         true
     }
 
+    /// The tab's signals were edited: queries that use them run again.
+    fn signals_changed(&mut self, ctx: &egui::Context) {
+        self.signals_gen += 1;
+        if self.pattern.contains('@') {
+            self.start_search(ctx);
+        } else if self.search.pattern.contains('@') {
+            self.rerun_search(ctx);
+        }
+    }
+
     fn build_filter(&self) -> Result<Filter, String> {
         let schema = self.file.as_ref().map(|f| f.schema()).unwrap_or_default();
-        read_box(self.mode, &self.pattern, &self.options, schema).0
+        read_box(self.mode, &self.pattern, &self.options, schema, &self.signals).0
     }
 
     /// Start searching with the current filter; returns whether a search
@@ -946,7 +991,7 @@ impl Tab {
             let include = terms
                 .iter()
                 .map(|t| {
-                    Query::compile_for(&t.nfd, schema)
+                    Query::compile_in(&t.nfd, schema, &self.signals)
                         .map(Filter::Query)
                         .map_err(|e| format!("Search: {}: {e}", t.name))
                 })
@@ -960,7 +1005,7 @@ impl Tab {
             });
         }
         let schema = self.file.as_ref().map(|f| f.schema()).unwrap_or_default();
-        let f = read_box(self.search.mode, &self.search.pattern, &self.search.options(), schema)
+        let f = read_box(self.search.mode, &self.search.pattern, &self.search.options(), schema, &self.signals)
             .0
             .map_err(|e| format!("Search: {e}"))?;
         Ok(ActiveSearch {
@@ -1022,7 +1067,7 @@ impl Tab {
             if p.role != Role::Include || !self.picks.is_lit(a.keys[i]) {
                 continue;
             }
-            let Ok(q) = Query::compile(a.exp.part_nfd(p)) else { continue };
+            let Ok(q) = Query::compile(a.exp.part_nfd(p)).and_then(|q| q.with_signals(&self.signals)) else { continue };
             include.push(Filter::Query(q));
             names.push(a.names[i].clone());
             colors.push(a.colors[i]);
@@ -1410,7 +1455,8 @@ impl Tab {
             }
         } else {
             let schema = self.file.as_ref().map(|f| f.schema()).unwrap_or_default();
-            let preview = self.filter_preview.get(self.mode, &self.pattern, &self.options, schema);
+            let sig = (&self.signals, self.signals_gen);
+            let preview = self.filter_preview.get(self.mode, &self.pattern, &self.options, schema, sig);
             if preview_ui(ui, &preview) {
                 self.mode = Mode::Text;
                 self.options.fixed_string = true;
@@ -1547,7 +1593,7 @@ impl Tab {
         } else {
             let schema = self.file.as_ref().map(|f| f.schema()).unwrap_or_default();
             let s = &mut self.search;
-            let preview = s.preview.get(s.mode, &s.pattern, &s.options(), schema);
+            let preview = s.preview.get(s.mode, &s.pattern, &s.options(), schema, (&self.signals, self.signals_gen));
             if preview_ui(ui, &preview) {
                 self.search.mode = Mode::Text;
                 self.search.regex = false;
@@ -1756,6 +1802,7 @@ struct App {
     tabs: Vec<Tab>,
     active: usize,
     show_bookmarks: bool,
+    show_signals: bool,
     /// Text of the Ctrl+G dialog while it is open.
     goto: Option<String>,
     /// The About dialog is open.
@@ -2444,6 +2491,11 @@ impl App {
                      b / Shift+B jump to the next / previous one. Saved next to the log as <file>.nerka-marks.",
                 );
                 let queries: usize = self.library.packs().iter().map(|p| p.queries.len()).sum();
+                let signals = self.tabs.get(self.active).map_or(0, |t| t.signals.len());
+                ui.toggle_value(&mut self.show_signals, format!("📈 Signals ({signals})")).on_hover_text(
+                    "Values the lines of this tab carry, captured by a regex group: filter with @name \
+                     (@speed > 100, @gear == D)",
+                );
                 ui.toggle_value(&mut self.show_library, format!("📚 Library ({queries})")).on_hover_text(
                     "Saved queries from packs (*.nerka-pack): pick them for the filter or the search \
                      (Ctrl+Shift+L)",
@@ -2566,6 +2618,22 @@ impl App {
                 .inner;
             if close {
                 self.show_bookmarks = false;
+            }
+        }
+        if self.show_signals {
+            let line = tab.current_line();
+            let out = egui::Panel::right("signals")
+                .resizable(true)
+                .default_size(320.0)
+                .show(ui, |ui| {
+                    signals::signals_panel(ui, &mut tab.signals_ui, &mut tab.signals, tab.signals_gen, &*file, line)
+                })
+                .inner;
+            if out.close {
+                self.show_signals = false;
+            }
+            if out.changed {
+                tab.signals_changed(&ctx);
             }
         }
         let search_history = &self.search_history;
@@ -3006,7 +3074,7 @@ query timeouts  labels: vision
             Err(_) => "error",
         };
         let read = |mode, s: &str| {
-            let (f, p) = read_box(mode, s, &lit, &[]);
+            let (f, p) = read_box(mode, s, &lit, &[], &Signals::default());
             (kind(&f), p)
         };
         assert_eq!(
@@ -3025,12 +3093,12 @@ query timeouts  labels: vision
         assert_eq!(read(Mode::Auto, "/SSL|CERT/i"), ("query", Preview::AutoRegex("/SSL|CERT/i".into())));
         // Regex ticked: Auto's plain words and its text are regexes.
         let re = MatcherOptions { fixed_string: false, ..Default::default() };
-        let (f, p) = read_box(Mode::Auto, "cam[12] frame", &re, &[]);
+        let (f, p) = read_box(Mode::Auto, "cam[12] frame", &re, &[], &Signals::default());
         assert!(matches!(f, Ok(Filter::Regex(_))), "{p:?}");
         assert_eq!(p, Preview::AutoText { text: "cam[12] frame".into(), why: p_why(&p), regex: true });
-        let (_, p) = read_box(Mode::Auto, "drop.* AND level >= ERROR", &re, &[]);
+        let (_, p) = read_box(Mode::Auto, "drop.* AND level >= ERROR", &re, &[], &Signals::default());
         assert!(matches!(p, Preview::AutoText { regex: true, .. }), "{p:?}");
-        let (f, p) = read_box(Mode::Auto, "fr.me AND level >= ERROR", &re, &[]);
+        let (f, p) = read_box(Mode::Auto, "fr.me AND level >= ERROR", &re, &[], &Signals::default());
         assert_eq!((kind(&f), p), ("query", Preview::AutoQuery("/fr.me/ AND level >= ERROR".into())));
         // Text mode never reads a query; NFD mode never falls back.
         assert_eq!(read(Mode::Text, "level >= ERROR"), ("text", Preview::None));
@@ -3041,7 +3109,7 @@ query timeouts  labels: vision
         // Invert in Auto wraps a query in NOT; ignore case reaches phrases.
         let file = nerka_core::TextFile::from_bytes("t", LOG.as_bytes().to_vec());
         let run = |mode, s: &str, o: &MatcherOptions| {
-            let f = read_box(mode, s, o, &[]).0.unwrap();
+            let f = read_box(mode, s, o, &[], &Signals::default()).0.unwrap();
             nerka_core::search(&file, &f, &nerka_core::Progress::default()).unwrap().lines
         };
         let inv = MatcherOptions { invert: true, ..lit.clone() };
@@ -3349,6 +3417,49 @@ query timeouts  labels: vision
         settle(&mut tab, &ctx);
         assert_eq!(tab.search.pattern, "(/frame drop/)");
         assert_eq!(hits(&tab), [(0, vec!["drops"]), (1, vec!["drops"]), (2, vec!["drops"])]);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_tab_filters_by_its_signals() {
+        let dir = std::env::temp_dir().join(format!("nerka-gui-signals-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("app.log");
+        std::fs::write(&log, "v=10\nv=60\nboot\nWARN v=80\n").unwrap();
+        let ctx = egui::Context::default();
+        let mut tab = Tab::open(&ctx, log, &SearchPrefs::default());
+        settle(&mut tab, &ctx);
+
+        // Unknown until the tab defines it: Auto reads it as text.
+        tab.mode = Mode::Auto;
+        tab.pattern = "@v > 50".into();
+        let sig = (&tab.signals, tab.signals_gen);
+        let p = tab.filter_preview.get(tab.mode, &tab.pattern, &tab.options, &[], sig);
+        assert!(p_why(&p).is_some_and(|w| w.contains("unknown signal '@v'")), "{p:?}");
+
+        tab.signals.set(nerka_core::SignalDef::parse_spec(r"v=/v=(?<v>\d+)/").unwrap());
+        tab.signals_changed(&ctx);
+        settle(&mut tab, &ctx);
+        assert_eq!(tab.result.as_ref().unwrap().lines, [1, 3]);
+        let sig = (&tab.signals, tab.signals_gen);
+        let p = tab.filter_preview.get(tab.mode, &tab.pattern, &tab.options, &[], sig);
+        assert!(matches!(&p, Preview::AutoQuery(q) if q == "@v > 50"), "{p:?}");
+
+        // The Search box knows them too.
+        tab.search.pattern = "level >= WARN AND @v > 70".into();
+        tab.run_search_box(&ctx);
+        settle(&mut tab, &ctx);
+        assert_eq!(hits(&tab).iter().map(|h| h.0).collect::<Vec<_>>(), [3]);
+
+        // Removing the signal runs the filter again: Auto now reads the box
+        // as text, and NFD mode says why it can't run.
+        tab.signals.remove("v");
+        tab.signals_changed(&ctx);
+        settle(&mut tab, &ctx);
+        assert!(tab.result.as_ref().unwrap().lines.is_empty());
+        tab.mode = Mode::Query;
+        assert!(!tab.start_search(&ctx));
+        assert!(tab.status.contains("unknown signal '@v' (no signals are defined)"), "{}", tab.status);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

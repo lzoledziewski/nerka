@@ -9,12 +9,14 @@
 //!     nerka expand -q vision.frame_drops -p cam=CAM1    (pack picks -> plain NFD)
 //!     nerka search --in 'level >= WARN' timeout app.log (search inside a filter)
 //!     nerka search --in 'ecu == SOCB' -l ota app.log     (per pack query)
+//!     nerka --signal 'v=/v=(?<v>\d+)/' filter '@v > 100' app.log   (signals)
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use nerka_core::pack::{self, Expansion, Library, ParamValue, Params, Pick, Role, Selection};
 use nerka_core::{
-    Bookmarks, FieldDef, Filter, LogSource, Matcher, MatcherOptions, Progress, Query, SearchSet, search, search_within,
+    Bookmarks, FieldDef, Filter, LogSource, Matcher, MatcherOptions, Progress, Query, SearchSet, SignalDef, Signals,
+    search, search_within,
 };
 use std::io::{BufWriter, Write};
 use std::path::PathBuf;
@@ -31,6 +33,10 @@ struct Cli {
     /// MF4; repeatable). Default: 3490.
     #[arg(long = "dlt-port", global = true, value_name = "PORT")]
     dlt_port: Vec<u16>,
+    /// Define a signal for `@name` in queries (repeatable):
+    /// NAME[(GROUP)][:num|enum]=QUERY, e.g. 'speed=/speed=(?<speed>\d+)/'.
+    #[arg(long, global = true, value_name = "SPEC")]
+    signal: Vec<String>,
     #[command(subcommand)]
     cmd: Cmd,
 }
@@ -159,7 +165,8 @@ fn library(extra: &[PathBuf]) -> Result<Library> {
 
 /// Compile an NFD query for a source, with a caret under the error.
 fn compile(query: &str, schema: &[FieldDef]) -> Result<Query> {
-    Query::compile_for(query, schema).map_err(|e| {
+    let signals = SIGNALS.get_or_init(Default::default);
+    Query::compile_in(query, schema, signals).map_err(|e| {
         anyhow::anyhow!("{e}\n  {query}\n  {}^", " ".repeat(query[..e.pos.min(query.len())].chars().count()))
     })
 }
@@ -253,6 +260,9 @@ fn run_search_within(
     Ok(())
 }
 
+/// The `--signal` definitions, set once in `main`.
+static SIGNALS: std::sync::OnceLock<Signals> = std::sync::OnceLock::new();
+
 /// How files are opened (`--dlt-port`), set once in `main`.
 static OPEN_OPTIONS: std::sync::OnceLock<nerka_core::OpenOptions> = std::sync::OnceLock::new();
 
@@ -289,6 +299,11 @@ fn run() -> Result<()> {
         options.capture.dlt_udp_ports = cli.dlt_port.clone();
     }
     OPEN_OPTIONS.set(options).expect("set once");
+    let mut signals = Signals::default();
+    for spec in &cli.signal {
+        signals.set(SignalDef::parse_spec(spec).with_context(|| format!("--signal {spec}"))?);
+    }
+    SIGNALS.set(signals).expect("set once");
     let stdout = std::io::stdout().lock();
     let mut out = BufWriter::with_capacity(1 << 16, stdout);
 

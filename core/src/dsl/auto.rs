@@ -11,6 +11,7 @@
 use super::parser::{OpTok, Tok, tokens};
 use super::{DslError, Query};
 use crate::event::FieldDef;
+use crate::signal::Signals;
 use crate::{MatcherOptions, text_to_nfd};
 
 /// How Auto reads a box.
@@ -49,6 +50,11 @@ pub fn read_auto(src: &str, ignore_case: bool, schema: &[FieldDef]) -> AutoRead 
 /// [`AutoRead::Text`] and [`AutoRead::NotQuery`] carry the box's text; the
 /// caller reads it with the same options.
 pub fn read_auto_with(src: &str, phrases: &MatcherOptions, schema: &[FieldDef]) -> AutoRead {
+    read_auto_in(src, phrases, schema, &Signals::default())
+}
+
+/// [`read_auto_with`] in a tab that defines `signals` (`@speed > 100`).
+pub fn read_auto_in(src: &str, phrases: &MatcherOptions, schema: &[FieldDef], signals: &Signals) -> AutoRead {
     let text = src.trim().to_owned();
     let toks = match tokens(src) {
         Ok(t) => t,
@@ -96,7 +102,7 @@ pub fn read_auto_with(src: &str, phrases: &MatcherOptions, schema: &[FieldDef]) 
     if toks.is_empty() || whole_phrase {
         return AutoRead::Text(text);
     }
-    match Query::compile_for(&nfd, schema) {
+    match Query::compile_in(&nfd, schema, signals) {
         Ok(query) => {
             let term = match toks.as_slice() {
                 [(t, _)] => Some(t),
@@ -225,6 +231,19 @@ mod tests {
         assert!(e.unwrap().contains("apid"));
         let schema = [FieldDef { name: "apid", kind: FieldKind::Str, costly: false }];
         assert_eq!(read_with("apid == NAV AND timeout", false, &schema).unwrap(), "apid == NAV AND \"timeout\"");
+    }
+
+    #[test]
+    fn signals_mix_with_phrases() {
+        let lit = MatcherOptions { fixed_string: true, ..Default::default() };
+        let mut sig = Signals::default();
+        sig.set(crate::SignalDef::parse_spec(r"v=/v=(?<v>\d+)/").unwrap());
+        match read_auto_in("@v > 1 AND disk full", &lit, &[], &sig) {
+            AutoRead::Query { nfd, .. } => assert_eq!(nfd, "@v > 1 AND \"disk full\""),
+            r => panic!("{r:?}"),
+        }
+        // Without the signal it isn't a query: literal text.
+        assert!(matches!(read("@v > 1"), Err((_, Some(e))) if e.contains("unknown signal '@v'")));
     }
 
     #[test]

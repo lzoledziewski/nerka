@@ -1,6 +1,6 @@
 # Sources & Signals — design
 
-_Status: agreed direction. Written 2026-10-17. Implemented so far: **DLT from `.dlt` files** (2026-10-18: source-supplied fields, DSL field predicates, own reader, table view) and **DLT inside pcap / pcapng and MF4** (2026-10-20: own readers in `core/src/input/capture/`, no dependency). Signals, SOME/IP, the time model and the plugin crates are still design. Current state and decisions: `status.md`._
+_Status: agreed direction. Written 2026-10-17. **Signals v1** (2026-10-24): per-tab signals from explicit captures, `@name` in NFD; see "What a signal is" and `status.md` → "Signals". Implemented so far: **DLT from `.dlt` files** (2026-10-18: source-supplied fields, DSL field predicates, own reader, table view) and **DLT inside pcap / pcapng and MF4** (2026-10-20: own readers in `core/src/input/capture/`, no dependency). Signals, SOME/IP, the time model and the plugin crates are still design. Current state and decisions: `status.md`._
 
 ## Goal
 
@@ -10,6 +10,19 @@ Two new capabilities beyond plain-text logs:
 2. **Signals**: time series monitored alongside the log.
    - Initially from **SOME/IP**, decoded with a **FIBEX or ARXML** database. The user **selects the signals to monitor**; we don't decode everything. Browsing the full catalog is tentative.
    - Later from other producers: embedded state machines, regex extractors, other plugins.
+
+## What a signal is (owner, 2026-10-24)
+
+A **signal** is a named value that some rows of a log carry, defined **per tab**.
+
+- **Where it comes from:** an explicit capture (v1), or later a typed argument of a DLT non-verbose message described by FIBEX. A named group in a regex is **not** a signal by itself: the user defines the signal and says which group it takes.
+- **Definition:** name, kind, an NFD query, and the regex group to take the value from (by default the signal's name). A row carries the value when the query matches it and the group captured something.
+- **Kinds:** `num` (the capture read as a number: decimal, float or `0x` hex) and `enum` (the captured text). A capture that doesn't read as a number gives the row no value.
+- **First use: filtering.** In NFD a signal is written with `@`, so it can't be mistaken for a source field: `@speed > 100`, `@gear == D`, `@gear ~ /D|N/`. Like a field, a row without a value only satisfies `!=` and `!~`. A query that names a signal works only in a tab that defines it; elsewhere `@speed` is a bind error ("unknown signal"), the same way `apid` is on a plain-text file.
+- **Row values vs held values.** v1 compares the value **the row itself carries**. "Every line *while* `@gear == D`" (the value holds until the next sample) needs one sequential pass and is a later, opt-in step.
+- **Time** will be a signal too: the receive time on DLT, a `time` capture on plain text (the user has to define it). Not in v1.
+- **Plotting** is a separate feature built on top: values over time, with search and filter hits as markers on the same time axis.
+- **Not now:** export, comparing signals across files, derived signals (rates, state machines), signals defined from other signals.
 
 ## Decisions taken with the owner
 
@@ -60,6 +73,8 @@ Two new capabilities beyond plain-text logs:
 - **Subscription model.** Browsing the catalog is cheap. Decoding everything is not. The user subscribes to signals, the SOME/IP decoder builds a `(service, method/event) → layouts` lookup from the subscription, and every other payload is skipped after one hash lookup.
 
 ## DSL sketch for derived signals (tentative)
+
+_Superseded for v1 by "What a signal is" above: signals are defined per tab outside NFD, and NFD only refers to them with `@name`. Kept as ideas for derived signals later._
 
 ```
 signal speed   = /speed=(\d+)/ as f64            # regex capture → numeric
@@ -112,7 +127,7 @@ Each one must be justified in its PR (spec §3.1).
 1. Time model and source-supplied fields in `Event`, with DSL field predicates. Use plain-text timestamps as the first user. — **Fields and predicates done** (`LogSource::schema` / `field` / `supplied_level`, `Query::bind`); the `Timestamp` / clock model is **not** done (DLT exposes `tmsp` as a number, `time` is display-only).
 2. DLT from `.dlt` files, with the header-only index fast path. — **Done** in `core/src/input/dlt/` (index = message offsets; headers read in place).
 3. DLT over UDP in pcap / pcapng. — **Done** in `core/src/input/capture/` (not a separate crate yet).
-4. `SignalStore`, `egui_plot` panel, regex extractor in the DSL (the first signal producer, with no database needed).
+4. `SignalStore`, `egui_plot` panel, regex extractor in the DSL (the first signal producer, with no database needed). — **Regex captures done** as per-tab signal definitions with `@name` in NFD (2026-10-24); no store or plot yet: values are read per row when a query needs them.
 5. `SignalDb`: ARXML, then FIBEX. `nerka-someip` with subscriptions.
 6. MF4 bus-logging channels. — **Done** for Ethernet and DLT channels with an own reader. State machines in the DSL: open.
 7. Later: live capture, external plugin ABI.
