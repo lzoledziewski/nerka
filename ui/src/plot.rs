@@ -3,7 +3,11 @@
 //! as its state, a step line; an enum as coloured bands. Each lane can show
 //! its events (when the value was received). The cursor is the current
 //! line. Wheel zooms, drag pans, double-click shows everything, a click
-//! goes to the nearest event; right-clicking a lane's name sets its y axis.
+//! goes to the nearest event; right-clicking a lane's name sets its y axis
+//! and its markers (horizontal lines at chosen values: limits, thresholds).
+//! Time cursors (owner: like a logic analyzer) are vertical lines placed
+//! with a right-click in the plot and dragged; the time between neighbours
+//! is shown (Δt).
 //! The plot can move to a window of its own and back.
 //!
 //! Drawn with egui's painter (no plot crate): lanes are decimated to one
@@ -97,6 +101,13 @@ pub struct PlotState {
     range: Option<(f64, f64)>,
     /// Lanes' y axes (absent: [`YAxis::All`]).
     pub y: HashMap<String, YAxis>,
+    /// Lanes' markers: horizontal lines at chosen values.
+    pub markers: HashMap<String, Vec<Marker>>,
+    /// Time cursors (A, B, C… in the order placed), x values.
+    pub cursors: Vec<f64>,
+    /// The cursor being dragged, and where the context menu was opened.
+    drag_cursor: Option<usize>,
+    menu_x: Option<f64>,
     /// Lanes, built for (signals generation, the filter result).
     data: Option<((u64, usize), PlotData)>,
 }
@@ -116,7 +127,8 @@ impl PlotState {
         self.data = None;
     }
 
-    /// Forget signals that are gone.
+    /// Forget signals that are gone (their markers stay, for when a signal
+    /// of that name comes back).
     pub fn retain(&mut self, signals: &Signals) {
         self.plotted.retain(|n| signals.get(n).is_some());
         self.events.retain(|n| signals.get(n).is_some());
@@ -140,6 +152,20 @@ struct Lane {
     /// Enum ids' texts.
     labels: Vec<String>,
     y_range: (f64, f64),
+}
+
+/// A horizontal line across a number lane (a limit, a threshold).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Marker {
+    pub value: f64,
+    /// Shown next to the value; may be empty.
+    pub label: String,
+}
+
+/// The y range a lane shows: its values' range `(lo, hi)` widened to its
+/// markers (fitted axes only; a fixed axis is what it says).
+fn with_markers((lo, hi): (f64, f64), markers: &[Marker]) -> (f64, f64) {
+    markers.iter().fold((lo, hi), |(lo, hi), m| (lo.min(m.value), hi.max(m.value)))
 }
 
 /// What the plot asks the tab to do.
@@ -240,9 +266,17 @@ pub fn plot_panel(ui: &mut egui::Ui, state: &mut PlotState, src: Source<'_>) -> 
         ui.weak(format!("x: {}", Clock::of(file, signals).describe())).on_hover_text(
             "The file's own time, else the first signal of kind time that has events, else line numbers",
         );
-        ui.weak("· wheel: zoom · drag: pan · double-click: all · click: go to the event · right-click a name: y axis");
+        // The help is a hover, so the row never gets wider than the panel.
+        ui.weak("ℹ").on_hover_text(
+            "Wheel: zoom. Drag: pan (drag a time cursor to move it). Double-click: everything. Click: go to the \
+             nearest event. Right-click: place or remove time cursors (Δt between them). Right-click a lane's \
+             name: its y axis and markers.",
+        );
     });
     let clock = Clock::of(file, signals);
+    if !state.cursors.is_empty() {
+        ui.horizontal_wrapped(|ui| ui.monospace(cursor_summary(&state.cursors, clock.is_time())));
+    }
     let key = (generation, kept);
     if state.data.as_ref().is_none_or(|(k, _)| *k != key) {
         match build(state, signals, file, &clock, series_of) {
@@ -275,11 +309,39 @@ pub fn plot_panel(ui: &mut egui::Ui, state: &mut PlotState, src: Source<'_>) -> 
         state.range = None;
         (x0, x1) = data.full;
     }
+    // A drag that starts on a time cursor moves it; elsewhere it pans.
+    let cursor_px: Vec<f32> = state.cursors.iter().map(|&c| to_px(c, x0, x1)).collect();
+    let near_cursor = |p: Pos2| {
+        (plot.y_range().contains(p.y)).then(|| cursor_px.iter().position(|&c| (c - p.x).abs() <= 5.0)).flatten()
+    };
+    if response.hover_pos().and_then(near_cursor).is_some() || state.drag_cursor.is_some() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
+    }
+    if response.drag_started() {
+        // Where the press began: egui starts a drag only after some movement.
+        state.drag_cursor = ui.input(|i| i.pointer.press_origin()).and_then(near_cursor);
+    }
     if response.dragged() {
         let dx = response.drag_delta().x as f64 * (x1 - x0) / w;
-        (x0, x1) = (x0 - dx, x1 - dx);
-        state.range = Some((x0, x1));
+        match state.drag_cursor {
+            Some(i) => state.cursors[i] += dx,
+            None => {
+                (x0, x1) = (x0 - dx, x1 - dx);
+                state.range = Some((x0, x1));
+            }
+        }
     }
+    if response.drag_stopped() {
+        state.drag_cursor = None;
+    }
+    // Right-click in the plot: the time cursors' menu, at that x.
+    if response.secondary_clicked()
+        && let Some(p) = response.interact_pointer_pos()
+    {
+        state.menu_x = Some(x0 + (p.x - plot.min.x).clamp(0.0, plot.width()) as f64 / w * (x1 - x0));
+    }
+    let menu_x = state.menu_x;
+    response.context_menu(|ui| cursor_menu(ui, &mut state.cursors, menu_x));
     if let Some(p) = response.hover_pos().filter(|_| response.hovered()) {
         let notches = ui.input_mut(|i| {
             i.smooth_scroll_delta = egui::Vec2::ZERO;
@@ -336,12 +398,12 @@ pub fn plot_panel(ui: &mut egui::Ui, state: &mut PlotState, src: Source<'_>) -> 
         let name_r = ui.interact(name_rect, ui.scope_id().with(("lane", &lane.name)), Sense::click());
         if lane.kind != SignalKind::Enum {
             let y = state.y.entry(lane.name.clone()).or_insert(YAxis::All);
-            name_r
-                .on_hover_text(format!(
-                    "{name}
-Right-click: y axis"
-                ))
-                .context_menu(|ui| y_axis_menu(ui, y, lane.y_range));
+            let markers = state.markers.entry(lane.name.clone()).or_default();
+            name_r.on_hover_text(format!("{name}\nRight-click: y axis, markers")).context_menu(|ui| {
+                y_axis_menu(ui, y, lane.y_range);
+                ui.separator();
+                markers_menu(ui, markers, lane.y_range);
+            });
         } else {
             name_r.on_hover_text(name.as_str());
         }
@@ -368,11 +430,15 @@ Right-click: y axis"
         match lane.kind {
             SignalKind::Enum => draw_bands(&painter, lane, area, from, i1, |x| to_px(x, x0, x1), &font),
             _ => {
+                let markers = state.markers.get(&lane.name).map_or(&[][..], Vec::as_slice);
                 let (lo, hi) = match state.y.get(&lane.name).copied().unwrap_or(YAxis::All) {
-                    YAxis::All => lane.y_range,
-                    YAxis::Visible => lane.ys[from..i1.max(from + 1).min(lane.ys.len())]
-                        .iter()
-                        .fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), &v| (lo.min(v), hi.max(v))),
+                    YAxis::All => with_markers(lane.y_range, markers),
+                    YAxis::Visible => with_markers(
+                        lane.ys[from..i1.max(from + 1).min(lane.ys.len())]
+                            .iter()
+                            .fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), &v| (lo.min(v), hi.max(v))),
+                        markers,
+                    ),
                     YAxis::Fixed(lo, hi) => (lo, hi),
                 };
                 // Labels show the range; a little room around the values.
@@ -382,6 +448,23 @@ Right-click: y axis"
                 let to_py =
                     |y: f64| (area.max.y - ((y - lo) / (hi - lo)) as f32 * area.height()).clamp(area.min.y, area.max.y);
                 draw_steps(&painter, lane, area, from..i1, |x| to_px(x, x0, x1), to_py, color);
+                // Markers: dashed lines, the label and value at the right.
+                for m in markers.iter().filter(|m| (lo..=hi).contains(&m.value)) {
+                    let y = to_py(m.value);
+                    let stroke = Stroke::new(1.0, text_color.gamma_multiply(0.7));
+                    painter.extend(egui::Shape::dashed_line(
+                        &[pos2(area.min.x, y), pos2(area.max.x, y)],
+                        stroke,
+                        6.0,
+                        4.0,
+                    ));
+                    let text = if m.label.is_empty() {
+                        short_num(m.value)
+                    } else {
+                        format!("{} {}", m.label, short_num(m.value))
+                    };
+                    painter.text(pos2(area.max.x - 4.0, y - 1.0), Align2::RIGHT_BOTTOM, text, font.clone(), text_color);
+                }
                 let fmt = |v: f64| short_num(v);
                 painter.text(pos2(plot.min.x - 4.0, area.min.y), Align2::RIGHT_TOP, fmt(hi_l), font.clone(), weak);
                 painter.text(pos2(plot.min.x - 4.0, area.max.y), Align2::RIGHT_BOTTOM, fmt(lo_l), font.clone(), weak);
@@ -402,6 +485,43 @@ Right-click: y axis"
         painter.line_segment([pos2(px, plot.min.y), pos2(px, axis_y)], Stroke::new(1.0, grid.gamma_multiply(0.5)));
         painter.text(pos2(px, axis_y + 2.0), Align2::CENTER_TOP, x_label(t, step, data.is_time), font.clone(), weak);
         t += step;
+    }
+
+    // ----- time cursors: lines, names, and Δt between neighbours -----
+    let amber = Color32::from_rgb(230, 150, 20);
+    let mut placed: Vec<(usize, f64)> = state.cursors.iter().copied().enumerate().collect();
+    placed.sort_by(|a, b| a.1.total_cmp(&b.1));
+    for &(i, c) in &placed {
+        if !(x0..=x1).contains(&c) {
+            continue;
+        }
+        let px = to_px(c, x0, x1);
+        painter.extend(egui::Shape::dashed_line(
+            &[pos2(px, plot.min.y), pos2(px, axis_y)],
+            Stroke::new(1.5, amber),
+            5.0,
+            3.0,
+        ));
+        let tag = Rect::from_center_size(pos2(px, plot.min.y + 7.0), vec2(14.0, 13.0));
+        painter.rect_filled(tag, 2.0, amber);
+        painter.text(tag.center(), Align2::CENTER_CENTER, cursor_name(i), font.clone(), Color32::BLACK);
+    }
+    for pair in placed.windows(2) {
+        let ((i, a), (j, b)) = (pair[0], pair[1]);
+        let (pa, pb) = (to_px(a, x0, x1).max(plot.min.x), to_px(b, x0, x1).min(plot.max.x));
+        if pb <= pa {
+            continue;
+        }
+        let y = plot.min.y + 22.0;
+        let stroke = Stroke::new(1.0, amber);
+        painter.line_segment([pos2(pa, y), pos2(pb, y)], stroke);
+        painter.line_segment([pos2(pa, y - 4.0), pos2(pa, y + 4.0)], stroke);
+        painter.line_segment([pos2(pb, y - 4.0), pos2(pb, y + 4.0)], stroke);
+        let text = format!("{}→{} {}", cursor_name(i), cursor_name(j), duration(b - a, data.is_time));
+        let galley = painter.layout_no_wrap(text, font.clone(), amber);
+        let at = pos2((pa + pb) / 2.0 - galley.size().x / 2.0, y - galley.size().y - 2.0);
+        painter.rect_filled(Rect::from_min_size(at, galley.size()).expand(2.0), 2.0, ui.visuals().panel_fill);
+        painter.galley(at, galley, amber);
     }
 
     // ----- cursor -----
@@ -447,6 +567,70 @@ Right-click: y axis"
     out
 }
 
+/// A time cursor's name: A … Z, then C27 and so on.
+fn cursor_name(i: usize) -> String {
+    match u8::try_from(i).ok().filter(|&i| i < 26) {
+        Some(i) => char::from(b'A' + i).to_string(),
+        None => format!("C{}", i + 1),
+    }
+}
+
+/// A time difference: µs, ms, s, or h m s; a number of lines without time.
+fn duration(dt: f64, is_time: bool) -> String {
+    if !is_time {
+        let n = dt.round() as i64;
+        return format!("{n} line{}", if n.abs() == 1 { "" } else { "s" });
+    }
+    let a = dt.abs();
+    let sign = if dt < 0.0 { "-" } else { "" };
+    if a < 1e-3 {
+        format!("{sign}{:.1} µs", a * 1e6)
+    } else if a < 1.0 {
+        format!("{sign}{:.3} ms", a * 1e3)
+    } else if a < 3600.0 {
+        format!("{sign}{a:.3} s")
+    } else {
+        let s = a.rem_euclid(60.0);
+        let m = (a / 60.0).floor() as u64;
+        format!("{sign}{}h {}m {s:.3}s", m / 60, m % 60)
+    }
+}
+
+/// The header line: each cursor's place, and Δt between neighbours.
+fn cursor_summary(cursors: &[f64], is_time: bool) -> String {
+    let at = |x: f64| if is_time { format_time(x, 6) } else { format!("line {}", x.round() as i64 + 1) };
+    let mut parts: Vec<String> =
+        cursors.iter().enumerate().map(|(i, &c)| format!("{} {}", cursor_name(i), at(c))).collect();
+    let mut placed: Vec<(usize, f64)> = cursors.iter().copied().enumerate().collect();
+    placed.sort_by(|a, b| a.1.total_cmp(&b.1));
+    for pair in placed.windows(2) {
+        let ((i, a), (j, b)) = (pair[0], pair[1]);
+        parts.push(format!("Δ {}→{} {}", cursor_name(i), cursor_name(j), duration(b - a, is_time)));
+    }
+    parts.join("   ")
+}
+
+/// The plot's right-click menu: time cursors (`x`: where it was opened).
+fn cursor_menu(ui: &mut egui::Ui, cursors: &mut Vec<f64>, x: Option<f64>) {
+    ui.label(egui::RichText::new("Time cursors").strong());
+    let Some(x) = x else { return };
+    if ui.button(format!("Place cursor {} here", cursor_name(cursors.len()))).clicked() {
+        cursors.push(x);
+        ui.close();
+    }
+    let near = (0..cursors.len()).min_by(|&a, &b| (cursors[a] - x).abs().total_cmp(&(cursors[b] - x).abs()));
+    if let Some(i) = near
+        && ui.button(format!("Remove cursor {}", cursor_name(i))).clicked()
+    {
+        cursors.remove(i);
+        ui.close();
+    }
+    if !cursors.is_empty() && ui.button("Remove all cursors").clicked() {
+        cursors.clear();
+        ui.close();
+    }
+}
+
 /// The y-axis menu of a number lane; `all` is the range of all its values.
 fn y_axis_menu(ui: &mut egui::Ui, y: &mut YAxis, all: (f64, f64)) {
     ui.label(egui::RichText::new("Y axis").strong());
@@ -471,6 +655,30 @@ fn y_axis_menu(ui: &mut egui::Ui, y: &mut YAxis, all: (f64, f64)) {
         if *hi <= *lo {
             *hi = *lo + 1.0;
         }
+    }
+}
+
+/// A number lane's markers: each value and label, remove; add one (at the
+/// middle of `all`, the values' range).
+fn markers_menu(ui: &mut egui::Ui, markers: &mut Vec<Marker>, all: (f64, f64)) {
+    ui.label(egui::RichText::new("Markers").strong())
+        .on_hover_text("Horizontal lines at chosen values: limits, thresholds");
+    let speed = (all.1 - all.0).abs().max(1.0) * 0.005;
+    let mut remove = None;
+    for (i, m) in markers.iter_mut().enumerate() {
+        ui.horizontal(|ui| {
+            ui.add(egui::DragValue::new(&mut m.value).speed(speed));
+            ui.add(egui::TextEdit::singleline(&mut m.label).hint_text("label").desired_width(90.0));
+            if ui.small_button("−").on_hover_text("Remove").clicked() {
+                remove = Some(i);
+            }
+        });
+    }
+    if let Some(i) = remove {
+        markers.remove(i);
+    }
+    if ui.button("+ Add marker").clicked() {
+        markers.push(Marker { value: (all.0 + all.1) / 2.0, label: String::new() });
     }
 }
 
@@ -727,6 +935,79 @@ mod tests {
         step(vec![press(to, false)], &mut st);
         let (y0, y1) = st.range.unwrap();
         assert!(y0 < x0 && (y1 - y0 - (x1 - x0)).abs() < 1e-9, "{y0} {y1}");
+    }
+
+    #[test]
+    fn dragging_a_time_cursor_moves_it_not_the_view() {
+        let text: String = (0..100)
+            .map(|i| {
+                format!(
+                    "00:{:02}:{:02} v={}
+",
+                    i / 60,
+                    i % 60,
+                    i % 7
+                )
+            })
+            .collect();
+        let file = nerka_core::TextFile::from_bytes("t", text.into_bytes());
+        let mut sig = Signals::default();
+        sig.set(nerka_core::SignalDef::parse_spec(r"t:time=/^(?<t>\S+)/").unwrap());
+        sig.set(nerka_core::SignalDef::parse_spec(r"v=/v=(?<v>\d+)/").unwrap());
+        for d in sig.iter() {
+            d.series(&file, &nerka_core::Progress::new()).unwrap();
+        }
+        let mut st = PlotState::default();
+        st.toggle("v");
+        st.cursors = vec![49.5];
+        let ctx = egui::Context::default();
+        let mut t = 0.0;
+        let mut step = |events, st: &mut PlotState| {
+            t += 1.0 / 60.0;
+            frame(&ctx, t, events, st, &sig, &file)
+        };
+        step(vec![], &mut st);
+        let w = 800.0 - 8.0 - GUTTER;
+        let at = pos2(GUTTER + w / 2.0, 60.0);
+        let button = |pos, pressed| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        step(vec![egui::Event::PointerMoved(at)], &mut st);
+        step(vec![button(at, true)], &mut st);
+        for k in 1..=5 {
+            step(vec![egui::Event::PointerMoved(at + vec2(10.0 * k as f32, 0.0))], &mut st);
+        }
+        step(vec![button(at + vec2(50.0, 0.0), false)], &mut st);
+        assert!(st.range.is_none(), "the view didn't pan");
+        let moved = st.cursors[0] - 49.5;
+        assert!((moved - 50.0 / w as f64 * 99.0).abs() < 0.5, "{moved}");
+    }
+
+    #[test]
+    fn durations_and_cursor_names() {
+        assert_eq!(duration(0.000_250, true), "250.0 µs");
+        assert_eq!(duration(0.0123, true), "12.300 ms");
+        assert_eq!(duration(-3.2, true), "-3.200 s");
+        assert_eq!(duration(3725.5, true), "1h 2m 5.500s");
+        assert_eq!(duration(12.0, false), "12 lines");
+        assert_eq!(duration(1.0, false), "1 line");
+        assert_eq!((cursor_name(0), cursor_name(25), cursor_name(26)), ("A".into(), "Z".into(), "C27".into()));
+        // In placing order; Δ between neighbours in time.
+        assert_eq!(
+            cursor_summary(&[10.0, 4.0, 12.5], false),
+            "A line 11   B line 5   C line 14   Δ B→A 6 lines   Δ A→C 3 lines"
+        );
+    }
+
+    #[test]
+    fn markers_widen_a_fitted_axis() {
+        let m = |value| Marker { value, label: String::new() };
+        assert_eq!(with_markers((10.0, 20.0), &[]), (10.0, 20.0));
+        assert_eq!(with_markers((10.0, 20.0), &[m(15.0)]), (10.0, 20.0));
+        assert_eq!(with_markers((10.0, 20.0), &[m(25.0), m(-5.0)]), (-5.0, 25.0));
     }
 
     #[test]

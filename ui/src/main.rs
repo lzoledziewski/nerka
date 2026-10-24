@@ -78,6 +78,10 @@ fn main() -> eframe::Result {
     let mut plotted: Vec<String> = Vec::new();
     // `--fibex FILE`: FIBEX files for DLT non-verbose messages.
     let mut fibex: Vec<PathBuf> = Vec::new();
+    // `--cursor TIME`: time cursors in the plot.
+    let mut cursors: Vec<f64> = Vec::new();
+    // `--marker NAME=VALUE[:LABEL]`: horizontal lines in a plotted lane.
+    let mut markers: Vec<(String, plot::Marker)> = Vec::new();
     // `--plot-window`: the plot starts in a window of its own.
     let mut plot_window = false;
     let (mut new_window, mut window_name, mut preset_file) = (false, None, None);
@@ -130,6 +134,27 @@ fn main() -> eframe::Result {
                 fibex.push(PathBuf::from(value()));
                 continue;
             }
+            Some("--marker") => {
+                // NAME=VALUE[:LABEL]
+                let v = value();
+                let parsed = v.split_once('=').and_then(|(name, rest)| {
+                    let (num, label) = rest.split_once(':').unwrap_or((rest, ""));
+                    Some((name.to_owned(), plot::Marker { value: num.trim().parse().ok()?, label: label.to_owned() }))
+                });
+                match parsed {
+                    Some(m) => markers.push(m),
+                    None => eprintln!("nerka-gui: --marker {v}: expected NAME=VALUE[:LABEL]"),
+                }
+                continue;
+            }
+            Some("--cursor") => {
+                // A time (2026-10-17 10:00:01.5, 10:00:01, seconds) or a line number.
+                match nerka_core::time::parse_time(&value()) {
+                    Some(x) => cursors.push(x),
+                    None => eprintln!("nerka-gui: --cursor: expected a time or a number"),
+                }
+                continue;
+            }
             Some("--plot-window") => {
                 plot_window = true;
                 continue;
@@ -173,6 +198,8 @@ fn main() -> eframe::Result {
         && signals.is_empty()
         && plotted.is_empty()
         && fibex.is_empty()
+        && markers.is_empty()
+        && cursors.is_empty()
         && !show_library
         && preset_file.is_none()
         && window_name.is_none();
@@ -226,6 +253,10 @@ fn main() -> eframe::Result {
                 app.open_files(&cc.egui_ctx, initial);
                 if let Some(tab) = app.tabs.last_mut() {
                     plotted.iter().for_each(|n| plot::lock(&tab.plot).toggle(n));
+                    plot::lock(&tab.plot).cursors.extend(&cursors);
+                    for (name, m) in &markers {
+                        plot::lock(&tab.plot).markers.entry(name.clone()).or_default().push(m.clone());
+                    }
                     // A plotted name can be a FIBEX argument: it becomes a signal.
                     if let Some(f) = &app.fibex {
                         tab.arg_picks = f.arguments().into_iter().filter(|a| plotted.contains(&a.name)).collect();
