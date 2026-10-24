@@ -142,6 +142,7 @@ impl PickArgs {
         let sel = Selection {
             include: picks(&self.queries, &self.labels),
             exclude: picks(&self.exclude, &self.exclude_labels),
+            signal: Vec::new(),
         };
         let mut params = Params::new();
         for (list, raw) in [(&self.params, false), (&self.raw_params, true)] {

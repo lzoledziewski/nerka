@@ -20,6 +20,16 @@ fn pack(text: &str) -> Pack {
 }
 
 #[test]
+fn signals_attribute_pins_kinds() {
+    use crate::signal::SignalKind;
+    let p = pack("pack p\nquery q  signals: v:num, t:time, v:enum\n    /v=(?<v>\\d+)/\n");
+    assert_eq!(p.queries[0].signals, [("t".to_owned(), SignalKind::Time), ("v".to_owned(), SignalKind::Enum)]);
+    assert!(format_query(&p.queries[0]).starts_with("query q  signals: t:time, v:enum\n"));
+    let e = parse_pack("t", "pack p\nquery q  signals: v:big\n    /x/\n").unwrap_err();
+    assert!(e.to_string().contains("invalid signal 'v:big'"), "{e}");
+}
+
+#[test]
 fn parses_the_example() {
     let p = pack(VISION);
     assert_eq!(p.name, "vision");
@@ -118,7 +128,7 @@ query c  parent: \"camera team.scope\"
     lib.add(p).unwrap();
     lib.add(child).unwrap();
     assert_eq!(lib.chain("other.c"), ["camera team.scope", "other.c"]);
-    let sel = Selection { include: vec![Pick::Query("camera team.drops".into())], exclude: vec![] };
+    let sel = Selection { include: vec![Pick::Query("camera team.drops".into())], ..Default::default() };
     assert_eq!(expand(&sel, &lib, &Params::new()).unwrap().nfd, "(/x/) AND (/y/)");
     // Written back quoted.
     let q = PackQuery { parent: Some("camera team.scope".into()), ..lib.get("other.c").unwrap().1.clone() };
@@ -153,7 +163,7 @@ fn header_errors() {
     assert_error(&q("query a  color: Violet"), 2, 17, "invalid colour 'Violet'");
     assert_error(&q("query a  color: #12345"), 2, 17, "invalid colour '#12345'");
     assert_error(&q("query a  colour: red"), 2, 10, "unknown attribute 'colour:'");
-    assert_error(&q("query a(x)  red"), 2, 13, "expected parent:, labels: or color: but found 'red'");
+    assert_error(&q("query a(x)  red"), 2, 13, "expected parent:, labels:, color: or signals: but found 'red'");
     // Attribute values may follow the colon directly.
     let p = pack(&q("query a  labels:x,y  parent:b  color:red  # comment"));
     assert_eq!(p.queries[0].labels, ["x", "y"]);

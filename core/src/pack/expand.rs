@@ -32,6 +32,9 @@ pub enum Pick {
 pub struct Selection {
     pub include: Vec<Pick>,
     pub exclude: Vec<Pick>,
+    /// Queries that don't filter: they give signals (their named groups)
+    /// and can colour lines.
+    pub signal: Vec<Pick>,
 }
 
 impl Selection {
@@ -45,7 +48,11 @@ impl Selection {
             }
             Ok(out)
         };
-        Ok(Selection { include: freeze(&self.include)?, exclude: freeze(&self.exclude)? })
+        Ok(Selection {
+            include: freeze(&self.include)?,
+            exclude: freeze(&self.exclude)?,
+            signal: freeze(&self.signal)?,
+        })
     }
 }
 
@@ -75,6 +82,8 @@ pub type Params = BTreeMap<String, ParamValue>;
 pub enum Role {
     Include,
     Exclude,
+    /// Not in the filter: signals and line colours only.
+    Signal,
 }
 
 /// Where one picked query sits in [`Expansion::nfd`].
@@ -100,7 +109,8 @@ pub struct Part {
 pub struct Expansion {
     /// Plain NFD, one line.
     pub nfd: String,
-    /// Included parts first, in pick order, then excluded ones.
+    /// Included parts first, in pick order, then excluded ones, then the
+    /// signal ones (in `aside`).
     pub parts: Vec<Part>,
     /// The texts of covered parts, which `nfd` leaves out.
     pub aside: String,
@@ -109,7 +119,7 @@ pub struct Expansion {
 impl Expansion {
     /// The standalone NFD of a part.
     pub fn part_nfd(&self, part: &Part) -> &str {
-        let text = if part.covered.is_some() { &self.aside } else { &self.nfd };
+        let text = if part.covered.is_some() || part.role == Role::Signal { &self.aside } else { &self.nfd };
         &text[part.range.clone()]
     }
 
@@ -172,7 +182,8 @@ fn resolve(lib: &Library, picks: &[Pick]) -> Result<Vec<String>, ExpandError> {
 pub fn expand(sel: &Selection, lib: &Library, params: &Params) -> Result<Expansion, ExpandError> {
     let include = resolve(lib, &sel.include)?;
     let exclude = resolve(lib, &sel.exclude)?;
-    if include.is_empty() && exclude.is_empty() {
+    let signal = resolve(lib, &sel.signal)?;
+    if include.is_empty() && exclude.is_empty() && signal.is_empty() {
         return Err(ExpandError::Empty);
     }
     let include_cov = covers(lib, &include)?;
@@ -219,6 +230,13 @@ pub fn expand(sel: &Selection, lib: &Library, params: &Params) -> Result<Expansi
         if chain > 1 {
             nfd.push(')');
         }
+    }
+    // Signal queries don't filter: their texts go aside.
+    for id in &signal {
+        if !aside.is_empty() {
+            aside.push(' ');
+        }
+        parts.push(part(lib, id, Role::Signal, params, &mut aside)?);
     }
     Ok(Expansion { nfd, parts, aside })
 }

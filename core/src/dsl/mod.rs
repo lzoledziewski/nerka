@@ -59,7 +59,9 @@ mod auto;
 mod parser;
 
 use crate::event::{Event, FieldDef, FieldId, FieldKind, FieldValue, Level};
-use crate::signal::{SignalDef, SignalKind, SignalSeries, SignalView, Signals, ValueRef, source_key, view_at};
+use crate::signal::{
+    SignalDef, SignalKind, SignalScope, SignalSeries, SignalView, Signals, ValueRef, source_key, view_at,
+};
 use crate::time::{TIME_OF_DAY_END, parse_time};
 use crate::{LogSource, Progress};
 use regex::bytes::Regex;
@@ -351,6 +353,15 @@ impl SignalCond {
             };
             return Err(DslError { msg: format!("unknown signal '@{}' ({known})", self.name), pos: self.pos });
         };
+        if def.scope() == SignalScope::Filtered {
+            return Err(DslError {
+                msg: format!(
+                    "'@{}' takes its events from the filtered lines only: a filter can't use it (make it 'all')",
+                    self.name
+                ),
+                pos: self.pos,
+            });
+        }
         let name = &self.name;
         let fail = |msg: String, pos| Err(DslError { msg, pos });
         let test = std::mem::replace(&mut self.test, FieldTest::Num(CmpOp::Eq, 0));

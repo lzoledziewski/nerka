@@ -21,11 +21,21 @@
 //! plain text captures one. A tab's [`Clock`] is the time its lines are
 //! plotted and compared at.
 //!
-//! Spec text (CLI `--signal`, one line):
+//! Signals come from three places: definitions the user writes (saved
+//! as spec lines, [`Signals::to_text`]), the named groups of the queries
+//! picked in a selection ([`query_signals`], kinds from the values unless
+//! the pack pins them), and the source itself (`@time`). Later: FIBEX.
+//!
+//! A signal's **scope** ([`SignalScope`]) says where its events come from:
+//! every line, or only the lines the tab's filter keeps (for the panel and
+//! the plot; a filter can't use such a signal, it would depend on itself).
+//!
+//! Spec text (CLI `--signal`, the saved file; one line each):
 //!
 //! ```text
-//! spec  := NAME [ "(" GROUP ")" ] [ ":" KIND ] "=" QUERY
+//! spec  := NAME [ "(" GROUP ")" ] [ ":" KIND ] [ ":" SCOPE ] "=" QUERY
 //! KIND  := num | enum | time           -- default num
+//! SCOPE := all | filtered              -- default all
 //! GROUP := regex group name            -- default NAME
 //! ```
 //!
@@ -39,6 +49,25 @@ use crate::{LineNo, LogSource, Progress};
 use rayon::prelude::*;
 use regex::bytes::Regex;
 use std::sync::{Arc, Mutex};
+
+/// Where a signal's events come from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SignalScope {
+    /// Every line of the file.
+    #[default]
+    All,
+    /// Only the lines the tab's filter keeps (panel and plot only).
+    Filtered,
+}
+
+impl SignalScope {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SignalScope::All => "all",
+            SignalScope::Filtered => "filtered",
+        }
+    }
+}
 
 /// Which side of a signal a condition looks at (`@x`, `@x.event`, …).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -159,6 +188,26 @@ impl Events {
         self.rows.is_empty()
     }
 
+    /// The events on rows `keep` holds (both ascending).
+    fn within(&self, keep: &[LineNo]) -> Events {
+        let mut idx = Vec::new();
+        let mut j = 0;
+        for (i, &r) in self.rows.iter().enumerate() {
+            j += keep[j..].partition_point(|&k| k < r);
+            if keep.get(j) == Some(&r) {
+                idx.push(i);
+            }
+        }
+        let rows = idx.iter().map(|&i| self.rows[i]).collect();
+        let values = match &self.values {
+            Values::Num(v) => Values::Num(idx.iter().map(|&i| v[i]).collect()),
+            Values::Enum { ids, table } => {
+                Values::Enum { ids: idx.iter().map(|&i| ids[i]).collect(), table: table.clone() }
+            }
+        };
+        Events { rows, values }
+    }
+
     /// Row and value of the `i`-th event.
     pub fn get(&self, i: usize) -> (LineNo, ValueRef<'_>) {
         let v = match &self.values {
@@ -245,6 +294,24 @@ impl SignalSeries {
 
     pub fn len(&self) -> usize {
         self.parts.iter().map(|p| p.2.len()).sum()
+    }
+
+    /// Only the events on `lines` (rows of the whole source, ascending):
+    /// a [`SignalScope::Filtered`] signal's view.
+    pub fn within(&self, lines: &[LineNo]) -> SignalSeries {
+        let parts = self
+            .parts
+            .iter()
+            .map(|(first, key, ev)| {
+                let local: Vec<LineNo> = lines
+                    .iter()
+                    .filter(|&&l| l >= *first && l - first < ev.rows.last().map_or(0, |&r| r + 1))
+                    .map(|&l| l - first)
+                    .collect();
+                (*first, *key, Arc::new(ev.within(&local)))
+            })
+            .collect();
+        SignalSeries { key: self.key, parts }
     }
 
     pub fn is_empty(&self) -> bool {
@@ -336,6 +403,10 @@ pub struct SignalDef {
     cache: Cache,
     /// The built-in `@time`: the source's own time of each line.
     from_source: bool,
+    scope: SignalScope,
+    /// The selection queries it comes from (their names); empty for one
+    /// the user defined.
+    queries: Vec<String>,
 }
 
 impl SignalDef {
@@ -370,7 +441,50 @@ impl SignalDef {
             query,
             cache: Cache::default(),
             from_source: false,
+            scope: SignalScope::All,
+            queries: Vec::new(),
         })
+    }
+
+    /// The same signal with its events from `scope`.
+    pub fn with_scope(mut self, scope: SignalScope) -> SignalDef {
+        self.scope = scope;
+        self
+    }
+
+    pub fn scope(&self) -> SignalScope {
+        self.scope
+    }
+
+    /// The selection queries it comes from; empty for a defined one.
+    pub fn queries(&self) -> &[String] {
+        &self.queries
+    }
+
+    /// The kind its values suggest: `num` if the first ones (up to 64,
+    /// within the first 200 000 lines) read as numbers, `time` if they read
+    /// as times, else `enum`.
+    pub fn infer_kind(&self, source: &dyn LogSource) -> SignalKind {
+        let Ok(def) = (SignalDef { kind: SignalKind::Enum, ..self.clone() }).bind(source.schema()) else {
+            return SignalKind::Enum;
+        };
+        let mut texts = Vec::new();
+        for line in 0..source.line_count().min(200_000) {
+            if let Some(SignalValue::Enum(t)) = def.value(&mut Event::from_source(source, line)) {
+                texts.push(t);
+                if texts.len() == 64 {
+                    break;
+                }
+            }
+        }
+        let all = |f: &dyn Fn(&[u8]) -> bool| !texts.is_empty() && texts.iter().all(|t| f(t));
+        if all(&|t| parse_num(t).is_some()) {
+            SignalKind::Num
+        } else if all(&|t| std::str::from_utf8(t).ok().and_then(parse_time).is_some()) {
+            SignalKind::Time
+        } else {
+            SignalKind::Enum
+        }
     }
 
     /// The built-in `@time` of a source that knows its lines' times (DLT's
@@ -383,6 +497,8 @@ impl SignalDef {
             query: Query::compile("/(?<time>)/").expect("valid"),
             cache: Cache::default(),
             from_source: true,
+            scope: SignalScope::All,
+            queries: Vec::new(),
         }
     }
 
@@ -393,21 +509,30 @@ impl SignalDef {
 
     /// Parse one spec line (module docs).
     pub fn parse_spec(spec: &str) -> Result<SignalDef, SignalError> {
-        let bad = || SignalError::Spec(format!("'{spec}' isn't NAME[(GROUP)][:num|enum]=QUERY"));
+        let bad = || SignalError::Spec(format!("'{spec}' isn't NAME[(GROUP)][:KIND][:SCOPE]=QUERY"));
         let (head, query) = spec.split_once('=').ok_or_else(bad)?;
-        let (head, kind) = match head.split_once(':') {
-            Some((h, k)) => (
-                h,
-                SignalKind::parse(k)
-                    .ok_or_else(|| SignalError::Spec(format!("unknown kind '{}' (num, enum)", k.trim())))?,
-            ),
-            None => (head, SignalKind::Num),
-        };
+        let mut it = head.split(':');
+        let head = it.next().unwrap_or_default();
+        let (mut kind, mut scope) = (SignalKind::Num, SignalScope::All);
+        for w in it {
+            match w.trim().to_ascii_lowercase().as_str() {
+                "all" => scope = SignalScope::All,
+                "filtered" => scope = SignalScope::Filtered,
+                k => {
+                    kind = SignalKind::parse(k).ok_or_else(|| {
+                        SignalError::Spec(format!(
+                            "unknown kind or scope '{}' (num, enum, time; all, filtered)",
+                            w.trim()
+                        ))
+                    })?
+                }
+            }
+        }
         let (name, group) = match head.split_once('(') {
             Some((n, g)) => (n, Some(g.trim().strip_suffix(')').ok_or_else(bad)?)),
             None => (head, None),
         };
-        SignalDef::new(name, kind, query, group)
+        Ok(SignalDef::new(name, kind, query, group)?.with_scope(scope))
     }
 
     /// The spec line [`Self::parse_spec`] reads back.
@@ -416,7 +541,8 @@ impl SignalDef {
             return "time:time (the file's own time)".into();
         }
         let group = if self.group == self.name { String::new() } else { format!("({})", self.group) };
-        format!("{}{group}:{}={}", self.name, self.kind.as_str(), self.query.source())
+        let scope = if self.scope == SignalScope::Filtered { ":filtered" } else { "" };
+        format!("{}{group}:{}{scope}={}", self.name, self.kind.as_str(), self.query.source())
     }
 
     pub fn name(&self) -> &str {
@@ -628,6 +754,106 @@ impl Signals {
     }
 }
 
+impl Signals {
+    /// The signals the user defined (not from queries or the source) as
+    /// the saved file: a spec line each.
+    pub fn to_text(&self) -> String {
+        let mut out = String::from("# nerka signals: NAME[(GROUP)][:KIND][:SCOPE]=QUERY, one per line\n");
+        for d in self.iter().filter(|d| !d.from_source && d.queries.is_empty()) {
+            out += &d.spec();
+            out.push('\n');
+        }
+        out
+    }
+
+    /// Read a saved file: the signals, and an error per line that isn't
+    /// one (`line N: …`).
+    pub fn parse_text(text: &str) -> (Signals, Vec<String>) {
+        let (mut s, mut errors) = (Signals::default(), Vec::new());
+        for (i, line) in text.lines().enumerate() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            match SignalDef::parse_spec(line) {
+                Ok(d) => s.set(d),
+                Err(e) => errors.push(format!("line {}: {e}", i + 1)),
+            }
+        }
+        (s, errors)
+    }
+}
+
+/// A picked query as a source of signals: its name, its NFD (parents and
+/// parameters expanded) and the kinds its pack pins for named groups.
+pub struct QueryPart<'a> {
+    pub name: &'a str,
+    pub nfd: &'a str,
+    pub pins: &'a [(String, SignalKind)],
+}
+
+/// The signals the named groups of picked queries give: one per group
+/// name, its query the OR of every query that has the group (a line takes
+/// the value from the one that matched). The kind is `chosen`'s, else the
+/// pack's pin, else what the values in `source` suggest
+/// ([`SignalDef::infer_kind`]). Queries that don't compile give nothing.
+pub fn query_signals(
+    parts: &[QueryPart<'_>],
+    source: &dyn LogSource,
+    chosen: &dyn Fn(&str) -> Option<SignalKind>,
+) -> Vec<SignalDef> {
+    /// A group name and the picked queries that have it.
+    struct Group {
+        name: String,
+        queries: Vec<String>,
+        nfds: Vec<String>,
+        pin: Option<SignalKind>,
+    }
+    let mut groups: Vec<Group> = Vec::new();
+    for p in parts {
+        let Ok(q) = Query::compile(p.nfd) else { continue };
+        let mut names: Vec<String> = Vec::new();
+        positive_regexes(q.expr(), false, &mut |re| {
+            for g in re.capture_names().flatten() {
+                if !names.iter().any(|n| n == g) {
+                    names.push(g.to_owned());
+                }
+            }
+        });
+        for g in names.into_iter().filter(|g| is_name(g)) {
+            let pin = p.pins.iter().find(|(x, _)| *x == g).map(|(_, k)| *k);
+            match groups.iter_mut().find(|e| e.name == g) {
+                Some(e) if !e.nfds.iter().any(|n| n == p.nfd) => {
+                    e.queries.push(p.name.to_owned());
+                    e.nfds.push(p.nfd.to_owned());
+                    e.pin = e.pin.or(pin);
+                }
+                Some(_) => {}
+                None => {
+                    groups.push(Group { name: g, queries: vec![p.name.to_owned()], nfds: vec![p.nfd.to_owned()], pin })
+                }
+            }
+        }
+    }
+    groups
+        .into_iter()
+        .filter_map(|g| {
+            let text = if g.nfds.len() == 1 {
+                g.nfds[0].clone()
+            } else {
+                g.nfds.iter().map(|n| format!("({n})")).collect::<Vec<_>>().join(" OR ")
+            };
+            let mut def = SignalDef::new(&g.name, SignalKind::Enum, &text, Some(&g.name)).ok()?;
+            def.queries = g.queries;
+            def.kind = match chosen(&def.name).or(g.pin) {
+                Some(k) => k,
+                None => def.infer_kind(source),
+            };
+            Some(def)
+        })
+        .collect()
+}
+
 /// What a tab's lines are timed by, for plots and time comparisons.
 #[derive(Debug, Clone)]
 pub enum Clock {
@@ -761,6 +987,80 @@ mod tests {
         }
         let d = SignalDef::parse_spec(r" Speed =/(?<Speed>\d)/").unwrap();
         assert_eq!((d.name(), d.group(), d.kind()), ("speed", "Speed", SignalKind::Num));
+    }
+
+    #[test]
+    fn query_groups_are_signals_with_inferred_kinds() {
+        let log = "2026-10-17 10:00:01 v=12 gear=D\nboot\n2026-10-17 10:00:02 v=13.5 gear=N\nalt w=7\n";
+        let file = crate::TextFile::from_bytes("t", log.as_bytes().to_vec());
+        let part = |name, nfd| QueryPart { name, nfd, pins: &[] };
+        let pinned = [("v".to_owned(), SignalKind::Enum)];
+        let parts = [
+            part("speed", r"/^(?<t>\S+ \S+) v=(?<v>[\d.]+) gear=(?<gear>\w)/"),
+            // The same group in another query: one signal, the two OR'ed.
+            part("alt", r"/alt w=(?<v>\d+)/"),
+            // Negated: captures nothing.
+            part("not", r"NOT /(?<n>x)/"),
+            part("broken", "/("),
+        ];
+        let sig = query_signals(&parts, &file, &|_| None);
+        let got: Vec<(&str, &str, Vec<String>)> =
+            sig.iter().map(|d| (d.name(), d.kind().as_str(), d.queries().to_vec())).collect();
+        assert_eq!(
+            got,
+            [
+                ("t", "time", vec!["speed".to_owned()]),
+                ("v", "num", vec!["speed".to_owned(), "alt".to_owned()]),
+                ("gear", "enum", vec!["speed".to_owned()]),
+            ]
+        );
+        let v = &sig[1];
+        let series = v.series(&file, &Progress::new()).unwrap();
+        let events: Vec<(LineNo, String)> = series.iter().map(|(r, x)| (r, v.format(x))).collect();
+        assert_eq!(events, [(0, "12".into()), (2, "13.5".into()), (3, "7".into())]);
+        // A pin and a choice win over the values.
+        let pinned_parts = [QueryPart { name: "speed", nfd: parts[0].nfd, pins: &pinned }];
+        let sig = query_signals(&pinned_parts, &file, &|g| (g == "t").then_some(SignalKind::Enum));
+        assert_eq!(
+            sig.iter().map(|d| d.kind()).collect::<Vec<_>>(),
+            [SignalKind::Enum, SignalKind::Enum, SignalKind::Enum]
+        );
+    }
+
+    #[test]
+    fn saved_signals_round_trip_with_their_scope() {
+        let mut s = Signals::default();
+        s.set(SignalDef::parse_spec(r"lat=/latency=(?<lat>\d+)/").unwrap());
+        s.set(SignalDef::parse_spec(r"gear(g):enum:filtered=apid == NAV AND /gear (?<g>\w)/").unwrap());
+        s.set(SignalDef::source_time());
+        let text = s.to_text();
+        assert!(!text.contains("time:time"), "the built-in isn't saved: {text}");
+        let (back, errors) = Signals::parse_text(&format!("{text}\n# note\nbad line\n"));
+        assert_eq!(errors, ["line 6: 'bad line' isn't NAME[(GROUP)][:KIND][:SCOPE]=QUERY"]);
+        assert_eq!(
+            back.iter().map(|d| d.spec()).collect::<Vec<_>>(),
+            [r"lat:num=/latency=(?<lat>\d+)/", r"gear(g):enum:filtered=apid == NAV AND /gear (?<g>\w)/",]
+        );
+        assert_eq!(back.get("gear").unwrap().scope(), SignalScope::Filtered);
+        assert!(
+            matches!(SignalDef::parse_spec("x:sometimes=/(?<x>.)/"), Err(SignalError::Spec(m)) if m.contains("'sometimes'"))
+        );
+    }
+
+    #[test]
+    fn filtered_events_and_filters() {
+        let file = crate::TextFile::from_bytes("t", b"v=1\nv=2\nx\nv=3\nv=4\n".to_vec());
+        let d = SignalDef::parse_spec(r"v:filtered=/v=(?<v>\d)/").unwrap();
+        let series = d.series(&file, &Progress::new()).unwrap();
+        let kept = series.within(&[1, 2, 4]);
+        assert_eq!(kept.iter().map(|(r, _)| r).collect::<Vec<_>>(), [1, 4]);
+        // The state on a kept line comes from kept events only.
+        assert_eq!(kept.state(3).map(|(r, _)| r), Some(1));
+        let mut sig = Signals::default();
+        sig.set(d);
+        let e = Query::compile_in("/x/ OR @v > 1", &[], &sig).unwrap_err();
+        assert_eq!(e.pos, 7);
+        assert!(e.msg.contains("filtered lines only"), "{e}");
     }
 
     #[test]

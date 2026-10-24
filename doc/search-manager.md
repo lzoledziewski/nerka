@@ -21,6 +21,8 @@ Nerka is a **log viewer first**. The search manager helps you build good queries
 - **No parameter-name mapping** between packs. Nobody has to use the same set of queries.
 - **Scenarios** (saved investigations, steps, skill export) are **parked**: too abstract for now.
 
+**Signal role (owner, 2026-10-24):** besides include and exclude, a selected query can have the **signal** role (`~`): it doesn't take part in the filter, its named groups are signals (`sources-and-signals.md`), and it can colour the lines it matches. Presets store it as `node signal`; packs can pin its groups' kinds with `signals: name:kind`.
+
 ## Model
 
 | Concept | What it is |

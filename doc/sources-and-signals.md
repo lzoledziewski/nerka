@@ -15,7 +15,8 @@ Two new capabilities beyond plain-text logs:
 
 A **signal** is a named value that some rows of a log carry, defined **per tab**.
 
-- **Where it comes from:** an explicit capture (v1), or later a typed argument of a DLT non-verbose message described by FIBEX. A named group in a regex is **not** a signal by itself: the user defines the signal and says which group it takes.
+- **Where it comes from (owner, 2026-10-24):** three sources. (1) **Pack queries**: the named groups of the queries in the selection with role Include or the Signal role (a role that doesn't filter); picking the query is the explicit step. (2) **Signals the user defines** in the Signals panel, saved (`<config>/nerka/signals`) for every tab. (3) Later, **imports** (FIBEX / ARXML). The file's own time is the built-in `@time`. Kinds of query signals are inferred from the values, a pack can pin them (`signals: t:time`), the panel can override them.
+- **Scope (owner):** per signal, `all` lines or only the `filtered` ones (what the filter keeps; panel and plot). Only `all` signals can be used in a filter.
 - **Definition:** name, kind, an NFD query, and the regex group to take the value from (by default the signal's name). A row carries the value when the query matches it and the group captured something.
 - **Kinds:** `num` (the capture read as a number: decimal, float or `0x` hex) and `enum` (the captured text). A capture that doesn't read as a number gives the row no value.
 - **First use: filtering.** In NFD a signal is written with `@`, so it can't be mistaken for a source field: `@speed > 100`, `@gear == D`, `@gear ~ /D|N/`. Like a field, a row without a value only satisfies `!=` and `!~`. A query that names a signal works only in a tab that defines it; elsewhere `@speed` is a bind error ("unknown signal"), the same way `apid` is on a plain-text file.

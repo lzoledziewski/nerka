@@ -1,14 +1,21 @@
-//! The Signals panel: the tab's signal definitions (`doc/sources-and-signals.md`
-//! → "What a signal is"), each with its value on the current line. Core
-//! does the capturing; the panel only edits definitions and shows values.
+//! The Signals panel: the tab's signals (`doc/sources-and-signals.md` →
+//! "What a signal is"), each with its state on the current line. They come
+//! from the file (`@time`), from the user's saved definitions (edited
+//! here) and from the named groups of the selection's queries (kind and
+//! scope chosen here). Core does the capturing; the panel only edits
+//! definitions and shows values.
 
+use crate::plot::PlotState;
 use eframe::egui::{self, RichText};
-use nerka_core::{LineNo, LogSource, SignalDef, SignalKind, Signals};
+use nerka_core::{LineNo, LogSource, SearchResult, SignalDef, SignalKind, SignalScope, SignalSeries, Signals};
+use std::collections::HashMap;
+use std::sync::Arc;
 
 /// The panel's state in one tab.
+#[derive(Default)]
 pub struct SignalsUi {
     draft: Draft,
-    /// The signal the form edits (its name), or none for a new one.
+    /// The saved signal the form edits (its name), or none for a new one.
     editing: Option<String>,
     /// The definitions bound to the tab's source, by generation.
     bound: Vec<(String, Result<SignalDef, String>)>,
@@ -23,20 +30,9 @@ struct Draft {
     error: Option<String>,
 }
 
-impl Default for SignalsUi {
+impl Default for Draft {
     fn default() -> Self {
-        Self {
-            draft: Draft {
-                name: String::new(),
-                kind: SignalKind::Num,
-                group: String::new(),
-                query: String::new(),
-                error: None,
-            },
-            editing: None,
-            bound: Vec::new(),
-            bound_gen: None,
-        }
+        Draft { name: String::new(), kind: SignalKind::Num, group: String::new(), query: String::new(), error: None }
     }
 }
 
@@ -44,23 +40,63 @@ impl Default for SignalsUi {
 #[derive(Default)]
 pub struct Output {
     pub close: bool,
-    /// A definition was added, changed or removed.
-    pub changed: bool,
+    /// A saved signal was added, changed or removed.
+    pub saved_changed: bool,
+    /// A kind chosen for a query signal.
+    pub kind: Option<(String, SignalKind)>,
+    /// A scope chosen for a signal.
+    pub scope: Option<(String, SignalScope)>,
     /// Go to this line (the event that set a state was clicked).
     pub goto: Option<LineNo>,
 }
 
-/// `generation` changes whenever `signals` does, so bound definitions are made
-/// again only then.
-pub fn signals_panel(
-    ui: &mut egui::Ui,
-    st: &mut SignalsUi,
-    signals: &mut Signals,
-    generation: u64,
-    file: &dyn LogSource,
-    line: LineNo,
-    plot: &mut crate::plot::PlotState,
-) -> Output {
+/// The events each signal shows: all of them, or for a
+/// [`SignalScope::Filtered`] one those on the lines the filter keeps
+/// (worked out once per filter result).
+#[derive(Default)]
+pub struct Views {
+    key: (u64, usize),
+    filtered: HashMap<String, Arc<SignalSeries>>,
+}
+
+impl Views {
+    /// `generation` changes with the signals; `kept` is the filter result.
+    pub fn series(
+        &mut self,
+        def: &SignalDef,
+        file: &dyn LogSource,
+        kept: Option<&Arc<SearchResult>>,
+        generation: u64,
+    ) -> Option<Arc<SignalSeries>> {
+        let all = def.cached_series(file)?;
+        let Some(kept) = kept.filter(|_| def.scope() == SignalScope::Filtered) else { return Some(Arc::new(all)) };
+        let key = (generation, Arc::as_ptr(kept) as usize);
+        if self.key != key {
+            self.filtered.clear();
+            self.key = key;
+        }
+        Some(self.filtered.entry(def.name().to_owned()).or_insert_with(|| Arc::new(all.within(&kept.lines))).clone())
+    }
+}
+
+/// What the panel shows and edits.
+pub struct Input<'a> {
+    /// The tab's signals (generation: changes whenever they do).
+    pub signals: &'a Signals,
+    pub generation: u64,
+    /// The user's saved signals (every tab has them).
+    pub saved: &'a mut Signals,
+    pub file: &'a dyn LogSource,
+    /// The current line.
+    pub line: LineNo,
+    pub plot: &'a mut PlotState,
+    pub views: &'a mut Views,
+    /// The filter result, if a filter is applied.
+    pub kept: Option<&'a Arc<SearchResult>>,
+}
+
+pub fn signals_panel(ui: &mut egui::Ui, st: &mut SignalsUi, input: Input<'_>) -> Output {
+    let Input { signals, generation, saved, file, line, plot, views, kept } = input;
     let mut out = Output::default();
     ui.horizontal(|ui| {
         ui.heading("Signals");
@@ -70,7 +106,8 @@ pub fn signals_panel(
     });
     ui.weak(
         "Values captured by a regex group. An event is a line that carries one; the state holds it until the \
-         next. Filter with @name (the state), @name.event or @name.changed.",
+         next. Filter with @name (the state), @name.event or @name.changed. Named groups of the selection's \
+         included and signal (~) queries are signals too.",
     );
     ui.separator();
 
@@ -85,7 +122,7 @@ pub fn signals_panel(
     }
     let mut remove = None;
     let mut edit = None;
-    egui::Grid::new("signals").num_columns(5).striped(true).show(ui, |ui| {
+    egui::Grid::new("signals").num_columns(6).striped(true).show(ui, |ui| {
         for d in signals.iter() {
             // Plotting a time against time says nothing.
             if d.kind() == SignalKind::Time {
@@ -99,10 +136,11 @@ pub fn signals_panel(
             let hover = if d.is_from_source() {
                 "time\nThe file's own time of each line (DLT: when the logger received it)".to_owned()
             } else {
-                format!("{}\ngroup: {}\n{}", d.kind().as_str(), d.group(), d.query().source())
+                format!("group: {}\n{}", d.group(), d.query().source())
             };
             ui.label(RichText::new(format!("@{}", d.name())).monospace().strong()).on_hover_text(hover);
-            ui.weak(d.kind().as_str());
+            kind_cell(ui, d, &mut out);
+            scope_cell(ui, d, &mut out);
             if d.is_from_source() {
                 let t = file.time(line).map_or_else(|| "—".to_owned(), |t| nerka_core::time::format_time(t, 6));
                 ui.label(RichText::new(t).monospace()).on_hover_text("Every line is an event");
@@ -112,7 +150,7 @@ pub fn signals_panel(
             }
             let bound = st.bound.iter().find(|(n, _)| n == d.name()).map(|(_, b)| b);
             match bound {
-                Some(Ok(_)) => match d.cached_series(file) {
+                Some(Ok(_)) => match views.series(d, file, kept, generation) {
                     // The state on the cursor line, and the event that set it.
                     Some(series) => match series.state(line) {
                         Some((row, v)) => {
@@ -120,11 +158,11 @@ pub fn signals_panel(
                             let events = series.len();
                             if row == line {
                                 ui.label(RichText::new(format!("{v}  • event")).monospace())
-                                    .on_hover_text(format!("Received on line {} ({events} events in all)", line + 1));
+                                    .on_hover_text(format!("Received on line {} ({events} events)", line + 1));
                             } else {
                                 let r = ui.link(RichText::new(format!("{v}  ↑ {}", row + 1)).monospace());
                                 if r.on_hover_text(format!(
-                                    "State on line {}, set by the event on line {} ({events} events in all). \
+                                    "State on line {}, set by the event on line {} ({events} events). \
                                      Click to go there.",
                                     line + 1,
                                     row + 1
@@ -151,14 +189,25 @@ pub fn signals_panel(
                     ui.label("");
                 }
             }
-            ui.horizontal(|ui| {
-                if ui.small_button("✎").on_hover_text("Edit").clicked() {
-                    edit = Some((*d).clone());
-                }
-                if ui.small_button("−").on_hover_text("Remove").clicked() {
-                    remove = Some(d.name().to_owned());
-                }
-            });
+            if d.queries().is_empty() {
+                ui.horizontal(|ui| {
+                    if ui.small_button("✎").on_hover_text("Edit").clicked() {
+                        edit = Some((*d).clone());
+                    }
+                    if ui.small_button("−").on_hover_text("Remove (from every tab)").clicked() {
+                        remove = Some(d.name().to_owned());
+                    }
+                });
+            } else {
+                ui.weak("query").on_hover_text(format!(
+                    "From the named group (?<{}>…) of: {}\nIt goes away with the query; pin its kind in the pack \
+                     with signals: {}:{}",
+                    d.group(),
+                    d.queries().join(", "),
+                    d.group(),
+                    d.kind().as_str()
+                ));
+            }
             ui.end_row();
         }
     });
@@ -173,15 +222,16 @@ pub fn signals_panel(
         st.editing = Some(d.name().to_owned());
     }
     if let Some(name) = remove {
-        signals.remove(&name);
+        saved.remove(&name);
         if st.editing.as_deref() == Some(name.as_str()) {
             st.editing = None;
         }
-        out.changed = true;
+        out.saved_changed = true;
     }
 
     ui.separator();
-    ui.label(RichText::new(if st.editing.is_some() { "Edit signal" } else { "New signal" }).strong());
+    ui.label(RichText::new(if st.editing.is_some() { "Edit signal" } else { "New signal" }).strong())
+        .on_hover_text("Saved for every tab and the next start");
     let d = &mut st.draft;
     egui::Grid::new("signal_form").num_columns(2).show(ui, |ui| {
         ui.label("Name");
@@ -217,25 +267,62 @@ pub fn signals_panel(
             let group = (!d.group.trim().is_empty()).then_some(d.group.as_str());
             match SignalDef::new(&d.name, d.kind, &d.query, group) {
                 Ok(def) => {
+                    // An edit keeps the signal's scope.
+                    let scope = st.editing.as_deref().and_then(|n| saved.get(n)).map(|o| o.scope()).unwrap_or_default();
                     if let Some(old) = st.editing.take()
                         && old != def.name()
                     {
-                        signals.remove(&old);
+                        saved.remove(&old);
                     }
-                    signals.set(def);
-                    st.draft = SignalsUi::default().draft;
-                    out.changed = true;
+                    saved.set(def.with_scope(scope));
+                    st.draft = Draft::default();
+                    out.saved_changed = true;
                 }
                 Err(e) => st.draft.error = Some(e.to_string()),
             }
         }
         if st.editing.is_some() && ui.button("Cancel").clicked() {
             st.editing = None;
-            st.draft = SignalsUi::default().draft;
+            st.draft = Draft::default();
         }
     });
     if let Some(e) = &st.draft.error {
         ui.colored_label(ui.visuals().error_fg_color, e);
     }
     out
+}
+
+/// The kind: a choice for a query signal (inferred from its values until
+/// chosen), else a label.
+fn kind_cell(ui: &mut egui::Ui, d: &SignalDef, out: &mut Output) {
+    if d.queries().is_empty() {
+        ui.weak(d.kind().as_str());
+        return;
+    }
+    let mut kind = d.kind();
+    egui::ComboBox::from_id_salt(("kind", d.name())).width(48.0).selected_text(kind.as_str()).show_ui(ui, |ui| {
+        for k in [SignalKind::Num, SignalKind::Enum, SignalKind::Time] {
+            ui.selectable_value(&mut kind, k, k.as_str());
+        }
+    });
+    if kind != d.kind() {
+        out.kind = Some((d.name().to_owned(), kind));
+    }
+}
+
+/// The scope: all lines, or only the lines the filter keeps.
+fn scope_cell(ui: &mut egui::Ui, d: &SignalDef, out: &mut Output) {
+    if d.is_from_source() {
+        ui.label("");
+        return;
+    }
+    let filtered = d.scope() == SignalScope::Filtered;
+    let r = ui.selectable_label(filtered, if filtered { "filtered" } else { "all" }).on_hover_text(
+        "all: events from every line (a filter can use it)\nfiltered: only from the lines the filter keeps \
+         (panel and plot only). Click to switch.",
+    );
+    if r.clicked() {
+        let to = if filtered { SignalScope::All } else { SignalScope::Filtered };
+        out.scope = Some((d.name().to_owned(), to));
+    }
 }

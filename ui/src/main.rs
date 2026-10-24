@@ -51,7 +51,7 @@ use nerka_core::pack::{self, Library, Role};
 use nerka_core::preset::{BoxText, Preset};
 use nerka_core::{
     Bookmarks, FieldDef, Filter, Highlighter, LineNo, LogSource, Matcher, MatcherOptions, Query, SearchHistory,
-    SearchHits, SearchResult, SearchSet, Signals, text_to_nfd,
+    SearchHits, SearchResult, SearchSet, SignalKind, SignalScope, Signals, text_to_nfd,
 };
 use prefs::SearchPrefs;
 use std::borrow::Cow;
@@ -71,7 +71,8 @@ fn main() -> eframe::Result {
     let mut searches: Vec<String> = Vec::new();
     let mut highlight: Vec<String> = Vec::new();
     let mut params = std::collections::BTreeMap::new();
-    // `--signal SPEC` (as for the CLI): signals of the tab opened at startup.
+    // `--signal SPEC` (as for the CLI): signals for this session (saved
+    // with the others once the Signals panel changes them).
     let mut signals = Signals::default();
     // `--plot NAME`: plot these signals.
     let mut plotted: Vec<String> = Vec::new();
@@ -93,6 +94,10 @@ fn main() -> eframe::Result {
             }
             Some("--exclude") => {
                 startup.push((Use::Exclude, value()));
+                continue;
+            }
+            Some("--signal-pick") => {
+                startup.push((Use::Signal, value()));
                 continue;
             }
             Some("--highlight") => {
@@ -178,6 +183,10 @@ fn main() -> eframe::Result {
             app.server = instance::Server::start(move || ctx.request_repaint());
             app.load_history();
             app.load_prefs();
+            app.load_saved_signals();
+            for d in signals.iter() {
+                app.saved_signals.set((**d).clone());
+            }
             app.load_library();
             app.presets.load();
             let mut picks = Picks::default();
@@ -198,7 +207,6 @@ fn main() -> eframe::Result {
             if !initial.is_empty() {
                 app.open_files(&cc.egui_ctx, initial);
                 if let Some(tab) = app.tabs.last_mut() {
-                    tab.signals = signals;
                     plotted.iter().for_each(|n| tab.plot.toggle(n));
                 }
                 if let (Some(p), Some(tab)) = (&moved, app.tabs.last_mut()) {
@@ -475,6 +483,15 @@ struct Tab {
     /// with each definition).
     signals_job: Option<Job<()>>,
     plot: plot::PlotState,
+    /// What `signals` was built from: (saved signals' generation, choices'
+    /// generation, the selection's fingerprint); none: build again.
+    signals_key: Option<(u64, u64, String)>,
+    /// Kinds and scopes chosen for query signals, and their generation.
+    query_kind: std::collections::HashMap<String, SignalKind>,
+    query_scope: std::collections::HashMap<String, SignalScope>,
+    choices_gen: u64,
+    /// The events each signal shows (filtered ones per filter result).
+    views: signals::Views,
     status: String,
 }
 
@@ -719,6 +736,11 @@ impl Tab {
             signals_ui: signals::SignalsUi::default(),
             signals_job: None,
             plot: plot::PlotState::default(),
+            signals_key: None,
+            query_kind: Default::default(),
+            query_scope: Default::default(),
+            choices_gen: 0,
+            views: signals::Views::default(),
             status: String::new(),
         }
     }
@@ -811,6 +833,52 @@ impl Tab {
         }
     }
 
+    /// Build the tab's signals again if what they come from changed: the
+    /// file's `@time`, the user's `saved` signals, the named groups of the
+    /// selection's included and signal queries (with the kinds and scopes
+    /// chosen here).
+    fn refresh_signals(&mut self, ctx: &egui::Context, lib: &Library, saved: &Signals, saved_gen: u64) {
+        let Some(file) = self.file.clone() else { return };
+        let fingerprint = format!(
+            "{:?}{:?}",
+            self.picks
+                .nodes
+                .iter()
+                .map(|n| (n.role, &n.text, &n.parent, &n.source, n.edited, n.detached, &n.signals))
+                .collect::<Vec<_>>(),
+            self.picks.params
+        );
+        let key = (saved_gen, self.choices_gen, fingerprint);
+        if self.signals_key.as_ref() == Some(&key) {
+            return;
+        }
+        self.signals_key = Some(key);
+        let mut s = Signals::default().for_source(&*file);
+        for d in saved.iter() {
+            s.set((**d).clone());
+        }
+        if let Ok(a) = self.picks.expand(lib) {
+            let parts: Vec<nerka_core::QueryPart<'_>> = a
+                .exp
+                .parts
+                .iter()
+                .enumerate()
+                .filter(|(_, p)| p.role != Role::Exclude)
+                .map(|(i, p)| nerka_core::QueryPart { name: &a.names[i], nfd: a.exp.part_nfd(p), pins: &a.pins[i] })
+                .collect();
+            let chosen = |g: &str| self.query_kind.get(g).copied();
+            for d in nerka_core::query_signals(&parts, &*file, &chosen) {
+                // A saved signal of the same name wins.
+                if s.get(d.name()).is_none() {
+                    let scope = self.query_scope.get(d.name()).copied().unwrap_or_default();
+                    s.set(d.with_scope(scope));
+                }
+            }
+        }
+        self.signals = s;
+        self.signals_changed(ctx);
+    }
+
     /// Collect the events of every signal in the background, so the panel
     /// shows states without waiting for a filter to need them.
     fn collect_signals(&mut self, ctx: &egui::Context) {
@@ -896,12 +964,10 @@ impl Tab {
                                 Bookmarks::default()
                             });
                             self.columns = Columns::from_defs(f.columns());
-                            let file: Arc<dyn LogSource> = Arc::from(f);
-                            // `@time` when the file knows its lines' times.
-                            self.signals = self.signals.for_source(&*file);
-                            self.signals_gen += 1;
-                            self.file = Some(file);
-                            self.collect_signals(ctx);
+                            self.file = Some(Arc::from(f));
+                            // Built with the next frame (`@time` if the
+                            // file knows its lines' times).
+                            self.signals_key = None;
                             if !self.pattern.trim().is_empty() {
                                 self.start_search(ctx);
                             } else {
@@ -1119,7 +1185,7 @@ impl Tab {
         }
         let (mut include, mut names, mut colors) = (Vec::new(), Vec::new(), Vec::new());
         for (i, p) in a.exp.parts.iter().enumerate() {
-            if p.role != Role::Include || !self.picks.is_lit(a.keys[i]) {
+            if p.role == Role::Exclude || !self.picks.is_lit(a.keys[i]) {
                 continue;
             }
             let Ok(q) = Query::compile(a.exp.part_nfd(p)).and_then(|q| q.with_signals(&self.signals)) else { continue };
@@ -1801,6 +1867,8 @@ fn expansion_lines<'a>(a: &'a Applied, lit: &dyn Fn(u64) -> bool) -> Vec<ChipLin
                 Role::Include if includes == 0 => "",
                 Role::Include => "OR",
                 Role::Exclude => "AND NOT",
+                // Not in the box: signals and colours only.
+                Role::Signal => "signals:",
             };
             if p.role == Role::Include {
                 includes += 1;
@@ -1830,7 +1898,7 @@ In '{by}', which is picked too: not repeated in the box"
                 color: a.colors[i],
                 nfd: a.exp.part_nfd(p),
                 origin,
-                lit: (p.role == Role::Include).then(|| (a.keys[i], lit(a.keys[i]))),
+                lit: (p.role != Role::Exclude).then(|| (a.keys[i], lit(a.keys[i]))),
             }
         })
         .collect()
@@ -1891,6 +1959,12 @@ struct App {
     /// Tabs moved to new windows so far (temp file names).
     moves: u32,
     presets: presets::Presets,
+    /// Signals the user defined, for every tab; saved in
+    /// `<config>/nerka/signals`. The generation changes with them.
+    saved_signals: Signals,
+    saved_gen: u64,
+    /// The plot is in a window of its own.
+    plot_window: bool,
 }
 
 /// The Settings window's fields: this window's name and the DLT ports
@@ -1962,6 +2036,14 @@ fn history_path() -> Option<PathBuf> {
 
 fn search_history_path() -> Option<PathBuf> {
     nerka_core::config_dir().map(|d| d.join("search-history"))
+}
+
+fn signals_path() -> Option<PathBuf> {
+    // Tests never touch the user's signals.
+    if cfg!(test) {
+        return None;
+    }
+    nerka_core::config_dir().map(|d| d.join("signals"))
 }
 
 fn prefs_path() -> Option<PathBuf> {
@@ -2061,6 +2143,28 @@ impl App {
             }
         }
     }
+    fn load_saved_signals(&mut self) {
+        let Some(path) = signals_path() else { return };
+        let Ok(text) = std::fs::read_to_string(&path) else { return };
+        let (s, errors) = Signals::parse_text(&text);
+        self.saved_signals = s;
+        if !errors.is_empty() {
+            self.status = format!("{}: {}", path.display(), errors.join("; "));
+        }
+    }
+
+    fn save_saved_signals(&mut self) {
+        self.saved_gen += 1;
+        let Some(path) = signals_path() else { return };
+        let write = path
+            .parent()
+            .map_or(Ok(()), std::fs::create_dir_all)
+            .and_then(|_| std::fs::write(&path, self.saved_signals.to_text()));
+        if let Err(e) = write {
+            self.status = format!("Could not save signals to {}: {e}", path.display());
+        }
+    }
+
     fn load_history(&mut self) {
         if let Some(path) = history_path() {
             match SearchHistory::load(&path) {
@@ -2601,6 +2705,11 @@ impl App {
             });
         });
 
+        if let Some(tab) = self.tabs.get_mut(self.active) {
+            tab.refresh_signals(&ctx, &self.library, &self.saved_signals, self.saved_gen);
+        }
+        // Saved after the tab is done with (the panel changed them).
+        let mut save_signals = false;
         let show_bookmarks = self.show_bookmarks;
         let mut focus_search = std::mem::take(&mut self.focus_search);
         let Some(tab) = self.tabs.get_mut(self.active) else {
@@ -2677,26 +2786,46 @@ impl App {
         }
         if self.show_signals {
             let line = tab.current_line();
+            let saved = &mut self.saved_signals;
             let out = egui::Panel::right("signals")
                 .resizable(true)
-                .default_size(320.0)
+                .default_size(360.0)
                 .show(ui, |ui| {
-                    signals::signals_panel(
-                        ui,
-                        &mut tab.signals_ui,
-                        &mut tab.signals,
-                        tab.signals_gen,
-                        &*file,
+                    let input = signals::Input {
+                        signals: &tab.signals,
+                        generation: tab.signals_gen,
+                        saved,
+                        file: &*file,
                         line,
-                        &mut tab.plot,
-                    )
+                        plot: &mut tab.plot,
+                        views: &mut tab.views,
+                        kept: tab.result.as_ref(),
+                    };
+                    signals::signals_panel(ui, &mut tab.signals_ui, input)
                 })
                 .inner;
             if out.close {
                 self.show_signals = false;
             }
-            if out.changed {
-                tab.signals_changed(&ctx);
+            if let Some((name, kind)) = out.kind {
+                tab.query_kind.insert(name, kind);
+                tab.choices_gen += 1;
+            }
+            if let Some((name, scope)) = out.scope {
+                match self.saved_signals.get(&name) {
+                    Some(d) => {
+                        let d = (**d).clone().with_scope(scope);
+                        self.saved_signals.set(d);
+                        save_signals = true;
+                    }
+                    None => {
+                        tab.query_scope.insert(name, scope);
+                        tab.choices_gen += 1;
+                    }
+                }
+            }
+            if out.saved_changed {
+                save_signals = true;
             }
             if let Some(line) = out.goto {
                 tab.goto_line(line);
@@ -2711,12 +2840,51 @@ impl App {
             .inner;
         if !tab.plot.plotted.is_empty() {
             let line = tab.current_line();
-            let out = egui::Panel::bottom("plot")
-                .resizable(true)
-                .default_size(220.0)
-                .min_size(80.0)
-                .show(ui, |ui| plot::plot_panel(ui, &mut tab.plot, &tab.signals, tab.signals_gen, &*file, line))
-                .inner;
+            let in_window = self.plot_window;
+            let title = tab.title();
+            let kept = tab.result.clone();
+            let (views, generation) = (&mut tab.views, tab.signals_gen);
+            let mut series_of = |d: &nerka_core::SignalDef| views.series(d, &*file, kept.as_ref(), generation);
+            let src = plot::Source {
+                signals: &tab.signals,
+                generation,
+                file: &*file,
+                cursor: line,
+                kept: kept.as_ref().map_or(0, |r| Arc::as_ptr(r) as usize),
+                series_of: &mut series_of,
+                in_window,
+            };
+            let plot = &mut tab.plot;
+            let out = if in_window {
+                let builder = egui::ViewportBuilder::default()
+                    .with_title(format!("Plot — {title} — nerka"))
+                    .with_inner_size([1100.0, 460.0]);
+                let id = egui::ViewportId::from_hash_of("nerka-plot");
+                // Drawn once per frame: the callback takes the source.
+                let mut src = Some(src);
+                let (out, closed) = ctx.show_viewport_immediate(id, builder, |ui, _| {
+                    let src = src.take();
+                    let plot = &mut *plot;
+                    let out = egui::CentralPanel::default()
+                        .show(ui, |ui| src.map(|s| plot::plot_panel(ui, plot, s)).unwrap_or_default())
+                        .inner;
+                    (out, ui.input(|i| i.viewport().close_requested()))
+                });
+                if closed {
+                    self.plot_window = false;
+                }
+                out
+            } else {
+                egui::Panel::bottom("plot")
+                    .resizable(true)
+                    .default_size(220.0)
+                    .min_size(80.0)
+                    .show(ui, |ui| plot::plot_panel(ui, plot, src))
+                    .inner
+            };
+            if out.toggle_window {
+                self.plot_window = !self.plot_window;
+            }
             if let Some(line) = out.goto {
                 tab.goto_line(line);
             }
@@ -2731,6 +2899,9 @@ impl App {
         }
         if let Some((tag, pattern)) = found {
             self.record_search_box(tag, &pattern);
+        }
+        if save_signals {
+            self.save_saved_signals();
         }
     }
 }
@@ -3495,6 +3666,66 @@ query timeouts  labels: vision
         settle(&mut tab, &ctx);
         assert_eq!(tab.search.pattern, "(/frame drop/)");
         assert_eq!(hits(&tab), [(0, vec!["drops"]), (1, vec!["drops"]), (2, vec!["drops"])]);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn named_groups_of_picked_queries_are_signals() {
+        let dir = std::env::temp_dir().join(format!("nerka-gui-qsig-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("app.log");
+        std::fs::write(
+            &log,
+            "10:00:01 v=10 gear=P
+boot
+10:00:02 v=60 gear=D
+10:00:03 WARN v=80 gear=D
+",
+        )
+        .unwrap();
+        let mut lib = Library::new();
+        let pack_text = r"pack p
+query speed
+    /v=(?<v>\d+) gear=(?<gear>\w)/
+query clock  signals: t:time
+    /^(?<t>\S+)/
+";
+        lib.add(pack::parse_pack("p.nerka-pack", pack_text).unwrap()).unwrap();
+        let ctx = egui::Context::default();
+        let mut tab = Tab::open(&ctx, log, &SearchPrefs::default());
+        settle(&mut tab, &ctx);
+        let mut saved = Signals::default();
+        tab.refresh_signals(&ctx, &lib, &saved, 0);
+        assert!(tab.signals.is_empty(), "nothing picked, no time in the file");
+
+        // A signal pick: its groups are signals; the filter stays empty.
+        tab.picks.add(&lib, "p.speed", Use::Signal, None);
+        tab.picks.add(&lib, "p.clock", Use::Signal, None);
+        tab.refresh_signals(&ctx, &lib, &saved, 0);
+        let kinds: Vec<(&str, &str)> = tab.signals.iter().map(|d| (d.name(), d.kind().as_str())).collect();
+        assert_eq!(kinds, [("v", "num"), ("gear", "enum"), ("t", "time")]);
+        assert_eq!(tab.picks.expand(&lib).unwrap().exp.nfd, "");
+        tab.mode = Mode::Query;
+        tab.pattern = "@gear == D AND level >= WARN".into();
+        tab.start_search(&ctx);
+        settle(&mut tab, &ctx);
+        assert_eq!(tab.result.as_ref().unwrap().lines, [3]);
+
+        // A chosen kind wins over the values; a saved signal over the query's.
+        tab.query_kind.insert("v".into(), SignalKind::Enum);
+        tab.choices_gen += 1;
+        saved.set(nerka_core::SignalDef::parse_spec(r"gear:enum=/gear=(?<gear>[A-Z])/").unwrap());
+        tab.refresh_signals(&ctx, &lib, &saved, 1);
+        assert_eq!(tab.signals.get("v").unwrap().kind(), SignalKind::Enum);
+        assert!(tab.signals.get("gear").unwrap().queries().is_empty(), "the saved one");
+
+        // A filtered signal can't be used in a filter.
+        tab.query_scope.insert("v".into(), SignalScope::Filtered);
+        tab.choices_gen += 1;
+        tab.refresh_signals(&ctx, &lib, &saved, 1);
+        tab.pattern = "@v == 10".into();
+        assert!(!tab.start_search(&ctx));
+        assert!(tab.status.contains("filtered lines only"), "{}", tab.status);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

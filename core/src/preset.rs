@@ -12,6 +12,7 @@
 //! node include lit          query vision.cam
 //! node exclude              query "camera team.noise"
 //! node include detached     query vision.drops
+//! node signal lit           query vision.speed
 //! node include lit          local n1  from vision.timeouts  name "slow ones"
 //! param cam = CAM1
 //! param re raw = a.b(c)?
@@ -25,7 +26,7 @@
 //!
 //! ```text
 //! file   := "preset" NAME line* [ "pack" "_preset" query* ]   -- queries as in packs
-//! line   := "node" ("include" | "exclude") flag* source
+//! line   := "node" ("include" | "exclude" | "signal") flag* source
 //!         | "param" NAME ["raw"] "=" VALUE                    -- VALUE: rest of the line
 //!         | ("filter" | "search") ("selection" | TAG TEXT)    -- TAG: auto, text, regex, query
 //! flag   := "lit" | "detached"
@@ -37,7 +38,7 @@
 //! spaces or quotes. `filter selection` means the Filter box held the
 //! selection's expansion, which is expanded again when the preset is used.
 
-use crate::pack::{Pack, PackError, PackQuery, format_query, parse_pack};
+use crate::pack::{Pack, PackError, PackQuery, Role, format_query, parse_pack};
 use std::path::{Path, PathBuf};
 
 /// File extension of preset files.
@@ -64,7 +65,7 @@ pub struct Preset {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PresetNode {
     pub source: NodeSource,
-    pub exclude: bool,
+    pub role: Role,
     /// Its lines are coloured.
     pub lit: bool,
     /// Without its parents: only its own text counts.
@@ -106,7 +107,11 @@ impl Preset {
     pub fn serialize(&self) -> String {
         let mut out = format!("preset {}\n", quote(&self.name));
         for n in &self.nodes {
-            out += if n.exclude { "node exclude" } else { "node include" };
+            out += match n.role {
+                Role::Include => "node include",
+                Role::Exclude => "node exclude",
+                Role::Signal => "node signal",
+            };
             if n.lit {
                 out += " lit";
             }
@@ -368,11 +373,12 @@ type NodeErr = (Option<usize>, String);
 
 fn node(w: &[(String, usize)]) -> Result<PresetNode, NodeErr> {
     let mut it = w.iter().skip(1).peekable();
-    let role = it.next().ok_or((None, "expected include or exclude".to_owned()))?;
-    let exclude = match role.0.as_str() {
-        "include" => false,
-        "exclude" => true,
-        r => return Err((Some(role.1), format!("expected include or exclude but found '{r}'"))),
+    let what = it.next().ok_or((None, "expected include, exclude or signal".to_owned()))?;
+    let role = match what.0.as_str() {
+        "include" => Role::Include,
+        "exclude" => Role::Exclude,
+        "signal" => Role::Signal,
+        r => return Err((Some(what.1), format!("expected include, exclude or signal but found '{r}'"))),
     };
     let (mut lit, mut detached) = (false, false);
     while let Some((f, _)) = it.peek() {
@@ -412,7 +418,7 @@ fn node(w: &[(String, usize)]) -> Result<PresetNode, NodeErr> {
     if let Some((extra, col)) = it.next() {
         return Err((Some(*col), format!("unexpected '{extra}'")));
     }
-    Ok(PresetNode { source, exclude, lit, detached })
+    Ok(PresetNode { source, role, lit, detached })
 }
 
 #[cfg(test)]
@@ -427,6 +433,7 @@ mod tests {
             labels: vec!["x".into()],
             params: params_in(text),
             color: Some("red".into()),
+            signals: Vec::new(),
             text: text.into(),
             line: 0,
             end_line: 0,
@@ -439,19 +446,19 @@ mod tests {
             nodes: vec![
                 PresetNode {
                     source: NodeSource::Library("vision.cam".into()),
-                    exclude: false,
+                    role: Role::Include,
                     lit: true,
                     detached: false,
                 },
                 PresetNode {
                     source: NodeSource::Library("camera team.noise".into()),
-                    exclude: true,
+                    role: Role::Exclude,
                     lit: false,
                     detached: false,
                 },
                 PresetNode {
                     source: NodeSource::Library("vision.drops".into()),
-                    exclude: false,
+                    role: Role::Include,
                     lit: false,
                     detached: true,
                 },
@@ -461,13 +468,13 @@ mod tests {
                         from: Some("vision.timeouts".into()),
                         name: "slow \"ones\"".into(),
                     },
-                    exclude: false,
+                    role: Role::Include,
                     lit: true,
                     detached: false,
                 },
                 PresetNode {
                     source: NodeSource::Local { id: "n2".into(), from: None, name: String::new() },
-                    exclude: false,
+                    role: Role::Include,
                     lit: false,
                     detached: false,
                 },
@@ -481,6 +488,15 @@ mod tests {
             search: Some(BoxText::Typed { tag: "auto".into(), text: "timeout AND level >= WARN".into() }),
             locals: vec![local("n1", "/timeout/ AND\n  level >= ERROR"), local("n2", "/$cam/")],
         }
+    }
+
+    #[test]
+    fn signal_nodes_round_trip() {
+        let text = "preset p\nnode signal lit query v.speed\n";
+        let p = parse_preset("t", text).unwrap();
+        assert_eq!(p.nodes[0].role, Role::Signal);
+        assert!(p.nodes[0].lit);
+        assert_eq!(p.serialize(), text);
     }
 
     #[test]
@@ -525,7 +541,7 @@ mod tests {
         bad("preset \"a.b\"\n", 1, 8, "invalid preset name");
         bad("preset \"a\n", 1, 8, "missing closing");
         bad("preset p\npreset q\n", 2, 1, "second 'preset'");
-        bad("preset p\nnode maybe query a.b\n", 2, 6, "include or exclude");
+        bad("preset p\nnode maybe query a.b\n", 2, 6, "include, exclude or signal");
         bad("preset p\nnode include query ab\n", 2, 14, "isn't a qualified id");
         bad("preset p\nnode include lit thing a.b\n", 2, 18, "'query' or 'local'");
         bad("preset p\nnode include query a.b extra\n", 2, 24, "unexpected 'extra'");

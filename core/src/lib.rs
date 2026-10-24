@@ -40,7 +40,10 @@ pub use input::dlt::DltFile;
 pub use input::text::TextFile;
 pub use input::{ColumnDef, LogSource, OpenOptions, open, open_with};
 pub use pack::{Library, Pack, PackError, PackQuery};
-pub use signal::{Clock, SignalDef, SignalKind, SignalSeries, SignalValue, SignalView, Signals, ValueRef};
+pub use signal::{
+    Clock, QueryPart, SignalDef, SignalKind, SignalScope, SignalSeries, SignalValue, SignalView, Signals, ValueRef,
+    query_signals,
+};
 
 /// Line numbers are 0-based internally; UIs add 1 for display.
 pub type LineNo = u64;

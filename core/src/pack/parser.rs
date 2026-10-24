@@ -175,6 +175,7 @@ fn header(line: &str, content: &str, ln: usize) -> Result<PackQuery, (usize, Str
         labels: vec![],
         params,
         color: None,
+        signals: Vec::new(),
         text: String::new(),
         line: ln,
         end_line: ln,
@@ -236,6 +237,20 @@ fn header(line: &str, content: &str, ln: usize) -> Result<PackQuery, (usize, Str
                 }
                 q.color = Some(v.to_owned());
             }
+            "signals" => {
+                let mut p = val.start;
+                for part in content[val.clone()].split(',') {
+                    let start = p + part.len() - part.trim_start().len();
+                    p += part.len() + 1;
+                    let s = part.trim();
+                    let kind = s.split_once(':').and_then(|(g, k)| Some((g, crate::signal::SignalKind::parse(k)?)));
+                    let Some((g, kind)) = kind.filter(|(g, _)| is_name(g)) else {
+                        return at(start, format!("invalid signal '{s}' (group:kind, kind num, enum or time)"));
+                    };
+                    q.signals.retain(|(x, _)| x != g);
+                    q.signals.push((g.to_owned(), kind));
+                }
+            }
             _ => unreachable!(),
         }
     }
@@ -248,7 +263,7 @@ type Attr = (&'static str, usize, Range<usize>);
 /// Split `content[from..]` into `key: value` attributes:
 /// `(key, key offset, value byte range)`.
 fn attributes(content: &str, from: usize) -> Result<Vec<Attr>, (usize, String)> {
-    const KEYS: [&str; 3] = ["parent", "labels", "color"];
+    const KEYS: [&str; 4] = ["parent", "labels", "color", "signals"];
     let mut out: Vec<Attr> = Vec::new();
     let rest = &content[from..];
     for tok in rest.split_whitespace() {
@@ -256,9 +271,11 @@ fn attributes(content: &str, from: usize) -> Result<Vec<Attr>, (usize, String)> 
         let key =
             tok.split_once(':').map(|(k, _)| k).filter(|k| !k.is_empty() && k.chars().all(|c| c.is_ascii_alphabetic()));
         match key {
+            // Inside `signals:` a `group:kind` is a value, not a key.
+            Some(k) if !KEYS.contains(&k) && out.last().is_some_and(|a| a.0 == "signals") => {}
             Some(k) => {
                 let Some(&known) = KEYS.iter().find(|&&x| x == k) else {
-                    return Err((t_at, format!("unknown attribute '{k}:' (parent:, labels:, color:)")));
+                    return Err((t_at, format!("unknown attribute '{k}:' (parent:, labels:, color:, signals:)")));
                 };
                 if let Some(last) = out.last_mut() {
                     last.2.end = t_at;
@@ -266,7 +283,7 @@ fn attributes(content: &str, from: usize) -> Result<Vec<Attr>, (usize, String)> 
                 out.push((known, t_at, t_at + k.len() + 1..content.len()));
             }
             None if out.is_empty() => {
-                return Err((t_at, format!("expected parent:, labels: or color: but found '{tok}'")));
+                return Err((t_at, format!("expected parent:, labels:, color: or signals: but found '{tok}'")));
             }
             None => {}
         }

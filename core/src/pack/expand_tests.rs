@@ -51,7 +51,26 @@ fn sel(include: &[&str], exclude: &[&str]) -> Selection {
         Some(l) => Pick::Label(l.to_owned()),
         None => Pick::Query(s.to_string()),
     };
-    Selection { include: include.iter().map(pick).collect(), exclude: exclude.iter().map(pick).collect() }
+    Selection {
+        include: include.iter().map(pick).collect(),
+        exclude: exclude.iter().map(pick).collect(),
+        signal: vec![],
+    }
+}
+
+#[test]
+fn signal_picks_stay_out_of_the_filter() {
+    let lib = lib();
+    let mut s = sel(&["nav.slow"], &[]);
+    s.signal.push(Pick::Query("txt.cam".into()));
+    let exp = expand(&s, &lib, &params(&[("app", "NAV"), ("cam", "c1")])).unwrap();
+    assert_eq!(exp.nfd, "(apid == \"NAV\") AND (/slow/)");
+    let p = exp.parts.iter().find(|p| p.role == Role::Signal).unwrap();
+    assert_eq!(exp.part_nfd(p), "(raw ~ /c1 frame drop/)");
+    // Signal picks alone: an empty filter.
+    let only = Selection { signal: vec![Pick::Query("txt.cam".into())], ..Default::default() };
+    assert_eq!(expand(&only, &lib, &params(&[("cam", "c1")])).unwrap().nfd, "");
+    assert!(matches!(expand(&Selection::default(), &lib, &params(&[])), Err(ExpandError::Empty)));
 }
 
 fn mem() -> MemSource {

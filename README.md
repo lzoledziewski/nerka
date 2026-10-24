@@ -105,7 +105,7 @@ nerka --signal 'gear:enum=/gear=(?<gear>\w+)/' filter '@gear == D' app.log   # s
 | Text | bare `/re/` and `"text"` match the whole line (`raw`) |
 | Logic | `AND OR NOT`, parentheses |
 | Fields | `raw`, `level`; DLT adds `ecu apid ctid type mcnt tmsp seid mid mode payload`; several files add `file` |
-| Signals | `@name`: a value the tab captures with a named regex group (`--signal`, 📈 Signals panel). `@gear == D` is the state (held until the next event), `@gear.event == D` a line that carries it, `@gear.changed` a change. Kinds `num`, `enum`, `time`; DLT has `@time` (receive time): `@time >= "2025-10-18 10:00:00"` |
+| Signals | `@name`: a value captured by a named regex group — of a picked query (include or the `~` signal role), or a signal you define (📈 Signals panel, `--signal`; saved). `@gear == D` is the state (held until the next event), `@gear.event == D` a line that carries it, `@gear.changed` a change. Kinds `num`, `enum`, `time`; DLT has `@time` (receive time): `@time >= "2025-10-18 10:00:00"` |
 
 ## Documentation
 
