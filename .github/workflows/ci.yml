@@ -1,5 +1,6 @@
 # Checks on every push to main and every pull request: format, clippy,
-# tests. Linux and Windows only; macOS runners cost 10x the minutes
+# tests, dependency licences / advisories (cargo deny), DCO sign-offs.
+# Builds and tests on Linux and Windows only; macOS runners cost 10x the minutes
 # (doc/status.md, "CI and releases").
 name: CI
 
@@ -41,3 +42,43 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Test
         run: cargo test --workspace
+
+  # Licences, security advisories and banned or duplicate crates (deny.toml).
+  deny:
+    name: cargo deny
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check
+
+  # Every commit of a pull request carries a DCO sign-off by its author
+  # (CONTRIBUTING.md). The maintainer's own commits are exempt: they hold
+  # the copyright (doc/status.md, "Licensing").
+  dco:
+    name: DCO sign-off
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    env:
+      MAINTAINER: l.zoledziewski@gmail.com
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Check sign-offs
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+          HEAD: ${{ github.event.pull_request.head.sha }}
+        run: |
+          fail=0
+          for c in $(git rev-list --no-merges "$BASE..$HEAD"); do
+            email="$(git log -1 --format='%ae' "$c")"
+            [ "$email" = "$MAINTAINER" ] && continue
+            author="$(git log -1 --format='%an <%ae>' "$c")"
+            if ! git log -1 --format='%B' "$c" | grep -F "Signed-off-by: $author" > /dev/null; then
+              echo "::error::$(git log -1 --format='%h %s' "$c"): no 'Signed-off-by: $author' line (commit with -s, see CONTRIBUTING.md)"
+              fail=1
+            fi
+          done
+          exit $fail

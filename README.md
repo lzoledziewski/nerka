@@ -113,7 +113,14 @@ nerka --pack packs/ expand -l ota -p cam=CAM1            # pack picks -> NFD
 - [doc/sources-and-signals.md](doc/sources-and-signals.md): input formats and the planned signal support.
 - [CLAUDE.md](CLAUDE.md): guide for contributors and AI agents (commands, rules).
 
+## Contributing
+
+Issues and pull requests are welcome: see [CONTRIBUTING.md](CONTRIBUTING.md). Every commit needs a
+DCO sign-off (`git commit -s`). Security problems: please report them privately, see
+[SECURITY.md](SECURITY.md). Conduct: [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md).
+
 ## License
 
 Licensed under either of [Apache License 2.0](LICENSE-APACHE) or
-[MIT license](LICENSE-MIT), at your option.
+[MIT license](LICENSE-MIT), at your option. Unless you state otherwise, any contribution you submit
+is dual-licensed the same way, without additional terms.
