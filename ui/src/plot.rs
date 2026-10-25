@@ -224,6 +224,8 @@ pub struct Output {
 
 const GUTTER: f32 = 120.0;
 const GUTTER_MIN: f32 = 60.0;
+/// A row of the strip above the lanes (tags, Δt).
+const MARK_ROW: f32 = 17.0;
 /// Width of a character of the lane names (monospace 11), and room kept for
 /// the y labels beside them.
 const CHAR_W: f32 = 6.7;
@@ -393,7 +395,19 @@ pub fn plot_panel(ui: &mut egui::Ui, state: &mut PlotState, src: Source<'_>) -> 
     let rect = ui.available_rect_before_wrap();
     let response = ui.allocate_rect(rect, Sense::click_and_drag());
     let gutter = if state.gutter > 0.0 { state.gutter } else { GUTTER }.min((rect.width() / 2.0).max(GUTTER_MIN));
-    let plot = Rect::from_min_max(pos2(rect.min.x + gutter, rect.min.y), pos2(rect.max.x - 8.0, rect.max.y - AXIS_H));
+    // The strip for the cursors' and bookmarks' tags (a row) and the Δt
+    // between them (a second row), above the lanes.
+    let tagged = state.cursors.len() + marks.len();
+    let strip_h = match tagged {
+        0 => 0.0,
+        1 => MARK_ROW,
+        _ => 2.0 * MARK_ROW,
+    };
+    let plot = Rect::from_min_max(
+        pos2(rect.min.x + gutter, rect.min.y + strip_h),
+        pos2(rect.max.x - 8.0, rect.max.y - AXIS_H),
+    );
+    let strip = Rect::from_min_max(pos2(plot.min.x, rect.min.y), pos2(plot.max.x, plot.min.y));
     if plot.width() < 20.0 || plot.height() < 10.0 {
         return out;
     }
@@ -472,9 +486,6 @@ pub fn plot_panel(ui: &mut egui::Ui, state: &mut PlotState, src: Source<'_>) -> 
         }
     }
     let capturing = state.capture.is_some();
-    // While a picture of all lanes is taken, what sits on the top or bottom
-    // of the lanes is drawn only in the first or last part.
-    let (top_marks, bottom_marks) = (!capturing || state.scroll <= 0.5, !capturing || state.scroll >= max_scroll - 0.5);
     let (mut x0, mut x1) = state.range.unwrap_or(data.full);
     let w = plot.width() as f64;
     let to_px = |x: f64, x0: f64, x1: f64| plot.min.x + ((x - x0) / (x1 - x0) * w) as f32;
@@ -487,7 +498,9 @@ pub fn plot_panel(ui: &mut egui::Ui, state: &mut PlotState, src: Source<'_>) -> 
     // A drag that starts on a time cursor moves it; elsewhere it pans.
     let cursor_px: Vec<f32> = state.cursors.iter().map(|&c| to_px(c, x0, x1)).collect();
     let near_cursor = |p: Pos2| {
-        (plot.y_range().contains(p.y)).then(|| cursor_px.iter().position(|&c| (c - p.x).abs() <= 5.0)).flatten()
+        ((strip.min.y..=plot.max.y).contains(&p.y))
+            .then(|| cursor_px.iter().position(|&c| (c - p.x).abs() <= 5.0))
+            .flatten()
     };
     if response.hover_pos().and_then(near_cursor).is_some() || state.drag_cursor.is_some() {
         ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
@@ -769,72 +782,82 @@ pub fn plot_panel(ui: &mut egui::Ui, state: &mut PlotState, src: Source<'_>) -> 
         t += step;
     }
 
-    // ----- time cursors and bookmarks: lines, names, Δt between neighbours -----
+    // ----- time cursors and bookmarks: lines through the lanes; their tags
+    // and the Δt between neighbours in a strip of their own above the lanes
+    // (owner, 2026-10-25: not over the values) -----
     let amber = Color32::from_rgb(230, 150, 20);
     let red = Color32::from_rgb(220, 60, 60);
     let mut placed: Vec<(String, f64)> = state.cursors.iter().enumerate().map(|(i, &c)| (cursor_name(i), c)).collect();
     placed.extend(marks.iter().map(|m| (m.name(), m.x)));
     placed.sort_by(|a, b| a.1.total_cmp(&b.1));
-    for (i, &c) in state.cursors.iter().enumerate() {
-        if !(x0..=x1).contains(&c) {
-            continue;
-        }
+    for &c in state.cursors.iter().filter(|c| (x0..=x1).contains(*c)) {
         let px = to_px(c, x0, x1);
-        painter.extend(egui::Shape::dashed_line(
-            &[pos2(px, plot.min.y), pos2(px, axis_y)],
-            Stroke::new(1.5, amber),
-            5.0,
-            3.0,
-        ));
-        if !top_marks {
-            continue;
-        }
-        let tag = Rect::from_center_size(pos2(px, plot.min.y + 7.0), vec2(14.0, 13.0));
-        painter.rect_filled(tag, 2.0, amber);
-        painter.text(tag.center(), Align2::CENTER_CENTER, cursor_name(i), font.clone(), Color32::BLACK);
+        let line = [pos2(px, strip.min.y), pos2(px, axis_y)];
+        painter.extend(egui::Shape::dashed_line(&line, Stroke::new(1.5, amber), 5.0, 3.0));
     }
     for m in marks.iter().filter(|m| (x0..=x1).contains(&m.x)) {
         let px = to_px(m.x, x0, x1);
-        painter.line_segment([pos2(px, plot.min.y), pos2(px, axis_y)], Stroke::new(1.5, red));
-        if !bottom_marks {
-            continue;
-        }
-        // The name and the note (shortened) on a tag at the bottom; hover:
-        // all of it, click: go to the line.
-        let label = match m.note.char_indices().nth(18) {
-            Some((i, _)) => format!("🔖{} {}…", m.name, &m.note[..i]),
-            None => format!("🔖{} {}", m.name, m.note).trim_end().to_owned(),
+        painter.line_segment([pos2(px, strip.min.y), pos2(px, axis_y)], Stroke::new(1.5, red));
+    }
+    // Tags, left to right; each is cut where the next one starts (hover:
+    // all of it).
+    enum Tag<'m> {
+        Cursor(usize),
+        Mark(&'m BookmarkCursor),
+    }
+    let mut tags: Vec<(f32, Tag)> = state
+        .cursors
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| (x0..=x1).contains(*c))
+        .map(|(i, &c)| (to_px(c, x0, x1), Tag::Cursor(i)))
+        .collect();
+    tags.extend(marks.iter().filter(|m| (x0..=x1).contains(&m.x)).map(|m| (to_px(m.x, x0, x1), Tag::Mark(m))));
+    tags.sort_by(|a, b| a.0.total_cmp(&b.0));
+    let tag_row = Rect::from_min_size(strip.min, vec2(strip.width(), MARK_ROW - 2.0));
+    for (k, (px, tag)) in tags.iter().enumerate() {
+        let next = tags.get(k + 1).map_or(rect.max.x, |t| t.0);
+        let (text, fill, ink) = match tag {
+            Tag::Cursor(i) => (cursor_name(*i), amber, Color32::BLACK),
+            Tag::Mark(m) => (format!("🔖{} {}", m.name, m.note).trim_end().to_owned(), red, Color32::WHITE),
         };
-        let galley = painter.layout_no_wrap(label, font.clone(), Color32::WHITE);
-        let tag = Rect::from_min_size(pos2(px + 1.0, axis_y - galley.size().y - 3.0), galley.size()).expand(1.5);
-        painter.rect_filled(tag, 2.0, red);
-        painter.galley(tag.min + vec2(1.5, 1.5), galley, Color32::WHITE);
-        let r = ui.interact(tag, ui.scope_id().with(("bookmark", m.line)), Sense::click());
-        let tip = if m.note.is_empty() {
-            format!("{}, line {}", m.name, m.line + 1)
-        } else {
-            format!("{}, line {}: {}", m.name, m.line + 1, m.note)
-        };
-        if r.on_hover_text(format!("{tip}\nClick: go to the line")).clicked() {
-            out.goto = Some(m.line);
+        let galley = painter.layout_no_wrap(text, font.clone(), ink);
+        let w = (galley.size().x + 4.0).min((next - px - 1.0).max(14.0));
+        let r = Rect::from_min_size(pos2(px - 1.0, tag_row.min.y), vec2(w, tag_row.height()));
+        let clip = painter.with_clip_rect(r.intersect(rect));
+        clip.rect_filled(r, 2.0, fill);
+        clip.galley(pos2(r.min.x + 2.0, r.center().y - galley.size().y / 2.0), galley, ink);
+        if let Tag::Mark(m) = tag {
+            let resp = ui.interact(r, ui.scope_id().with(("bookmark", m.line)), Sense::click());
+            let tip = if m.note.is_empty() {
+                format!("{}, line {}", m.name, m.line + 1)
+            } else {
+                format!("{}, line {}: {}", m.name, m.line + 1, m.note)
+            };
+            if resp.on_hover_text(format!("{tip}\nClick: go to the line")).clicked() {
+                out.goto = Some(m.line);
+            }
         }
     }
+    // Δt between neighbours, on the strip's second row, cut to its span.
+    let dt_y = strip.min.y + MARK_ROW + MARK_ROW / 2.0;
     for pair in placed.windows(2) {
         let ((ni, a), (nj, b)) = ((&pair[0].0, pair[0].1), (&pair[1].0, pair[1].1));
         let (pa, pb) = (to_px(a, x0, x1).max(plot.min.x), to_px(b, x0, x1).min(plot.max.x));
-        if pb <= pa || !top_marks {
+        if pb <= pa {
             continue;
         }
-        let y = plot.min.y + 22.0;
         let stroke = Stroke::new(1.0, amber);
-        painter.line_segment([pos2(pa, y), pos2(pb, y)], stroke);
-        painter.line_segment([pos2(pa, y - 4.0), pos2(pa, y + 4.0)], stroke);
-        painter.line_segment([pos2(pb, y - 4.0), pos2(pb, y + 4.0)], stroke);
+        painter.line_segment([pos2(pa, dt_y), pos2(pb, dt_y)], stroke);
+        painter.line_segment([pos2(pa, dt_y - 4.0), pos2(pa, dt_y + 4.0)], stroke);
+        painter.line_segment([pos2(pb, dt_y - 4.0), pos2(pb, dt_y + 4.0)], stroke);
         let text = format!("{ni}→{nj} {}", duration(b - a, data.is_time));
         let galley = painter.layout_no_wrap(text, font.clone(), amber);
-        let at = pos2((pa + pb) / 2.0 - galley.size().x / 2.0, y - galley.size().y - 2.0);
-        painter.rect_filled(Rect::from_min_size(at, galley.size()).expand(2.0), 2.0, ui.visuals().panel_fill);
-        painter.galley(at, galley, amber);
+        let at = pos2(((pa + pb) / 2.0 - galley.size().x / 2.0).max(pa + 3.0), dt_y - galley.size().y / 2.0);
+        let span = Rect::from_min_max(pos2(pa + 3.0, dt_y - 8.0), pos2(pb - 3.0, dt_y + 8.0));
+        let clip = painter.with_clip_rect(span.intersect(rect));
+        clip.rect_filled(Rect::from_min_size(at, galley.size()).expand(1.0), 2.0, ui.visuals().panel_fill);
+        clip.galley(at, galley, amber);
     }
 
     // ----- cursor -----
