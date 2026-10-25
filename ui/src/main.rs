@@ -40,6 +40,7 @@ mod plot;
 mod prefs;
 mod presets;
 mod recall;
+mod shot;
 mod signals;
 mod view;
 
@@ -542,6 +543,9 @@ struct Tab {
     bookmarks: Bookmarks,
     /// Bookmarks whose line is unfolded in the panel.
     marks_open: std::collections::HashSet<LineNo>,
+    /// A bookmark's name being typed in the panel; set when the field
+    /// loses focus (so it can be emptied and retyped).
+    mark_rename: Option<(LineNo, String)>,
     /// The line shown whole in the line window (Enter), if open.
     detail: Option<LineDetail>,
     /// The tab's signals (`@name` in its queries), the generation that
@@ -893,6 +897,7 @@ impl Tab {
             filter_preview: PreviewCache::default(),
             bookmarks: Bookmarks::default(),
             marks_open: Default::default(),
+            mark_rename: None,
             detail: None,
             signals: Signals::default(),
             signals_gen: 0,
@@ -1696,12 +1701,28 @@ impl Tab {
         let mut jump = None;
         let mut edits: Vec<(LineNo, String)> = Vec::new();
         let mut remove = None;
+        let mut rename = None;
         let mut fold = None;
         egui::ScrollArea::vertical().show(ui, |ui| {
-            for (line, note) in self.bookmarks.iter() {
+            for (line, name, note) in self.bookmarks.iter_named() {
                 let open = self.marks_open.contains(&line);
                 ui.horizontal(|ui| {
-                    if ui.link(format!("{}", line + 1)).on_hover_text("Go to the line").clicked() {
+                    // The name (the plot shows it); edited in place.
+                    let mut text = match &self.mark_rename {
+                        Some((l, t)) if *l == line => t.clone(),
+                        _ => name.to_owned(),
+                    };
+                    let r = ui.add(
+                        egui::TextEdit::singleline(&mut text).font(egui::TextStyle::Monospace).desired_width(80.0),
+                    );
+                    if r.changed() {
+                        self.mark_rename = Some((line, text));
+                    }
+                    if r.lost_focus() && self.mark_rename.as_ref().is_some_and(|(l, _)| *l == line) {
+                        rename = self.mark_rename.take();
+                    }
+                    r.on_hover_text("The bookmark's name (the plot shows it); type to rename");
+                    if ui.link(format!("line {}", line + 1)).on_hover_text("Go to the line").clicked() {
                         jump = Some(line);
                     }
                     let tip = if open { "Fold the line" } else { "Show the whole line" };
@@ -1753,9 +1774,13 @@ impl Tab {
         {
             self.marks_open.insert(l);
         }
-        let changed = !edits.is_empty() || remove.is_some();
+        let changed = !edits.is_empty() || rename.is_some() || remove.is_some();
         for (l, t) in edits {
             self.bookmarks.set_note(l, t);
+        }
+        if let Some((l, t)) = rename {
+            // Left empty: a free name again.
+            self.bookmarks.set_name(l, t);
         }
         if let Some(l) = remove {
             self.bookmarks.toggle(l);
@@ -2662,6 +2687,17 @@ impl App {
         if shortcut(Modifiers::COMMAND, Key::W) {
             self.close(self.active);
         }
+        // Before Ctrl+S, if one comes: matching ignores an unrequested Shift.
+        if shortcut(Modifiers::COMMAND | Modifiers::SHIFT, Key::S) {
+            shot::request(ctx, None);
+        }
+        if let Some(image) = shot::take(ctx) {
+            let [w, h] = image.size;
+            ctx.copy_image((*image).clone());
+            if let Some(t) = self.tab() {
+                t.status = format!("Screenshot copied to the clipboard ({w} × {h})");
+            }
+        }
         if shortcut(Modifiers::NONE, Key::F1) {
             self.about = true;
         }
@@ -3007,6 +3043,10 @@ impl App {
                     if ui.selectable_label(self.settings_open, "⚙").on_hover_text("Settings (Ctrl+,)").clicked() {
                         self.settings_open = !self.settings_open;
                     }
+                    let r = ui.button("📷").on_hover_text("Screenshot of the window to the clipboard (Ctrl+Shift+S)");
+                    if r.clicked() {
+                        shot::request(ui.ctx(), None);
+                    }
                 });
             });
         });
@@ -3197,7 +3237,7 @@ impl App {
                     file: file.clone(),
                     cursor: line,
                     kept: tab.result.clone(),
-                    bookmarks: tab.bookmarks.iter().map(|(l, n)| (l, n.to_owned())).collect(),
+                    bookmarks: plot::Bookmark::all(&tab.bookmarks),
                 });
                 let out = std::mem::take(&mut d.out);
                 if let Some((l, note)) = out.bookmark {
@@ -3225,7 +3265,7 @@ impl App {
             let kept = tab.result.clone();
             let (views, generation) = (&mut tab.views, tab.signals_gen);
             let mut series_of = |d: &nerka_core::SignalDef| views.series(d, &*file, kept.as_ref(), generation);
-            let marks: Vec<(LineNo, String)> = tab.bookmarks.iter().map(|(l, n)| (l, n.to_owned())).collect();
+            let marks = plot::Bookmark::all(&tab.bookmarks);
             let src = plot::Source {
                 signals: &tab.signals,
                 generation,
@@ -3724,7 +3764,7 @@ gear=D
         t.toggle_bookmark_at(3);
         assert_eq!(
             std::fs::read_to_string(Bookmarks::sidecar_path(&b)).unwrap(),
-            "2	
+            "2		B1
 "
         );
         assert!(!Bookmarks::sidecar_path(&a).exists());

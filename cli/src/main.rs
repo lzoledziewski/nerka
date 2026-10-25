@@ -394,12 +394,12 @@ fn run() -> Result<()> {
         Cmd::Marks { file } => {
             let marks = Bookmarks::load_for(&file)?;
             let (f, _) = open(&file)?;
-            for (l, note) in marks.iter() {
+            for (l, name, note) in marks.iter_named() {
                 let text = f.line_text(l).unwrap_or_default();
                 if note.is_empty() {
-                    writeln!(out, "{}: {text}", l + 1)?;
+                    writeln!(out, "{name} {}: {text}", l + 1)?;
                 } else {
-                    writeln!(out, "{}: {text}\n    # {note}", l + 1)?;
+                    writeln!(out, "{name} {}: {text}\n    # {note}", l + 1)?;
                 }
             }
         }

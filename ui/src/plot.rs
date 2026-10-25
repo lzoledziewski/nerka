@@ -53,7 +53,25 @@ pub struct WindowInput {
     pub file: Arc<dyn LogSource>,
     pub cursor: LineNo,
     pub kept: Option<Arc<nerka_core::SearchResult>>,
-    pub bookmarks: Vec<(LineNo, String)>,
+    pub bookmarks: Vec<Bookmark>,
+}
+
+/// A bookmark of the tab, as the plot shows it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Bookmark {
+    pub line: LineNo,
+    pub name: String,
+    pub note: String,
+}
+
+impl Bookmark {
+    /// The tab's bookmarks, in line order.
+    pub fn all(marks: &nerka_core::Bookmarks) -> Vec<Self> {
+        marks
+            .iter_named()
+            .map(|(line, name, note)| Self { line, name: name.to_owned(), note: note.to_owned() })
+            .collect()
+    }
 }
 
 /// Paint the plot's own window (the deferred viewport's callback).
@@ -276,16 +294,20 @@ pub struct Source<'a> {
     pub series_of: &'a mut dyn FnMut(&SignalDef) -> Option<Arc<SignalSeries>>,
     /// Drawn in a window of its own.
     pub in_window: bool,
-    /// The tab's bookmarks: line and note.
-    pub bookmarks: &'a [(LineNo, String)],
+    /// The tab's bookmarks.
+    pub bookmarks: &'a [Bookmark],
 }
 
 pub fn plot_panel(ui: &mut egui::Ui, state: &mut PlotState, src: Source<'_>) -> Output {
     let Source { signals, generation, file, cursor, kept, series_of, in_window, bookmarks } = src;
     let mut out = Output::default();
+    let panel = ui.max_rect();
     ui.horizontal(|ui| {
         let label = if in_window { "⧉ Back into the main window" } else { "⧉ Own window" };
         out.toggle_window = ui.small_button(label).clicked();
+        if ui.small_button("📷").on_hover_text("Screenshot of the plot to the clipboard").clicked() {
+            crate::shot::request(ui.ctx(), Some(panel));
+        }
         let fit = ui.add_enabled(state.range.is_some(), egui::Button::new("↔ Fit").small());
         if fit.on_hover_text("Show the whole x range (also: double-click the plot)").clicked() {
             state.range = None;
@@ -299,7 +321,7 @@ pub fn plot_panel(ui: &mut egui::Ui, state: &mut PlotState, src: Source<'_>) -> 
             state.hide_bookmarks = !show;
         }
         ui.weak("ℹ").on_hover_text(
-            "Wheel: zoom. Drag: pan (drag a time cursor to move it). Double-click: everything. Click: go to the \
+            "Wheel: zoom (over the lane names: scroll). Drag: pan, up and down through the lanes (drag a time cursor to move it). Double-click: everything. Click: go to the \
              nearest event. Right-click: place or remove time cursors (Δt between them). Right-click a lane's \
              name: its y axis and markers.",
         );
@@ -315,11 +337,12 @@ pub fn plot_panel(ui: &mut egui::Ui, state: &mut PlotState, src: Source<'_>) -> 
     } else {
         bookmarks
             .iter()
-            .filter_map(|(line, note)| {
+            .filter_map(|b| {
                 Some(BookmarkCursor {
-                    line: *line,
-                    note: note.clone(),
-                    x: clock.at(file, clock_series.as_ref(), *line)?,
+                    line: b.line,
+                    name: b.name.clone(),
+                    note: b.note.clone(),
+                    x: clock.at(file, clock_series.as_ref(), b.line)?,
                 })
             })
             .collect()
@@ -405,8 +428,12 @@ pub fn plot_panel(ui: &mut egui::Ui, state: &mut PlotState, src: Source<'_>) -> 
         match state.drag_cursor {
             Some(i) => state.cursors[i] += dx,
             None => {
-                (x0, x1) = (x0 - dx, x1 - dx);
-                state.range = Some((x0, x1));
+                if dx != 0.0 {
+                    (x0, x1) = (x0 - dx, x1 - dx);
+                    state.range = Some((x0, x1));
+                }
+                // Up and down: through the lanes (owner, 2026-10-25).
+                state.scroll = (state.scroll - response.drag_delta().y).clamp(0.0, max_scroll);
             }
         }
     }
@@ -436,8 +463,8 @@ pub fn plot_panel(ui: &mut egui::Ui, state: &mut PlotState, src: Source<'_>) -> 
         state.bookmark_note = state
             .menu_row
             .as_ref()
-            .and_then(|(row, _)| bookmarks.iter().find(|(l, _)| l == row))
-            .map(|(_, n)| n.clone())
+            .and_then(|(row, _)| bookmarks.iter().find(|b| b.line == *row))
+            .map(|b| b.note.clone())
             .unwrap_or_default();
     }
     let (menu_x, menu_row) = (state.menu_x, state.menu_row.clone());
@@ -636,20 +663,22 @@ pub fn plot_panel(ui: &mut egui::Ui, state: &mut PlotState, src: Source<'_>) -> 
     for m in marks.iter().filter(|m| (x0..=x1).contains(&m.x)) {
         let px = to_px(m.x, x0, x1);
         painter.line_segment([pos2(px, plot.min.y), pos2(px, axis_y)], Stroke::new(1.5, red));
-        // The note (shortened) on a tag at the bottom; hover: all of it,
-        // click: go to the line.
+        // The name and the note (shortened) on a tag at the bottom; hover:
+        // all of it, click: go to the line.
         let label = match m.note.char_indices().nth(18) {
-            Some((i, _)) => format!("🔖 {}…", &m.note[..i]),
-            None if m.note.is_empty() => format!("🔖 {}", m.line + 1),
-            None => format!("🔖 {}", m.note),
+            Some((i, _)) => format!("🔖{} {}…", m.name, &m.note[..i]),
+            None => format!("🔖{} {}", m.name, m.note).trim_end().to_owned(),
         };
         let galley = painter.layout_no_wrap(label, font.clone(), Color32::WHITE);
         let tag = Rect::from_min_size(pos2(px + 1.0, axis_y - galley.size().y - 3.0), galley.size()).expand(1.5);
         painter.rect_filled(tag, 2.0, red);
         painter.galley(tag.min + vec2(1.5, 1.5), galley, Color32::WHITE);
         let r = ui.interact(tag, ui.scope_id().with(("bookmark", m.line)), Sense::click());
-        let tip =
-            if m.note.is_empty() { format!("Line {}", m.line + 1) } else { format!("Line {}: {}", m.line + 1, m.note) };
+        let tip = if m.note.is_empty() {
+            format!("{}, line {}", m.name, m.line + 1)
+        } else {
+            format!("{}, line {}: {}", m.name, m.line + 1, m.note)
+        };
         if r.on_hover_text(format!("{tip}\nClick: go to the line")).clicked() {
             out.goto = Some(m.line);
         }
@@ -758,14 +787,15 @@ fn cursor_summary(cursors: &[f64], marks: &[BookmarkCursor], is_time: bool) -> S
 /// A bookmark drawn as a cursor.
 struct BookmarkCursor {
     line: LineNo,
+    name: String,
     note: String,
     x: f64,
 }
 
 impl BookmarkCursor {
-    /// Its name in Δt and the summary: 🔖 and its line number.
+    /// Its name in Δt and the summary: 🔖 and the bookmark's name.
     fn name(&self) -> String {
-        format!("🔖{}", self.line + 1)
+        format!("🔖{}", self.name)
     }
 }
 
@@ -1173,6 +1203,22 @@ mod tests {
         step(vec![egui::Event::PointerMoved(pos2(GUTTER + 200.0, 120.0))], &mut st);
         step(vec![wheel(1.0)], &mut st);
         assert!(st.range.is_some() && st.scroll == 0.0);
+        // Dragging up scrolls down through the lanes, the x range stays.
+        let range = st.range;
+        let at = pos2(GUTTER + 200.0, 200.0);
+        let button = |pos, pressed| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        step(vec![button(at, true)], &mut st);
+        for k in 1..=5 {
+            step(vec![egui::Event::PointerMoved(at - vec2(0.0, 10.0 * k as f32))], &mut st);
+        }
+        step(vec![button(at - vec2(0.0, 50.0), false)], &mut st);
+        assert_eq!(st.range, range);
+        assert!(st.scroll > 30.0 && st.scroll <= 50.0, "{}", st.scroll);
     }
 
     #[test]
@@ -1239,8 +1285,8 @@ mod tests {
             "A line 11   B line 5   C line 14   Δ B→A 6 lines   Δ A→C 3 lines"
         );
         // Bookmarks are cursors too.
-        let m = BookmarkCursor { line: 7, note: "boot".into(), x: 7.0 };
-        assert_eq!(cursor_summary(&[10.0], &[m], false), "A line 11   🔖8 line 8   Δ 🔖8→A 3 lines");
+        let m = BookmarkCursor { line: 7, name: "B1".into(), note: "boot".into(), x: 7.0 };
+        assert_eq!(cursor_summary(&[10.0], &[m], false), "A line 11   🔖B1 line 8   Δ 🔖B1→A 3 lines");
     }
 
     #[test]
