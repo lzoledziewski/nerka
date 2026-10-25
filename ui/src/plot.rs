@@ -15,7 +15,7 @@
 //! Drawn with egui's painter (no plot crate): lanes are decimated to one
 //! step per pixel column, so millions of events draw as fast as a few.
 
-use eframe::egui::{self, Align2, Color32, FontId, Pos2, Rect, Sense, Stroke, pos2, vec2};
+use eframe::egui::{self, Align2, Color32, ColorImage, FontId, Pos2, Rect, Sense, Stroke, pos2, vec2};
 use nerka_core::{Clock, LineNo, LogSource, SignalDef, SignalKind, SignalSeries, Signals, ValueRef, time::format_time};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -118,6 +118,17 @@ pub enum YAxis {
 pub struct PlotState {
     /// Plotted signals, in lane order.
     pub plotted: Vec<String>,
+    /// Each plotted signal's colour (a palette slot, given when first
+    /// drawn), so moving a lane keeps its colour.
+    colors: HashMap<String, usize>,
+    /// Width of the lane names' column; 0: the default (`GUTTER`).
+    gutter: f32,
+    /// A lane being dragged by its name to a new place, and where it goes
+    /// (applied at the next frame: `(from, to)` in lane order).
+    drag_lane: Option<usize>,
+    reorder: Option<(usize, usize)>,
+    /// A picture of the whole plot being taken (all lanes, scrolling).
+    capture: Option<Capture>,
     /// Lanes that show their events.
     pub events: std::collections::HashSet<String>,
     /// Visible x range; none: everything.
@@ -212,6 +223,11 @@ pub struct Output {
 }
 
 const GUTTER: f32 = 120.0;
+const GUTTER_MIN: f32 = 60.0;
+/// Width of a character of the lane names (monospace 11), and room kept for
+/// the y labels beside them.
+const CHAR_W: f32 = 6.7;
+const Y_LABELS_W: f32 = 36.0;
 const AXIS_H: f32 = 18.0;
 const LANE_MAX: f32 = 110.0;
 /// Lanes are never lower than this (name, events and y labels fit); more
@@ -301,12 +317,19 @@ pub struct Source<'a> {
 pub fn plot_panel(ui: &mut egui::Ui, state: &mut PlotState, src: Source<'_>) -> Output {
     let Source { signals, generation, file, cursor, kept, series_of, in_window, bookmarks } = src;
     let mut out = Output::default();
+    if let Some((from, to)) = state.reorder.take() {
+        let names: Vec<String> =
+            state.data.as_ref().map(|(_, d)| d.lanes.iter().map(|l| l.name.clone()).collect()).unwrap_or_default();
+        move_lane(&mut state.plotted, &names, from, to);
+        state.data = None;
+    }
     let panel = ui.max_rect();
     ui.horizontal(|ui| {
         let label = if in_window { "⧉ Back into the main window" } else { "⧉ Own window" };
         out.toggle_window = ui.small_button(label).clicked();
         if ui.small_button("📷").on_hover_text("Screenshot of the plot to the clipboard").clicked() {
-            crate::shot::request(ui.ctx(), Some(panel));
+            state.capture = Some(Capture { back_to: state.scroll, settle: 2, ..Default::default() });
+            state.scroll = 0.0;
         }
         let fit = ui.add_enabled(state.range.is_some(), egui::Button::new("↔ Fit").small());
         if fit.on_hover_text("Show the whole x range (also: double-click the plot)").clicked() {
@@ -369,10 +392,27 @@ pub fn plot_panel(ui: &mut egui::Ui, state: &mut PlotState, src: Source<'_>) -> 
 
     let rect = ui.available_rect_before_wrap();
     let response = ui.allocate_rect(rect, Sense::click_and_drag());
-    let plot = Rect::from_min_max(pos2(rect.min.x + GUTTER, rect.min.y), pos2(rect.max.x - 8.0, rect.max.y - AXIS_H));
+    let gutter = if state.gutter > 0.0 { state.gutter } else { GUTTER }.min((rect.width() / 2.0).max(GUTTER_MIN));
+    let plot = Rect::from_min_max(pos2(rect.min.x + gutter, rect.min.y), pos2(rect.max.x - 8.0, rect.max.y - AXIS_H));
     if plot.width() < 20.0 || plot.height() < 10.0 {
         return out;
     }
+    // The names' column: drag its edge to widen it, double-click to fit the
+    // longest name (owner, 2026-10-25).
+    let edge = Rect::from_min_max(pos2(plot.min.x - 3.0, plot.min.y), pos2(plot.min.x + 3.0, plot.max.y));
+    let edge_r = ui.interact(edge, ui.scope_id().with("names-edge"), Sense::click_and_drag());
+    if edge_r.hovered() || edge_r.dragged() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeColumn);
+    }
+    if edge_r.dragged() {
+        state.gutter = (gutter + edge_r.drag_delta().x).clamp(GUTTER_MIN, (rect.width() / 2.0).max(GUTTER_MIN));
+    }
+    if edge_r.double_clicked() {
+        let longest = data.lanes.iter().map(|l| l.name.chars().count() + 1).max().unwrap_or(0);
+        state.gutter =
+            (longest as f32 * CHAR_W + Y_LABELS_W + 8.0).clamp(GUTTER_MIN, (rect.width() / 2.0).max(GUTTER_MIN));
+    }
+    edge_r.on_hover_text("Drag: widen the names. Double-click: fit the longest name.");
     // Lanes share the height, between LANE_MIN and LANE_MAX; more than fit
     // scroll (wheel over the names, or the scrollbar).
     let n = data.lanes.len().max(1) as f32;
@@ -402,6 +442,39 @@ pub fn plot_panel(ui: &mut egui::Ui, state: &mut PlotState, src: Source<'_>) -> 
         }
     }
     state.scroll = state.scroll.clamp(0.0, max_scroll);
+    // ----- a picture of all the lanes -----
+    if let Some(c) = &mut state.capture {
+        ui.ctx().request_repaint();
+        let got = c.pending.lock().unwrap_or_else(|e| e.into_inner()).take();
+        if let Some(part) = got {
+            c.parts.push(part);
+            c.scrolls.push(state.scroll);
+            c.waiting = false;
+            if state.scroll >= max_scroll - 0.5 {
+                let (top, bottom) = (plot.min.y - panel.min.y, plot.max.y - panel.min.y);
+                let ppp = ui.ctx().pixels_per_point();
+                if let Some(all) = crate::shot::stitch(&c.parts, &c.scrolls, top, bottom, ppp) {
+                    crate::shot::deliver(ui.ctx(), all);
+                }
+                state.scroll = c.back_to.min(max_scroll);
+                state.capture = None;
+            } else {
+                state.scroll = (state.scroll + plot.height()).min(max_scroll);
+                c.settle = 2;
+            }
+        } else if !c.waiting {
+            if c.settle > 0 {
+                c.settle -= 1;
+            } else {
+                crate::shot::request_part(ui.ctx(), panel, c.pending.clone());
+                c.waiting = true;
+            }
+        }
+    }
+    let capturing = state.capture.is_some();
+    // While a picture of all lanes is taken, what sits on the top or bottom
+    // of the lanes is drawn only in the first or last part.
+    let (top_marks, bottom_marks) = (!capturing || state.scroll <= 0.5, !capturing || state.scroll >= max_scroll - 0.5);
     let (mut x0, mut x1) = state.range.unwrap_or(data.full);
     let w = plot.width() as f64;
     let to_px = |x: f64, x0: f64, x1: f64| plot.min.x + ((x - x0) / (x1 - x0) * w) as f32;
@@ -473,7 +546,7 @@ pub fn plot_panel(ui: &mut egui::Ui, state: &mut PlotState, src: Source<'_>) -> 
         bookmark = cursor_menu(ui, &mut state.cursors, menu_x, menu_row, &mut state.bookmark_note);
     });
     out.bookmark = bookmark;
-    if let Some(p) = response.hover_pos().filter(|_| response.hovered()) {
+    if let Some(p) = ui.input(|i| i.pointer.hover_pos()).filter(|_| response.contains_pointer()) {
         let notches = ui.input_mut(|i| {
             i.smooth_scroll_delta = egui::Vec2::ZERO;
             i.events
@@ -500,7 +573,7 @@ pub fn plot_panel(ui: &mut egui::Ui, state: &mut PlotState, src: Source<'_>) -> 
     }
 
     // ----- lanes -----
-    let painter = ui.painter_at(rect);
+    let base = ui.painter_at(rect);
     let vis = ui.visuals();
     let text_color = vis.text_color();
     let weak = vis.weak_text_color();
@@ -509,7 +582,8 @@ pub fn plot_panel(ui: &mut egui::Ui, state: &mut PlotState, src: Source<'_>) -> 
     let mut hovered_lane = None;
     // The lanes' own drawing stays above the axis (scrolled lanes are cut).
     let lanes_clip = Rect::from_min_max(pos2(rect.min.x, plot.min.y), pos2(rect.max.x, plot.max.y));
-    let painter = painter.with_clip_rect(lanes_clip);
+    let painter = base.with_clip_rect(lanes_clip);
+    let mut drop_at = None;
     for (k, lane) in data.lanes.iter().enumerate() {
         let top = plot.min.y + k as f32 * lane_h - state.scroll;
         if top + lane_h < plot.min.y {
@@ -521,34 +595,80 @@ pub fn plot_panel(ui: &mut egui::Ui, state: &mut PlotState, src: Source<'_>) -> 
         // Widgets only where they're in view.
         let shown = |r: Rect| r.min.y >= plot.min.y - 0.5 && r.max.y <= plot.max.y + 0.5;
         let area = Rect::from_min_max(pos2(plot.min.x, top + 3.0), pos2(plot.max.x, top + lane_h - 3.0));
-        let color = crate::library::palette(k);
+        let next = state.colors.len();
+        let color = crate::library::palette(*state.colors.entry(lane.name.clone()).or_insert(next));
         painter.line_segment([pos2(rect.min.x, top + lane_h), pos2(plot.max.x, top + lane_h)], Stroke::new(1.0, grid));
         // The lane's name, and a checkbox for its events, in the gutter.
         // Long names are shortened to fit beside the y labels (hover: all).
         let name = format!("@{}", lane.name);
-        let short = match name.char_indices().nth(12) {
-            Some((i, _)) if name.chars().count() > 13 => format!("{}…", &name[..i]),
+        let fit = (((gutter - Y_LABELS_W - 8.0) / CHAR_W) as usize).max(4);
+        let short = match name.char_indices().nth(fit - 1) {
+            Some((i, _)) if name.chars().count() > fit => format!("{}…", &name[..i]),
             _ => name.clone(),
         };
         painter.text(pos2(rect.min.x + 4.0, top + 4.0), Align2::LEFT_TOP, short, font.clone(), color);
         // Right-click the name: the y axis.
-        let name_rect = Rect::from_min_size(pos2(rect.min.x, top), vec2(GUTTER - 4.0, 18.0));
+        let name_rect = Rect::from_min_size(pos2(rect.min.x, top), vec2(gutter - 4.0, 18.0));
         // Clipped to the lanes, so a lane scrolled half out of view doesn't
-        // take the pointer from the rows above.
-        let name_r =
-            ui.interact(name_rect.intersect(lanes_clip), ui.scope_id().with(("lane", &lane.name)), Sense::click());
+        // take the pointer from the rows above. Drag the name: move the lane.
+        let name_r = ui.interact(
+            name_rect.intersect(lanes_clip),
+            ui.scope_id().with(("lane", &lane.name)),
+            Sense::click_and_drag(),
+        );
+        if name_r.drag_started() {
+            state.drag_lane = Some(k);
+        }
+        if name_r.dragged() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+        } else if name_r.hovered() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
+        }
+        if name_r.drag_stopped()
+            && let (Some(from), Some(p)) = (state.drag_lane.take(), ui.ctx().pointer_latest_pos())
+        {
+            let to = lane_at(p.y, plot.min.y, lane_h, state.scroll, data.lanes.len());
+            if to != from {
+                state.reorder = Some((from, to));
+            }
+        }
+        let last = data.lanes.len() - 1;
+        let mut moved = None;
+        let move_menu = |ui: &mut egui::Ui, moved: &mut Option<(usize, usize)>| {
+            ui.label(egui::RichText::new("Lane").strong());
+            for (label, to, ok) in [
+                ("⏶ Move up", k.saturating_sub(1), k > 0),
+                ("⏷ Move down", k + 1, k < last),
+                ("To the top", 0, k > 0),
+                ("To the bottom", last, k < last),
+            ] {
+                if ui.add_enabled(ok, egui::Button::new(label)).clicked() {
+                    *moved = Some((k, to));
+                    ui.close();
+                }
+            }
+        };
         if lane.kind != SignalKind::Enum {
             let y = state.y.entry(lane.name.clone()).or_insert(YAxis::All);
             let markers = state.markers.entry(lane.name.clone()).or_default();
-            name_r.on_hover_text(format!("{name}\nRight-click: y axis, markers")).context_menu(|ui| {
-                y_axis_menu(ui, y, lane.y_range);
-                ui.separator();
-                markers_menu(ui, markers, lane.y_range);
-            });
+            name_r
+                .on_hover_text(format!("{name}\nDrag: move the lane. Right-click: y axis, markers, order"))
+                .context_menu(|ui| {
+                    y_axis_menu(ui, y, lane.y_range);
+                    ui.separator();
+                    markers_menu(ui, markers, lane.y_range);
+                    ui.separator();
+                    move_menu(ui, &mut moved);
+                });
         } else {
-            name_r.on_hover_text(name.as_str());
+            name_r
+                .on_hover_text(format!("{name}\nDrag: move the lane. Right-click: order"))
+                .context_menu(|ui| move_menu(ui, &mut moved));
         }
-        let cb = Rect::from_min_size(pos2(rect.min.x + 4.0, top + 20.0), vec2(GUTTER - 10.0, 16.0));
+        if moved.is_some() {
+            state.reorder = moved;
+        }
+        let cb = Rect::from_min_size(pos2(rect.min.x + 4.0, top + 20.0), vec2(gutter - 10.0, 16.0));
         let mut show = state.events.contains(&lane.name);
         if shown(cb)
             && ui
@@ -619,9 +739,19 @@ pub fn plot_panel(ui: &mut egui::Ui, state: &mut PlotState, src: Source<'_>) -> 
             draw_ticks(&painter, lane, area, i0, i1, |x| to_px(x, x0, x1), color);
         }
     }
+    // Where a dragged lane would go: a line between lanes.
+    if let (Some(from), Some(p)) = (state.drag_lane, ui.ctx().pointer_latest_pos()) {
+        let to = lane_at(p.y, plot.min.y, lane_h, state.scroll, data.lanes.len());
+        drop_at =
+            (to != from).then(|| plot.min.y + (if to > from { to + 1 } else { to }) as f32 * lane_h - state.scroll);
+    }
+    if let Some(y) = drop_at {
+        painter.line_segment([pos2(rect.min.x, y), pos2(plot.max.x, y)], Stroke::new(2.5, text_color));
+    }
 
-    let painter = painter.with_clip_rect(rect);
-    if let Some(thumb) = thumb {
+    // Axis, cursors and tags: not clipped to the lanes.
+    let painter = base;
+    if let Some(thumb) = thumb.filter(|_| !capturing) {
         painter.rect_filled(bar, 3.0, grid.gamma_multiply(0.4));
         let c = if state.drag_scroll { text_color } else { weak };
         painter.rect_filled(thumb, 3.0, c.gamma_multiply(0.8));
@@ -656,6 +786,9 @@ pub fn plot_panel(ui: &mut egui::Ui, state: &mut PlotState, src: Source<'_>) -> 
             5.0,
             3.0,
         ));
+        if !top_marks {
+            continue;
+        }
         let tag = Rect::from_center_size(pos2(px, plot.min.y + 7.0), vec2(14.0, 13.0));
         painter.rect_filled(tag, 2.0, amber);
         painter.text(tag.center(), Align2::CENTER_CENTER, cursor_name(i), font.clone(), Color32::BLACK);
@@ -663,6 +796,9 @@ pub fn plot_panel(ui: &mut egui::Ui, state: &mut PlotState, src: Source<'_>) -> 
     for m in marks.iter().filter(|m| (x0..=x1).contains(&m.x)) {
         let px = to_px(m.x, x0, x1);
         painter.line_segment([pos2(px, plot.min.y), pos2(px, axis_y)], Stroke::new(1.5, red));
+        if !bottom_marks {
+            continue;
+        }
         // The name and the note (shortened) on a tag at the bottom; hover:
         // all of it, click: go to the line.
         let label = match m.note.char_indices().nth(18) {
@@ -686,7 +822,7 @@ pub fn plot_panel(ui: &mut egui::Ui, state: &mut PlotState, src: Source<'_>) -> 
     for pair in placed.windows(2) {
         let ((ni, a), (nj, b)) = ((&pair[0].0, pair[0].1), (&pair[1].0, pair[1].1));
         let (pa, pb) = (to_px(a, x0, x1).max(plot.min.x), to_px(b, x0, x1).min(plot.max.x));
-        if pb <= pa {
+        if pb <= pa || !top_marks {
             continue;
         }
         let y = plot.min.y + 22.0;
@@ -782,6 +918,40 @@ fn cursor_summary(cursors: &[f64], marks: &[BookmarkCursor], is_time: bool) -> S
         parts.push(format!("Δ {}→{} {}", pair[0].0, pair[1].0, duration(pair[1].1 - pair[0].1, is_time)));
     }
     parts.join("   ")
+}
+
+/// A picture of the plot with all its lanes: the lanes are scrolled
+/// through, a picture taken at each place, and the parts put together.
+#[derive(Default)]
+struct Capture {
+    /// Where the lanes were scrolled before.
+    back_to: f32,
+    parts: Vec<ColorImage>,
+    scrolls: Vec<f32>,
+    /// The part being taken (filled outside the frame).
+    pending: Arc<Mutex<Option<ColorImage>>>,
+    waiting: bool,
+    /// Frames to let pass after scrolling, before taking a part.
+    settle: u8,
+}
+
+/// The lane at height `y` (for a dropped lane), within `0..n`.
+fn lane_at(y: f32, top: f32, lane_h: f32, scroll: f32, n: usize) -> usize {
+    (((y - top + scroll) / lane_h).floor().max(0.0) as usize).min(n.saturating_sub(1))
+}
+
+/// Move lane `from` to place `to` (`lanes`: the lanes' names in order) in
+/// `plotted`, which may also hold signals without a lane (not built yet).
+fn move_lane(plotted: &mut Vec<String>, lanes: &[String], from: usize, to: usize) {
+    let (Some(name), Some(target)) = (lanes.get(from), lanes.get(to)) else { return };
+    let Some(i) = plotted.iter().position(|n| n == name) else { return };
+    let moving = plotted.remove(i);
+    let Some(j) = plotted.iter().position(|n| n == target) else {
+        plotted.insert(i, moving);
+        return;
+    };
+    // Down: after the target; up: before it.
+    plotted.insert(if to > from { j + 1 } else { j }, moving);
 }
 
 /// A bookmark drawn as a cursor.
@@ -1287,6 +1457,23 @@ mod tests {
         // Bookmarks are cursors too.
         let m = BookmarkCursor { line: 7, name: "B1".into(), note: "boot".into(), x: 7.0 };
         assert_eq!(cursor_summary(&[10.0], &[m], false), "A line 11   🔖B1 line 8   Δ 🔖B1→A 3 lines");
+    }
+
+    #[test]
+    fn lanes_move_by_name() {
+        let names = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let lanes = names(&["a", "b", "c", "d"]);
+        // `x` is plotted but has no lane yet: it stays where it is.
+        let mut plotted = names(&["a", "x", "b", "c", "d"]);
+        move_lane(&mut plotted, &lanes, 0, 2);
+        assert_eq!(plotted, names(&["x", "b", "c", "a", "d"]), "down: after the target");
+        move_lane(&mut plotted, &lanes, 3, 1);
+        assert_eq!(plotted, names(&["x", "d", "b", "c", "a"]), "up: before the target");
+        // Dropped on a lane: the lane under the pointer, scrolled or not.
+        assert_eq!(lane_at(10.0, 0.0, 50.0, 0.0, 4), 0);
+        assert_eq!(lane_at(10.0, 0.0, 50.0, 60.0, 4), 1);
+        assert_eq!(lane_at(999.0, 0.0, 50.0, 0.0, 4), 3);
+        assert_eq!(lane_at(-5.0, 0.0, 50.0, 0.0, 4), 0);
     }
 
     #[test]
