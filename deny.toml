@@ -1,0 +1,64 @@
+# cargo-deny (https://embarkstudios.github.io/cargo-deny/): licences,
+# security advisories, banned crates and sources of the dependency tree.
+# Run locally with `cargo deny check`; CI runs it on every push and pull
+# request (.github/workflows/ci.yml).
+
+[graph]
+all-features = false
+
+[advisories]
+# Unmaintained or unsound crates are reported too; ignore one here only
+# with a reason. All of these come in through eframe (the GUI), not through
+# our code, and can't be updated from our side; check again when eframe is
+# updated.
+ignore = [
+    # quick-xml 0.38 via eframe → accesskit (Linux accessibility) → zbus_xml,
+    # which pins 0.38 (fixed in 0.41). It parses D-Bus introspection XML
+    # from the local session bus, not files nerka opens.
+    { id = "RUSTSEC-2026-0194", reason = "quick-xml 0.38 pinned by zbus_xml (eframe's Linux accessibility); local D-Bus XML only" },
+    { id = "RUSTSEC-2026-0195", reason = "quick-xml 0.38 pinned by zbus_xml (eframe's Linux accessibility); local D-Bus XML only" },
+    # Unmaintained, no known vulnerability: egui's font parsing and the
+    # Linux D-Bus stack of eframe.
+    { id = "RUSTSEC-2026-0192", reason = "ttf-parser: egui's font parsing (built-in fonts), through eframe" },
+    { id = "RUSTSEC-2026-0370", reason = "zvariant: eframe's Linux D-Bus stack (accessibility)" },
+    { id = "RUSTSEC-2026-0371", reason = "zbus_names: eframe's Linux D-Bus stack (accessibility)" },
+    { id = "RUSTSEC-2026-0372", reason = "zvariant_derive: eframe's Linux D-Bus stack (accessibility)" },
+]
+
+[licenses]
+# Permissive licences, compatible with shipping nerka as MIT OR Apache-2.0.
+# A crate under a dual licence (e.g. Apache-2.0 OR GPL-2.0-only) passes as
+# long as one side is here.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    "ISC",
+    "Unicode-3.0",
+    "Unlicense",
+    "Zlib",
+    "0BSD",
+]
+confidence-threshold = 0.9
+
+# egui's built-in fonts, compiled into nerka-gui: their licence texts must
+# ship with the GUI (release archives).
+[[licenses.exceptions]]
+crate = "epaint_default_fonts"
+allow = ["OFL-1.1", "Ubuntu-font-1.0"]
+
+[bans]
+# Several versions of a crate (common for the windows-* crates) are reported,
+# not refused.
+multiple-versions = "warn"
+wildcards = "deny"
+# Our own crates depend on each other by path.
+allow-wildcard-paths = true
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

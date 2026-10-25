@@ -2,6 +2,8 @@
 name = "nerka-gui"
 description = "Nerka desktop log viewer (egui)"
 version.workspace = true
+# Not on crates.io (yet): released as archives (.github/workflows/release.yml).
+publish = false
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true

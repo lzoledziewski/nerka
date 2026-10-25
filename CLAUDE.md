@@ -14,6 +14,7 @@ Read `doc/nerka_architecture_implementation_spec_v_0.md` (requirements) and
 cargo test --workspace                       # all tests
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all
+cargo deny check                             # dependency licences / advisories (deny.toml)
 cargo run -p nerka-cli -- filter 'level >= ERROR AND raw ~ /SSL/' app.log
 cargo run -p nerka-gui -- app.log --query 'level >= ERROR'
 cargo run -p nerka-cli -- --pack packs/ expand -l ota -p cam=CAM1 --parts   # pack picks -> NFD
@@ -28,7 +29,7 @@ cargo run --release -p nerka-core --example probe_capture -- trace.pcapng log.mf
 powershell -ExecutionPolicy Bypass -File tools/screenshot.ps1 -Out shot.png -AppArgs app.log  # GUI screenshot (Windows)
 ```
 
-CI (`.github/workflows/ci.yml`) runs fmt, clippy and tests on Linux and Windows; `release.yml`
+CI (`.github/workflows/ci.yml`) runs fmt, clippy and tests on Linux and Windows, `cargo deny`, and a DCO sign-off check on pull requests (`CONTRIBUTING.md`; commit with `git commit -s`); `release.yml`
 builds Linux/Windows archives and publishes a pre-release on a `v*` tag.
 
 `doc/status.md` records the current state and the owner's GUI decisions; read it
