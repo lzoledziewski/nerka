@@ -64,6 +64,8 @@ The binaries are `target/release/nerka-gui` and `target/release/nerka`.
 nerka-gui app.log                              # open a file (several: one view)
 nerka-gui trace.pcapng --query 'apid == NAV'   # open and filter
 nerka-gui app.log --new-window --name triage   # a separate, named window
+nerka-gui app.log --signal 'lat=/latency_us=(?<lat>\d+)/' --query '@lat > 9000'   # a signal
+nerka-gui app.log --signal 't:time=/^(?<t>\S+ \S+)/' --signal 'lat=/latency_us=(?<lat>\d+)/' --plot lat   # plot it over time
 ```
 
 | Keys | |
@@ -89,6 +91,8 @@ nerka search --in 'level >= WARN' -c timeout app.log     # search inside a filte
 nerka filter 'apid == NAV AND level >= WARN' trace.dlt
 nerka lines app.log 100 120
 nerka --pack packs/ expand -l ota -p cam=CAM1            # pack picks -> NFD
+nerka --signal 'gear:enum=/gear=(?<gear>\w+)/' filter '@gear == D' app.log   # signals
+nerka --fibex ecu1.xml filter 'apid == NAV' trace.dlt     # DLT non-verbose messages decoded
 ```
 
 `nerka help <command>` lists every option.
@@ -102,6 +106,7 @@ nerka --pack packs/ expand -l ota -p cam=CAM1            # pack picks -> NFD
 | Text | bare `/re/` and `"text"` match the whole line (`raw`) |
 | Logic | `AND OR NOT`, parentheses |
 | Fields | `raw`, `level`; DLT adds `ecu apid ctid type mcnt tmsp seid mid mode payload`; several files add `file` |
+| Signals | `@name`: a value captured by a named regex group — of a picked query (include or the `~` signal role), or a signal you define (📈 Signals panel, `--signal`; saved). `@gear == D` is the state (held until the next event), `@gear.event == D` a line that carries it, `@gear.changed` a change. Kinds `num`, `enum`, `time`; DLT has `@time` (receive time): `@time >= "2025-10-18 10:00:00"` |
 
 ## Documentation
 
@@ -110,7 +115,7 @@ nerka --pack packs/ expand -l ota -p cam=CAM1            # pack picks -> NFD
   [original spec](doc/nerka_architecture_implementation_spec_v_0.md).
 - [doc/search-manager.md](doc/search-manager.md): query packs, expansion, library and selection.
 - [doc/search-modes.md](doc/search-modes.md): Auto, Text and NFD modes.
-- [doc/sources-and-signals.md](doc/sources-and-signals.md): input formats and the planned signal support.
+- [doc/sources-and-signals.md](doc/sources-and-signals.md): input formats and signals (what a signal is, what's next).
 - [CLAUDE.md](CLAUDE.md): guide for contributors and AI agents (commands, rules).
 
 ## Contributing

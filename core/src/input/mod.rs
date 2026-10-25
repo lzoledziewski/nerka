@@ -21,6 +21,8 @@ use std::path::Path;
 pub struct OpenOptions {
     /// How DLT is found in captures (pcap, pcapng, MF4).
     pub capture: capture::CaptureOptions,
+    /// Descriptions of DLT non-verbose messages (FIBEX).
+    pub fibex: Option<std::sync::Arc<dlt::fibex::Fibex>>,
 }
 
 /// Open `path` with the reader its content calls for (default
@@ -38,9 +40,9 @@ pub fn open_with(path: impl AsRef<Path>, options: &OpenOptions, progress: &Progr
     let n = File::open(path)?.read(&mut head)?;
     let head = &head[..n];
     Ok(if dlt::is_dlt(head) {
-        Box::new(dlt::DltFile::open(path, progress)?)
+        Box::new(dlt::DltFile::open(path, progress)?.with_fibex(options.fibex.clone()))
     } else if capture::is_capture(head) {
-        Box::new(capture::open(path, &options.capture, progress)?.0)
+        Box::new(capture::open(path, &options.capture, progress)?.0.with_fibex(options.fibex.clone()))
     } else {
         Box::new(text::TextFile::open(path, progress)?)
     })
@@ -180,6 +182,27 @@ pub trait LogSource: Send + Sync {
     /// per file).
     fn part_files(&self) -> Vec<(LineNo, LineNo)> {
         vec![(0, self.line_count())]
+    }
+
+    /// The time of `line` as the source knows it, in seconds since the Unix
+    /// epoch (UTC): DLT's storage (receive) time. Plain text has none: a
+    /// tab captures it with a `time` signal instead.
+    fn time(&self, _line: LineNo) -> Option<f64> {
+        None
+    }
+
+    /// Argument `index` of `line`'s message, if the source knows the
+    /// message's arguments (DLT non-verbose messages described by FIBEX):
+    /// a value without a regex, for signals.
+    fn argument(&self, _line: LineNo, _index: usize) -> Option<crate::signal::SignalValue> {
+        None
+    }
+
+    /// Identifies the data the source reads, for caches (signal events): a
+    /// part of a [`concat::Concat`] answers its file's, so the part made
+    /// for each scan is the same one.
+    fn data_id(&self) -> usize {
+        self as *const Self as *const () as usize
     }
 }
 

@@ -36,20 +36,23 @@ mod icon_art;
 mod instance;
 mod job;
 mod library;
+mod plot;
 mod prefs;
 mod presets;
 mod recall;
+mod shot;
+mod signals;
 mod view;
 
 use eframe::egui::{self, Color32, Key, KeyboardShortcut, Modifiers, RichText};
 use job::{Job, Poll};
 use library::{Applied, LibraryView, Picks, Target, Term, Use};
-use nerka_core::dsl::{AutoRead, Plain, read_auto_with};
+use nerka_core::dsl::{AutoRead, Plain, read_auto_in, read_auto_with};
 use nerka_core::pack::{self, Library, Role};
 use nerka_core::preset::{BoxText, Preset};
 use nerka_core::{
     Bookmarks, FieldDef, Filter, Highlighter, LineNo, LogSource, Matcher, MatcherOptions, Query, SearchHistory,
-    SearchHits, SearchResult, SearchSet, text_to_nfd,
+    SearchHits, SearchResult, SearchSet, SignalKind, SignalScope, Signals, text_to_nfd,
 };
 use prefs::SearchPrefs;
 use std::borrow::Cow;
@@ -69,6 +72,19 @@ fn main() -> eframe::Result {
     let mut searches: Vec<String> = Vec::new();
     let mut highlight: Vec<String> = Vec::new();
     let mut params = std::collections::BTreeMap::new();
+    // `--signal SPEC` (as for the CLI): signals for this session (saved
+    // with the others once the Signals panel changes them).
+    let mut signals = Signals::default();
+    // `--plot NAME`: plot these signals.
+    let mut plotted: Vec<String> = Vec::new();
+    // `--fibex FILE`: FIBEX files for DLT non-verbose messages.
+    let mut fibex: Vec<PathBuf> = Vec::new();
+    // `--cursor TIME`: time cursors in the plot.
+    let mut cursors: Vec<f64> = Vec::new();
+    // `--marker NAME=VALUE[:LABEL]`: horizontal lines in a plotted lane.
+    let mut markers: Vec<(String, plot::Marker)> = Vec::new();
+    // `--plot-window`: the plot starts in a window of its own.
+    let mut plot_window = false;
     let (mut new_window, mut window_name, mut preset_file) = (false, None, None);
     let mut args = std::env::args_os().skip(1);
     while let Some(a) = args.next() {
@@ -89,6 +105,10 @@ fn main() -> eframe::Result {
                 startup.push((Use::Exclude, value()));
                 continue;
             }
+            Some("--signal-pick") => {
+                startup.push((Use::Signal, value()));
+                continue;
+            }
             Some("--highlight") => {
                 highlight.push(value());
                 continue;
@@ -105,6 +125,47 @@ fn main() -> eframe::Result {
             }
             Some("--library") => {
                 show_library = true;
+                continue;
+            }
+            Some("--plot") => {
+                plotted.push(value());
+                continue;
+            }
+            Some("--fibex") => {
+                fibex.push(PathBuf::from(value()));
+                continue;
+            }
+            Some("--marker") => {
+                // NAME=VALUE[:LABEL]
+                let v = value();
+                let parsed = v.split_once('=').and_then(|(name, rest)| {
+                    let (num, label) = rest.split_once(':').unwrap_or((rest, ""));
+                    Some((name.to_owned(), plot::Marker { value: num.trim().parse().ok()?, label: label.to_owned() }))
+                });
+                match parsed {
+                    Some(m) => markers.push(m),
+                    None => eprintln!("nerka-gui: --marker {v}: expected NAME=VALUE[:LABEL]"),
+                }
+                continue;
+            }
+            Some("--cursor") => {
+                // A time (2026-10-17 10:00:01.5, 10:00:01, seconds) or a line number.
+                match nerka_core::time::parse_time(&value()) {
+                    Some(x) => cursors.push(x),
+                    None => eprintln!("nerka-gui: --cursor: expected a time or a number"),
+                }
+                continue;
+            }
+            Some("--plot-window") => {
+                plot_window = true;
+                continue;
+            }
+            Some("--signal") => {
+                let spec = value();
+                match nerka_core::SignalDef::parse_spec(&spec) {
+                    Ok(d) => signals.set(d),
+                    Err(e) => eprintln!("nerka-gui: --signal {spec}: {e}"),
+                }
                 continue;
             }
             Some("--new-window") => {
@@ -135,6 +196,11 @@ fn main() -> eframe::Result {
         && searches.is_empty()
         && highlight.is_empty()
         && params.is_empty()
+        && signals.is_empty()
+        && plotted.is_empty()
+        && fibex.is_empty()
+        && markers.is_empty()
+        && cursors.is_empty()
         && !show_library
         && preset_file.is_none()
         && window_name.is_none();
@@ -146,17 +212,27 @@ fn main() -> eframe::Result {
             .with_inner_size([1280.0, 800.0])
             .with_title("nerka")
             .with_icon(icon::icon()),
+        wgpu_options: wgpu_options(),
         ..Default::default()
     };
     eframe::run_native(
         "nerka",
         options,
         Box::new(move |cc| {
-            let mut app = App { pack_paths: packs, show_library, window_name, ..Default::default() };
+            let show_signals = !signals.is_empty();
+            let mut app =
+                App { pack_paths: packs, show_library, show_signals, window_name, plot_window, ..Default::default() };
             let ctx = cc.egui_ctx.clone();
             app.server = instance::Server::start(move || ctx.request_repaint());
             app.load_history();
             app.load_prefs();
+            app.load_saved_signals();
+            if !fibex.is_empty() {
+                app.set_fibex(&cc.egui_ctx, fibex);
+            }
+            for d in signals.iter() {
+                app.saved_signals.set((**d).clone());
+            }
             app.load_library();
             app.presets.load();
             let mut picks = Picks::default();
@@ -176,6 +252,17 @@ fn main() -> eframe::Result {
             // kinds differ).
             if !initial.is_empty() {
                 app.open_files(&cc.egui_ctx, initial);
+                if let Some(tab) = app.tabs.last_mut() {
+                    plotted.iter().for_each(|n| plot::lock(&tab.plot).toggle(n));
+                    plot::lock(&tab.plot).cursors.extend(&cursors);
+                    for (name, m) in &markers {
+                        plot::lock(&tab.plot).markers.entry(name.clone()).or_default().push(m.clone());
+                    }
+                    // A plotted name can be a FIBEX argument: it becomes a signal.
+                    if let Some(f) = &app.fibex {
+                        tab.arg_picks = f.arguments().into_iter().filter(|a| plotted.contains(&a.name)).collect();
+                    }
+                }
                 if let (Some(p), Some(tab)) = (&moved, app.tabs.last_mut()) {
                     tab.use_preset(&cc.egui_ctx, &app.library, p);
                     tab.preset = None;
@@ -199,6 +286,23 @@ fn main() -> eframe::Result {
             Ok(Box::new(app))
         }),
     )
+}
+
+/// The graphics setup: wgpu's own, except that on Windows it draws with
+/// DirectX 12. wgpu picked Vulkan there, and NVIDIA's Vulkan driver
+/// (`nvoglv64.dll`) crashed when a window was maximized while the plot had
+/// a window of its own (owner, 2026-10-24); DirectX 12 didn't. Linux and
+/// macOS keep wgpu's choice; `WGPU_BACKEND` (e.g. `vulkan`) still decides
+/// when set.
+fn wgpu_options() -> eframe::WgpuConfiguration {
+    let mut options = eframe::WgpuConfiguration::default();
+    if cfg!(windows)
+        && std::env::var_os("WGPU_BACKEND").is_none()
+        && let eframe::egui_wgpu::WgpuSetup::CreateNew(setup) = &mut options.wgpu_setup
+    {
+        setup.instance_descriptor.backends = eframe::wgpu::Backends::DX12;
+    }
+    options
 }
 
 /// How a Filter or Search box reads its text (`doc/search-modes.md`).
@@ -270,6 +374,7 @@ fn read_box(
     pattern: &str,
     options: &MatcherOptions,
     schema: &[FieldDef],
+    signals: &Signals,
 ) -> (Result<Filter, String>, Preview) {
     let text = |t: &str, o: MatcherOptions| {
         Matcher::new(t, o).map(Filter::Regex).map_err(|e| {
@@ -279,7 +384,7 @@ fn read_box(
     };
     match mode {
         Mode::Text => (text(pattern, options.clone()), Preview::None),
-        Mode::Query => match Query::compile_for(pattern, schema) {
+        Mode::Query => match Query::compile_in(pattern, schema, signals) {
             Ok(q) => (Ok(Filter::Query(q)), Preview::None),
             Err(e) if pattern.trim().is_empty() => (Err(format!("Query error: {e}")), Preview::None),
             Err(e) => (Err(format!("Query error: {e}")), Preview::QueryError(e.to_string())),
@@ -287,7 +392,7 @@ fn read_box(
         Mode::Auto => {
             // Phrases and plain text are literal, or regexes with Regex ticked.
             let regex = !options.fixed_string;
-            match read_auto_with(pattern, options, schema) {
+            match read_auto_in(pattern, options, schema, signals) {
                 AutoRead::Text(t) => {
                     let preview = if t.is_empty() {
                         Preview::None
@@ -312,7 +417,7 @@ fn read_box(
                     if !options.invert {
                         return (Ok(Filter::Query(query)), preview);
                     }
-                    let not = Query::compile_for(&format!("NOT ({nfd})"), schema).map(Filter::Query);
+                    let not = Query::compile_in(&format!("NOT ({nfd})"), schema, signals).map(Filter::Query);
                     (not.map_err(|e| format!("Query error: {e}")), preview)
                 }
             }
@@ -367,11 +472,21 @@ struct PreviewCache {
 }
 
 impl PreviewCache {
-    fn get(&mut self, mode: Mode, pattern: &str, options: &MatcherOptions, schema: &[FieldDef]) -> Preview {
-        let key =
-            format!("{mode:?}|{}|{}|{}|{pattern}", options.fixed_string, options.case_insensitive, options.invert);
+    /// `signals_gen` changes whenever the tab's signals do.
+    fn get(
+        &mut self,
+        mode: Mode,
+        pattern: &str,
+        options: &MatcherOptions,
+        schema: &[FieldDef],
+        (signals, signals_gen): (&Signals, u64),
+    ) -> Preview {
+        let key = format!(
+            "{mode:?}|{}|{}|{}|{signals_gen}|{pattern}",
+            options.fixed_string, options.case_insensitive, options.invert
+        );
         if self.key != key || self.preview.is_none() {
-            self.preview = Some(read_box(mode, pattern, options, schema).1);
+            self.preview = Some(read_box(mode, pattern, options, schema, signals).1);
             self.key = key;
         }
         self.preview.clone().unwrap_or(Preview::None)
@@ -428,8 +543,34 @@ struct Tab {
     bookmarks: Bookmarks,
     /// Bookmarks whose line is unfolded in the panel.
     marks_open: std::collections::HashSet<LineNo>,
+    /// A bookmark's name being typed in the panel; set when the field
+    /// loses focus (so it can be emptied and retyped).
+    mark_rename: Option<(LineNo, String)>,
     /// The line shown whole in the line window (Enter), if open.
     detail: Option<LineDetail>,
+    /// The tab's signals (`@name` in its queries), the generation that
+    /// changes with them, and their panel.
+    signals: Signals,
+    signals_gen: u64,
+    signals_ui: signals::SignalsUi,
+    /// Collects the signals' events for the panel (the engine keeps them
+    /// with each definition).
+    signals_job: Option<Job<()>>,
+    /// Shared with the plot's own window.
+    plot: plot::SharedPlot,
+    /// What `signals` was built from: (saved signals' generation, choices'
+    /// generation, the selection's fingerprint); none: build again.
+    signals_key: Option<(u64, u64, String)>,
+    /// Kinds and scopes chosen for query signals, and their generation.
+    query_kind: std::collections::HashMap<String, SignalKind>,
+    query_scope: std::collections::HashMap<String, SignalScope>,
+    choices_gen: u64,
+    /// The events each signal shows (filtered ones per filter result).
+    views: signals::Views,
+    /// Read again: the line to show once it is loaded.
+    reopen_at: Option<LineNo>,
+    /// FIBEX arguments used as signals (picked in the Signals panel).
+    arg_picks: Vec<nerka_core::Argument>,
     status: String,
 }
 
@@ -441,6 +582,84 @@ struct LineDetail {
     /// Column names of a table source; empty for plain text.
     names: Vec<&'static str>,
     wrap: bool,
+    /// The tab's signals on this line (filled by the tab every frame:
+    /// values appear once their events are collected).
+    signals: Vec<LineSignal>,
+    /// A line the window asks to go to (an event that set a state).
+    goto: Option<LineNo>,
+}
+
+/// One signal in the line window: its value on the line, and whether the
+/// line itself carries it (an event) or it holds from an earlier one.
+#[derive(Debug, Clone, PartialEq)]
+struct LineSignal {
+    name: String,
+    kind: &'static str,
+    /// Where it comes from: built in, saved, query, FIBEX.
+    origin: &'static str,
+    /// The value, or none (no event yet, or still collecting).
+    value: Option<String>,
+    /// The line of the event that set the value; this line for an event.
+    from: Option<LineNo>,
+}
+
+/// The line window's Signals section: the signals the line carries (its
+/// events); the others' state on it, with the line that set it, folded
+/// away below. Returns a line to go to (one of those was clicked).
+fn signals_section(ui: &mut egui::Ui, line: LineNo, signals: &[LineSignal]) -> Option<LineNo> {
+    let (events, held): (Vec<&LineSignal>, Vec<&LineSignal>) =
+        signals.iter().filter(|s| s.from.is_some()).partition(|s| s.from == Some(line));
+    let pending = signals.iter().filter(|s| s.from.is_none() && s.value.is_some()).count();
+    let mut goto = None;
+    egui::CollapsingHeader::new(RichText::new(format!("Signals on this line ({})", events.len())).strong())
+        .id_salt("line-detail-signals")
+        .default_open(true)
+        .show(ui, |ui| {
+            if events.is_empty() {
+                ui.weak("None: this line carries no signal's value.");
+            }
+            egui::Grid::new("line-detail-signals-grid").num_columns(3).spacing([12.0, 2.0]).striped(true).show(
+                ui,
+                |ui| {
+                    for s in &events {
+                        ui.label(RichText::new(format!("@{}", s.name)).monospace().strong());
+                        ui.monospace(s.value.as_deref().unwrap_or("—"));
+                        ui.weak(format!("{} · {}", s.kind, s.origin));
+                        ui.end_row();
+                    }
+                },
+            );
+            if pending > 0 {
+                ui.weak(format!("{pending} more still being collected…"));
+            }
+            if held.is_empty() {
+                return;
+            }
+            egui::CollapsingHeader::new(format!("Held from earlier lines ({})", held.len()))
+                .id_salt("line-detail-held")
+                .default_open(false)
+                .show(ui, |ui| {
+                    egui::Grid::new("line-detail-held-grid").num_columns(4).spacing([12.0, 2.0]).striped(true).show(
+                        ui,
+                        |ui| {
+                            for s in &held {
+                                ui.monospace(format!("@{}", s.name));
+                                ui.monospace(s.value.as_deref().unwrap_or("—"));
+                                let from = s.from.expect("held");
+                                let r = ui.link(format!("↑ line {}", from + 1));
+                                if r.on_hover_text("The state: set by the event on that line. Click to go there.")
+                                    .clicked()
+                                {
+                                    goto = Some(from);
+                                }
+                                ui.weak(format!("{} · {}", s.kind, s.origin));
+                                ui.end_row();
+                            }
+                        },
+                    );
+                });
+        });
+    goto
 }
 
 /// Text shown in the line window at most; Copy still copies all of it.
@@ -450,7 +669,7 @@ impl LineDetail {
     fn of(file: &dyn LogSource, line: LineNo) -> Option<Self> {
         let cells = file.line_detail(line)?;
         let names = file.columns().iter().map(|c| c.name).collect();
-        Some(LineDetail { line, cells, names, wrap: true })
+        Some(LineDetail { line, cells, names, wrap: true, signals: Vec::new(), goto: None })
     }
 
     /// The window: the cells before the message as a name / value grid,
@@ -493,6 +712,9 @@ impl LineDetail {
                             ui.end_row();
                         }
                     });
+                }
+                if !self.signals.is_empty() {
+                    self.goto = signals_section(ui, self.line, &self.signals).or(self.goto);
                 }
                 ui.separator();
                 let mut shown = msg;
@@ -628,14 +850,21 @@ impl SearchBox {
 impl Tab {
     #[cfg(test)]
     fn open(ctx: &egui::Context, path: PathBuf, prefs: &SearchPrefs) -> Self {
-        Self::open_many(ctx, vec![path], prefs)
+        Self::open_many(ctx, vec![path], prefs, None)
     }
 
     /// One tab for `paths`: one file, or several of one kind one after
     /// another (nerka_core::open_many checks the kind).
-    fn open_many(ctx: &egui::Context, paths: Vec<PathBuf>, prefs: &SearchPrefs) -> Self {
+    /// `fibex` describes DLT non-verbose messages.
+    fn open_many(
+        ctx: &egui::Context,
+        paths: Vec<PathBuf>,
+        prefs: &SearchPrefs,
+        fibex: Option<Arc<nerka_core::Fibex>>,
+    ) -> Self {
         let ps = paths.clone();
-        let options = prefs.open_options();
+        let mut options = prefs.open_options();
+        options.fibex = fibex;
         Self {
             path: paths[0].clone(),
             paths,
@@ -668,7 +897,20 @@ impl Tab {
             filter_preview: PreviewCache::default(),
             bookmarks: Bookmarks::default(),
             marks_open: Default::default(),
+            mark_rename: None,
             detail: None,
+            signals: Signals::default(),
+            signals_gen: 0,
+            signals_ui: signals::SignalsUi::default(),
+            signals_job: None,
+            plot: Default::default(),
+            signals_key: None,
+            query_kind: Default::default(),
+            query_scope: Default::default(),
+            choices_gen: 0,
+            views: signals::Views::default(),
+            reopen_at: None,
+            arg_picks: Vec::new(),
             status: String::new(),
         }
     }
@@ -688,7 +930,11 @@ impl Tab {
     }
 
     fn is_busy(&self) -> bool {
-        self.loading.is_some() || self.searching.is_some() || self.search.job.is_some() || self.colors_job.is_some()
+        self.loading.is_some()
+            || self.searching.is_some()
+            || self.search.job.is_some()
+            || self.colors_job.is_some()
+            || self.signals_job.is_some()
     }
 
     fn cancel_jobs(&mut self) {
@@ -702,6 +948,9 @@ impl Tab {
             j.cancel();
         }
         if let Some((_, j)) = self.colors_job.take() {
+            j.cancel();
+        }
+        if let Some(j) = self.signals_job.take() {
             j.cancel();
         }
     }
@@ -742,9 +991,115 @@ impl Tab {
         true
     }
 
+    /// The tab's signals were edited: queries that use them run again.
+    fn signals_changed(&mut self, ctx: &egui::Context) {
+        self.signals_gen += 1;
+        plot::lock(&self.plot).retain(&self.signals);
+        self.collect_signals(ctx);
+        if self.pattern.contains('@') {
+            self.start_search(ctx);
+        } else if self.search.pattern.contains('@') {
+            self.rerun_search(ctx);
+        }
+    }
+
+    /// Read the tab's files again (other FIBEX files): filter, search and
+    /// selection stay, and so does the current line.
+    fn reopen(&mut self, ctx: &egui::Context, prefs: &SearchPrefs, fibex: Option<Arc<nerka_core::Fibex>>) {
+        let line = self.current_line();
+        self.cancel_jobs();
+        let ps = self.paths.clone();
+        let mut options = prefs.open_options();
+        options.fibex = fibex;
+        self.file = None;
+        self.result = None;
+        self.reopen_at = Some(line);
+        self.loading = Some(Job::spawn(ctx, move |prog| nerka_core::open_many(&ps, &options, prog)));
+    }
+
+    /// Build the tab's signals again if what they come from changed: the
+    /// file's `@time`, the user's `saved` signals, the named groups of the
+    /// selection's included and signal queries (with the kinds and scopes
+    /// chosen here).
+    fn refresh_signals(&mut self, ctx: &egui::Context, lib: &Library, saved: &Signals, saved_gen: u64) {
+        let Some(file) = self.file.clone() else { return };
+        let fingerprint = format!(
+            "{:?}{:?}",
+            self.picks
+                .nodes
+                .iter()
+                .map(|n| (n.role, &n.text, &n.parent, &n.source, n.edited, n.detached, &n.signals))
+                .collect::<Vec<_>>(),
+            self.picks.params
+        );
+        let key = (saved_gen, self.choices_gen, fingerprint);
+        if self.signals_key.as_ref() == Some(&key) {
+            return;
+        }
+        self.signals_key = Some(key);
+        let mut s = Signals::default().for_source(&*file);
+        for d in saved.iter() {
+            s.set((**d).clone());
+        }
+        // FIBEX arguments picked in the Signals panel.
+        for a in &self.arg_picks {
+            let query = match &a.ecu {
+                Some(ecu) => format!("mid == {} AND ecu == \"{ecu}\"", a.mid),
+                None => format!("mid == {}", a.mid),
+            };
+            let from = format!("FIBEX message {}: {}", a.mid, a.message);
+            let kind = self.query_kind.get(&a.name).copied().unwrap_or(a.ty.kind());
+            if s.get(&a.name).is_none()
+                && let Ok(d) = nerka_core::SignalDef::argument(&a.name, kind, &query, a.index, &from)
+            {
+                s.set(d.with_scope(self.query_scope.get(&a.name).copied().unwrap_or_default()));
+            }
+        }
+        if let Ok(a) = self.picks.expand(lib) {
+            let parts: Vec<nerka_core::QueryPart<'_>> = a
+                .exp
+                .parts
+                .iter()
+                .enumerate()
+                .filter(|(_, p)| p.role != Role::Exclude)
+                .map(|(i, p)| nerka_core::QueryPart { name: &a.names[i], nfd: a.exp.part_nfd(p), pins: &a.pins[i] })
+                .collect();
+            let chosen = |g: &str| self.query_kind.get(g).copied();
+            for d in nerka_core::query_signals(&parts, &*file, &chosen) {
+                // A saved signal of the same name wins.
+                if s.get(d.name()).is_none() {
+                    let scope = self.query_scope.get(d.name()).copied().unwrap_or_default();
+                    s.set(d.with_scope(scope));
+                }
+            }
+        }
+        self.signals = s;
+        self.signals_changed(ctx);
+    }
+
+    /// Collect the events of every signal in the background, so the panel
+    /// shows states without waiting for a filter to need them.
+    fn collect_signals(&mut self, ctx: &egui::Context) {
+        if let Some(j) = self.signals_job.take() {
+            j.cancel();
+        }
+        let Some(file) = self.file.clone() else { return };
+        if self.signals.is_empty() {
+            return;
+        }
+        let defs: Vec<_> = self.signals.iter().cloned().collect();
+        self.signals_job = Some(Job::spawn(ctx, move |prog| {
+            for d in defs {
+                // A definition that doesn't fit the file says so in the panel.
+                let _ = d.series(&*file, prog);
+            }
+            Ok(())
+        }));
+    }
+
     fn build_filter(&self) -> Result<Filter, String> {
         let schema = self.file.as_ref().map(|f| f.schema()).unwrap_or_default();
-        read_box(self.mode, &self.pattern, &self.options, schema).0
+        read_box(self.mode, &self.pattern, &self.options, schema, &self.signals).0
     }
 
     /// Start searching with the current filter; returns whether a search
@@ -784,6 +1139,12 @@ impl Tab {
     /// Advance background jobs. Returns `false` if the file failed to open
     /// (the tab should then be closed; `status` holds the reason).
     fn poll_jobs(&mut self, ctx: &egui::Context) -> bool {
+        if let Some(job) = &self.signals_job {
+            match job.poll() {
+                Poll::Running => ctx.request_repaint_after(Duration::from_millis(50)),
+                Poll::Done(..) => self.signals_job = None,
+            }
+        }
         if let Some(job) = &self.loading {
             match job.poll() {
                 Poll::Running => ctx.request_repaint_after(Duration::from_millis(50)),
@@ -802,6 +1163,12 @@ impl Tab {
                             });
                             self.columns = Columns::from_defs(f.columns());
                             self.file = Some(Arc::from(f));
+                            // Built with the next frame (`@time` if the
+                            // file knows its lines' times).
+                            self.signals_key = None;
+                            if let Some(line) = self.reopen_at.take() {
+                                self.goto_line(line);
+                            }
                             if !self.pattern.trim().is_empty() {
                                 self.start_search(ctx);
                             } else {
@@ -946,7 +1313,7 @@ impl Tab {
             let include = terms
                 .iter()
                 .map(|t| {
-                    Query::compile_for(&t.nfd, schema)
+                    Query::compile_in(&t.nfd, schema, &self.signals)
                         .map(Filter::Query)
                         .map_err(|e| format!("Search: {}: {e}", t.name))
                 })
@@ -960,7 +1327,7 @@ impl Tab {
             });
         }
         let schema = self.file.as_ref().map(|f| f.schema()).unwrap_or_default();
-        let f = read_box(self.search.mode, &self.search.pattern, &self.search.options(), schema)
+        let f = read_box(self.search.mode, &self.search.pattern, &self.search.options(), schema, &self.signals)
             .0
             .map_err(|e| format!("Search: {e}"))?;
         Ok(ActiveSearch {
@@ -1019,10 +1386,10 @@ impl Tab {
         }
         let (mut include, mut names, mut colors) = (Vec::new(), Vec::new(), Vec::new());
         for (i, p) in a.exp.parts.iter().enumerate() {
-            if p.role != Role::Include || !self.picks.is_lit(a.keys[i]) {
+            if p.role == Role::Exclude || !self.picks.is_lit(a.keys[i]) {
                 continue;
             }
-            let Ok(q) = Query::compile(a.exp.part_nfd(p)) else { continue };
+            let Ok(q) = Query::compile(a.exp.part_nfd(p)).and_then(|q| q.with_signals(&self.signals)) else { continue };
             include.push(Filter::Query(q));
             names.push(a.names[i].clone());
             colors.push(a.colors[i]);
@@ -1183,6 +1550,82 @@ impl Tab {
         self.save_bookmarks();
     }
 
+    /// The tab's signals on `line` for the line window: events (the line
+    /// carries them) first, then the others' state there.
+    ///
+    /// `args` are the FIBEX catalog's arguments: a non-verbose message it
+    /// describes lists all of its own arguments with their values, also
+    /// those not used as signals.
+    fn line_signals(&mut self, line: LineNo, args: &[nerka_core::Argument]) -> Vec<LineSignal> {
+        let Some(file) = self.file.clone() else { return Vec::new() };
+        let kept = self.result.clone();
+        let mut out: Vec<LineSignal> = Vec::new();
+        for d in self.signals.iter() {
+            let origin = if d.is_from_source() {
+                "built in"
+            } else if d.argument_index().is_some() {
+                "FIBEX"
+            } else if !d.queries().is_empty() {
+                "query"
+            } else {
+                "saved"
+            };
+            let base =
+                LineSignal { name: d.name().to_owned(), kind: d.kind().as_str(), origin, value: None, from: None };
+            if d.is_from_source() {
+                let value = file.time(line).map(|t| nerka_core::time::format_time(t, 6));
+                out.push(LineSignal { from: value.as_ref().map(|_| line), value, ..base });
+                continue;
+            }
+            let Some(series) = self.views.series(d, &*file, kept.as_ref(), self.signals_gen) else {
+                out.push(LineSignal { value: Some("…".into()), ..base });
+                continue;
+            };
+            match series.state(line) {
+                Some((row, v)) => out.push(LineSignal { value: Some(d.format(v)), from: Some(row), ..base }),
+                None => out.push(base),
+            }
+        }
+        // The message's own FIBEX arguments that aren't signals of the tab.
+        let mid = file.schema().iter().position(|f| f.name == "mid").and_then(|id| match file.field(line, id) {
+            Some(nerka_core::FieldValue::U64(m)) => u32::try_from(m).ok(),
+            _ => None,
+        });
+        let ecu = file.schema().iter().position(|f| f.name == "ecu").and_then(|id| match file.field(line, id) {
+            Some(nerka_core::FieldValue::Str(e)) => Some(String::from_utf8_lossy(&e).into_owned()),
+            _ => None,
+        });
+        if let Some(mid) = mid {
+            let own = args
+                .iter()
+                .filter(|a| a.mid == mid && a.ecu.as_ref().is_none_or(|e| Some(e) == ecu.as_ref()))
+                .filter(|a| self.signals.get(&a.name).is_none());
+            for a in own {
+                let value = file.argument(line, a.index).map(|v| v.to_string());
+                out.push(LineSignal {
+                    name: a.name.clone(),
+                    kind: a.ty.kind().as_str(),
+                    origin: "FIBEX, not used",
+                    from: value.as_ref().map(|_| line),
+                    value,
+                });
+            }
+        }
+        // Events first; otherwise the tab's order.
+        out.sort_by_key(|s| s.from != Some(line));
+        out
+    }
+
+    /// Bookmark `line` with `note` (a bookmark already there gets the note).
+    fn set_bookmark(&mut self, line: LineNo, note: String) {
+        if !self.bookmarks.contains(line) {
+            self.bookmarks.toggle(line);
+        }
+        self.bookmarks.set_note(line, note);
+        self.status = format!("Bookmark on line {}", line + 1);
+        self.save_bookmarks();
+    }
+
     /// Each file keeps its own sidecar; a view of several maps lines.
     fn load_bookmarks(&self) -> std::io::Result<Bookmarks> {
         if self.paths.len() == 1 {
@@ -1223,6 +1666,16 @@ impl Tab {
         {
             self.detail = LineDetail::of(&**file, line_of_row(row));
         }
+        // An open line window follows the line selected in either view
+        // (owner, 2026-10-24), keeping its Wrap setting.
+        if let (Some(row), Some(d), Some(file)) = (out.moved_to, &self.detail, &self.file)
+            && out.detail.is_none()
+            && line_of_row(row) != d.line
+            && let Some(mut next) = LineDetail::of(&**file, line_of_row(row))
+        {
+            next.wrap = d.wrap;
+            self.detail = Some(next);
+        }
     }
 
     /// Returns true when the panel's close button was clicked.
@@ -1248,12 +1701,28 @@ impl Tab {
         let mut jump = None;
         let mut edits: Vec<(LineNo, String)> = Vec::new();
         let mut remove = None;
+        let mut rename = None;
         let mut fold = None;
         egui::ScrollArea::vertical().show(ui, |ui| {
-            for (line, note) in self.bookmarks.iter() {
+            for (line, name, note) in self.bookmarks.iter_named() {
                 let open = self.marks_open.contains(&line);
                 ui.horizontal(|ui| {
-                    if ui.link(format!("{}", line + 1)).on_hover_text("Go to the line").clicked() {
+                    // The name (the plot shows it); edited in place.
+                    let mut text = match &self.mark_rename {
+                        Some((l, t)) if *l == line => t.clone(),
+                        _ => name.to_owned(),
+                    };
+                    let r = ui.add(
+                        egui::TextEdit::singleline(&mut text).font(egui::TextStyle::Monospace).desired_width(80.0),
+                    );
+                    if r.changed() {
+                        self.mark_rename = Some((line, text));
+                    }
+                    if r.lost_focus() && self.mark_rename.as_ref().is_some_and(|(l, _)| *l == line) {
+                        rename = self.mark_rename.take();
+                    }
+                    r.on_hover_text("The bookmark's name (the plot shows it); type to rename");
+                    if ui.link(format!("line {}", line + 1)).on_hover_text("Go to the line").clicked() {
                         jump = Some(line);
                     }
                     let tip = if open { "Fold the line" } else { "Show the whole line" };
@@ -1305,9 +1774,13 @@ impl Tab {
         {
             self.marks_open.insert(l);
         }
-        let changed = !edits.is_empty() || remove.is_some();
+        let changed = !edits.is_empty() || rename.is_some() || remove.is_some();
         for (l, t) in edits {
             self.bookmarks.set_note(l, t);
+        }
+        if let Some((l, t)) = rename {
+            // Left empty: a free name again.
+            self.bookmarks.set_name(l, t);
         }
         if let Some(l) = remove {
             self.bookmarks.toggle(l);
@@ -1410,7 +1883,8 @@ impl Tab {
             }
         } else {
             let schema = self.file.as_ref().map(|f| f.schema()).unwrap_or_default();
-            let preview = self.filter_preview.get(self.mode, &self.pattern, &self.options, schema);
+            let sig = (&self.signals, self.signals_gen);
+            let preview = self.filter_preview.get(self.mode, &self.pattern, &self.options, schema, sig);
             if preview_ui(ui, &preview) {
                 self.mode = Mode::Text;
                 self.options.fixed_string = true;
@@ -1547,7 +2021,7 @@ impl Tab {
         } else {
             let schema = self.file.as_ref().map(|f| f.schema()).unwrap_or_default();
             let s = &mut self.search;
-            let preview = s.preview.get(s.mode, &s.pattern, &s.options(), schema);
+            let preview = s.preview.get(s.mode, &s.pattern, &s.options(), schema, (&self.signals, self.signals_gen));
             if preview_ui(ui, &preview) {
                 self.search.mode = Mode::Text;
                 self.search.regex = false;
@@ -1700,6 +2174,8 @@ fn expansion_lines<'a>(a: &'a Applied, lit: &dyn Fn(u64) -> bool) -> Vec<ChipLin
                 Role::Include if includes == 0 => "",
                 Role::Include => "OR",
                 Role::Exclude => "AND NOT",
+                // Not in the box: signals and colours only.
+                Role::Signal => "signals:",
             };
             if p.role == Role::Include {
                 includes += 1;
@@ -1729,7 +2205,7 @@ In '{by}', which is picked too: not repeated in the box"
                 color: a.colors[i],
                 nfd: a.exp.part_nfd(p),
                 origin,
-                lit: (p.role == Role::Include).then(|| (a.keys[i], lit(a.keys[i]))),
+                lit: (p.role != Role::Exclude).then(|| (a.keys[i], lit(a.keys[i]))),
             }
         })
         .collect()
@@ -1756,6 +2232,7 @@ struct App {
     tabs: Vec<Tab>,
     active: usize,
     show_bookmarks: bool,
+    show_signals: bool,
     /// Text of the Ctrl+G dialog while it is open.
     goto: Option<String>,
     /// The About dialog is open.
@@ -1789,6 +2266,19 @@ struct App {
     /// Tabs moved to new windows so far (temp file names).
     moves: u32,
     presets: presets::Presets,
+    /// Signals the user defined, for every tab; saved in
+    /// `<config>/nerka/signals`. The generation changes with them.
+    saved_signals: Signals,
+    saved_gen: u64,
+    /// FIBEX files for DLT non-verbose messages (this session), read into
+    /// one catalog that every DLT tab is opened with.
+    fibex: Option<Arc<nerka_core::Fibex>>,
+    fibex_paths: Vec<PathBuf>,
+    /// The catalog's arguments (for the line window), by catalog.
+    fibex_args: Option<(usize, Arc<Vec<nerka_core::Argument>>)>,
+    /// The plot is in a window of its own, and what that window shares.
+    plot_window: bool,
+    plot_win: Arc<std::sync::Mutex<plot::Detached>>,
 }
 
 /// The Settings window's fields: this window's name and the DLT ports
@@ -1860,6 +2350,14 @@ fn history_path() -> Option<PathBuf> {
 
 fn search_history_path() -> Option<PathBuf> {
     nerka_core::config_dir().map(|d| d.join("search-history"))
+}
+
+fn signals_path() -> Option<PathBuf> {
+    // Tests never touch the user's signals.
+    if cfg!(test) {
+        return None;
+    }
+    nerka_core::config_dir().map(|d| d.join("signals"))
 }
 
 fn prefs_path() -> Option<PathBuf> {
@@ -1959,6 +2457,28 @@ impl App {
             }
         }
     }
+    fn load_saved_signals(&mut self) {
+        let Some(path) = signals_path() else { return };
+        let Ok(text) = std::fs::read_to_string(&path) else { return };
+        let (s, errors) = Signals::parse_text(&text);
+        self.saved_signals = s;
+        if !errors.is_empty() {
+            self.status = format!("{}: {}", path.display(), errors.join("; "));
+        }
+    }
+
+    fn save_saved_signals(&mut self) {
+        self.saved_gen += 1;
+        let Some(path) = signals_path() else { return };
+        let write = path
+            .parent()
+            .map_or(Ok(()), std::fs::create_dir_all)
+            .and_then(|_| std::fs::write(&path, self.saved_signals.to_text()));
+        if let Err(e) = write {
+            self.status = format!("Could not save signals to {}: {e}", path.display());
+        }
+    }
+
     fn load_history(&mut self) {
         if let Some(path) = history_path() {
             match SearchHistory::load(&path) {
@@ -2076,7 +2596,7 @@ impl App {
             self.active = i;
             return;
         }
-        self.tabs.push(Tab::open_many(ctx, paths, &self.prefs));
+        self.tabs.push(Tab::open_many(ctx, paths, &self.prefs, self.fibex.clone()));
         self.active = self.tabs.len() - 1;
     }
 
@@ -2167,6 +2687,17 @@ impl App {
         if shortcut(Modifiers::COMMAND, Key::W) {
             self.close(self.active);
         }
+        // Before Ctrl+S, if one comes: matching ignores an unrequested Shift.
+        if shortcut(Modifiers::COMMAND | Modifiers::SHIFT, Key::S) {
+            shot::request(ctx, None);
+        }
+        if let Some(image) = shot::take(ctx) {
+            let [w, h] = image.size;
+            ctx.copy_image((*image).clone());
+            if let Some(t) = self.tab() {
+                t.status = format!("Screenshot copied to the clipboard ({w} × {h})");
+            }
+        }
         if shortcut(Modifiers::NONE, Key::F1) {
             self.about = true;
         }
@@ -2195,6 +2726,34 @@ impl App {
             }
             if b {
                 tab.jump_bookmark(!shift);
+            }
+        }
+    }
+
+    /// Use these FIBEX files (none: decode nothing); DLT tabs read their
+    /// files again with them.
+    fn set_fibex(&mut self, ctx: &egui::Context, paths: Vec<PathBuf>) {
+        if paths.is_empty() {
+            self.fibex = None;
+        } else {
+            match nerka_core::Fibex::load(&paths) {
+                Ok(f) => {
+                    self.status = format!("FIBEX: {} messages from {} files", f.len(), f.files.len());
+                    self.fibex = Some(Arc::new(f));
+                }
+                Err(e) => {
+                    self.status = format!("FIBEX not loaded: {e}");
+                    if let Some(t) = self.tabs.get_mut(self.active) {
+                        t.status = self.status.clone();
+                    }
+                    return;
+                }
+            }
+        }
+        self.fibex_paths = paths;
+        for t in &mut self.tabs {
+            if t.file.as_ref().is_some_and(|f| !f.columns().is_empty()) {
+                t.reopen(ctx, &self.prefs, self.fibex.clone());
             }
         }
     }
@@ -2422,10 +2981,30 @@ impl App {
         if let Some(t) = self.tabs.get_mut(self.active)
             && let Some(d) = &mut t.detail
         {
+            let line = d.line;
+            // The FIBEX arguments, worked out once per catalog.
+            let key = self.fibex.as_ref().map_or(0, |f| Arc::as_ptr(f) as usize);
+            if self.fibex_args.as_ref().is_none_or(|(k, _)| *k != key) {
+                let args = self.fibex.as_ref().map(|f| f.arguments()).unwrap_or_default();
+                self.fibex_args = Some((key, Arc::new(args)));
+            }
+            let args = self.fibex_args.as_ref().map(|(_, a)| a.clone()).unwrap_or_default();
+            let t = self.tabs.get_mut(self.active).expect("checked");
+            let signals = t.line_signals(line, &args);
+            let d = t.detail.as_mut().expect("still there");
+            d.signals = signals;
             let (open, copied) = d.show(&ctx);
             if let Some(text) = copied {
                 ctx.copy_text(text);
                 t.status = "Copied".into();
+            }
+            if let Some(l) = t.detail.as_mut().and_then(|d| d.goto.take()) {
+                t.goto_line(l);
+                // The window goes along to that line.
+                let wrap = t.detail.as_ref().is_some_and(|d| d.wrap);
+                if let Some(file) = &t.file {
+                    t.detail = LineDetail::of(&**file, l).map(|d| LineDetail { wrap, ..d });
+                }
             }
             if !open {
                 t.detail = None;
@@ -2444,6 +3023,11 @@ impl App {
                      b / Shift+B jump to the next / previous one. Saved next to the log as <file>.nerka-marks.",
                 );
                 let queries: usize = self.library.packs().iter().map(|p| p.queries.len()).sum();
+                let signals = self.tabs.get(self.active).map_or(0, |t| t.signals.len());
+                ui.toggle_value(&mut self.show_signals, format!("📈 Signals ({signals})")).on_hover_text(
+                    "Values the lines of this tab carry, captured by a regex group: filter with @name \
+                     (@speed > 100, @gear == D)",
+                );
                 ui.toggle_value(&mut self.show_library, format!("📚 Library ({queries})")).on_hover_text(
                     "Saved queries from packs (*.nerka-pack): pick them for the filter or the search \
                      (Ctrl+Shift+L)",
@@ -2458,6 +3042,10 @@ impl App {
                     }
                     if ui.selectable_label(self.settings_open, "⚙").on_hover_text("Settings (Ctrl+,)").clicked() {
                         self.settings_open = !self.settings_open;
+                    }
+                    let r = ui.button("📷").on_hover_text("Screenshot of the window to the clipboard (Ctrl+Shift+S)");
+                    if r.clicked() {
+                        shot::request(ui.ctx(), None);
                     }
                 });
             });
@@ -2494,6 +3082,13 @@ impl App {
             });
         });
 
+        if let Some(tab) = self.tabs.get_mut(self.active) {
+            tab.refresh_signals(&ctx, &self.library, &self.saved_signals, self.saved_gen);
+        }
+        // Saved after the tab is done with (the panel changed them), and
+        // FIBEX files chosen there (every DLT tab reads its file again).
+        let mut save_signals = false;
+        let mut fibex_action = None;
         let show_bookmarks = self.show_bookmarks;
         let mut focus_search = std::mem::take(&mut self.focus_search);
         let Some(tab) = self.tabs.get_mut(self.active) else {
@@ -2568,6 +3163,60 @@ impl App {
                 self.show_bookmarks = false;
             }
         }
+        if self.show_signals {
+            let line = tab.current_line();
+            let saved = &mut self.saved_signals;
+            let fibex = self.fibex.clone();
+            let out = egui::Panel::right("signals")
+                .resizable(true)
+                .default_size(360.0)
+                .show(ui, |ui| {
+                    let input = signals::Input {
+                        signals: &tab.signals,
+                        generation: tab.signals_gen,
+                        saved,
+                        file: &*file,
+                        line,
+                        plot: &mut plot::lock(&tab.plot),
+                        views: &mut tab.views,
+                        kept: tab.result.as_ref(),
+                        fibex: fibex.as_deref(),
+                        arg_picks: &mut tab.arg_picks,
+                    };
+                    signals::signals_panel(ui, &mut tab.signals_ui, input)
+                })
+                .inner;
+            if out.close {
+                self.show_signals = false;
+            }
+            if let Some((name, kind)) = out.kind {
+                tab.query_kind.insert(name, kind);
+                tab.choices_gen += 1;
+            }
+            if let Some((name, scope)) = out.scope {
+                match self.saved_signals.get(&name) {
+                    Some(d) => {
+                        let d = (**d).clone().with_scope(scope);
+                        self.saved_signals.set(d);
+                        save_signals = true;
+                    }
+                    None => {
+                        tab.query_scope.insert(name, scope);
+                        tab.choices_gen += 1;
+                    }
+                }
+            }
+            if out.saved_changed {
+                save_signals = true;
+            }
+            fibex_action = out.fibex;
+            if out.args_changed {
+                tab.choices_gen += 1;
+            }
+            if let Some(line) = out.goto {
+                tab.goto_line(line);
+            }
+        }
         let search_history = &self.search_history;
         let found = egui::Panel::bottom("search")
             .resizable(true)
@@ -2575,6 +3224,75 @@ impl App {
             .min_size(120.0)
             .show(ui, |ui| tab.search_panel(ui, &*file, search_history))
             .inner;
+        let plotted = !plot::lock(&tab.plot).plotted.is_empty();
+        if plotted && self.plot_window {
+            // The plot's own window: what it draws now, and what it asked.
+            let line = tab.current_line();
+            let (goto, toggle, closed) = {
+                let mut d = self.plot_win.lock().unwrap_or_else(|e| e.into_inner());
+                d.input = Some(plot::WindowInput {
+                    plot: tab.plot.clone(),
+                    signals: tab.signals.clone(),
+                    generation: tab.signals_gen,
+                    file: file.clone(),
+                    cursor: line,
+                    kept: tab.result.clone(),
+                    bookmarks: plot::Bookmark::all(&tab.bookmarks),
+                });
+                let out = std::mem::take(&mut d.out);
+                if let Some((l, note)) = out.bookmark {
+                    tab.set_bookmark(l, note);
+                }
+                (out.goto, out.toggle_window, std::mem::take(&mut d.closed))
+            };
+            let shared = self.plot_win.clone();
+            let builder = egui::ViewportBuilder::default()
+                .with_title(format!("Plot — {} — nerka", tab.title()))
+                .with_inner_size([1100.0, 460.0]);
+            let id = egui::ViewportId::from_hash_of("nerka-plot");
+            ctx.show_viewport_deferred(id, builder, move |ui, _| plot::window_ui(ui, &shared));
+            // The cursor or the data may have changed.
+            ctx.request_repaint_of(id);
+            if toggle || closed {
+                self.plot_window = false;
+            }
+            if let Some(line) = goto {
+                tab.goto_line(line);
+            }
+        } else if plotted {
+            let line = tab.current_line();
+            let in_window = false;
+            let kept = tab.result.clone();
+            let (views, generation) = (&mut tab.views, tab.signals_gen);
+            let mut series_of = |d: &nerka_core::SignalDef| views.series(d, &*file, kept.as_ref(), generation);
+            let marks = plot::Bookmark::all(&tab.bookmarks);
+            let src = plot::Source {
+                signals: &tab.signals,
+                generation,
+                file: &*file,
+                cursor: line,
+                kept: kept.as_ref().map_or(0, |r| Arc::as_ptr(r) as usize),
+                series_of: &mut series_of,
+                in_window,
+                bookmarks: &marks,
+            };
+            let shared = tab.plot.clone();
+            let out = egui::Panel::bottom("plot")
+                .resizable(true)
+                .default_size(220.0)
+                .min_size(80.0)
+                .show(ui, |ui| plot::plot_panel(ui, &mut plot::lock(&shared), src))
+                .inner;
+            if out.toggle_window {
+                self.plot_window = !self.plot_window;
+            }
+            if let Some((l, note)) = out.bookmark {
+                tab.set_bookmark(l, note);
+            }
+            if let Some(line) = out.goto {
+                tab.goto_line(line);
+            }
+        }
         egui::CentralPanel::default().show(ui, |ui| tab.main_panel(ui, &*file));
         let after = tab.search_prefs();
         if after != before {
@@ -2585,6 +3303,31 @@ impl App {
         }
         if let Some((tag, pattern)) = found {
             self.record_search_box(tag, &pattern);
+        }
+        if save_signals {
+            self.save_saved_signals();
+        }
+        match fibex_action {
+            Some(signals::FibexAction::Add) => {
+                if let Some(paths) = rfd::FileDialog::new()
+                    .add_filter("FIBEX", &["xml", "fibex"])
+                    .add_filter("All files", &["*"])
+                    .pick_files()
+                {
+                    let mut all = self.fibex_paths.clone();
+                    all.extend(paths);
+                    self.set_fibex(&ctx, all);
+                }
+            }
+            Some(signals::FibexAction::Forget) => {
+                self.set_fibex(&ctx, Vec::new());
+                // Without FIBEX the messages have no arguments.
+                for t in &mut self.tabs {
+                    t.arg_picks.clear();
+                    t.choices_gen += 1;
+                }
+            }
+            None => {}
         }
     }
 }
@@ -2649,6 +3392,153 @@ query timeouts  labels: vision
     fn hits(tab: &Tab) -> Vec<(LineNo, Vec<&str>)> {
         let (a, h) = tab.search.hits.as_ref().expect("search hits");
         (0..h.len()).map(|i| (h.lines[i], h.matched(i).map(|q| short(&a.names[q])).collect())).collect()
+    }
+
+    #[test]
+    fn a_dlt_tab_reads_its_file_again_with_fibex() {
+        use nerka_core::input::dlt::writer::{Msg, Payload};
+        let dir = std::env::temp_dir().join(format!("nerka-gui-fibex-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (dlt, xml) = (dir.join("t.dlt"), dir.join("t.xml"));
+        let mut buf = Vec::new();
+        for i in 0..5u16 {
+            let data = (40 + i).to_le_bytes().to_vec();
+            let m = Msg {
+                ext: None,
+                payload: Payload::NonVerbose { id: 7, data },
+                ..Msg::log(nerka_core::Level::Info, "E1", "", "", vec![])
+            };
+            m.encode(&mut buf);
+        }
+        std::fs::write(&dlt, &buf).unwrap();
+        std::fs::write(
+            &xml,
+            r#"<fx:FIBEX xmlns:fx="f" xmlns:ho="h"><fx:ELEMENTS><fx:PDUS>
+              <fx:PDU ID="p"><ho:DESC>speed</ho:DESC><fx:SIGNAL-INSTANCES><fx:SIGNAL-INSTANCE ID="s">
+                <fx:SEQUENCE-NUMBER>0</fx:SEQUENCE-NUMBER><fx:SIGNAL-REF ID-REF="S_UINT16"/></fx:SIGNAL-INSTANCE></fx:SIGNAL-INSTANCES></fx:PDU>
+            </fx:PDUS><fx:FRAMES><fx:FRAME ID="ID_7"><fx:PDU-INSTANCES><fx:PDU-INSTANCE ID="i"><fx:PDU-REF ID-REF="p"/>
+              <fx:SEQUENCE-NUMBER>0</fx:SEQUENCE-NUMBER></fx:PDU-INSTANCE></fx:PDU-INSTANCES>
+              <fx:MANUFACTURER-EXTENSION><APPLICATION_ID>NAV</APPLICATION_ID></fx:MANUFACTURER-EXTENSION></fx:FRAME></fx:FRAMES>
+            </fx:ELEMENTS></fx:FIBEX>"#,
+        )
+        .unwrap();
+        let ctx = egui::Context::default();
+        let mut tab = Tab::open(&ctx, dlt, &SearchPrefs::default());
+        settle(&mut tab, &ctx);
+        let text = |tab: &Tab, l| tab.file.as_ref().unwrap().line_text(l).unwrap().into_owned();
+        assert!(text(&tab, 2).ends_with("[7] 2a 00"), "{}", text(&tab, 2));
+        tab.goto_line(3);
+        // A filter in the box (not run yet) runs when the file is read again.
+        tab.mode = Mode::Query;
+        tab.pattern = "payload ~ /speed 4[2-4]/".into();
+
+        let fibex = Arc::new(nerka_core::Fibex::load(&[&xml]).unwrap());
+        tab.reopen(&ctx, &SearchPrefs::default(), Some(fibex));
+        settle(&mut tab, &ctx);
+        assert!(text(&tab, 2).ends_with("	E1	NAV			speed 42"), "{}", text(&tab, 2));
+        // The filter ran again on the decoded text; the current line stayed.
+        assert_eq!(tab.result.as_ref().unwrap().lines, [2, 3, 4]);
+        assert_eq!(tab.current_line(), 3);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn fibex_arguments_become_signals_of_a_tab() {
+        use nerka_core::input::dlt::writer::{Msg, Payload};
+        let dir = std::env::temp_dir().join(format!("nerka-gui-fibex-args-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (dlt, xml) = (dir.join("t.dlt"), dir.join("t.xml"));
+        let mut buf = Vec::new();
+        for size in [512u16, 64, 900, 32] {
+            let m = Msg {
+                ext: None,
+                payload: Payload::NonVerbose { id: 11, data: size.to_le_bytes().to_vec() },
+                ..Msg::log(nerka_core::Level::Info, "ECU1", "", "", vec![])
+            };
+            m.encode(&mut buf);
+        }
+        std::fs::write(&dlt, &buf).unwrap();
+        std::fs::write(
+            &xml,
+            r#"<fx:FIBEX xmlns:fx="f" xmlns:ho="h"><fx:ELEMENTS><fx:ECUS><fx:ECU ID="ECU1"/></fx:ECUS><fx:PDUS>
+              <fx:PDU ID="t"><ho:DESC>Queue almost full. Free slots:</ho:DESC></fx:PDU>
+              <fx:PDU ID="v"><fx:SIGNAL-INSTANCES><fx:SIGNAL-INSTANCE ID="s"><fx:SEQUENCE-NUMBER>0</fx:SEQUENCE-NUMBER>
+                <fx:SIGNAL-REF ID-REF="S_UINT16"/></fx:SIGNAL-INSTANCE></fx:SIGNAL-INSTANCES></fx:PDU>
+            </fx:PDUS><fx:FRAMES><fx:FRAME ID="ID_11"><fx:PDU-INSTANCES>
+              <fx:PDU-INSTANCE ID="1"><fx:PDU-REF ID-REF="t"/><fx:SEQUENCE-NUMBER>0</fx:SEQUENCE-NUMBER></fx:PDU-INSTANCE>
+              <fx:PDU-INSTANCE ID="2"><fx:PDU-REF ID-REF="v"/><fx:SEQUENCE-NUMBER>1</fx:SEQUENCE-NUMBER></fx:PDU-INSTANCE>
+            </fx:PDU-INSTANCES><fx:MANUFACTURER-EXTENSION><APPLICATION_ID>QUE</APPLICATION_ID></fx:MANUFACTURER-EXTENSION>
+            </fx:FRAME></fx:FRAMES></fx:ELEMENTS></fx:FIBEX>"#,
+        )
+        .unwrap();
+        let fibex = Arc::new(nerka_core::Fibex::load(&[&xml]).unwrap());
+        let args = fibex.arguments();
+        assert_eq!(args.iter().map(|a| a.name.as_str()).collect::<Vec<_>>(), ["free_slots"]);
+        let ctx = egui::Context::default();
+        let mut tab = Tab::open_many(&ctx, vec![dlt], &SearchPrefs::default(), Some(fibex));
+        settle(&mut tab, &ctx);
+        // Not picked yet: the line window still lists the message's argument.
+        let own = tab.line_signals(0, &args);
+        let free: Vec<(&str, Option<&str>, &str)> =
+            own.iter().map(|s| (s.name.as_str(), s.value.as_deref(), s.origin)).collect();
+        assert_eq!(free, [("free_slots", Some("512"), "FIBEX, not used")]);
+        tab.arg_picks = args.clone();
+        tab.choices_gen += 1;
+        tab.refresh_signals(&ctx, &Library::new(), &Signals::default(), 0);
+        settle(&mut tab, &ctx);
+        let d = tab.signals.get("free_slots").expect("a signal");
+        assert_eq!((d.kind(), d.argument_index()), (SignalKind::Num, Some(0)));
+        tab.mode = Mode::Query;
+        tab.pattern = "@free_slots < 100".into();
+        tab.start_search(&ctx);
+        settle(&mut tab, &ctx);
+        assert_eq!(tab.result.as_ref().unwrap().lines, [1, 3]);
+        // Picked, it is listed once, as the tab's signal.
+        let own = tab.line_signals(1, &args);
+        // (with the file's built-in @time, an event on every DLT line).
+        assert_eq!(
+            own.iter().map(|s| (s.name.as_str(), s.origin)).collect::<Vec<_>>(),
+            [("time", "built in"), ("free_slots", "FIBEX")]
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn the_line_window_lists_signals_and_follows_the_selection() {
+        let dir = std::env::temp_dir().join(format!("nerka-gui-detail-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("app.log");
+        std::fs::write(
+            &log,
+            "v=10 gear=P
+boot
+v=60
+gear=D
+",
+        )
+        .unwrap();
+        let ctx = egui::Context::default();
+        let mut tab = Tab::open(&ctx, log, &SearchPrefs::default());
+        settle(&mut tab, &ctx);
+        tab.signals.set(nerka_core::SignalDef::parse_spec(r"v=/v=(?<v>\d+)/").unwrap());
+        tab.signals.set(nerka_core::SignalDef::parse_spec(r"gear:enum=/gear=(?<gear>\w)/").unwrap());
+        tab.signals_changed(&ctx);
+        settle(&mut tab, &ctx);
+        // Line 3 carries v; gear holds P from line 1.
+        let s = tab.line_signals(2, &[]);
+        let rows: Vec<(&str, Option<&str>, Option<LineNo>)> =
+            s.iter().map(|s| (s.name.as_str(), s.value.as_deref(), s.from)).collect();
+        assert_eq!(rows, [("v", Some("60"), Some(2)), ("gear", Some("P"), Some(0))], "events first");
+        assert_eq!(tab.line_signals(1, &[])[0].from, Some(0), "a state");
+        // The window follows the line selected in a view.
+        let file = tab.file.clone().unwrap();
+        tab.detail = LineDetail::of(&*file, 0);
+        tab.detail.as_mut().unwrap().wrap = false;
+        tab.view_output(&view::ViewOutput { moved_to: Some(3), ..Default::default() }, |r| r);
+        let d = tab.detail.as_ref().unwrap();
+        assert_eq!((d.line, d.wrap), (3, false), "keeps Wrap");
+        assert_eq!(d.cells.last().map(String::as_str), Some("gear=D"));
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
@@ -2874,7 +3764,7 @@ query timeouts  labels: vision
         t.toggle_bookmark_at(3);
         assert_eq!(
             std::fs::read_to_string(Bookmarks::sidecar_path(&b)).unwrap(),
-            "2	
+            "2		B1
 "
         );
         assert!(!Bookmarks::sidecar_path(&a).exists());
@@ -3006,7 +3896,7 @@ query timeouts  labels: vision
             Err(_) => "error",
         };
         let read = |mode, s: &str| {
-            let (f, p) = read_box(mode, s, &lit, &[]);
+            let (f, p) = read_box(mode, s, &lit, &[], &Signals::default());
             (kind(&f), p)
         };
         assert_eq!(
@@ -3025,12 +3915,12 @@ query timeouts  labels: vision
         assert_eq!(read(Mode::Auto, "/SSL|CERT/i"), ("query", Preview::AutoRegex("/SSL|CERT/i".into())));
         // Regex ticked: Auto's plain words and its text are regexes.
         let re = MatcherOptions { fixed_string: false, ..Default::default() };
-        let (f, p) = read_box(Mode::Auto, "cam[12] frame", &re, &[]);
+        let (f, p) = read_box(Mode::Auto, "cam[12] frame", &re, &[], &Signals::default());
         assert!(matches!(f, Ok(Filter::Regex(_))), "{p:?}");
         assert_eq!(p, Preview::AutoText { text: "cam[12] frame".into(), why: p_why(&p), regex: true });
-        let (_, p) = read_box(Mode::Auto, "drop.* AND level >= ERROR", &re, &[]);
+        let (_, p) = read_box(Mode::Auto, "drop.* AND level >= ERROR", &re, &[], &Signals::default());
         assert!(matches!(p, Preview::AutoText { regex: true, .. }), "{p:?}");
-        let (f, p) = read_box(Mode::Auto, "fr.me AND level >= ERROR", &re, &[]);
+        let (f, p) = read_box(Mode::Auto, "fr.me AND level >= ERROR", &re, &[], &Signals::default());
         assert_eq!((kind(&f), p), ("query", Preview::AutoQuery("/fr.me/ AND level >= ERROR".into())));
         // Text mode never reads a query; NFD mode never falls back.
         assert_eq!(read(Mode::Text, "level >= ERROR"), ("text", Preview::None));
@@ -3041,7 +3931,7 @@ query timeouts  labels: vision
         // Invert in Auto wraps a query in NOT; ignore case reaches phrases.
         let file = nerka_core::TextFile::from_bytes("t", LOG.as_bytes().to_vec());
         let run = |mode, s: &str, o: &MatcherOptions| {
-            let f = read_box(mode, s, o, &[]).0.unwrap();
+            let f = read_box(mode, s, o, &[], &Signals::default()).0.unwrap();
             nerka_core::search(&file, &f, &nerka_core::Progress::default()).unwrap().lines
         };
         let inv = MatcherOptions { invert: true, ..lit.clone() };
@@ -3349,6 +4239,121 @@ query timeouts  labels: vision
         settle(&mut tab, &ctx);
         assert_eq!(tab.search.pattern, "(/frame drop/)");
         assert_eq!(hits(&tab), [(0, vec!["drops"]), (1, vec!["drops"]), (2, vec!["drops"])]);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn named_groups_of_picked_queries_are_signals() {
+        let dir = std::env::temp_dir().join(format!("nerka-gui-qsig-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("app.log");
+        std::fs::write(
+            &log,
+            "10:00:01 v=10 gear=P
+boot
+10:00:02 v=60 gear=D
+10:00:03 WARN v=80 gear=D
+",
+        )
+        .unwrap();
+        let mut lib = Library::new();
+        let pack_text = r"pack p
+query speed
+    /v=(?<v>\d+) gear=(?<gear>\w)/
+query clock  signals: t:time
+    /^(?<t>\S+)/
+";
+        lib.add(pack::parse_pack("p.nerka-pack", pack_text).unwrap()).unwrap();
+        let ctx = egui::Context::default();
+        let mut tab = Tab::open(&ctx, log, &SearchPrefs::default());
+        settle(&mut tab, &ctx);
+        let mut saved = Signals::default();
+        tab.refresh_signals(&ctx, &lib, &saved, 0);
+        assert!(tab.signals.is_empty(), "nothing picked, no time in the file");
+
+        // A signal pick: its groups are signals; the filter stays empty.
+        tab.picks.add(&lib, "p.speed", Use::Signal, None);
+        tab.picks.add(&lib, "p.clock", Use::Signal, None);
+        tab.refresh_signals(&ctx, &lib, &saved, 0);
+        let kinds: Vec<(&str, &str)> = tab.signals.iter().map(|d| (d.name(), d.kind().as_str())).collect();
+        assert_eq!(kinds, [("v", "num"), ("gear", "enum"), ("t", "time")]);
+        assert_eq!(tab.picks.expand(&lib).unwrap().exp.nfd, "");
+        tab.mode = Mode::Query;
+        tab.pattern = "@gear == D AND level >= WARN".into();
+        tab.start_search(&ctx);
+        settle(&mut tab, &ctx);
+        assert_eq!(tab.result.as_ref().unwrap().lines, [3]);
+
+        // A chosen kind wins over the values; a saved signal over the query's.
+        tab.query_kind.insert("v".into(), SignalKind::Enum);
+        tab.choices_gen += 1;
+        saved.set(nerka_core::SignalDef::parse_spec(r"gear:enum=/gear=(?<gear>[A-Z])/").unwrap());
+        tab.refresh_signals(&ctx, &lib, &saved, 1);
+        assert_eq!(tab.signals.get("v").unwrap().kind(), SignalKind::Enum);
+        assert!(tab.signals.get("gear").unwrap().queries().is_empty(), "the saved one");
+
+        // A filtered signal can't be used in a filter.
+        tab.query_scope.insert("v".into(), SignalScope::Filtered);
+        tab.choices_gen += 1;
+        tab.refresh_signals(&ctx, &lib, &saved, 1);
+        tab.pattern = "@v == 10".into();
+        assert!(!tab.start_search(&ctx));
+        assert!(tab.status.contains("filtered lines only"), "{}", tab.status);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_tab_filters_by_its_signals() {
+        let dir = std::env::temp_dir().join(format!("nerka-gui-signals-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("app.log");
+        std::fs::write(&log, "v=10\nv=60\nboot\nWARN v=80\n").unwrap();
+        let ctx = egui::Context::default();
+        let mut tab = Tab::open(&ctx, log, &SearchPrefs::default());
+        settle(&mut tab, &ctx);
+
+        // Unknown until the tab defines it: Auto reads it as text.
+        tab.mode = Mode::Auto;
+        tab.pattern = "@v > 50".into();
+        let sig = (&tab.signals, tab.signals_gen);
+        let p = tab.filter_preview.get(tab.mode, &tab.pattern, &tab.options, &[], sig);
+        assert!(p_why(&p).is_some_and(|w| w.contains("unknown signal '@v'")), "{p:?}");
+
+        tab.signals.set(nerka_core::SignalDef::parse_spec(r"v=/v=(?<v>\d+)/").unwrap());
+        tab.signals_changed(&ctx);
+        settle(&mut tab, &ctx);
+        // The state holds on "boot" too.
+        assert_eq!(tab.result.as_ref().unwrap().lines, [1, 2, 3]);
+        // The panel's events were collected in the background.
+        let file = tab.file.clone().unwrap();
+        let series = tab.signals.get("v").unwrap().cached_series(&*file).expect("collected");
+        assert_eq!(series.state(2).map(|(row, v)| (row, v.to_value().to_string())), Some((1, "60".into())));
+        tab.pattern = "@v.event".into();
+        tab.start_search(&ctx);
+        settle(&mut tab, &ctx);
+        assert_eq!(tab.result.as_ref().unwrap().lines, [0, 1, 3]);
+        tab.pattern = "@v > 50".into();
+        tab.start_search(&ctx);
+        settle(&mut tab, &ctx);
+        let sig = (&tab.signals, tab.signals_gen);
+        let p = tab.filter_preview.get(tab.mode, &tab.pattern, &tab.options, &[], sig);
+        assert!(matches!(&p, Preview::AutoQuery(q) if q == "@v > 50"), "{p:?}");
+
+        // The Search box knows them too.
+        tab.search.pattern = "level >= WARN AND @v > 70".into();
+        tab.run_search_box(&ctx);
+        settle(&mut tab, &ctx);
+        assert_eq!(hits(&tab).iter().map(|h| h.0).collect::<Vec<_>>(), [3]);
+
+        // Removing the signal runs the filter again: Auto now reads the box
+        // as text, and NFD mode says why it can't run.
+        tab.signals.remove("v");
+        tab.signals_changed(&ctx);
+        settle(&mut tab, &ctx);
+        assert!(tab.result.as_ref().unwrap().lines.is_empty());
+        tab.mode = Mode::Query;
+        assert!(!tab.start_search(&ctx));
+        assert!(tab.status.contains("unknown signal '@v' (no signals are defined)"), "{}", tab.status);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

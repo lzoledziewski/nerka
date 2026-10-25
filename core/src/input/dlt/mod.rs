@@ -17,6 +17,7 @@
 //! datagram) live in a side buffer. No temporary `.dlt` is written. A
 //! message without an ECU id takes its capture channel's.
 
+pub mod fibex;
 mod format;
 mod payload;
 pub mod writer;
@@ -24,10 +25,12 @@ pub mod writer;
 use super::{Bytes, ColumnDef};
 use crate::event::{FieldDef, FieldId, FieldKind, FieldValue, Level};
 use crate::{LineNo, LogSource, Progress, Result};
+use fibex::{Fibex, Frame};
 use format::{MAGIC, MSTP_APP_TRACE, MSTP_CONTROL, MSTP_LOG, MSTP_NW_TRACE, Message, NO_ECU, STORAGE_LEN, Storage};
 use std::borrow::Cow;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 /// Columns of a rendered line, separated by tabs.
 pub const COLUMNS: [ColumnDef; 7] = [
@@ -141,6 +144,8 @@ pub struct DltFile {
     data: Bytes,
     index: Index,
     skipped: u64,
+    /// Descriptions of non-verbose messages, if FIBEX files were given.
+    fibex: Option<Arc<Fibex>>,
 }
 
 impl DltFile {
@@ -149,13 +154,20 @@ impl DltFile {
         let data = Bytes::map(path)?;
         let (offsets, skipped) = build_index(data.bytes(), progress)?;
         let name = path.display().to_string();
-        Ok(Self { name, path: Some(path.to_path_buf()), data, index: Index::Stored(offsets), skipped })
+        Ok(Self { name, path: Some(path.to_path_buf()), data, index: Index::Stored(offsets), skipped, fibex: None })
     }
 
     /// In-memory source, handy for tests.
     pub fn from_bytes(name: impl Into<String>, bytes: Vec<u8>) -> Self {
         let (offsets, skipped) = build_index(&bytes, &Progress::new()).expect("not cancelled");
-        Self { name: name.into(), path: None, data: Bytes::Owned(bytes), index: Index::Stored(offsets), skipped }
+        Self {
+            name: name.into(),
+            path: None,
+            data: Bytes::Owned(bytes),
+            index: Index::Stored(offsets),
+            skipped,
+            fibex: None,
+        }
     }
 
     /// DLT messages found inside another file (`data`, e.g. a mapped pcap):
@@ -172,7 +184,20 @@ impl DltFile {
         channel_ecus: Vec<[u8; 4]>,
         skipped: u64,
     ) -> Self {
-        Self { name, path, data, index: Index::Framed { msgs, side, channel_ecus }, skipped }
+        Self { name, path, data, index: Index::Framed { msgs, side, channel_ecus }, skipped, fibex: None }
+    }
+
+    /// Decode non-verbose messages with `fibex`: their payload as text, and
+    /// the APID, CTID, type and level they don't carry themselves.
+    pub fn with_fibex(mut self, fibex: Option<Arc<Fibex>>) -> Self {
+        self.fibex = fibex;
+        self
+    }
+
+    /// The FIBEX description of a non-verbose message, if there is one.
+    fn frame(&self, m: &Message<'_>) -> Option<&Frame> {
+        let fibex = self.fibex.as_ref()?;
+        fibex.frame(non_verbose_id(m)?, m.ecu(), m.apid(), m.ctid())
     }
 
     pub fn path(&self) -> Option<&Path> {
@@ -231,6 +256,14 @@ fn build_index(buf: &[u8], progress: &Progress) -> Result<(Vec<u64>, u64)> {
     Ok((offsets, skipped))
 }
 
+/// The level, from the message's extended header or its FIBEX description.
+fn level_with(m: &Message<'_>, frame: Option<&Frame>) -> Option<Level> {
+    match m.mstp() {
+        Some(_) => level_of(m),
+        None => frame?.level(),
+    }
+}
+
 fn level_of(m: &Message<'_>) -> Option<Level> {
     if m.mstp() != Some(MSTP_LOG) {
         return None;
@@ -246,8 +279,8 @@ fn level_of(m: &Message<'_>) -> Option<Level> {
     })
 }
 
-fn type_of(m: &Message<'_>) -> Option<&'static str> {
-    Some(match m.mstp()? {
+fn type_of(m: &Message<'_>, frame: Option<&Frame>) -> Option<&'static str> {
+    Some(match m.mstp().or(frame.and_then(|f| f.mstp))? {
         MSTP_LOG => "log",
         MSTP_APP_TRACE => "app_trace",
         MSTP_NW_TRACE => "nw_trace",
@@ -257,15 +290,15 @@ fn type_of(m: &Message<'_>) -> Option<&'static str> {
 }
 
 /// The `type` column: the level for log messages, else the message type.
-fn type_column(m: &Message<'_>) -> &'static str {
-    match level_of(m) {
+fn type_column(m: &Message<'_>, frame: Option<&Frame>) -> &'static str {
+    match level_with(m, frame) {
         Some(Level::Fatal) => "fatal",
         Some(Level::Error) => "error",
         Some(Level::Warn) => "warn",
         Some(Level::Info | Level::Notice) => "info",
         Some(Level::Debug) => "debug",
         Some(Level::Trace) => "verbose",
-        None => type_of(m).unwrap_or(""),
+        None => type_of(m, frame).unwrap_or(""),
     }
 }
 
@@ -299,28 +332,30 @@ fn write_time(out: &mut Vec<u8>, secs: u32, usecs: i32) {
     );
 }
 
-fn render_line(m: &Message<'_>) -> Vec<u8> {
+fn render_line(m: &Message<'_>, frame: Option<&Frame>) -> Vec<u8> {
     let mut out = Vec::with_capacity(80 + m.payload().len() * 3);
-    render_header(m, &mut out);
+    render_header(m, frame, &mut out);
     out.push(b'\t');
-    payload::render(m, &mut out);
+    payload::render(m, frame, &mut out);
     out
 }
 
 /// The columns before the payload, tab-separated (no trailing tab).
-fn render_header(m: &Message<'_>, out: &mut Vec<u8>) {
+fn render_header(m: &Message<'_>, frame: Option<&Frame>, out: &mut Vec<u8>) {
     let (secs, usecs) = m.storage_time();
     write_time(out, secs, usecs);
     out.push(b'\t');
     if let Some(t) = m.timestamp() {
         let _ = write!(out, "{}.{:04}", t / 10_000, t % 10_000);
     }
-    for id in [Some(m.ecu()), m.apid(), m.ctid()] {
+    let apid = m.apid().or_else(|| frame?.apid.as_deref().map(str::as_bytes));
+    let ctid = m.ctid().or_else(|| frame?.ctid.as_deref().map(str::as_bytes));
+    for id in [Some(m.ecu()), apid, ctid] {
         out.push(b'\t');
         out.extend_from_slice(id.unwrap_or_default());
     }
     out.push(b'\t');
-    out.extend_from_slice(type_column(m).as_bytes());
+    out.extend_from_slice(type_column(m, frame).as_bytes());
 }
 
 impl LogSource for DltFile {
@@ -336,16 +371,17 @@ impl LogSource for DltFile {
     }
 
     fn line_bytes(&self, line: LineNo) -> Option<Cow<'_, [u8]>> {
-        self.msg(line).map(|m| Cow::Owned(render_line(&m)))
+        self.msg(line).map(|m| Cow::Owned(render_line(&m, self.frame(&m))))
     }
 
     fn line_detail(&self, line: LineNo) -> Option<Vec<String>> {
         let m = self.msg(line)?;
+        let frame = self.frame(&m);
         let mut head = Vec::new();
-        render_header(&m, &mut head);
+        render_header(&m, frame, &mut head);
         let mut cells: Vec<String> = String::from_utf8_lossy(&head).split('\t').map(str::to_owned).collect();
         let mut payload = Vec::new();
-        payload::render_formatted(&m, &mut payload);
+        payload::render_formatted(&m, frame, &mut payload);
         cells.push(String::from_utf8_lossy(&payload).into_owned());
         Some(cells)
     }
@@ -376,9 +412,16 @@ impl LogSource for DltFile {
         let s = |b: &'static str| FieldValue::Str(b.as_bytes().into());
         match id {
             ECU => Some(FieldValue::Str(m.ecu().into())),
-            APID => m.apid().map(|b| FieldValue::Str(b.into())),
-            CTID => m.ctid().map(|b| FieldValue::Str(b.into())),
-            TYPE => type_of(&m).map(s),
+            // A non-verbose message without them: from its FIBEX description.
+            APID => match m.apid() {
+                Some(b) => Some(FieldValue::Str(b.into())),
+                None => self.frame(&m)?.apid.as_deref().map(|a| FieldValue::Str(a.as_bytes().into())),
+            },
+            CTID => match m.ctid() {
+                Some(b) => Some(FieldValue::Str(b.into())),
+                None => self.frame(&m)?.ctid.as_deref().map(|c| FieldValue::Str(c.as_bytes().into())),
+            },
+            TYPE => type_of(&m, if m.mstp().is_none() { self.frame(&m) } else { None }).map(s),
             MCNT => Some(FieldValue::U64(m.mcnt().into())),
             TMSP => m.timestamp().map(|t| FieldValue::U64(t.into())),
             SEID => m.session_id().map(|t| FieldValue::U64(t.into())),
@@ -387,7 +430,7 @@ impl LogSource for DltFile {
             MODE => Some(s(if m.verbose() { "verbose" } else { "non-verbose" })),
             PAYLOAD => {
                 let mut out = Vec::new();
-                payload::render(&m, &mut out);
+                payload::render(&m, self.frame(&m), &mut out);
                 Some(FieldValue::Str(out.into()))
             }
             _ => None,
@@ -395,7 +438,20 @@ impl LogSource for DltFile {
     }
 
     fn supplied_level(&self, line: LineNo) -> Option<Option<Level>> {
-        Some(self.msg(line).as_ref().and_then(level_of))
+        let m = self.msg(line)?;
+        let frame = if m.mstp().is_none() { self.frame(&m) } else { None };
+        Some(level_with(&m, frame))
+    }
+
+    fn time(&self, line: LineNo) -> Option<f64> {
+        let (secs, usecs) = self.msg(line)?.storage_time();
+        Some(f64::from(secs) + f64::from(usecs) / 1e6)
+    }
+
+    fn argument(&self, line: LineNo, index: usize) -> Option<crate::signal::SignalValue> {
+        let m = self.msg(line)?;
+        let frame = self.frame(&m)?;
+        frame.arg(m.payload().get(4..)?, m.big_endian(), index)
     }
 }
 

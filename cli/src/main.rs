@@ -9,12 +9,15 @@
 //!     nerka expand -q vision.frame_drops -p cam=CAM1    (pack picks -> plain NFD)
 //!     nerka search --in 'level >= WARN' timeout app.log (search inside a filter)
 //!     nerka search --in 'ecu == SOCB' -l ota app.log     (per pack query)
+//!     nerka --signal 'v=/v=(?<v>\d+)/' filter '@v > 100' app.log   (signals)
+//!     nerka --fibex ecu1.xml filter 'apid == NAV' trace.dlt         (non-verbose DLT)
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use nerka_core::pack::{self, Expansion, Library, ParamValue, Params, Pick, Role, Selection};
 use nerka_core::{
-    Bookmarks, FieldDef, Filter, LogSource, Matcher, MatcherOptions, Progress, Query, SearchSet, search, search_within,
+    Bookmarks, Filter, LogSource, Matcher, MatcherOptions, Progress, Query, SearchSet, SignalDef, Signals, search,
+    search_within,
 };
 use std::io::{BufWriter, Write};
 use std::path::PathBuf;
@@ -31,6 +34,14 @@ struct Cli {
     /// MF4; repeatable). Default: 3490.
     #[arg(long = "dlt-port", global = true, value_name = "PORT")]
     dlt_port: Vec<u16>,
+    /// FIBEX file describing DLT non-verbose messages (repeatable): their
+    /// payload is shown as text, and their APID / CTID / level come from it.
+    #[arg(long, global = true, value_name = "FILE")]
+    fibex: Vec<PathBuf>,
+    /// Define a signal for `@name` in queries (repeatable):
+    /// NAME[(GROUP)][:num|enum]=QUERY, e.g. 'speed=/speed=(?<speed>\d+)/'.
+    #[arg(long, global = true, value_name = "SPEC")]
+    signal: Vec<String>,
     #[command(subcommand)]
     cmd: Cmd,
 }
@@ -136,6 +147,7 @@ impl PickArgs {
         let sel = Selection {
             include: picks(&self.queries, &self.labels),
             exclude: picks(&self.exclude, &self.exclude_labels),
+            signal: Vec::new(),
         };
         let mut params = Params::new();
         for (list, raw) in [(&self.params, false), (&self.raw_params, true)] {
@@ -158,22 +170,24 @@ fn library(extra: &[PathBuf]) -> Result<Library> {
 }
 
 /// Compile an NFD query for a source, with a caret under the error.
-fn compile(query: &str, schema: &[FieldDef]) -> Result<Query> {
-    Query::compile_for(query, schema).map_err(|e| {
+fn compile(query: &str, source: &dyn LogSource) -> Result<Query> {
+    // `--signal` definitions, and `@time` on files that know their time.
+    let signals = SIGNALS.get_or_init(Default::default).for_source(source);
+    Query::compile_in(query, source.schema(), &signals).map_err(|e| {
         anyhow::anyhow!("{e}\n  {query}\n  {}^", " ".repeat(query[..e.pos.min(query.len())].chars().count()))
     })
 }
 
-/// `build` gets the opened source's field schema, so query errors about
+/// `build` gets the opened source (its fields, its time), so query errors about
 /// unknown fields point into the query like syntax errors do.
 fn run_filter(
     file: &PathBuf,
-    build: impl FnOnce(&[FieldDef]) -> Result<Filter>,
+    build: impl FnOnce(&dyn LogSource) -> Result<Filter>,
     o: &OutputArgs,
     out: &mut impl Write,
 ) -> Result<()> {
     let (f, t_index) = open(file)?;
-    let filter = build(f.schema())?;
+    let filter = build(&*f)?;
     let t = Instant::now();
     let res = search(&*f, &filter, &Progress::new())?;
     let t_search = t.elapsed();
@@ -211,7 +225,7 @@ fn run_search_within(
     out: &mut impl Write,
 ) -> Result<()> {
     let (f, t_index) = open(file)?;
-    let filter = within.map(|q| compile(q, f.schema())).transpose()?;
+    let filter = within.map(|q| compile(q, &*f)).transpose()?;
     let t = Instant::now();
     let lines = match filter {
         Some(q) => Some(search(&*f, &Filter::Query(q), &Progress::new())?.lines),
@@ -253,6 +267,9 @@ fn run_search_within(
     Ok(())
 }
 
+/// The `--signal` definitions, set once in `main`.
+static SIGNALS: std::sync::OnceLock<Signals> = std::sync::OnceLock::new();
+
 /// How files are opened (`--dlt-port`), set once in `main`.
 static OPEN_OPTIONS: std::sync::OnceLock<nerka_core::OpenOptions> = std::sync::OnceLock::new();
 
@@ -288,7 +305,15 @@ fn run() -> Result<()> {
     if !cli.dlt_port.is_empty() {
         options.capture.dlt_udp_ports = cli.dlt_port.clone();
     }
+    if !cli.fibex.is_empty() {
+        options.fibex = Some(std::sync::Arc::new(nerka_core::Fibex::load(&cli.fibex)?));
+    }
     OPEN_OPTIONS.set(options).expect("set once");
+    let mut signals = Signals::default();
+    for spec in &cli.signal {
+        signals.set(SignalDef::parse_spec(spec).with_context(|| format!("--signal {spec}"))?);
+    }
+    SIGNALS.set(signals).expect("set once");
     let stdout = std::io::stdout().lock();
     let mut out = BufWriter::with_capacity(1 << 16, stdout);
 
@@ -332,7 +357,7 @@ fn run() -> Result<()> {
             }
         }
         Cmd::Filter { query, file, out: o } => {
-            run_filter(&file, |schema| Ok(Filter::Query(compile(&query, schema)?)), &o, &mut out)?;
+            run_filter(&file, |source| Ok(Filter::Query(compile(&query, source)?)), &o, &mut out)?;
         }
         Cmd::Expand { picks, parts } => {
             if picks.is_empty() {
@@ -369,12 +394,12 @@ fn run() -> Result<()> {
         Cmd::Marks { file } => {
             let marks = Bookmarks::load_for(&file)?;
             let (f, _) = open(&file)?;
-            for (l, note) in marks.iter() {
+            for (l, name, note) in marks.iter_named() {
                 let text = f.line_text(l).unwrap_or_default();
                 if note.is_empty() {
-                    writeln!(out, "{}: {text}", l + 1)?;
+                    writeln!(out, "{name} {}: {text}", l + 1)?;
                 } else {
-                    writeln!(out, "{}: {text}\n    # {note}", l + 1)?;
+                    writeln!(out, "{name} {}: {text}\n    # {note}", l + 1)?;
                 }
             }
         }

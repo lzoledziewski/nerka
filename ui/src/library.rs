@@ -22,6 +22,7 @@
 
 use eframe::egui::{self, Color32, RichText};
 use nerka_core::FieldDef;
+use nerka_core::SignalKind;
 use nerka_core::pack::{
     self, Expansion, Library, Pack, PackQuery, ParamValue, Params, Pick, Selection, format_query, is_query_name,
     params_in, parse_pack, upsert_query,
@@ -36,6 +37,9 @@ pub enum Use {
     Include,
     /// Lines it matches are dropped (AND NOT).
     Exclude,
+    /// Not in the filter: its named groups are signals, and it can colour
+    /// the lines it matches.
+    Signal,
 }
 
 impl Use {
@@ -43,6 +47,7 @@ impl Use {
         match self {
             Use::Include => "+",
             Use::Exclude => "−",
+            Use::Signal => "~",
         }
     }
 
@@ -50,6 +55,27 @@ impl Use {
         match self {
             Use::Include => "+  include in the filter",
             Use::Exclude => "−  exclude from the filter",
+            Use::Signal => "~  signals only (doesn't filter; can colour lines)",
+        }
+    }
+}
+
+impl From<pack::Role> for Use {
+    fn from(r: pack::Role) -> Use {
+        match r {
+            pack::Role::Include => Use::Include,
+            pack::Role::Exclude => Use::Exclude,
+            pack::Role::Signal => Use::Signal,
+        }
+    }
+}
+
+impl From<Use> for pack::Role {
+    fn from(u: Use) -> pack::Role {
+        match u {
+            Use::Include => pack::Role::Include,
+            Use::Exclude => pack::Role::Exclude,
+            Use::Signal => pack::Role::Signal,
         }
     }
 }
@@ -88,6 +114,8 @@ pub struct Node {
     pub open: bool,
     /// Last save error.
     pub error: Option<String>,
+    /// Kinds its pack pins for its named groups (`signals:`).
+    pub signals: Vec<(String, SignalKind)>,
 }
 
 impl Node {
@@ -107,6 +135,7 @@ impl Node {
             detached: false,
             open: true,
             error: None,
+            signals: Vec::new(),
         }
     }
 
@@ -120,6 +149,7 @@ impl Node {
             parent: p.parent_of(q),
             labels: q.labels.join(", "),
             color: q.color.clone().unwrap_or_default(),
+            signals: q.signals.clone(),
             edited: false,
             open: false,
             ..Node::blank(key, role)
@@ -148,6 +178,7 @@ impl Node {
             labels: self.labels.split(',').map(str::trim).filter(|l| !l.is_empty()).map(str::to_owned).collect(),
             params: params_in(&self.text),
             color: Some(self.color.trim().to_owned()).filter(|c| !c.is_empty()),
+            signals: self.signals.clone(),
             text: self.text.clone(),
             line: 0,
             end_line: 0,
@@ -194,6 +225,8 @@ pub struct Applied {
     pub keys: Vec<u64>,
     pub names: Vec<String>,
     pub colors: Vec<Color32>,
+    /// Per part: the kinds its pack pins for its named groups.
+    pub pins: Vec<Vec<(String, SignalKind)>>,
 }
 
 /// One query of the Search box: its name, NFD and colour.
@@ -376,18 +409,20 @@ impl Picks {
             match n.role {
                 Use::Include => sel.include.push(Pick::Query(id.clone())),
                 Use::Exclude => sel.exclude.push(Pick::Query(id.clone())),
+                Use::Signal => sel.signal.push(Pick::Query(id.clone())),
             }
             by_id.push((id, n));
         }
         let exp = pack::expand(&sel, &full, &self.params()).map_err(|e| e.to_string())?;
-        let (mut keys, mut names, mut colors) = (Vec::new(), Vec::new(), Vec::new());
+        let (mut keys, mut names, mut colors, mut pins) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
         for p in &exp.parts {
             let n = by_id.iter().find(|(id, _)| *id == p.query).map(|(_, n)| *n).expect("expanded from these nodes");
             keys.push(n.key);
             names.push(n.display_name());
             colors.push(n.color());
+            pins.push(n.signals.clone());
         }
-        Ok(Applied { exp, keys, names, colors })
+        Ok(Applied { exp, keys, names, colors, pins })
     }
 
     /// A query to search for, expanded (parent chain and parameters), with
@@ -410,7 +445,7 @@ impl Picks {
                 (n.expand_id(), n.display_name(), n.color())
             }
         };
-        let sel = Selection { include: vec![Pick::Query(id)], exclude: vec![] };
+        let sel = Selection { include: vec![Pick::Query(id)], ..Default::default() };
         let exp = pack::expand(&sel, &full, &self.params()).map_err(|e| e.to_string())?;
         Ok(Term { name, nfd: exp.nfd, color })
     }
@@ -427,7 +462,7 @@ impl Picks {
             } else {
                 NodeSource::Library(n.source.clone().unwrap_or_default())
             };
-            p.nodes.push(PresetNode { source, exclude: n.role == Use::Exclude, lit: n.lit, detached: n.detached });
+            p.nodes.push(PresetNode { source, role: n.role.into(), lit: n.lit, detached: n.detached });
         }
         p.params = self
             .params
@@ -445,7 +480,7 @@ impl Picks {
         let mut missing = Vec::new();
         for pn in &preset.nodes {
             let key = self.next_key();
-            let role = if pn.exclude { Use::Exclude } else { Use::Include };
+            let role = Use::from(pn.role);
             let mut n = match &pn.source {
                 NodeSource::Library(id) => Node::of_library(key, lib, id, role).unwrap_or_else(|| {
                     missing.push(id.clone());
@@ -460,12 +495,13 @@ impl Picks {
                         parent: q.parent.clone(),
                         labels: q.labels.join(", "),
                         color: q.color.clone().unwrap_or_default(),
+                        signals: q.signals.clone(),
                         open: false,
                         ..Node::blank(key, role)
                     }
                 }
             };
-            n.lit = pn.lit && role == Use::Include;
+            n.lit = pn.lit && role != Use::Exclude;
             if pn.detached {
                 n.detached = true;
                 n.parent = None;
@@ -1204,7 +1240,7 @@ fn node_row(ui: &mut egui::Ui, n: &mut Node, remove: &mut Option<u64>, action: &
         .response
         .on_hover_text("Drag to reorder");
         egui::ComboBox::from_id_salt(("role", n.key)).width(28.0).selected_text(n.role.symbol()).show_ui(ui, |ui| {
-            for u in [Use::Include, Use::Exclude] {
+            for u in [Use::Include, Use::Exclude, Use::Signal] {
                 ui.selectable_value(&mut n.role, u, u.describe());
             }
         });
@@ -1212,7 +1248,7 @@ fn node_row(ui: &mut egui::Ui, n: &mut Node, remove: &mut Option<u64>, action: &
         let color = n.color();
         let (rect, r) = ui.allocate_exact_size(egui::vec2(12.0, 14.0), egui::Sense::click());
         let sw = egui::Rect::from_center_size(rect.center(), egui::vec2(10.0, 12.0));
-        if n.role == Use::Include {
+        if n.role != Use::Exclude {
             if n.lit {
                 ui.painter().rect_filled(sw, 2.0, color);
             } else {

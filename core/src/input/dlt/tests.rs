@@ -2,6 +2,7 @@ use super::writer::{Arg, Extended, Msg, Payload, Value, id};
 use super::*;
 use crate::engine::search::tests::run_on;
 use crate::{Filter, Matcher, Query};
+use fibex::Fibex;
 
 fn file(msgs: &[Msg]) -> DltFile {
     let mut buf = Vec::new();
@@ -338,4 +339,132 @@ fn open_picks_reader_from_content() {
     assert_eq!((b.line_count(), b.schema().len()), (2, 0));
     drop((a, b));
     let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn receive_time_is_the_built_in_time_signal() {
+    let msg = |secs, usecs, text: &str| {
+        let mut m = Msg::log(Level::Info, "E", "A", "C", vec![Value::Str(text.into()).into()]);
+        (m.secs, m.usecs) = (secs, usecs);
+        m
+    };
+    // 2025-10-18 00:00:00, +0.5 s, +0.5 s again, +2 s.
+    let t0 = 1_760_745_600;
+    let f = file(&[msg(t0, 0, "a"), msg(t0, 500_000, "b"), msg(t0, 500_000, "c"), msg(t0 + 2, 0, "d")]);
+    assert_eq!(f.time(1), Some(f64::from(t0) + 0.5));
+    let mut sig = crate::Signals::default();
+    sig.set(crate::SignalDef::source_time());
+    let run = |s: &str| run_on(&f, &Filter::Query(Query::compile(s).unwrap().with_signals(&sig).unwrap()));
+    assert_eq!(run(r#"@time >= "2025-10-18 00:00:00.5""#), [1, 2, 3]);
+    assert_eq!(run(r#"@time < "00:00:01" AND /b|c|d/"#), [1, 2]);
+    assert_eq!(run("@time.event"), [0, 1, 2, 3]);
+    assert_eq!(run("@time.changed"), [0, 1, 3]);
+    assert!(matches!(crate::Clock::of(&f, &sig), crate::Clock::Source));
+}
+
+/// A small FIBEX in the common convention: message 10 is a warning from
+/// NAV/SPD, "speed: <u16> km/h".
+const SPEED_FIBEX: &str = r#"<fx:FIBEX xmlns:fx="http://www.asam.net/xml/fbx" xmlns:ho="http://www.asam.net/xml">
+  <fx:ELEMENTS>
+    <fx:ECUS><fx:ECU ID="ECU1"/></fx:ECUS>
+    <fx:PDUS>
+      <fx:PDU ID="a"><ho:DESC>speed:</ho:DESC></fx:PDU>
+      <fx:PDU ID="b"><fx:SIGNAL-INSTANCES><fx:SIGNAL-INSTANCE ID="s"><fx:SEQUENCE-NUMBER>0</fx:SEQUENCE-NUMBER>
+        <fx:SIGNAL-REF ID-REF="S_UINT16"/></fx:SIGNAL-INSTANCE></fx:SIGNAL-INSTANCES></fx:PDU>
+      <fx:PDU ID="c"><ho:DESC>km/h</ho:DESC></fx:PDU>
+    </fx:PDUS>
+    <fx:FRAMES><fx:FRAME ID="ID_10"><fx:PDU-INSTANCES>
+      <fx:PDU-INSTANCE ID="1"><fx:PDU-REF ID-REF="a"/><fx:SEQUENCE-NUMBER>0</fx:SEQUENCE-NUMBER></fx:PDU-INSTANCE>
+      <fx:PDU-INSTANCE ID="2"><fx:PDU-REF ID-REF="b"/><fx:SEQUENCE-NUMBER>1</fx:SEQUENCE-NUMBER></fx:PDU-INSTANCE>
+      <fx:PDU-INSTANCE ID="3"><fx:PDU-REF ID-REF="c"/><fx:SEQUENCE-NUMBER>2</fx:SEQUENCE-NUMBER></fx:PDU-INSTANCE>
+    </fx:PDU-INSTANCES><fx:MANUFACTURER-EXTENSION>
+      <MESSAGE_TYPE>DLT_TYPE_LOG</MESSAGE_TYPE><MESSAGE_INFO>DLT_LOG_WARN</MESSAGE_INFO>
+      <APPLICATION_ID>NAV</APPLICATION_ID><CONTEXT_ID>SPD</CONTEXT_ID>
+    </fx:MANUFACTURER-EXTENSION></fx:FRAME></fx:FRAMES>
+  </fx:ELEMENTS>
+</fx:FIBEX>"#;
+
+/// Non-verbose speed messages (without extended header), a verbose one, an
+/// unknown non-verbose one, and one with its own extended header.
+fn speed_file(fibex: bool) -> DltFile {
+    let nv = |speed: u16, big_endian: bool| {
+        let data = if big_endian { speed.to_be_bytes() } else { speed.to_le_bytes() }.to_vec();
+        Msg {
+            ext: None,
+            big_endian,
+            payload: Payload::NonVerbose { id: 10, data },
+            ..Msg::log(Level::Info, "ECU1", "", "", vec![])
+        }
+    };
+    let msgs = [
+        nv(30, false),
+        Msg::log(Level::Error, "ECU1", "SYS", "PWR", vec![Value::Str("low".into()).into()]),
+        nv(130, true),
+        Msg {
+            ext: None,
+            payload: Payload::NonVerbose { id: 99, data: vec![1] },
+            ..Msg::log(Level::Info, "ECU1", "", "", vec![])
+        },
+        Msg {
+            payload: Payload::NonVerbose { id: 10, data: vec![5, 0] },
+            ..Msg::log(Level::Debug, "ECU1", "OWN", "CTX", vec![])
+        },
+    ];
+    let mut f = Fibex::default();
+    f.add("speed.xml", SPEED_FIBEX).unwrap();
+    file(&msgs).with_fibex(fibex.then(|| Arc::new(f)))
+}
+
+#[test]
+fn fibex_decodes_non_verbose_messages() {
+    let f = speed_file(true);
+    assert_eq!(payload(&f, 0), "speed: 30 km/h");
+    assert_eq!(payload(&f, 2), "speed: 130 km/h", "big endian");
+    assert_eq!(payload(&f, 3), "[99] 01", "not described");
+    // The header columns come from FIBEX when the message has none.
+    assert!(line(&f, 0).ends_with("\tECU1\tNAV\tSPD\twarn\tspeed: 30 km/h"), "{}", line(&f, 0));
+    let field = |l, name| f.field(l, SCHEMA.iter().position(|d| d.name == name).unwrap());
+    assert_eq!(field(0, "apid"), Some(FieldValue::Str(b"NAV"[..].into())));
+    assert_eq!(field(0, "ctid"), Some(FieldValue::Str(b"SPD"[..].into())));
+    assert_eq!(field(0, "type"), Some(FieldValue::Str(b"log"[..].into())));
+    assert_eq!(f.supplied_level(0), Some(Some(Level::Warn)));
+    // A message's own extended header wins; its payload is still decoded.
+    assert!(line(&f, 4).ends_with("\tOWN\tCTX\tdebug\tspeed: 5 km/h"), "{}", line(&f, 4));
+    assert_eq!(f.supplied_level(4), Some(Some(Level::Debug)));
+    // Without FIBEX nothing changes.
+    let raw = speed_file(false);
+    assert_eq!(payload(&raw, 0), "[10] 1e 00");
+    assert_eq!(raw.supplied_level(0), Some(None));
+}
+
+#[test]
+fn fibex_fields_filter_on_both_paths() {
+    let f = speed_file(true);
+    let q = |s: &str| run_on(&f, &Filter::Query(Query::compile_for(s, SCHEMA).unwrap()));
+    assert_eq!(q("apid == NAV"), [0, 2]);
+    assert_eq!(q("level >= WARN"), [0, 1, 2]);
+    assert_eq!(q(r"payload ~ /speed: 1\d\d/"), [2]);
+    assert_eq!(q(r"/km\/h/ AND ctid == SPD"), [0, 2]);
+    assert_eq!(q("mid == 10 AND apid != NAV"), [4]);
+}
+
+#[test]
+fn fibex_arguments_are_signals() {
+    let f = speed_file(true);
+    let mut sig = crate::Signals::default();
+    sig.set(
+        crate::SignalDef::argument("speed", crate::SignalKind::Num, r#"mid == 10 AND ecu == "ECU1""#, 0, "m10")
+            .unwrap(),
+    );
+    let q = |s: &str| run_on(&f, &Filter::Query(Query::compile(s).unwrap().with_signals(&sig).unwrap()));
+    assert_eq!(q("@speed.event"), [0, 2, 4]);
+    assert_eq!(q("@speed.event > 100"), [2]);
+    // The state holds over line 3 (another message).
+    assert_eq!(q("@speed > 100"), [2, 3]);
+    assert_eq!(q("@speed.changed AND @speed < 50"), [0, 4]);
+    // Without FIBEX the messages have no arguments.
+    let raw = speed_file(false);
+    assert!(
+        run_on(&raw, &Filter::Query(Query::compile("@speed.event").unwrap().with_signals(&sig).unwrap())).is_empty()
+    );
 }

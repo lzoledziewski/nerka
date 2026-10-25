@@ -34,6 +34,7 @@
 //!                                                     and QNAMEs
 //!          | "labels:" LABEL ("," LABEL)*          -- LABEL: seg ("/" seg)*
 //!          | "color:" (lowercase name | "#" 6 hex digits)
+//!          | "signals:" GROUP ":" KIND ("," GROUP ":" KIND)*  -- KIND: num, enum, time
 //! body    := indented lines (the NFD text, kept verbatim), up to the next
 //!            line that starts in column 1
 //! NAME    := [A-Za-z_][A-Za-z0-9_]*                -- also PARAM
@@ -78,6 +79,9 @@ pub struct PackQuery {
     /// Declared parameter names, in order.
     pub params: Vec<String>,
     pub color: Option<String>,
+    /// Kinds pinned for the query's named groups (`signals: speed:num`);
+    /// other groups get theirs from the values.
+    pub signals: Vec<(String, crate::signal::SignalKind)>,
     /// NFD text with `$param` placeholders, dedented, lines joined by `\n`.
     pub text: String,
     /// 0-based line of the `query` header in the file.

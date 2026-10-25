@@ -25,6 +25,8 @@ pub mod history;
 pub mod input;
 pub mod pack;
 pub mod preset;
+pub mod signal;
+pub mod time;
 
 pub use bookmarks::Bookmarks;
 pub use dsl::{DslError, Query};
@@ -35,9 +37,14 @@ pub use event::{Event, FieldDef, FieldId, FieldKind, FieldValue, Level};
 pub use history::SearchHistory;
 pub use input::concat::open_many;
 pub use input::dlt::DltFile;
+pub use input::dlt::fibex::{ArgType, Argument, Fibex, FibexError};
 pub use input::text::TextFile;
 pub use input::{ColumnDef, LogSource, OpenOptions, open, open_with};
 pub use pack::{Library, Pack, PackError, PackQuery};
+pub use signal::{
+    Clock, QueryPart, SignalDef, SignalKind, SignalScope, SignalSeries, SignalValue, SignalView, Signals, ValueRef,
+    query_signals,
+};
 
 /// Line numbers are 0-based internally; UIs add 1 for display.
 pub type LineNo = u64;

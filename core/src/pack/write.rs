@@ -30,6 +30,10 @@ pub fn format_query(q: &PackQuery) -> String {
     if let Some(c) = &q.color {
         out += &format!("  color: {c}");
     }
+    if !q.signals.is_empty() {
+        let s: Vec<String> = q.signals.iter().map(|(g, k)| format!("{g}:{}", k.as_str())).collect();
+        out += &format!("  signals: {}", s.join(", "));
+    }
     for line in q.text.lines() {
         out.push('\n');
         if !line.trim().is_empty() {
@@ -160,6 +164,7 @@ query b
             labels: vec![],
             params: params_in(text),
             color: None,
+            signals: Vec::new(),
             text: text.into(),
             line: 0,
             end_line: 0,

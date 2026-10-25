@@ -1,7 +1,8 @@
 //! Lexer + recursive-descent parser for NFD.
 
-use super::{CmpOp, Cond, DslError, Expr, FieldCond, FieldTest};
+use super::{CmpOp, Cond, DslError, Expr, FieldCond, FieldTest, SignalCond};
 use crate::event::Level;
+use crate::signal::SignalView;
 use regex::bytes::RegexBuilder;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -13,8 +14,13 @@ pub(super) enum Tok {
     Not,
     Op(OpTok),
     Word(String),
+    /// `@name`: a signal the tab defines.
+    Signal(String, SignalView),
     Str(String),
-    Regex { pat: String, ci: bool },
+    Regex {
+        pat: String,
+        ci: bool,
+    },
     End,
 }
 
@@ -78,6 +84,25 @@ impl<'a> Lexer<'a> {
         }
         if c == '/' || c == '"' {
             return self.delimited(c).map(|t| (t, start));
+        }
+        if c == '@' {
+            let name = &rest[1..];
+            let len = name.find(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '_')).unwrap_or(name.len());
+            if len == 0 {
+                return err("expected a signal name after '@'", start + 1);
+            }
+            self.pos += 1 + len;
+            let mut view = SignalView::State;
+            if let Some(after) = name[len..].strip_prefix('.') {
+                let vlen = after.find(|ch: char| !ch.is_ascii_alphabetic()).unwrap_or(after.len());
+                let vpos = self.pos + 1;
+                view = SignalView::parse(&after[..vlen]).ok_or_else(|| DslError {
+                    msg: format!("unknown signal view '.{}' (state, event, changed)", &after[..vlen]),
+                    pos: vpos,
+                })?;
+                self.pos = vpos + vlen;
+            }
+            return Ok((Tok::Signal(name[..len].to_ascii_lowercase(), view), start));
         }
         if c.is_alphanumeric() || c == '_' || c == '.' || c == '-' {
             let len = rest
@@ -178,6 +203,7 @@ fn describe(t: &Tok) -> String {
     match t {
         Tok::End => "end of query".into(),
         Tok::Word(w) => format!("'{w}'"),
+        Tok::Signal(s, _) => format!("'@{s}'"),
         Tok::RParen => "')'".into(),
         t => format!("{t:?}").to_lowercase(),
     }
@@ -230,6 +256,7 @@ impl Parser<'_> {
             Tok::Regex { pat, ci } => Ok(Expr::Cond(Cond::RawMatch(regex(&pat, ci, pos)?))),
             Tok::Str(s) => Ok(Expr::Cond(Cond::RawMatch(regex(&regex::escape(&s), false, pos)?))),
             Tok::Word(field) => self.condition(&field, pos),
+            Tok::Signal(name, view) => self.signal_condition(name, view, pos),
             t => err(format!("expected a condition but found {}", describe(&t)), pos),
         }
     }
@@ -299,6 +326,47 @@ impl Parser<'_> {
                 Ok(if op == OpTok::NotMatch { Expr::Not(Box::new(e)) } else { e })
             }
         }
+    }
+}
+
+impl Parser<'_> {
+    fn signal_condition(&mut self, name: String, view: SignalView, pos: usize) -> Result<Expr, DslError> {
+        let op_pos = self.pos;
+        let Tok::Op(op) = self.tok else {
+            // `@x.event` and `@x.changed` stand alone: any event (that
+            // changed the state).
+            if view != SignalView::State {
+                let test = FieldTest::Any;
+                return Ok(Expr::Cond(Cond::Signal(SignalCond {
+                    name,
+                    view,
+                    pos,
+                    op_pos,
+                    def: None,
+                    test,
+                    series: None,
+                })));
+            }
+            return err(
+                format!("expected an operator after '@{name}' (==, !=, >=, <=, >, <, ~, !~; or @{name}.event)"),
+                op_pos,
+            );
+        };
+        self.bump()?;
+        let val_pos = self.pos;
+        let test = match (op, self.bump()?) {
+            (OpTok::Match | OpTok::NotMatch, Tok::Regex { pat, ci }) => FieldTest::Match(regex(&pat, ci, val_pos)?),
+            (OpTok::Match | OpTok::NotMatch, Tok::Str(s)) => {
+                FieldTest::Match(regex(&regex::escape(&s), false, val_pos)?)
+            }
+            (OpTok::Match | OpTok::NotMatch, t) => {
+                return err(format!("expected /regex/ or \"text\" but found {}", describe(&t)), val_pos);
+            }
+            (OpTok::Cmp(c), Tok::Word(w) | Tok::Str(w)) => FieldTest::Literal(c, w, val_pos),
+            (OpTok::Cmp(_), t) => return err(format!("expected a value but found {}", describe(&t)), val_pos),
+        };
+        let e = Expr::Cond(Cond::Signal(SignalCond { name, view, pos, op_pos, def: None, test, series: None }));
+        Ok(if op == OpTok::NotMatch { Expr::Not(Box::new(e)) } else { e })
     }
 }
 

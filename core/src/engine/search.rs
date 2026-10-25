@@ -52,6 +52,11 @@ impl Matcher {
         Ok(Self { regex, options })
     }
 
+    /// A plain search for a compiled regex (an NFD `raw ~ /…/`).
+    pub(crate) fn from_regex(regex: Regex) -> Self {
+        Self { regex, options: MatcherOptions::default() }
+    }
+
     pub fn options(&self) -> &MatcherOptions {
         &self.options
     }
@@ -110,6 +115,23 @@ impl Filter {
             Filter::Regex(m) => Filter::Regex(m.clone()),
             Filter::Query(q) => Filter::Query(q.clone().bind(schema)?),
         })
+    }
+
+    /// Collect the events of the signals a bound query uses in `source`
+    /// (see [`Query::prepare`]).
+    pub fn prepare(self, source: &dyn LogSource, progress: &Progress) -> Result<Filter> {
+        Ok(match self {
+            Filter::Query(q) => Filter::Query(q.prepare(source, progress)?),
+            f => f,
+        })
+    }
+
+    /// Progress units [`Self::prepare`] has to do.
+    pub(crate) fn prepare_work(&self, source: &dyn LogSource) -> u64 {
+        match self {
+            Filter::Query(q) => q.prepare_work(source),
+            Filter::Regex(_) => 0,
+        }
     }
 
     fn prefilter(&self) -> Option<&Regex> {
@@ -172,8 +194,9 @@ impl SearchResult {
 }
 
 pub fn search(source: &dyn LogSource, filter: &Filter, progress: &Progress) -> Result<SearchResult> {
-    let filter = &filter.bind(source.schema())?;
-    progress.set_total(work(source, filter));
+    let filter = filter.bind(source.schema())?;
+    progress.set_total(work(source, &filter) + filter.prepare_work(source));
+    let filter = &filter.prepare(source, progress)?;
     Ok(SearchResult { lines: scan(source, filter, progress)? })
 }
 
@@ -311,7 +334,7 @@ pub(crate) mod tests {
     /// Naive reference: render every line and evaluate it on its own,
     /// sequentially, with fields read straight from the source.
     pub(crate) fn naive(source: &dyn LogSource, f: &Filter) -> Vec<LineNo> {
-        let f = f.bind(source.schema()).unwrap();
+        let f = f.bind(source.schema()).unwrap().prepare(source, &Progress::new()).unwrap();
         (0..source.line_count())
             .filter(|&l| {
                 let raw = source.line_bytes(l).unwrap();
@@ -494,5 +517,135 @@ pub(crate) mod tests {
         let text = TextFile::from_bytes("t", b"a\n".to_vec());
         let e = search(&text, &q("apid == NAV"), &Progress::new()).unwrap_err();
         assert!(matches!(e, crate::Error::Query(ref d) if d.msg.contains("unknown field 'apid'")), "{e:?}");
+    }
+
+    fn signals(specs: &[&str]) -> crate::Signals {
+        let mut s = crate::Signals::default();
+        specs.iter().for_each(|sp| s.set(crate::SignalDef::parse_spec(sp).unwrap()));
+        s
+    }
+
+    fn sq(s: &str, sig: &crate::Signals) -> Filter {
+        Filter::Query(Query::compile(s).unwrap().with_signals(sig).unwrap())
+    }
+
+    // Events: v at 0 (10), 2 (55), 4 (0x40), 5 (70), 6 (70 again); row 3's
+    // "fast" isn't a number. gear at 0 (P), 2 (D), 3 (D again), 4 (N), 6 (N again).
+    const SIGNAL_LOG: &str = "v=10 gear=P\nboot\nv=55 gear=D\nv=fast gear=D\nv=0x40 gear=N\nWARN v=70\nv=70 gear=N\n";
+
+    #[test]
+    fn signal_states_hold_until_the_next_event() {
+        let sig = signals(&[r"v=/v=(?<v>\S+)/", r"gear:enum=/gear=(?<gear>\w+)/"]);
+        let run = |s: &str| run_filter(SIGNAL_LOG, &sq(s, &sig));
+        assert_eq!(run("@v > 50"), [2, 3, 4, 5, 6]);
+        assert_eq!(run("@v.state >= 50 AND @v.state < 0x46"), [2, 3, 4]);
+        assert_eq!(run("@v != 10"), [2, 3, 4, 5, 6]);
+        assert_eq!(run("@gear == D"), [2, 3]);
+        assert_eq!(run("@gear ~ /D|N/"), [2, 3, 4, 5, 6]);
+        assert_eq!(run("@gear !~ /D/"), [0, 1, 4, 5, 6]);
+        // The state on lines that don't mention it.
+        assert_eq!(run("/boot/ AND @gear == P"), [1]);
+        assert_eq!(run("/WARN/ AND @v > 50 AND @gear == N"), [5]);
+        assert_eq!(run("@gear == D OR level >= WARN"), [2, 3, 5]);
+        assert_eq!(run("NOT @v > 10"), [0, 1]);
+        // Before the first event there is no state.
+        let late = signals(&[r"g:enum=/gear=(?<g>D)/"]);
+        assert_eq!(run_filter(SIGNAL_LOG, &sq("@g != D", &late)), [0, 1]);
+    }
+
+    #[test]
+    fn signal_events_and_changes() {
+        let sig = signals(&[r"v=/v=(?<v>\S+)/", r"gear:enum=/gear=(?<gear>\w+)/"]);
+        let run = |s: &str| run_filter(SIGNAL_LOG, &sq(s, &sig));
+        assert_eq!(run("@v.event > 50"), [2, 4, 5, 6]);
+        // Rows without an event (no capture, or not a number) only satisfy != and !~.
+        assert_eq!(run("@v.event != 10"), [1, 2, 3, 4, 5, 6]);
+        assert_eq!(run("@v.event"), [0, 2, 4, 5, 6]);
+        assert_eq!(run("NOT @v.event"), [1, 3]);
+        assert_eq!(run("@gear.event == D"), [2, 3]);
+        assert_eq!(run("@gear.event !~ /D/"), [0, 1, 4, 5, 6]);
+        // The first event changes the state; a repeated value doesn't.
+        assert_eq!(run("@gear.changed"), [0, 2, 4]);
+        assert_eq!(run("@v.changed"), [0, 2, 4, 5]);
+        assert_eq!(run("@gear.changed == D"), [2]);
+        assert_eq!(run("@gear.event AND NOT @gear.changed"), [3, 6]);
+        // Events and states together: warnings that report v while in N.
+        assert_eq!(run("level >= WARN AND @v.event AND @gear == N"), [5]);
+    }
+
+    #[test]
+    fn captured_times_roll_over_midnight() {
+        let log = "23:59:58 start
+more
+23:59:59.5 tick
+00:00:01 after midnight
+last
+";
+        let sig = signals(&[r"t:time=/^(?<t>\d\d:\d\d:\d\d(\.\d+)?)/"]);
+        let run = |s: &str| run_filter(log, &sq(s, &sig));
+        // A time of day compares with the value's time of day.
+        assert_eq!(run(r#"@t >= "23:59:59""#), [2]);
+        assert_eq!(run(r#"@t < "00:00:05""#), [3, 4]);
+        assert_eq!(run(r#"@t.event < "00:00:05""#), [3]);
+        // The events know the day: 00:00:01 is after 23:59:59.5.
+        let text = TextFile::from_bytes("t", log.as_bytes().to_vec());
+        let def = sig.get("t").unwrap();
+        let series = def.series(&text, &Progress::new()).unwrap();
+        let times: Vec<String> = series.iter().map(|(r, v)| format!("{r} {}", def.format(v))).collect();
+        assert_eq!(times, ["0 23:59:58.000000", "2 23:59:59.500000", "3 00:00:01.000000 +1d"]);
+        // The tab's clock: the time signal's state at each line.
+        let clock = crate::Clock::of(&text, &sig);
+        assert!(matches!(&clock, crate::Clock::Signal(d) if d.name() == "t"));
+        assert_eq!(clock.at(&text, Some(&series), 4), Some(86_401.0));
+        assert!(matches!(crate::Clock::of(&text, &crate::Signals::default()), crate::Clock::Lines));
+        // A time signal without events (its regex doesn't fit) isn't the clock.
+        let mut both = signals(&[r"bad:time=/^\[(?<bad>[^\]]+)\]/"]);
+        both.set(sig.get("t").unwrap().as_ref().clone());
+        assert!(
+            matches!(crate::Clock::of(&text, &both), crate::Clock::Signal(d) if d.name() == "bad"),
+            "not known yet"
+        );
+        both.get("bad").unwrap().series(&text, &Progress::new()).unwrap();
+        assert!(matches!(crate::Clock::of(&text, &both), crate::Clock::Signal(d) if d.name() == "t"));
+    }
+
+    #[test]
+    fn a_state_stays_in_its_file() {
+        let part =
+            |name, text: &str| -> Box<dyn LogSource> { Box::new(TextFile::from_bytes(name, text.as_bytes().to_vec())) };
+        let both =
+            crate::input::concat::Concat::new(vec![part("a", "gear=D\nx\n"), part("b", "y\ngear=P\nz\n")]).unwrap();
+        let sig = signals(&[r"gear:enum=/gear=(?<gear>\w)/"]);
+        assert_eq!(run_on(&both, &sq("@gear == D", &sig)), [0, 1]);
+        assert_eq!(run_on(&both, &sq("@gear != D", &sig)), [2, 3, 4]);
+        assert_eq!(run_on(&both, &sq("/gear/ AND @gear.changed", &sig)), [0, 3]);
+        assert_eq!(run_on(&both, &sq("@gear.event", &sig)), [0, 3]);
+    }
+
+    #[test]
+    fn signals_on_source_fields() {
+        // Captured from a field, and limited by a field condition.
+        let sig = signals(&[r"a(x):enum=apid ~ /^(?<x>.)/", r"n:enum=apid == NAV AND /(?<n>\w+)$/"]);
+        let src = mem();
+        assert_eq!(run_on(&src, &sq("@a == S", &sig)), [2, 3]);
+        assert_eq!(run_on(&src, &sq("@a.event == S", &sig)), [2]);
+        assert_eq!(run_on(&src, &sq("@a != N", &sig)), [2, 3]);
+        assert_eq!(run_on(&src, &sq("@n ~ /start|slow/", &sig)), [0, 4]);
+        assert_eq!(run_on(&src, &sq("@n == error AND NOT @n.event", &sig)), [2, 3]);
+    }
+
+    #[test]
+    fn signal_errors_at_search() {
+        let text = TextFile::from_bytes("t", b"a\n".to_vec());
+        // Not resolved against the tab's signals.
+        let e = search(&text, &q("@v > 1"), &Progress::new()).unwrap_err();
+        assert!(matches!(e, crate::Error::Query(ref d) if d.msg.contains("unknown signal '@v'")), "{e:?}");
+        // The signal's own query doesn't fit the source.
+        let sig = signals(&[r"v=apid == NAV AND /(?<v>\d)/"]);
+        let e = search(&text, &sq("/a/ AND @v > 1", &sig), &Progress::new()).unwrap_err();
+        assert!(
+            matches!(e, crate::Error::Query(ref d) if d.pos == 8 && d.msg.starts_with("signal '@v': unknown field 'apid'")),
+            "{e:?}"
+        );
     }
 }

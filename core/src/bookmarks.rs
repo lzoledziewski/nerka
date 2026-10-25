@@ -1,7 +1,10 @@
 //! Bookmarks with optional notes, persisted next to the log.
 //!
 //! Storage is a plain-text sidecar `<log>.nerka-marks`, one bookmark per
-//! line: `<1-based line number>\t<note>`. Human-readable, diff-able, and
+//! line: `<1-based line number>\t<note>\t<name>`. A bookmark has a short
+//! name (`B1`, `B2`… given when it is made, renamable) that the GUI shows
+//! instead of its line number; a sidecar without names (two columns) gets
+//! them when read. Human-readable, diff-able, and
 //! trivially shareable — the first step toward the shared annotations
 //! described in the roadmap (a server-backed store will speak the same
 //! model).
@@ -12,7 +15,13 @@ use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Bookmarks {
-    marks: BTreeMap<LineNo, String>,
+    marks: BTreeMap<LineNo, Mark>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct Mark {
+    name: String,
+    note: String,
 }
 
 impl Bookmarks {
@@ -49,7 +58,7 @@ impl Bookmarks {
     pub fn load_for_parts(files: &[(&Path, LineNo)]) -> std::io::Result<Self> {
         let mut marks = BTreeMap::new();
         for (log, first) in files {
-            marks.extend(Self::load_for(log)?.marks.into_iter().map(|(l, n)| (l + first, n)));
+            marks.extend(Self::load_for(log)?.marks.into_iter().map(|(l, m)| (l + first, m)));
         }
         Ok(Self { marks })
     }
@@ -58,40 +67,76 @@ impl Bookmarks {
     /// as that file numbers them. `files` is `(log, first line, line count)`.
     pub fn save_for_parts(&self, files: &[(&Path, LineNo, LineNo)]) -> std::io::Result<()> {
         for (log, first, count) in files {
-            let marks = self.marks.range(first..&(first + count)).map(|(l, n)| (l - first, n.clone())).collect();
+            let marks = self.marks.range(first..&(first + count)).map(|(l, m)| (l - first, m.clone())).collect();
             Self { marks }.save_for(log)?;
         }
         Ok(())
     }
 
     pub fn parse(s: &str) -> Self {
-        let marks = s
+        let mut marks: BTreeMap<LineNo, Mark> = s
             .lines()
             .filter_map(|l| {
-                let (n, note) = l.split_once('\t').unwrap_or((l, ""));
-                let n: LineNo = n.trim().parse().ok()?;
-                Some((n.checked_sub(1)?, note.to_owned()))
+                let mut cols = l.splitn(3, '\t');
+                let n: LineNo = cols.next()?.trim().parse().ok()?;
+                let note = cols.next().unwrap_or("").to_owned();
+                let name = cols.next().unwrap_or("").trim().to_owned();
+                Some((n.checked_sub(1)?, Mark { name, note }))
             })
             .collect();
+        // Unnamed ones (an older sidecar) get names in line order.
+        let unnamed: Vec<LineNo> = marks.iter().filter(|(_, m)| m.name.is_empty()).map(|(l, _)| *l).collect();
+        for l in unnamed {
+            let name = free_name(&marks);
+            marks.get_mut(&l).expect("listed").name = name;
+        }
         Self { marks }
     }
 
     pub fn serialize(&self) -> String {
-        self.marks.iter().map(|(l, n)| format!("{}\t{}\n", l + 1, n.replace(['\n', '\t'], " "))).collect()
+        let clean = |s: &str| s.replace(['\n', '\t'], " ");
+        self.marks.iter().map(|(l, m)| format!("{}\t{}\t{}\n", l + 1, clean(&m.note), clean(&m.name))).collect()
     }
 
-    /// Add or remove a bookmark; returns whether the line is now marked.
+    /// Add or remove a bookmark; returns whether the line is now marked. A
+    /// new one gets the first free name (`B1`, `B2`…).
     pub fn toggle(&mut self, line: LineNo) -> bool {
         if self.marks.remove(&line).is_some() {
             false
         } else {
-            self.marks.insert(line, String::new());
+            let name = free_name(&self.marks);
+            self.marks.insert(line, Mark { name, note: String::new() });
             true
         }
     }
 
+    /// Set the note (bookmarking the line if it isn't yet).
     pub fn set_note(&mut self, line: LineNo, note: impl Into<String>) {
-        self.marks.insert(line, note.into());
+        if !self.contains(line) {
+            self.toggle(line);
+        }
+        self.marks.get_mut(&line).expect("just made").note = note.into();
+    }
+
+    /// Rename a bookmark (an empty name gets a free one back).
+    pub fn set_name(&mut self, line: LineNo, name: impl Into<String>) {
+        let name = name.into().replace(['\n', '\t'], " ").trim().to_owned();
+        let Some(m) = self.marks.get_mut(&line) else { return };
+        m.name = name;
+        if m.name.is_empty() {
+            let free = free_name(&self.marks);
+            self.marks.get_mut(&line).expect("there").name = free;
+        }
+    }
+
+    /// Its name (`B1`, or what it was renamed to).
+    pub fn name(&self, line: LineNo) -> Option<&str> {
+        self.marks.get(&line).map(|m| m.name.as_str())
+    }
+
+    /// Bookmarks with their names and notes, in line order.
+    pub fn iter_named(&self) -> impl Iterator<Item = (LineNo, &str, &str)> {
+        self.marks.iter().map(|(l, m)| (*l, m.name.as_str(), m.note.as_str()))
     }
 
     pub fn contains(&self, line: LineNo) -> bool {
@@ -99,7 +144,7 @@ impl Bookmarks {
     }
 
     pub fn note(&self, line: LineNo) -> Option<&str> {
-        self.marks.get(&line).map(String::as_str)
+        self.marks.get(&line).map(|m| m.note.as_str())
     }
 
     pub fn next_after(&self, line: LineNo) -> Option<LineNo> {
@@ -111,7 +156,7 @@ impl Bookmarks {
     }
 
     pub fn iter(&self) -> impl Iterator<Item = (LineNo, &str)> {
-        self.marks.iter().map(|(l, n)| (*l, n.as_str()))
+        self.marks.iter().map(|(l, m)| (*l, m.note.as_str()))
     }
 
     pub fn len(&self) -> usize {
@@ -121,6 +166,11 @@ impl Bookmarks {
     pub fn is_empty(&self) -> bool {
         self.marks.is_empty()
     }
+}
+
+/// The first of `B1`, `B2`… no bookmark in `marks` is called.
+fn free_name(marks: &BTreeMap<LineNo, Mark>) -> String {
+    (1..).map(|n| format!("B{n}")).find(|c| !marks.values().any(|m| m.name == *c)).expect("unbounded")
 }
 
 #[cfg(test)]
@@ -140,17 +190,8 @@ mod tests {
         m.set_note(12, "in b");
         // a has lines 0..10, b 10..20 in the view.
         m.save_for_parts(&[(&a, 0, 10), (&b, 10, 10)]).unwrap();
-        assert_eq!(
-            std::fs::read_to_string(Bookmarks::sidecar_path(&a)).unwrap(),
-            "2	in a
-"
-        );
-        assert_eq!(
-            std::fs::read_to_string(Bookmarks::sidecar_path(&b)).unwrap(),
-            "1	
-3	in b
-"
-        );
+        assert_eq!(std::fs::read_to_string(Bookmarks::sidecar_path(&a)).unwrap(), "2\tin a\tB1\n");
+        assert_eq!(std::fs::read_to_string(Bookmarks::sidecar_path(&b)).unwrap(), "1\t\tB2\n3\tin b\tB3\n");
         let back = Bookmarks::load_for_parts(&[(&a, 0), (&b, 10)]).unwrap();
         assert_eq!(back, m);
         // Each file alone sees its own.
@@ -169,7 +210,7 @@ mod tests {
         assert_eq!(b.prev_before(41), Some(9));
         assert_eq!(b.next_after(41), None);
         let s = b.serialize();
-        assert_eq!(s, "10\t\n42\troot cause here\n");
+        assert_eq!(s, "10\t\tB1\n42\troot cause here\tB2\n");
         assert_eq!(Bookmarks::parse(&s), {
             let mut e = Bookmarks::default();
             e.toggle(9);
@@ -192,5 +233,24 @@ mod tests {
         b.save_for(&log).unwrap();
         assert!(!Bookmarks::sidecar_path(&log).exists());
         std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn names_are_given_kept_and_renamed() {
+        let mut b = Bookmarks::default();
+        b.toggle(5);
+        b.toggle(2);
+        assert_eq!((b.name(5), b.name(2)), (Some("B1"), Some("B2")), "in the order made");
+        b.set_name(5, "  boot ");
+        assert_eq!(b.name(5), Some("boot"));
+        b.toggle(7);
+        assert_eq!(b.name(7), Some("B1"), "the first free name");
+        b.set_name(7, "");
+        assert_eq!(b.name(7), Some("B1"), "an empty name gets a free one");
+        let back = Bookmarks::parse(&b.serialize());
+        assert_eq!(back, b);
+        // An older sidecar: names given in line order, notes kept.
+        let old = Bookmarks::parse("9\tsecond\n3\t\n");
+        assert_eq!(old.iter_named().collect::<Vec<_>>(), [(2, "B1", ""), (8, "B2", "second")]);
     }
 }
