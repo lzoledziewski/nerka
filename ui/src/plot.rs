@@ -851,7 +851,15 @@ pub fn plot_panel(ui: &mut egui::Ui, state: &mut PlotState, src: Source<'_>) -> 
         painter.line_segment([pos2(pa, dt_y), pos2(pb, dt_y)], stroke);
         painter.line_segment([pos2(pa, dt_y - 4.0), pos2(pa, dt_y + 4.0)], stroke);
         painter.line_segment([pos2(pb, dt_y - 4.0), pos2(pb, dt_y + 4.0)], stroke);
-        let text = format!("{ni}→{nj} {}", duration(b - a, data.is_time));
+        // Just the time: the ends' names are on their tags; an end out of
+        // view is named (owner, 2026-10-25).
+        let dt = duration(b - a, data.is_time);
+        let text = match (a < x0, b > x1) {
+            (false, false) => dt,
+            (true, false) => format!("‹ {ni}  {dt}"),
+            (false, true) => format!("{dt}  {nj} ›"),
+            (true, true) => format!("‹ {ni}  {dt}  {nj} ›"),
+        };
         let galley = painter.layout_no_wrap(text, font.clone(), amber);
         let at = pos2(((pa + pb) / 2.0 - galley.size().x / 2.0).max(pa + 3.0), dt_y - galley.size().y / 2.0);
         let span = Rect::from_min_max(pos2(pa + 3.0, dt_y - 8.0), pos2(pb - 3.0, dt_y + 8.0));
