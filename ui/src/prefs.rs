@@ -1,6 +1,6 @@
 //! Options remembered between runs: the last search mode and checkboxes
 //! the user picked become the default for new tabs; the UDP ports that
-//! carry DLT in captures.
+//! carry DLT in captures; the unpack cache's size limit.
 //!
 //! Stored as `key=value` lines in `<config>/nerka/prefs`. Unknown keys and
 //! bad values are ignored, so an old or hand-edited file never fails.
@@ -20,6 +20,8 @@ pub struct SearchPrefs {
     pub search_ignore_case: bool,
     /// UDP destination ports that carry DLT in captures (pcap, MF4).
     pub dlt_ports: Vec<u16>,
+    /// The unpack cache's size limit (compressed MF4), in GiB.
+    pub unpack_limit_gib: u64,
 }
 
 impl Default for SearchPrefs {
@@ -32,6 +34,7 @@ impl Default for SearchPrefs {
             search_regex: false,
             search_ignore_case: false,
             dlt_ports: nerka_core::input::capture::DEFAULT_DLT_PORTS.to_vec(),
+            unpack_limit_gib: nerka_core::input::capture::unpack::DEFAULT_UNPACK_LIMIT >> 30,
         }
     }
 }
@@ -48,6 +51,11 @@ impl SearchPrefs {
                         && let Some(ports) = parse_ports(v)
                     {
                         p.dlt_ports = ports;
+                    }
+                    if key.trim() == "unpack_limit_gib"
+                        && let Some(n) = parse_gib(v)
+                    {
+                        p.unpack_limit_gib = n;
                     }
                     let mode = match v {
                         "auto" => Some(Mode::Auto),
@@ -82,7 +90,7 @@ impl SearchPrefs {
             Mode::Query => "query",
         };
         format!(
-            "mode={}\nregex={}\nignore_case={}\ninvert={}\nsearch_mode={}\nsearch_regex={}\nsearch_ignore_case={}\ndlt_ports={}\n",
+            "mode={}\nregex={}\nignore_case={}\ninvert={}\nsearch_mode={}\nsearch_regex={}\nsearch_ignore_case={}\ndlt_ports={}\nunpack_limit_gib={}\n",
             name(self.mode),
             !self.options.fixed_string,
             self.options.case_insensitive,
@@ -90,7 +98,8 @@ impl SearchPrefs {
             name(self.search_mode),
             self.search_regex,
             self.search_ignore_case,
-            ports_text(&self.dlt_ports)
+            ports_text(&self.dlt_ports),
+            self.unpack_limit_gib
         )
     }
 
@@ -98,6 +107,8 @@ impl SearchPrefs {
     pub fn open_options(&self) -> nerka_core::OpenOptions {
         let mut o = nerka_core::OpenOptions::default();
         o.capture.dlt_udp_ports = self.dlt_ports.clone();
+        o.capture.unpack.dir = nerka_core::cache_dir();
+        o.capture.unpack.limit = self.unpack_limit_gib << 30;
         o
     }
 
@@ -135,6 +146,11 @@ pub fn parse_ports(s: &str) -> Option<Vec<u16>> {
     (!v.is_empty()).then_some(v)
 }
 
+/// A size limit as typed, in GiB: a whole number from 1 to 1024.
+pub fn parse_gib(s: &str) -> Option<u64> {
+    s.trim().parse().ok().filter(|n| (1..=1024).contains(n))
+}
+
 pub fn ports_text(ports: &[u16]) -> String {
     ports.iter().map(u16::to_string).collect::<Vec<_>>().join(" ")
 }
@@ -152,6 +168,7 @@ mod tests {
             search_regex: true,
             search_ignore_case: true,
             dlt_ports: vec![3490, 3489],
+            unpack_limit_gib: 20,
         };
         assert_eq!(SearchPrefs::parse(&p.serialize()), p);
         assert_eq!(SearchPrefs::parse(&SearchPrefs::default().serialize()), SearchPrefs::default());
@@ -171,5 +188,7 @@ mod tests {
         assert_eq!(parse_ports(""), None);
         assert_eq!(parse_ports("0"), None);
         assert_eq!(parse_ports("70000"), None);
+        assert_eq!(SearchPrefs::parse("unpack_limit_gib=0\n").unpack_limit_gib, 8);
+        assert_eq!(SearchPrefs::parse("unpack_limit_gib= 2\n").unpack_limit_gib, 2);
     }
 }

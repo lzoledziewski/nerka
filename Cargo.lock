@@ -2045,6 +2045,7 @@ version = "0.1.0-alpha.5"
 dependencies = [
  "memchr",
  "memmap2",
+ "miniz_oxide 0.9.1",
  "quick-xml 0.42.0",
  "rayon",
  "regex",

@@ -2326,6 +2326,8 @@ struct App {
     library_view: LibraryView,
     /// The ⚙ menu's ports field while it is edited.
     ports_text: Option<String>,
+    /// The unpack cache's limit as typed, while Settings is open.
+    limit_text: Option<String>,
     /// This window's name (title, Alt+Tab).
     window_name: Option<String>,
     /// The Settings window is open.
@@ -2350,11 +2352,21 @@ struct App {
     plot_win: Arc<std::sync::Mutex<plot::Detached>>,
 }
 
-/// The Settings window's fields: this window's name and the DLT ports
-/// (`ports` as typed). Returns the ports when they were changed to a
-/// valid list.
-fn settings_ui(ui: &mut egui::Ui, name: &mut String, ports: &mut String) -> Option<Vec<u16>> {
-    let mut save = None;
+/// What the Settings window changed.
+#[derive(Default)]
+struct SettingsChange {
+    /// The DLT ports, changed to a valid list.
+    ports: Option<Vec<u16>>,
+    /// The unpack cache's limit, changed to a valid number of GiB.
+    limit_gib: Option<u64>,
+    /// Empty the unpack cache.
+    clear: bool,
+}
+
+/// The Settings window's fields: this window's name, the DLT ports
+/// (`ports` as typed) and the unpack cache (`limit` as typed, in GiB).
+fn settings_ui(ui: &mut egui::Ui, name: &mut String, ports: &mut String, limit: &mut String) -> SettingsChange {
+    let mut save = SettingsChange::default();
     egui::Grid::new("settings-grid").num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| {
         ui.label(RichText::new("This window").strong());
         ui.end_row();
@@ -2373,7 +2385,7 @@ fn settings_ui(ui: &mut egui::Ui, name: &mut String, ports: &mut String) -> Opti
         match prefs::parse_ports(ports) {
             Some(p) => {
                 if r.changed() {
-                    save = Some(p);
+                    save.ports = Some(p);
                 }
                 ui.weak("Used for captures opened from now on");
             }
@@ -2382,8 +2394,54 @@ fn settings_ui(ui: &mut egui::Ui, name: &mut String, ports: &mut String) -> Opti
             }
         }
         ui.end_row();
+        ui.label(RichText::new("Compressed MF4").strong()).on_hover_text(
+            "Compressed data is unpacked once into the unpack cache and read from there, as fast as an \
+             uncompressed file. Opening the file again uses it.",
+        );
+        ui.end_row();
+        ui.label("Unpack cache");
+        match nerka_core::cache_dir() {
+            Some(dir) => {
+                let (files, bytes) = nerka_core::input::capture::cache_usage(&dir);
+                ui.horizontal(|ui| {
+                    ui.label(format!("{files} file{}, {}", if files == 1 { "" } else { "s" }, size_text(bytes)))
+                        .on_hover_text(dir.display().to_string());
+                    let r = ui.add_enabled(files > 0, egui::Button::new("Clear"));
+                    save.clear = r.on_hover_text("Remove the unpacked files (those open in a tab stay)").clicked();
+                });
+            }
+            None => {
+                ui.weak("No cache folder: unpacked into memory");
+            }
+        }
+        ui.end_row();
+        ui.label("Size limit");
+        ui.horizontal(|ui| {
+            let r = ui
+                .add(egui::TextEdit::singleline(limit).desired_width(48.0))
+                .on_hover_text("The least recently used unpacked files are removed when the cache grows past this");
+            ui.label("GiB");
+            match prefs::parse_gib(limit) {
+                Some(n) if r.changed() => save.limit_gib = Some(n),
+                Some(_) => {}
+                None => {
+                    ui.colored_label(ui.visuals().error_fg_color, "1–1024");
+                }
+            }
+        });
+        ui.end_row();
     });
     save
+}
+
+/// A byte count for people: `512 B`, `3.4 MiB`, `1.2 GiB`.
+fn size_text(n: u64) -> String {
+    match n {
+        n if n >= 1 << 30 => format!("{:.1} GiB", n as f64 / (1u64 << 30) as f64),
+        n if n >= 1 << 20 => format!("{:.1} MiB", n as f64 / (1u64 << 20) as f64),
+        n if n >= 1 << 10 => format!("{:.1} KiB", n as f64 / 1024.0),
+        n => format!("{n} B"),
+    }
 }
 
 /// A window-style close button: a thin painted "×" with a square hover
@@ -2581,7 +2639,7 @@ impl App {
             return;
         }
         let mut open = true;
-        let mut save = None;
+        let mut save = SettingsChange::default();
         egui::Window::new("Settings")
             .id(egui::Id::unique("settings"))
             .open(&mut open)
@@ -2589,27 +2647,51 @@ impl App {
             .collapsible(false)
             .show(ctx, |ui| {
                 let ports = self.ports_text.get_or_insert_with(|| prefs::ports_text(&self.prefs.dlt_ports));
-                save = settings_ui(ui, self.window_name.get_or_insert_with(String::new), ports);
+                let limit = self.limit_text.get_or_insert_with(|| self.prefs.unpack_limit_gib.to_string());
+                save = settings_ui(ui, self.window_name.get_or_insert_with(String::new), ports, limit);
             });
         if !open {
             self.settings_open = false;
             self.ports_text = None;
+            self.limit_text = None;
         }
-        if let Some(ports) = save
+        if save.clear
+            && let Some(dir) = nerka_core::cache_dir()
+        {
+            let (removed, in_use) = nerka_core::input::capture::clear_cache(&dir);
+            self.status = match in_use {
+                0 => format!("Removed {removed} unpacked file{}", if removed == 1 { "" } else { "s" }),
+                n => format!("Removed {removed} unpacked files; {n} in use stay"),
+            };
+        }
+        let mut changed = false;
+        if let Some(ports) = save.ports
             && ports != self.prefs.dlt_ports
         {
             self.prefs.dlt_ports = ports;
-            if let Some(path) = prefs_path()
-                && let Err(e) = self.prefs.save(&path)
-            {
-                self.status = format!("Could not save preferences: {e}");
-            }
+            changed = true;
+        }
+        if let Some(n) = save.limit_gib
+            && n != self.prefs.unpack_limit_gib
+        {
+            self.prefs.unpack_limit_gib = n;
+            changed = true;
+        }
+        if changed
+            && let Some(path) = prefs_path()
+            && let Err(e) = self.prefs.save(&path)
+        {
+            self.status = format!("Could not save preferences: {e}");
         }
     }
 
     fn save_prefs_from(&mut self, prefs: SearchPrefs) {
-        // A tab knows its search settings only; the ports stay.
-        let prefs = SearchPrefs { dlt_ports: self.prefs.dlt_ports.clone(), ..prefs };
+        // A tab knows its search settings only; the ports and the cache stay.
+        let prefs = SearchPrefs {
+            dlt_ports: self.prefs.dlt_ports.clone(),
+            unpack_limit_gib: self.prefs.unpack_limit_gib,
+            ..prefs
+        };
         if prefs == self.prefs {
             return;
         }
@@ -3967,7 +4049,7 @@ gear=D
                 let input = egui::RawInput { screen_rect: Some(screen), events, ..Default::default() };
                 let mut out = ctx.run_ui(input, |ui| {
                     egui::Window::new("Settings").show(ui.ctx(), |ui| {
-                        if let Some(p) = settings_ui(ui, name, ports) {
+                        if let Some(p) = settings_ui(ui, name, ports, &mut "8".to_owned()).ports {
                             saved = Some(p);
                         }
                     });

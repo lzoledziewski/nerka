@@ -34,6 +34,10 @@ struct Cli {
     /// MF4; repeatable). Default: 3490.
     #[arg(long = "dlt-port", global = true, value_name = "PORT")]
     dlt_port: Vec<u16>,
+    /// Folder compressed MF4 data is unpacked into (default: the per-user
+    /// cache folder); unpacked once, reused when the file is opened again.
+    #[arg(long = "unpack-dir", global = true, value_name = "DIR")]
+    unpack_dir: Option<PathBuf>,
     /// FIBEX file describing DLT non-verbose messages (repeatable): their
     /// payload is shown as text, and their APID / CTID / level come from it.
     #[arg(long, global = true, value_name = "FILE")]
@@ -305,6 +309,7 @@ fn run() -> Result<()> {
     if !cli.dlt_port.is_empty() {
         options.capture.dlt_udp_ports = cli.dlt_port.clone();
     }
+    options.capture.unpack.dir = cli.unpack_dir.clone().or_else(nerka_core::cache_dir);
     if !cli.fibex.is_empty() {
         options.fibex = Some(std::sync::Arc::new(nerka_core::Fibex::load(&cli.fibex)?));
     }

@@ -122,7 +122,8 @@ All checked on crates.io on 2026-10-17. All MIT and/or Apache-2.0.
 | SOME/IP headers | `someip_parse` 0.7 | Doesn't interpret payloads: that is `SignalDb`'s job. |
 | ARXML | `autosar-data` 0.23 | |
 | FIBEX | ~~`roxmltree` 0.21~~ `quick-xml` 0.42 + own mapping | **Used** (2026-10-24): streaming, needs only `memchr`. |
-| MF4 | ~~`mdf4-rs`, `mf4-rs`, `falcon_mdf`, `mdflib`, `mdfr`~~ | **Not used**: own reader for bus-logging channels (`capture/mf4.rs`, 2026-10-20; compressed DZ blocks not yet). |
+| MF4 | ~~`mdf4-rs`, `mf4-rs`, `falcon_mdf`, `mdflib`, `mdfr`~~ | **Not used**: own reader for bus-logging channels (`capture/mf4.rs`, 2026-10-20). |
+| Deflate (MF4 DZ blocks) | `miniz_oxide` 0.9 | **Used** (2026-10-26): pure Rust, MIT / Zlib / Apache-2.0, no dependencies of its own that aren't already built (the GUI's image decoding uses it). Streaming inflate into the unpack cache (`capture/unpack.rs`). Later for `.gz` captures too. |
 | Signal plots (GUI) | `egui_plot` 0.37 | Matches the current egui version. |
 
 Each one must be justified in its PR (spec §3.1).

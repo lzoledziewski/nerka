@@ -27,6 +27,8 @@ cargo run --release -p nerka-core --example gen_dlt -- big.dlt 1024   # 1 GiB DL
 cargo run --release -p nerka-cli -- filter -c --stats 'apid == NAV AND level >= WARN' big.dlt
 cargo run --release -p nerka-core --example dlt_to_pcap -- big.dlt big.pcap   # the same DLT as a pcap (VLAN, UDP, fragments)
 cargo run --release -p nerka-cli -- filter -c --stats 'apid == NAV AND level >= WARN' big.pcap
+cargo run --release -p nerka-core --example dlt_to_mf4 -- big.dlt big_z.mf4 --deflate   # the same DLT as an MF4 (DZ blocks; --one-block, or no --deflate)
+cargo run --release -p nerka-cli -- --unpack-dir cache filter -c --stats 'apid == NAV AND level >= WARN' big_z.mf4  # 1st run unpacks, then cached
 cargo run --release -p nerka-core --example probe_capture -- trace.pcapng log.mf4   # structure of real captures, no payload
 powershell -ExecutionPolicy Bypass -File tools/screenshot.ps1 -Out shot.png -AppArgs app.log  # GUI screenshot (Windows)
 ```
