@@ -1706,14 +1706,27 @@ impl Tab {
         egui::ScrollArea::vertical().show(ui, |ui| {
             for (line, name, note) in self.bookmarks.iter_named() {
                 let open = self.marks_open.contains(&line);
-                ui.horizontal(|ui| {
+                // Right-to-left, as the note row below: the name field takes
+                // the width left after the link and the fold button, so it
+                // grows with the panel (issue #5).
+                let row = egui::vec2(ui.available_width(), ui.spacing().interact_size.y);
+                ui.allocate_ui_with_layout(row, egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let tip = if open { "Fold the line" } else { "Show the whole line" };
+                    if ui.small_button(if open { "▾" } else { "▸" }).on_hover_text(tip).clicked() {
+                        fold = Some(line);
+                    }
+                    if ui.link(format!("line {}", line + 1)).on_hover_text("Go to the line").clicked() {
+                        jump = Some(line);
+                    }
                     // The name (the plot shows it); edited in place.
                     let mut text = match &self.mark_rename {
                         Some((l, t)) if *l == line => t.clone(),
                         _ => name.to_owned(),
                     };
                     let r = ui.add(
-                        egui::TextEdit::singleline(&mut text).font(egui::TextStyle::Monospace).desired_width(80.0),
+                        egui::TextEdit::singleline(&mut text)
+                            .font(egui::TextStyle::Monospace)
+                            .desired_width(ui.available_width()),
                     );
                     if r.changed() {
                         self.mark_rename = Some((line, text));
@@ -1722,13 +1735,6 @@ impl Tab {
                         rename = self.mark_rename.take();
                     }
                     r.on_hover_text("The bookmark's name (the plot shows it); type to rename");
-                    if ui.link(format!("line {}", line + 1)).on_hover_text("Go to the line").clicked() {
-                        jump = Some(line);
-                    }
-                    let tip = if open { "Fold the line" } else { "Show the whole line" };
-                    if ui.small_button(if open { "▾" } else { "▸" }).on_hover_text(tip).clicked() {
-                        fold = Some(line);
-                    }
                 });
                 // The line wrapped to two rows ("…" if longer); unfolded, all
                 // of it. Wrapping uses the width the panel has, so it never
