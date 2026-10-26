@@ -40,11 +40,14 @@ pub struct CaptureOptions {
     pub dlt_udp_ports: Vec<u16>,
     /// Where compressed MF4 data is unpacked.
     pub unpack: UnpackOptions,
+    /// An MF4 file whose header says its start time is local time (the
+    /// "local time" flag) is read in this computer's zone; off: as UTC.
+    pub mf4_local_time: bool,
 }
 
 impl Default for CaptureOptions {
     fn default() -> Self {
-        Self { dlt_udp_ports: DEFAULT_DLT_PORTS.to_vec(), unpack: UnpackOptions::default() }
+        Self { dlt_udp_ports: DEFAULT_DLT_PORTS.to_vec(), unpack: UnpackOptions::default(), mf4_local_time: true }
     }
 }
 

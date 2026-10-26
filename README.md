@@ -93,6 +93,8 @@ nerka lines app.log 100 120
 nerka --pack packs/ expand -l ota -p cam=CAM1            # pack picks -> NFD
 nerka --signal 'gear:enum=/gear=(?<gear>\w+)/' filter '@gear == D' app.log   # signals
 nerka --fibex ecu1.xml filter 'apid == NAV' trace.dlt     # DLT non-verbose messages decoded
+nerka --local-time lines trace.dlt 1 20                  # local time (CLI: UTC by default; GUI: local, ⚙ Settings)
+nerka --signal 'up1=ecu == ECU1 AND tmsp ~ /(?<up1>\d+)/' filter '@up1.changed AND @up1 < 10000' trace.dlt   # ECU1 resets
 ```
 
 `nerka help <command>` lists every option.

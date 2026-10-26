@@ -77,6 +77,20 @@ fn text(buf: &[u8], at: u64) -> &str {
     }
 }
 
+/// The header block's start time in ns since the epoch, UTC. With the
+/// "local time" flag (`hd_time_flags` bit 0) the stored value is the
+/// recorder's wall clock, its zone unknown: read in this computer's zone
+/// when `local` (as other MF4 tools do), else taken as UTC.
+fn start_time(hd: &[u8], local: bool) -> u64 {
+    let ns = le_u64(hd, 0);
+    if !local || hd.get(12).is_none_or(|f| f & 1 == 0) {
+        return ns;
+    }
+    let secs = (ns / 1_000_000_000) as f64;
+    let utc = crate::time::local_to_utc(secs);
+    (ns as i128 + ((utc - secs) as i128) * 1_000_000_000).max(0) as u64
+}
+
 fn le_u64(b: &[u8], at: usize) -> u64 {
     b.get(at..at + 8).map_or(0, |x| u64::from_le_bytes(x.try_into().unwrap()))
 }
@@ -436,7 +450,7 @@ pub(crate) fn read<'a>(
     }
     let hd =
         block(buf, 64).filter(|b| &b.id == b"HD").ok_or_else(|| Error::Format("MF4 without a header block".into()))?;
-    let start_ns = le_u64(hd.data, 0);
+    let start_ns = start_time(hd.data, sink.options.mf4_local_time);
     let mut reported = 0usize;
     let mut dg_at = hd.link(0);
     let mut guard = 0;

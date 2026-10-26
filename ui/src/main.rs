@@ -2361,13 +2361,45 @@ struct SettingsChange {
     limit_gib: Option<u64>,
     /// Empty the unpack cache.
     clear: bool,
+    /// Local time or UTC, or how MF4 local times are read, changed.
+    times: bool,
 }
 
-/// The Settings window's fields: this window's name, the DLT ports
-/// (`ports` as typed) and the unpack cache (`limit` as typed, in GiB).
-fn settings_ui(ui: &mut egui::Ui, name: &mut String, ports: &mut String, limit: &mut String) -> SettingsChange {
+/// What the Settings window shows: this window's name, the DLT ports
+/// (`ports` as typed), the unpack cache (`limit` as typed, in GiB) and the
+/// time settings.
+struct SettingsFields<'a> {
+    name: &'a mut String,
+    ports: &'a mut String,
+    limit: &'a mut String,
+    local_time: &'a mut bool,
+    mf4_local_time: &'a mut bool,
+}
+
+/// The Settings window's fields ([`SettingsFields`]).
+fn settings_ui(ui: &mut egui::Ui, f: SettingsFields<'_>) -> SettingsChange {
+    let SettingsFields { name, ports, limit, local_time, mf4_local_time } = f;
     let mut save = SettingsChange::default();
     egui::Grid::new("settings-grid").num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| {
+        ui.label(RichText::new("Times").strong());
+        ui.end_row();
+        ui.label("Show");
+        ui.horizontal(|ui| {
+            let a = ui.radio_value(local_time, true, "Local time").on_hover_text(
+                "This computer's time zone, with the daylight saving time of each date (as DLT Viewer and \
+                 Wireshark show times). Times typed in queries without a zone are local too.",
+            );
+            let b = ui.radio_value(local_time, false, "UTC");
+            save.times |= a.changed() || b.changed();
+        });
+        ui.end_row();
+        ui.label("MF4");
+        let r = ui.checkbox(mf4_local_time, "Start time marked as local time: read in this zone").on_hover_text(
+            "An MF4 file can say its start time is the recorder's local time, without saying the zone. \
+             On: read it in this computer's zone. Off: read it as UTC.",
+        );
+        save.times |= r.changed();
+        ui.end_row();
         ui.label(RichText::new("This window").strong());
         ui.end_row();
         ui.label("Name");
@@ -2622,11 +2654,13 @@ impl App {
     }
 
     fn load_prefs(&mut self) {
-        let Some(path) = prefs_path() else { return };
-        match SearchPrefs::load(&path) {
-            Ok(p) => self.prefs = p,
-            Err(e) => self.status = format!("Could not read preferences: {e}"),
+        if let Some(path) = prefs_path() {
+            match SearchPrefs::load(&path) {
+                Ok(p) => self.prefs = p,
+                Err(e) => self.status = format!("Could not read preferences: {e}"),
+            }
         }
+        nerka_core::time::set_local(self.prefs.local_time);
     }
 
     /// Remember the active tab's mode and options if the user changed them.
@@ -2648,7 +2682,16 @@ impl App {
             .show(ctx, |ui| {
                 let ports = self.ports_text.get_or_insert_with(|| prefs::ports_text(&self.prefs.dlt_ports));
                 let limit = self.limit_text.get_or_insert_with(|| self.prefs.unpack_limit_gib.to_string());
-                save = settings_ui(ui, self.window_name.get_or_insert_with(String::new), ports, limit);
+                save = settings_ui(
+                    ui,
+                    SettingsFields {
+                        name: self.window_name.get_or_insert_with(String::new),
+                        ports,
+                        limit,
+                        local_time: &mut self.prefs.local_time,
+                        mf4_local_time: &mut self.prefs.mf4_local_time,
+                    },
+                );
             });
         if !open {
             self.settings_open = false;
@@ -2677,6 +2720,17 @@ impl App {
             self.prefs.unpack_limit_gib = n;
             changed = true;
         }
+        if save.times {
+            // Rendered lines and collected time values change: every tab
+            // reads its files again (filter, search and line stay).
+            nerka_core::time::set_local(self.prefs.local_time);
+            for t in &mut self.tabs {
+                if t.file.is_some() {
+                    t.reopen(ctx, &self.prefs, self.fibex.clone());
+                }
+            }
+            changed = true;
+        }
         if changed
             && let Some(path) = prefs_path()
             && let Err(e) = self.prefs.save(&path)
@@ -2686,10 +2740,13 @@ impl App {
     }
 
     fn save_prefs_from(&mut self, prefs: SearchPrefs) {
-        // A tab knows its search settings only; the ports and the cache stay.
+        // A tab knows its search settings only; the ports, the cache and
+        // the times stay.
         let prefs = SearchPrefs {
             dlt_ports: self.prefs.dlt_ports.clone(),
             unpack_limit_gib: self.prefs.unpack_limit_gib,
+            local_time: self.prefs.local_time,
+            mf4_local_time: self.prefs.mf4_local_time,
             ..prefs
         };
         if prefs == self.prefs {
@@ -4049,7 +4106,14 @@ gear=D
                 let input = egui::RawInput { screen_rect: Some(screen), events, ..Default::default() };
                 let mut out = ctx.run_ui(input, |ui| {
                     egui::Window::new("Settings").show(ui.ctx(), |ui| {
-                        if let Some(p) = settings_ui(ui, name, ports, &mut "8".to_owned()).ports {
+                        let fields = SettingsFields {
+                            name,
+                            ports,
+                            limit: &mut "8".to_owned(),
+                            local_time: &mut true,
+                            mf4_local_time: &mut true,
+                        };
+                        if let Some(p) = settings_ui(ui, fields).ports {
                             saved = Some(p);
                         }
                     });

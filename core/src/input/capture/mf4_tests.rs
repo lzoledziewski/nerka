@@ -422,3 +422,23 @@ fn compressed_files_are_unpacked_into_the_cache_once() {
     assert_eq!(cache_usage(&cache), (0, 0));
     std::fs::remove_dir_all(&dir).ok();
 }
+
+#[test]
+fn start_time_with_the_local_time_flag() {
+    let start = 1_700_000_000_123_456_789u64;
+    let hd = |flags: u8| {
+        let mut d = start.to_le_bytes().to_vec();
+        d.extend_from_slice(&[0, 0, 0, 0, flags, 0, 0, 0]);
+        d
+    };
+    // UTC (no flag, or only "offsets valid"), or the flag ignored.
+    assert_eq!(super::start_time(&hd(0), true), start);
+    assert_eq!(super::start_time(&hd(2), true), start);
+    assert_eq!(super::start_time(&hd(1), false), start);
+    // The recorder's wall clock, read in this computer's zone.
+    let secs = (start / 1_000_000_000) as f64;
+    let shift = (crate::time::local_to_utc(secs) - secs) as i64 * 1_000_000_000;
+    assert_eq!(super::start_time(&hd(1), true) as i64, start as i64 + shift);
+    // A short header block is UTC.
+    assert_eq!(super::start_time(&start.to_le_bytes(), true), start);
+}

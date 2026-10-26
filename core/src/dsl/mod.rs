@@ -446,7 +446,8 @@ impl SignalCond {
             (Some(_), FieldTest::Any) => true,
             (Some(ValueRef::Num(v)), FieldTest::Float(op, want)) => op.test_f64(v, *want),
             (Some(ValueRef::Num(v)), FieldTest::Time(op, want, of_day)) => {
-                op.test_f64(if *of_day { v.rem_euclid(TIME_OF_DAY_END) } else { v }, *want)
+                // A time of day is compared as it is shown (UTC or local).
+                op.test_f64(if *of_day { crate::time::shown(v).rem_euclid(TIME_OF_DAY_END) } else { v }, *want)
             }
             (Some(ValueRef::Enum(v)), FieldTest::Str(op, want)) => op.test(v, want.as_slice()),
             (Some(ValueRef::Enum(v)), FieldTest::Match(re)) => re.is_match(v),

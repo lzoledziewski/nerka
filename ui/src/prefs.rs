@@ -1,6 +1,6 @@
 //! Options remembered between runs: the last search mode and checkboxes
 //! the user picked become the default for new tabs; the UDP ports that
-//! carry DLT in captures; the unpack cache's size limit.
+//! carry DLT in captures; the unpack cache's size limit; local time or UTC.
 //!
 //! Stored as `key=value` lines in `<config>/nerka/prefs`. Unknown keys and
 //! bad values are ignored, so an old or hand-edited file never fails.
@@ -22,6 +22,11 @@ pub struct SearchPrefs {
     pub dlt_ports: Vec<u16>,
     /// The unpack cache's size limit (compressed MF4), in GiB.
     pub unpack_limit_gib: u64,
+    /// Times shown (and typed) in this computer's local time, else UTC.
+    pub local_time: bool,
+    /// An MF4 start time marked as local time is read in this computer's
+    /// zone, else as UTC.
+    pub mf4_local_time: bool,
 }
 
 impl Default for SearchPrefs {
@@ -35,6 +40,9 @@ impl Default for SearchPrefs {
             search_ignore_case: false,
             dlt_ports: nerka_core::input::capture::DEFAULT_DLT_PORTS.to_vec(),
             unpack_limit_gib: nerka_core::input::capture::unpack::DEFAULT_UNPACK_LIMIT >> 30,
+            // As DLT Viewer and Wireshark show them (owner, 2026-10-26).
+            local_time: true,
+            mf4_local_time: true,
         }
     }
 }
@@ -77,6 +85,8 @@ impl SearchPrefs {
                 "invert" => p.options.invert = flag,
                 "search_regex" => p.search_regex = flag,
                 "search_ignore_case" => p.search_ignore_case = flag,
+                "local_time" => p.local_time = flag,
+                "mf4_local_time" => p.mf4_local_time = flag,
                 _ => {}
             }
         }
@@ -90,7 +100,7 @@ impl SearchPrefs {
             Mode::Query => "query",
         };
         format!(
-            "mode={}\nregex={}\nignore_case={}\ninvert={}\nsearch_mode={}\nsearch_regex={}\nsearch_ignore_case={}\ndlt_ports={}\nunpack_limit_gib={}\n",
+            "mode={}\nregex={}\nignore_case={}\ninvert={}\nsearch_mode={}\nsearch_regex={}\nsearch_ignore_case={}\ndlt_ports={}\nunpack_limit_gib={}\nlocal_time={}\nmf4_local_time={}\n",
             name(self.mode),
             !self.options.fixed_string,
             self.options.case_insensitive,
@@ -99,7 +109,9 @@ impl SearchPrefs {
             self.search_regex,
             self.search_ignore_case,
             ports_text(&self.dlt_ports),
-            self.unpack_limit_gib
+            self.unpack_limit_gib,
+            self.local_time,
+            self.mf4_local_time
         )
     }
 
@@ -109,6 +121,7 @@ impl SearchPrefs {
         o.capture.dlt_udp_ports = self.dlt_ports.clone();
         o.capture.unpack.dir = nerka_core::cache_dir();
         o.capture.unpack.limit = self.unpack_limit_gib << 30;
+        o.capture.mf4_local_time = self.mf4_local_time;
         o
     }
 
@@ -169,6 +182,8 @@ mod tests {
             search_ignore_case: true,
             dlt_ports: vec![3490, 3489],
             unpack_limit_gib: 20,
+            local_time: false,
+            mf4_local_time: false,
         };
         assert_eq!(SearchPrefs::parse(&p.serialize()), p);
         assert_eq!(SearchPrefs::parse(&SearchPrefs::default().serialize()), SearchPrefs::default());
