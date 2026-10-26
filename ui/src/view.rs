@@ -652,7 +652,12 @@ pub fn log_view(
         }
         let job = line_job(&shown, cells, cut, &spans, &font, text_color, dim);
         let galley = painter.layout_job(job);
-        max_w = max_w.max(galley.size().x);
+        // Only rows that stay in view under a horizontal scrollbar count:
+        // the cut-off last row would show the bar, which then covers it, so
+        // the bar would go again — and flicker on every repaint.
+        if y < outer.max.y - SCROLLBAR_W {
+            max_w = max_w.max(galley.size().x);
+        }
         painter.with_clip_rect(text_clip).galley(pos2(snap(text_x0 - state.x_off), snap(y + 1.0)), galley, text_color);
     }
     state.content_w = max_w;
@@ -1141,6 +1146,38 @@ mod tests {
         };
         let out = step(vec![enter], &mut s, &file);
         assert_eq!(out.detail, Some(0));
+    }
+
+    /// A long line in the half-visible row at the bottom must not make the
+    /// horizontal scrollbar come and go: showing the bar covered that row,
+    /// which then no longer counted, so the bar went away and the row came
+    /// back, every repaint (a hover is enough).
+    #[test]
+    fn a_long_last_row_does_not_make_the_scrollbar_flicker() {
+        let ctx = egui::Context::default();
+        let hl = Highlight { highlighter: None, bookmarks: None, search: None, lines: None };
+        let mut t = 0.0;
+        // Wherever the long line is, one of these rows is the cut-off last one.
+        for long in 0..30 {
+            let text: String =
+                (0..40).map(|i| if i == long { format!("{}\n", "x".repeat(400)) } else { format!("l{i}\n") }).collect();
+            let file = nerka_core::TextFile::from_bytes("t", text.into_bytes());
+            let mut s = ViewState::default();
+            let mut widths = Vec::new();
+            for _ in 0..8 {
+                t += 1.0 / 60.0;
+                let screen = Rect::from_min_size(pos2(0.0, 0.0), vec2(600.0, 300.0));
+                let input = egui::RawInput { screen_rect: Some(screen), time: Some(t), ..Default::default() };
+                let mut out = ctx.run_ui(input, |ui| {
+                    egui::CentralPanel::default().frame(egui::Frame::NONE).show(ui, |ui| {
+                        log_view(ui, "v", &mut s, file.line_count(), &|r| r, &file, &mut Columns::default(), &hl);
+                    });
+                });
+                out.textures_delta.clear();
+                widths.push(s.content_w);
+            }
+            assert!(widths[2..].windows(2).all(|w| w[0] == w[1]), "long line {long}: widths {widths:?}");
+        }
     }
 
     #[test]

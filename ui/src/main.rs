@@ -587,6 +587,11 @@ struct LineDetail {
     signals: Vec<LineSignal>,
     /// A line the window asks to go to (an event that set a state).
     goto: Option<LineNo>,
+    /// ↑ / ↓ pressed over the window: step to the next (true) or previous
+    /// line of the view it follows.
+    step: Option<bool>,
+    /// It follows the search hits (opened or moved there), else the main view.
+    in_hits: bool,
 }
 
 /// One signal in the line window: its value on the line, and whether the
@@ -669,7 +674,12 @@ impl LineDetail {
     fn of(file: &dyn LogSource, line: LineNo) -> Option<Self> {
         let cells = file.line_detail(line)?;
         let names = file.columns().iter().map(|c| c.name).collect();
-        Some(LineDetail { line, cells, names, wrap: true, signals: Vec::new(), goto: None })
+        Some(LineDetail { line, cells, names, wrap: true, signals: Vec::new(), goto: None, step: None, in_hits: false })
+    }
+
+    /// The same window on another line, keeping Wrap and the view it follows.
+    fn moved(&self, file: &dyn LogSource, line: LineNo) -> Option<Self> {
+        Self::of(file, line).map(|d| LineDetail { wrap: self.wrap, in_hits: self.in_hits, ..d })
     }
 
     /// The window: the cells before the message as a name / value grid,
@@ -686,6 +696,25 @@ impl LineDetail {
             .collapsible(false)
             .default_size([640.0, 360.0])
             .show(ctx, |ui| {
+                // ↑ / ↓ over the window, or with a widget in it focused, step
+                // through the log, not through the window's widgets (egui
+                // moves focus with arrows). Taken before the widgets see them.
+                let layer = ui.layer_id();
+                let here = ctx.pointer_hover_pos().is_some_and(|p| ctx.layer_id_at(p) == Some(layer))
+                    || ctx
+                        .memory(|m| m.focused())
+                        .and_then(|id| ctx.read_response(id))
+                        .is_some_and(|r| r.layer_id == layer);
+                if here {
+                    let none = egui::Modifiers::NONE;
+                    let (up, down) = ctx.input_mut(|i| {
+                        (i.consume_key(none, egui::Key::ArrowUp), i.consume_key(none, egui::Key::ArrowDown))
+                    });
+                    if up || down {
+                        ctx.memory_mut(|m| m.move_focus(egui::FocusDirection::None));
+                        self.step = Some(down);
+                    }
+                }
                 let msg = self.cells.last().map_or("", String::as_str);
                 ui.horizontal(|ui| {
                     if table {
@@ -704,53 +733,57 @@ impl LineDetail {
                     let s = if lines == 1 { "" } else { "s" };
                     ui.weak(format!("{} characters, {lines} line{s}", msg.chars().count()));
                 });
-                if table {
-                    egui::Grid::new("line-detail-cells").num_columns(2).spacing([12.0, 2.0]).show(ui, |ui| {
-                        for (name, value) in self.names.iter().zip(&self.cells[..self.cells.len() - 1]) {
-                            ui.label(RichText::new(*name).strong());
-                            ui.monospace(value);
-                            ui.end_row();
-                        }
-                    });
-                }
-                if !self.signals.is_empty() {
-                    self.goto = signals_section(ui, self.line, &self.signals).or(self.goto);
-                }
-                ui.separator();
-                let mut shown = msg;
-                if shown.len() > DETAIL_MAX_BYTES {
-                    let mut end = DETAIL_MAX_BYTES;
-                    while !shown.is_char_boundary(end) {
-                        end -= 1;
-                    }
-                    shown = &shown[..end];
-                    ui.weak(format!("Showing the first {} KiB; Copy copies all of it.", DETAIL_MAX_BYTES >> 10));
-                }
+                // Everything below the buttons scrolls: many columns or
+                // signals pushed the message out of a window that couldn't.
                 let scroll = if self.wrap { egui::ScrollArea::vertical() } else { egui::ScrollArea::both() };
-                scroll.auto_shrink([false, false]).show(ui, |ui| {
-                    // A `&str` buffer: selectable and copyable, not editable.
-                    let mut text = shown;
-                    // A text box never gets wider than the space it is in, so
-                    // without Wrap the layout ignores that width and the box
-                    // takes the text's own width (the scroll area scrolls it).
-                    let wrap = self.wrap;
-                    let mut layouter = |ui: &egui::Ui, buf: &dyn egui::TextBuffer, wrap_width: f32| {
-                        let font = egui::TextStyle::Monospace.resolve(ui.style());
-                        let width = if wrap { wrap_width } else { f32::INFINITY };
-                        let job = egui::text::LayoutJob::simple(
-                            buf.as_str().to_owned(),
-                            font,
-                            ui.visuals().text_color(),
-                            width,
-                        );
-                        ui.fonts_mut(|f| f.layout_job(job))
-                    };
-                    let edit = egui::TextEdit::multiline(&mut text)
-                        .font(egui::TextStyle::Monospace)
-                        .desired_width(f32::INFINITY)
-                        .clip_text(false)
-                        .layouter(&mut layouter);
-                    ui.add(edit);
+                scroll.id_salt("line-detail-scroll").auto_shrink([false, false]).show(ui, |ui| {
+                    if table {
+                        egui::Grid::new("line-detail-cells").num_columns(2).spacing([12.0, 2.0]).show(ui, |ui| {
+                            for (name, value) in self.names.iter().zip(&self.cells[..self.cells.len() - 1]) {
+                                ui.label(RichText::new(*name).strong());
+                                ui.monospace(value);
+                                ui.end_row();
+                            }
+                        });
+                    }
+                    if !self.signals.is_empty() {
+                        self.goto = signals_section(ui, self.line, &self.signals).or(self.goto);
+                    }
+                    ui.separator();
+                    let mut shown = msg;
+                    if shown.len() > DETAIL_MAX_BYTES {
+                        let mut end = DETAIL_MAX_BYTES;
+                        while !shown.is_char_boundary(end) {
+                            end -= 1;
+                        }
+                        shown = &shown[..end];
+                        ui.weak(format!("Showing the first {} KiB; Copy copies all of it.", DETAIL_MAX_BYTES >> 10));
+                    }
+                    {
+                        // A `&str` buffer: selectable and copyable, not editable.
+                        let mut text = shown;
+                        // A text box never gets wider than the space it is in, so
+                        // without Wrap the layout ignores that width and the box
+                        // takes the text's own width (the scroll area scrolls it).
+                        let wrap = self.wrap;
+                        let mut layouter = |ui: &egui::Ui, buf: &dyn egui::TextBuffer, wrap_width: f32| {
+                            let font = egui::TextStyle::Monospace.resolve(ui.style());
+                            let width = if wrap { wrap_width } else { f32::INFINITY };
+                            let job = egui::text::LayoutJob::simple(
+                                buf.as_str().to_owned(),
+                                font,
+                                ui.visuals().text_color(),
+                                width,
+                            );
+                            ui.fonts_mut(|f| f.layout_job(job))
+                        };
+                        let edit = egui::TextEdit::multiline(&mut text)
+                            .font(egui::TextStyle::Monospace)
+                            .desired_width(f32::INFINITY)
+                            .clip_text(false)
+                            .layouter(&mut layouter);
+                        ui.add(edit);
+                    }
                 });
             });
         (open, copied)
@@ -1650,7 +1683,8 @@ impl Tab {
     }
 
     /// Status messages and context-menu actions from a log view.
-    fn view_output(&mut self, out: &ViewOutput, line_of_row: impl Fn(u64) -> LineNo) {
+    /// `hits`: the output is the search hits list's, else the main view's.
+    fn view_output(&mut self, out: &ViewOutput, hits: bool, line_of_row: impl Fn(u64) -> LineNo) {
         if let Some((n, cut)) = out.copied {
             self.status = if cut {
                 format!("Copied the first {n} lines (copy is limited to {n} lines)")
@@ -1664,16 +1698,45 @@ impl Tab {
         if let Some(row) = out.detail
             && let Some(file) = &self.file
         {
-            self.detail = LineDetail::of(&**file, line_of_row(row));
+            self.detail = LineDetail::of(&**file, line_of_row(row)).map(|d| LineDetail { in_hits: hits, ..d });
         }
         // An open line window follows the line selected in either view
         // (owner, 2026-10-24), keeping its Wrap setting.
         if let (Some(row), Some(d), Some(file)) = (out.moved_to, &self.detail, &self.file)
             && out.detail.is_none()
             && line_of_row(row) != d.line
-            && let Some(mut next) = LineDetail::of(&**file, line_of_row(row))
+            && let Some(next) = d.moved(&**file, line_of_row(row))
         {
-            next.wrap = d.wrap;
+            self.detail = Some(LineDetail { in_hits: hits, ..next });
+        }
+    }
+
+    /// ↑ / ↓ in the line window: the next or previous line of the view it
+    /// follows (the search hits, else the main view), which moves there too.
+    fn step_detail(&mut self, down: bool) {
+        let Some(d) = &self.detail else { return };
+        let hits = self.search.hits.clone().filter(|(_, h)| d.in_hits && !h.is_empty());
+        let line = if let Some((_, hits)) = hits {
+            let n = hits.len() as u64;
+            let i = hits.position_at_or_after(d.line) as u64;
+            let i = if down { (i + 1).min(n - 1) } else { i.saturating_sub(1) };
+            self.hits_view.select(i, n);
+            let line = hits.lines[i as usize];
+            self.goto_line(line);
+            line
+        } else {
+            let rows = self.main_rows();
+            if rows == 0 {
+                return;
+            }
+            let row = self.row_of_line(d.line);
+            let row = if down { (row + 1).min(rows - 1) } else { row.saturating_sub(1) };
+            self.main_view.select(row, rows);
+            self.line_of_row(row)
+        };
+        if let Some(file) = &self.file
+            && let Some(next) = self.detail.as_ref().and_then(|d| d.moved(&**file, line))
+        {
             self.detail = Some(next);
         }
     }
@@ -1936,7 +1999,7 @@ impl Tab {
                     lines: lines.as_ref(),
                 },
             );
-            self.view_output(&out, |row| hits.lines[row as usize]);
+            self.view_output(&out, true, |row| hits.lines[row as usize]);
             // Selecting a hit moves the main view to it.
             let picked = out.clicked.or(if out.has_focus { self.hits_view.selected } else { None });
             if let Some(row) = picked {
@@ -2070,7 +2133,7 @@ impl Tab {
                 lines: lines.as_ref(),
             },
         );
-        self.view_output(&out, line_of_row);
+        self.view_output(&out, false, line_of_row);
     }
 }
 
@@ -3007,10 +3070,12 @@ impl App {
             if let Some(l) = t.detail.as_mut().and_then(|d| d.goto.take()) {
                 t.goto_line(l);
                 // The window goes along to that line.
-                let wrap = t.detail.as_ref().is_some_and(|d| d.wrap);
                 if let Some(file) = &t.file {
-                    t.detail = LineDetail::of(&**file, l).map(|d| LineDetail { wrap, ..d });
+                    t.detail = t.detail.as_ref().and_then(|d| d.moved(&**file, l));
                 }
+            }
+            if let Some(down) = t.detail.as_mut().and_then(|d| d.step.take()) {
+                t.step_detail(down);
             }
             if !open {
                 t.detail = None;
@@ -3540,10 +3605,68 @@ gear=D
         let file = tab.file.clone().unwrap();
         tab.detail = LineDetail::of(&*file, 0);
         tab.detail.as_mut().unwrap().wrap = false;
-        tab.view_output(&view::ViewOutput { moved_to: Some(3), ..Default::default() }, |r| r);
+        tab.view_output(&view::ViewOutput { moved_to: Some(3), ..Default::default() }, false, |r| r);
         let d = tab.detail.as_ref().unwrap();
         assert_eq!((d.line, d.wrap), (3, false), "keeps Wrap");
         assert_eq!(d.cells.last().map(String::as_str), Some("gear=D"));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// ↑ / ↓ over the line window step through the log (the filter result
+    /// here), not through the window's buttons.
+    #[test]
+    fn arrows_in_the_line_window_step_through_the_view() {
+        let dir = std::env::temp_dir().join(format!("nerka-gui-detail-keys-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("app.log");
+        std::fs::write(&log, "a ERROR\nb\nc ERROR\nd\ne ERROR\n").unwrap();
+        let ctx = egui::Context::default();
+        let mut tab = Tab::open(&ctx, log, &SearchPrefs::default());
+        settle(&mut tab, &ctx);
+        tab.pattern = "ERROR".into();
+        tab.start_search(&ctx);
+        settle(&mut tab, &ctx);
+        assert_eq!(tab.result.as_ref().unwrap().lines, [0, 2, 4]);
+        let file = tab.file.clone().unwrap();
+        tab.detail = LineDetail::of(&*file, 0);
+
+        // A key pressed with the pointer over the window asks for a step.
+        let key = |key| egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        };
+        let mut t = 0.0;
+        let mut frame = |events: Vec<egui::Event>, d: &mut LineDetail| {
+            t += 1.0 / 60.0;
+            let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1000.0, 800.0));
+            let input = egui::RawInput { screen_rect: Some(screen), time: Some(t), events, ..Default::default() };
+            let mut out = ctx.run_ui(input, |ui| {
+                d.show(ui.ctx());
+            });
+            out.textures_delta.clear();
+        };
+        let d = tab.detail.as_mut().unwrap();
+        frame(vec![], d);
+        frame(vec![], d);
+        let rect = ctx.memory(|m| m.area_rect(egui::Id::unique("line-detail"))).expect("the window");
+        frame(vec![egui::Event::PointerMoved(rect.center())], d);
+        frame(vec![key(egui::Key::ArrowDown)], d);
+        assert_eq!(d.step.take(), Some(true));
+        frame(vec![key(egui::Key::ArrowUp)], d);
+        assert_eq!(d.step.take(), Some(false));
+
+        // A step goes to the next kept line, and the main view goes along.
+        tab.step_detail(true);
+        assert_eq!(tab.detail.as_ref().unwrap().line, 2);
+        assert_eq!(tab.current_line(), 2);
+        tab.step_detail(true);
+        tab.step_detail(true);
+        assert_eq!(tab.detail.as_ref().unwrap().line, 4, "stops at the last line");
+        tab.step_detail(false);
+        assert_eq!((tab.detail.as_ref().unwrap().line, tab.current_line()), (2, 2));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
