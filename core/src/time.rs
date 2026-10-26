@@ -185,7 +185,7 @@ fn format_shown(t: f64, digits: usize) -> String {
 /// This computer's UTC offset at an instant, from the OS.
 #[cfg(all(unix, target_pointer_width = "64"))]
 mod os {
-    use std::ffi::{c_char, c_int, c_long};
+    use std::ffi::{c_char, c_int};
 
     /// `struct tm` with the `tm_gmtoff` and `tm_zone` that glibc, musl and
     /// the BSDs (macOS) have.
@@ -200,7 +200,8 @@ mod os {
         wday: c_int,
         yday: c_int,
         isdst: c_int,
-        gmtoff: c_long,
+        /// C's `long`: 64 bits on the 64-bit Unix this module is for.
+        gmtoff: i64,
         zone: *const c_char,
     }
 
@@ -219,7 +220,7 @@ mod os {
         // thread-safe and fills `tm` when it returns non-null.
         let ok = !unsafe { localtime_r(&t, tm.as_mut_ptr()) }.is_null();
         // SAFETY: zeroed is a valid Tm (a null `zone`); filled when `ok`.
-        ok.then(|| i64::from(unsafe { tm.assume_init() }.gmtoff))
+        ok.then(|| unsafe { tm.assume_init() }.gmtoff)
     }
 }
 
