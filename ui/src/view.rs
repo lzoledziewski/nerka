@@ -63,6 +63,10 @@ pub struct ViewState {
     pub sel: Option<(TextPos, TextPos)>,
     /// Lines picked one by one (Ctrl+click), as file lines.
     pub picked: std::collections::BTreeSet<LineNo>,
+    /// Takes ↑ / ↓ / Page Up / Page Down (and the focus) when no text box
+    /// or other log view has the focus — after a click on a button, or
+    /// before any click (the main view).
+    pub free_keys: bool,
     dragging: bool,
     /// Fraction of a row scrolled but not applied yet (trackpads).
     scroll_acc: f32,
@@ -109,6 +113,11 @@ impl Columns {
 }
 
 impl ViewState {
+    /// A view that takes the keys nothing else uses ([`Self::free_keys`]).
+    pub fn with_free_keys() -> Self {
+        Self { free_keys: true, ..Default::default() }
+    }
+
     pub fn select(&mut self, row: u64, rows: u64) {
         let row = row.min(rows.saturating_sub(1));
         self.selected = Some(row);
@@ -232,7 +241,33 @@ pub fn log_view(
     if response.clicked() || response.drag_started() || response.secondary_clicked() {
         response.request_focus();
     }
-    let has_focus = response.has_focus();
+    let mut has_focus = response.has_focus();
+    // Every log view's id, so a view knows when another one has the focus.
+    let views_id = egui::Id::unique("nerka-log-views");
+    ui.data_mut(|d| d.get_temp_mut_or_default::<std::collections::HashSet<egui::Id>>(views_id).insert(response.id));
+    if state.free_keys && !has_focus && rows > 0 {
+        let focused = ui.memory(|m| m.focused());
+        let views = ui.data(|d| d.get_temp::<std::collections::HashSet<egui::Id>>(views_id)).unwrap_or_default();
+        let free = focused.is_none_or(|f| !ui.ctx().text_edit_focused() && !views.contains(&f));
+        let nav = [Key::ArrowUp, Key::ArrowDown, Key::PageUp, Key::PageDown];
+        if free && ui.input(|i| !i.modifiers.any() && nav.iter().any(|&k| i.key_pressed(k))) {
+            response.request_focus();
+            has_focus = true;
+        }
+    }
+    if has_focus {
+        // The view's keys: without this, egui also moves the focus to the
+        // nearest widget in an arrow's direction (or drops it on Esc), and
+        // the next arrow goes through buttons instead of the log.
+        let keys = egui::EventFilter { horizontal_arrows: true, vertical_arrows: true, escape: true, tab: false };
+        ui.memory_mut(|m| m.set_focus_lock_filter(response.id, keys));
+        // The filter counts from the frame after the view got the focus;
+        // an arrow in that first frame would still move it.
+        let arrow = [Key::ArrowUp, Key::ArrowDown, Key::ArrowLeft, Key::ArrowRight];
+        if ui.input(|i| arrow.iter().any(|&k| i.key_pressed(k))) {
+            ui.memory_mut(|m| m.move_focus(egui::FocusDirection::None));
+        }
+    }
     if response.hovered() {
         // Raw wheel events, not egui's smoothed delta: a notch moves a fixed
         // number of whole rows at once, so text never sits between rows.
@@ -652,7 +687,12 @@ pub fn log_view(
         }
         let job = line_job(&shown, cells, cut, &spans, &font, text_color, dim);
         let galley = painter.layout_job(job);
-        max_w = max_w.max(galley.size().x);
+        // Only rows that stay in view under a horizontal scrollbar count:
+        // the cut-off last row would show the bar, which then covers it, so
+        // the bar would go again — and flicker on every repaint.
+        if y < outer.max.y - SCROLLBAR_W {
+            max_w = max_w.max(galley.size().x);
+        }
         painter.with_clip_rect(text_clip).galley(pos2(snap(text_x0 - state.x_off), snap(y + 1.0)), galley, text_color);
     }
     state.content_w = max_w;
@@ -1141,6 +1181,112 @@ mod tests {
         };
         let out = step(vec![enter], &mut s, &file);
         assert_eq!(out.detail, Some(0));
+    }
+
+    /// ↑ / ↓ in a focused view move its cursor line, and the view keeps the
+    /// focus: egui moved it to the nearest button in that direction too, so
+    /// the next press went through buttons instead of the log.
+    #[test]
+    fn arrows_move_through_the_log_not_through_buttons() {
+        let text: String = (0..100).map(|i| format!("line {i}\n")).collect();
+        let file = nerka_core::TextFile::from_bytes("t", text.into_bytes());
+        let ctx = egui::Context::default();
+        let hl = Highlight { highlighter: None, bookmarks: None, search: None, lines: None };
+        let mut t = 0.0;
+        let mut step = |events: Vec<egui::Event>, state: &mut ViewState| {
+            t += 1.0 / 60.0;
+            let screen = Rect::from_min_size(pos2(0.0, 0.0), vec2(600.0, 400.0));
+            let input = egui::RawInput { screen_rect: Some(screen), time: Some(t), events, ..Default::default() };
+            let mut res = None;
+            let mut out = ctx.run_ui(input, |ui| {
+                egui::Panel::top("buttons").show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        let _ = ui.button("above") | ui.button("beside");
+                    });
+                });
+                egui::Panel::bottom("more").show(ui, |ui| {
+                    let _ = ui.button("below");
+                });
+                egui::CentralPanel::default().show(ui, |ui| {
+                    res = Some(log_view(ui, "v", state, 100, &|r| r, &file, &mut Columns::default(), &hl));
+                });
+            });
+            out.textures_delta.clear();
+            res.unwrap()
+        };
+        let key = |key, pressed| egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        };
+        let button = |pos, pressed| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        let mut s = ViewState::default();
+        step(vec![], &mut s);
+        let row = pos2(300.0, 100.0);
+        step(vec![egui::Event::PointerMoved(row), button(row, true)], &mut s);
+        step(vec![button(row, false)], &mut s);
+        let start = s.selected.expect("a clicked row");
+        for k in [Key::ArrowDown, Key::ArrowDown, Key::ArrowDown, Key::ArrowUp, Key::ArrowDown] {
+            step(vec![key(k, true)], &mut s);
+            let out = step(vec![key(k, false)], &mut s);
+            assert!(out.has_focus, "the view lost the focus on {k:?}");
+        }
+        assert_eq!(s.selected, Some(start + 3));
+        // Esc clears the selection but leaves the focus in the view.
+        step(vec![key(Key::Escape, true)], &mut s);
+        assert!(step(vec![key(Key::Escape, false)], &mut s).has_focus);
+
+        // After a click on a button, the view (one that takes free keys)
+        // gets the arrows back.
+        s.free_keys = true;
+        let at = s.selected.unwrap();
+        let above = pos2(20.0, 12.0);
+        step(vec![egui::Event::PointerMoved(above), button(above, true)], &mut s);
+        assert!(!step(vec![button(above, false)], &mut s).has_focus, "the button took the focus");
+        for _ in 0..2 {
+            step(vec![key(Key::ArrowDown, true)], &mut s);
+            assert!(step(vec![key(Key::ArrowDown, false)], &mut s).has_focus);
+        }
+        assert_eq!(s.selected, Some(at + 2));
+    }
+
+    /// A long line in the half-visible row at the bottom must not make the
+    /// horizontal scrollbar come and go: showing the bar covered that row,
+    /// which then no longer counted, so the bar went away and the row came
+    /// back, every repaint (a hover is enough).
+    #[test]
+    fn a_long_last_row_does_not_make_the_scrollbar_flicker() {
+        let ctx = egui::Context::default();
+        let hl = Highlight { highlighter: None, bookmarks: None, search: None, lines: None };
+        let mut t = 0.0;
+        // Wherever the long line is, one of these rows is the cut-off last one.
+        for long in 0..30 {
+            let text: String =
+                (0..40).map(|i| if i == long { format!("{}\n", "x".repeat(400)) } else { format!("l{i}\n") }).collect();
+            let file = nerka_core::TextFile::from_bytes("t", text.into_bytes());
+            let mut s = ViewState::default();
+            let mut widths = Vec::new();
+            for _ in 0..8 {
+                t += 1.0 / 60.0;
+                let screen = Rect::from_min_size(pos2(0.0, 0.0), vec2(600.0, 300.0));
+                let input = egui::RawInput { screen_rect: Some(screen), time: Some(t), ..Default::default() };
+                let mut out = ctx.run_ui(input, |ui| {
+                    egui::CentralPanel::default().frame(egui::Frame::NONE).show(ui, |ui| {
+                        log_view(ui, "v", &mut s, file.line_count(), &|r| r, &file, &mut Columns::default(), &hl);
+                    });
+                });
+                out.textures_delta.clear();
+                widths.push(s.content_w);
+            }
+            assert!(widths[2..].windows(2).all(|w| w[0] == w[1]), "long line {long}: widths {widths:?}");
+        }
     }
 
     #[test]

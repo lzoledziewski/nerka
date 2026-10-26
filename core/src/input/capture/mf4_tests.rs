@@ -90,6 +90,22 @@ impl W {
         self.add(b"CG", &[next, cn, acq, si, 0, 0], &d)
     }
 
+    /// A DZ block holding `data` (that of an `org` block: DT, SD, …):
+    /// deflated, or transposed in `cols` columns first.
+    fn dz(&mut self, org: &[u8; 2], cols: Option<u32>, data: &[u8]) -> u64 {
+        let packed = match cols {
+            Some(c) => miniz_oxide::deflate::compress_to_vec_zlib(&transpose(data, c as usize), 6),
+            None => miniz_oxide::deflate::compress_to_vec_zlib(data, 6),
+        };
+        let mut d = org.to_vec();
+        d.extend_from_slice(&[u8::from(cols.is_some()), 0]);
+        d.extend_from_slice(&cols.unwrap_or(0).to_le_bytes());
+        d.extend_from_slice(&(data.len() as u64).to_le_bytes());
+        d.extend_from_slice(&(packed.len() as u64).to_le_bytes());
+        d.extend_from_slice(&packed);
+        self.add(b"DZ", &[], &d)
+    }
+
     fn header(&mut self, start_ns: u64) -> u64 {
         let mut d = start_ns.to_le_bytes().to_vec();
         d.extend_from_slice(&[0; 24]);
@@ -97,7 +113,29 @@ impl W {
     }
 }
 
+/// What a DZ transposition does: `cols` bytes per record, stored column by
+/// column; the bytes after the last whole record stay as they are.
+fn transpose(v: &[u8], cols: usize) -> Vec<u8> {
+    let rows = v.len() / cols;
+    let mut out = Vec::with_capacity(v.len());
+    for c in 0..cols {
+        out.extend((0..rows).map(|r| v[r * cols + c]));
+    }
+    out.extend_from_slice(&v[rows * cols..]);
+    out
+}
+
 const START_NS: u64 = 1_700_000_000_000_000_000;
+
+/// How [`x2e_packed`] stores its two data blocks.
+#[derive(Clone, Copy, Debug)]
+enum Pack {
+    Plain,
+    /// Both deflated (transposed in that many columns, if any).
+    Both(Option<u32>),
+    /// Only the second, deflated.
+    Second,
+}
 
 /// An X2E-style file: unsorted data (2-byte record ids), one Ethernet
 /// frame group (43-byte records) with its frame bytes in a VLSD group.
@@ -106,6 +144,10 @@ const START_NS: u64 = 1_700_000_000_000_000_000;
 /// EtherType); `vlsd_first` puts each frame's data before its record. The
 /// records go into two DT blocks split at `split` bytes.
 fn x2e(named: bool, frames: &[(u64, u8, u16, Vec<u8>)], vlsd_first: bool, split: usize) -> Vec<u8> {
+    x2e_packed(named, frames, vlsd_first, split, Pack::Plain)
+}
+
+fn x2e_packed(named: bool, frames: &[(u64, u8, u16, Vec<u8>)], vlsd_first: bool, split: usize, pack: Pack) -> Vec<u8> {
     let mut w = W::new();
     let hd = w.header(START_NS);
     let n = |s: &'static str| if named { s } else { "" };
@@ -145,8 +187,12 @@ fn x2e(named: bool, frames: &[(u64, u8, u16, Vec<u8>)], vlsd_first: bool, split:
         }
     }
     let split = split.min(records.len());
-    let dt1 = w.add(b"DT", &[], &records[..split]);
-    let dt2 = w.add(b"DT", &[], &records[split..]);
+    let (a, b) = records.split_at(split);
+    let (dt1, dt2) = match pack {
+        Pack::Plain => (w.add(b"DT", &[], a), w.add(b"DT", &[], b)),
+        Pack::Both(cols) => (w.dz(b"DT", cols, a), w.dz(b"DT", cols, b)),
+        Pack::Second => (w.add(b"DT", &[], a), w.dz(b"DT", None, b)),
+    };
     let mut dl_data = vec![0u8; 4];
     dl_data.extend_from_slice(&2u32.to_le_bytes());
     let dl = w.add(b"DL", &[0, dt1, dt2], &dl_data);
@@ -204,6 +250,13 @@ fn ethernet_frames_in_vlsd_groups() {
 /// record holds the offset), with the ECU id in the record.
 #[test]
 fn dlt_frames_with_signal_data() {
+    for packed in [false, true] {
+        dlt_frames_with_signal_data_in(packed);
+    }
+}
+
+/// `packed`: the SD block deflated in a DZ block.
+fn dlt_frames_with_signal_data_in(packed: bool) {
     let mut w = W::new();
     let hd = w.header(START_NS);
     let msgs: Vec<(&str, Vec<u8>)> =
@@ -229,7 +282,7 @@ fn dlt_frames_with_signal_data() {
         sd.extend_from_slice(bytes);
         records.extend(r);
     }
-    let sd = w.add(b"SD", &[], &sd);
+    let sd = if packed { w.dz(b"SD", None, &sd) } else { w.add(b"SD", &[], &sd) };
     let data = w.cn("DLT_Frame.DataBytes", 1, 0, 10, 21, 64, 0, 0, 0, sd);
     let ecu = w.cn("DLT_Frame.ECU_ID", 0, 0, 10, 13, 32, data, 0, 0, 0);
     let frame = w.cn("DLT_Frame", 0, 0, 10, 9, 160, 0, ecu, 0, 0);
@@ -258,7 +311,7 @@ fn compressed_and_other_files() {
     let dz = w.add(b"DZ", &[], &[b'D', b'T', 0, 0, 0, 0, 0, 0]);
     let dg = w.add(b"DG", &[0, cg, dz, 0], &[1, 0, 0, 0, 0, 0, 0, 0]);
     w.link(hd, 0, dg);
-    let e = from_bytes("t.mf4", w.0, &CaptureOptions::default()).err().expect("DZ is refused");
+    let e = from_bytes("t.mf4", w.0, &CaptureOptions::default()).err().expect("a cut DZ block is refused");
     assert!(e.to_string().contains("DZ"), "{e}");
     // An MF4 without DLT has no lines; `open` picks the MF4 reader by content.
     let empty = {
@@ -275,4 +328,117 @@ fn compressed_and_other_files() {
     assert_eq!(crate::open(&a, &p).unwrap().line_count(), 0);
     assert_eq!(crate::open(&b, &p).unwrap().line_count(), 1);
     std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn compressed_data_reads_like_uncompressed() {
+    let big = dlt("BIG", &"b".repeat(600));
+    let frags = fragments(9, &udp(3490, &big), 400);
+    let frames = vec![
+        (1_000_000, 1, 0x0800, ip_dlt(1, "NAV", "first")),
+        (3_000_000, 1, 0x0800, frags[1][..].to_vec()),
+        (4_000_000, 1, 0x0800, frags[0][..].to_vec()),
+        (6_000_000, 1, 0x0800, ip_dlt(2, "LAST", "last")),
+    ];
+    let o = CaptureOptions::default();
+    for split in [0, 61, 1000, usize::MAX] {
+        let (plain, ps) = from_bytes("t.mf4", x2e(true, &frames, false, split), &o).unwrap();
+        for pack in [Pack::Both(None), Pack::Both(Some(7)), Pack::Both(Some(45)), Pack::Second] {
+            let what = format!("split {split}, {pack:?}");
+            let file = x2e_packed(true, &frames, false, split, pack);
+            let (f, s) = from_bytes("t.mf4", file, &o).unwrap_or_else(|e| panic!("{what}: {e}"));
+            assert_eq!(lines(&f), lines(&plain), "{what}");
+            assert_eq!(s, ps, "{what}");
+            let all = |f: &crate::DltFile| {
+                (0..f.line_count()).map(|l| f.line_text(l).unwrap().into_owned()).collect::<Vec<_>>()
+            };
+            assert_eq!(all(&f), all(&plain), "{what}: times and columns too");
+        }
+    }
+}
+
+#[test]
+fn damaged_compressed_data_is_an_error() {
+    let frames = vec![(1_000_000, 1, 0x0800, ip_dlt(1, "NAV", "first"))];
+    let file = x2e_packed(true, &frames, false, 0, Pack::Both(None));
+    // The second half of the second block's packed bytes, zeroed.
+    let at = file.windows(4).rposition(|w| w == b"##DZ").unwrap();
+    let packed = u64::from_le_bytes(file[at + 40..at + 48].try_into().unwrap()) as usize;
+    let mut cut = file.clone();
+    cut[at + 48 + packed / 2..at + 48 + packed].fill(0);
+    let e = from_bytes("t.mf4", cut, &CaptureOptions::default()).err().expect("damaged");
+    assert!(e.to_string().contains("DZ"), "{e}");
+    // A zip type nerka doesn't know.
+    let mut other = file;
+    other[at + 24 + 2] = 2;
+    let e = from_bytes("t.mf4", other, &CaptureOptions::default()).err().expect("unknown zip type");
+    assert!(e.to_string().contains("zip type 2"), "{e}");
+}
+
+/// Opened from a file with a cache folder: unpacked into the cache once,
+/// read from there again; a changed file is unpacked anew, and the cache
+/// keeps under its limit.
+#[test]
+fn compressed_files_are_unpacked_into_the_cache_once() {
+    use crate::input::capture::{cache_usage, clear_cache};
+    let dir = std::env::temp_dir().join(format!("nerka-unpack-{}", std::process::id()));
+    let cache = dir.join("cache");
+    std::fs::create_dir_all(&dir).unwrap();
+    let log = dir.join("a.mf4");
+    let frames =
+        vec![(1_000_000, 1, 0x0800, ip_dlt(1, "NAV", "first")), (2_000_000, 1, 0x0800, ip_dlt(2, "NAV", "second"))];
+    std::fs::write(&log, x2e_packed(true, &frames, false, 61, Pack::Both(None))).unwrap();
+    let mut o = crate::OpenOptions::default();
+    o.capture.unpack.dir = Some(cache.clone());
+    let p = crate::Progress::new();
+    let text = |o: &crate::OpenOptions| {
+        let f = crate::open_with(&log, o, &p).unwrap();
+        (0..f.line_count()).map(|l| f.line_text(l).unwrap().rsplit('\t').next().unwrap().to_owned()).collect::<Vec<_>>()
+    };
+    assert_eq!(text(&o), ["first", "second"]);
+    assert_eq!(cache_usage(&cache).0, 1);
+    // The second time it comes from the cache: change the cached text to see.
+    let cached = std::fs::read_dir(&cache)
+        .unwrap()
+        .flatten()
+        .map(|e| e.path())
+        .find(|p| p.extension().is_some_and(|x| x == "mf4data"))
+        .unwrap();
+    let mut bytes = std::fs::read(&cached).unwrap();
+    let at = bytes.windows(6).position(|w| w == b"second").unwrap();
+    bytes[at..at + 6].copy_from_slice(b"SECOND");
+    std::fs::write(&cached, bytes).unwrap();
+    assert_eq!(text(&o), ["first", "SECOND"]);
+    // A changed file is unpacked again; over the limit, the older file goes.
+    let f = std::fs::File::options().write(true).open(&log).unwrap();
+    f.set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(60)).unwrap();
+    drop(f);
+    o.capture.unpack.limit = 1;
+    assert_eq!(text(&o), ["first", "second"]);
+    let files: Vec<_> = std::fs::read_dir(&cache).unwrap().flatten().map(|e| e.path()).collect();
+    assert_eq!(files.len(), 1, "{files:?}");
+    assert_ne!(files[0], cached);
+    assert_eq!(clear_cache(&cache), (1, 0));
+    assert_eq!(cache_usage(&cache), (0, 0));
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn start_time_with_the_local_time_flag() {
+    let start = 1_700_000_000_123_456_789u64;
+    let hd = |flags: u8| {
+        let mut d = start.to_le_bytes().to_vec();
+        d.extend_from_slice(&[0, 0, 0, 0, flags, 0, 0, 0]);
+        d
+    };
+    // UTC (no flag, or only "offsets valid"), or the flag ignored.
+    assert_eq!(super::start_time(&hd(0), true), start);
+    assert_eq!(super::start_time(&hd(2), true), start);
+    assert_eq!(super::start_time(&hd(1), false), start);
+    // The recorder's wall clock, read in this computer's zone.
+    let secs = (start / 1_000_000_000) as f64;
+    let shift = (crate::time::local_to_utc(secs) - secs) as i64 * 1_000_000_000;
+    assert_eq!(super::start_time(&hd(1), true) as i64, start as i64 + shift);
+    // A short header block is UTC.
+    assert_eq!(super::start_time(&start.to_le_bytes(), true), start);
 }

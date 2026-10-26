@@ -174,7 +174,7 @@ fn dlt_over_udp_is_read_in_place() {
     assert_eq!(f.index_memory_bytes(), 4 * 16);
 
     // Other ports when configured.
-    let o = CaptureOptions { dlt_udp_ports: vec![30490, 3489] };
+    let o = CaptureOptions { dlt_udp_ports: vec![30490, 3489], ..Default::default() };
     let got = lines(&from_bytes("t", pcap_file(1, &frames), &o).unwrap().0);
     assert_eq!(got, pairs(&[("XXX", "other port"), ("ALT", "another port")]));
 }

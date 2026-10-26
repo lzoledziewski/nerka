@@ -774,7 +774,9 @@ pub fn plot_panel(ui: &mut egui::Ui, state: &mut PlotState, src: Source<'_>) -> 
     let axis_y = plot.max.y;
     painter.line_segment([pos2(plot.min.x, axis_y), pos2(plot.max.x, axis_y)], Stroke::new(1.0, grid));
     let step = nice_step((x1 - x0) / (w / 110.0).max(1.0), data.is_time);
-    let mut t = (x0 / step).ceil() * step;
+    // Round in the time shown (local time's hours and days).
+    let shift = if data.is_time { nerka_core::time::shown(x0) - x0 } else { 0.0 };
+    let mut t = ((x0 + shift) / step).ceil() * step - shift;
     while t <= x1 {
         let px = to_px(t, x0, x1);
         painter.line_segment([pos2(px, plot.min.y), pos2(px, axis_y)], Stroke::new(1.0, grid.gamma_multiply(0.5)));

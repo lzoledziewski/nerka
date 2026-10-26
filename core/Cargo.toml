@@ -17,6 +17,7 @@ rayon.workspace = true
 regex.workspace = true
 thiserror.workspace = true
 quick-xml.workspace = true
+miniz_oxide.workspace = true
 
 [lints]
 workspace = true

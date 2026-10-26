@@ -10,7 +10,7 @@ decoded DLT headers you can filter on. It runs locally, with no backend, as a
 desktop viewer (`nerka-gui`) and a command-line tool (`nerka`) built on one
 UI-free engine (`nerka-core`).
 
-> Status: **alpha** (`0.1.0-alpha.5`). Windows is the main platform; Linux
+> Status: **alpha** (`0.1.0-alpha.6`). Windows is the main platform; Linux
 > builds come from CI. File formats and the GUI still change.
 
 ## Features
@@ -93,6 +93,8 @@ nerka lines app.log 100 120
 nerka --pack packs/ expand -l ota -p cam=CAM1            # pack picks -> NFD
 nerka --signal 'gear:enum=/gear=(?<gear>\w+)/' filter '@gear == D' app.log   # signals
 nerka --fibex ecu1.xml filter 'apid == NAV' trace.dlt     # DLT non-verbose messages decoded
+nerka --local-time lines trace.dlt 1 20                  # local time (CLI: UTC by default; GUI: local, ⚙ Settings)
+nerka --signal 'up1=ecu == ECU1 AND tmsp ~ /(?<up1>\d+)/' filter '@up1.changed AND @up1 < 10000' trace.dlt   # ECU1 resets
 ```
 
 `nerka help <command>` lists every option.

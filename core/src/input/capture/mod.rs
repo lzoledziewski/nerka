@@ -8,7 +8,8 @@
 //! it is: in the mapped file, or, for bytes that aren't contiguous there
 //! (reassembled datagrams, MF4 records spanning data blocks), in a side
 //! buffer ([`DltFile`] with [`Framed`] entries). Nothing is copied to a
-//! temporary `.dlt`.
+//! temporary `.dlt`; only compressed MF4 data is unpacked first, into a
+//! cache file that is mapped the same way ([`unpack`]).
 //!
 //! A message gets the capture time of the frame that completed its
 //! datagram, and keeps the capture's order. Its ECU is its own (WEID), else
@@ -17,6 +18,7 @@
 pub mod mf4;
 pub mod net;
 pub mod pcap;
+pub mod unpack;
 
 use super::Bytes;
 use super::dlt::{DltFile, Framed, MAX_CHANNELS};
@@ -24,6 +26,7 @@ use crate::{Error, Progress, Result};
 use net::{Net, NetStats, Payload};
 use std::borrow::Cow;
 use std::path::Path;
+pub use unpack::{UnpackOptions, cache_usage, clear_cache};
 
 /// UDP destination ports that carry DLT by default: 3490, the port the
 /// DLT protocol specification (AUTOSAR PRS) assigns. Others are configured
@@ -35,11 +38,16 @@ pub const DEFAULT_DLT_PORTS: [u16; 1] = [3490];
 pub struct CaptureOptions {
     /// UDP destination ports whose payloads are DLT messages.
     pub dlt_udp_ports: Vec<u16>,
+    /// Where compressed MF4 data is unpacked.
+    pub unpack: UnpackOptions,
+    /// An MF4 file whose header says its start time is local time (the
+    /// "local time" flag) is read in this computer's zone; off: as UTC.
+    pub mf4_local_time: bool,
 }
 
 impl Default for CaptureOptions {
     fn default() -> Self {
-        Self { dlt_udp_ports: DEFAULT_DLT_PORTS.to_vec() }
+        Self { dlt_udp_ports: DEFAULT_DLT_PORTS.to_vec(), unpack: UnpackOptions::default(), mf4_local_time: true }
     }
 }
 
@@ -85,17 +93,31 @@ fn read(
     options: &CaptureOptions,
     progress: &Progress,
 ) -> Result<(DltFile, CaptureStats)> {
-    let buf = data.bytes();
+    let file = data.bytes();
+    // Compressed MF4 data: unpacked, and the messages point into that.
+    let unpacked = if mf4::is_mf4(file) {
+        unpack::unpack(file, path.as_deref(), &mf4::leaves(file)?, &options.unpack, progress)?
+    } else {
+        None
+    };
+    let (bytes, layout) = match &unpacked {
+        Some((b, l)) => (b.bytes(), Some(l)),
+        None => (file, None),
+    };
     let mut sink = Sink {
         net: Net::default(),
-        c: Collector { base: buf, msgs: Vec::new(), side: Vec::new(), stats: CaptureStats::default() },
+        c: Collector { base: bytes, msgs: Vec::new(), side: Vec::new(), stats: CaptureStats::default() },
         options,
         channel_ecus: Vec::new(),
         too_far: false,
     };
-    let file_skipped = if mf4::is_mf4(buf) {
-        mf4::read(buf, progress, &mut sink)?
+    let file_skipped = if mf4::is_mf4(file) {
+        if layout.is_none() {
+            progress.set_total(file.len() as u64);
+        }
+        mf4::read(file, bytes, layout, progress, &mut sink)?
     } else {
+        let buf = file;
         pcap::frames(buf, progress, &mut |fr| sink.link_frame(fr.link, fr.data, fr.secs, fr.usecs, fr.channel))?
     };
     if sink.too_far {
@@ -110,6 +132,10 @@ fn read(
     msgs.shrink_to_fit();
     side.shrink_to_fit();
     let skipped = stats.dlt_skipped;
+    let data = match unpacked {
+        Some((b, _)) => b,
+        None => data,
+    };
     Ok((DltFile::from_frames(name, path, data, msgs, side, channel_ecus, skipped), stats))
 }
 

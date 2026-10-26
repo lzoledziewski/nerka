@@ -34,6 +34,10 @@ struct Cli {
     /// MF4; repeatable). Default: 3490.
     #[arg(long = "dlt-port", global = true, value_name = "PORT")]
     dlt_port: Vec<u16>,
+    /// Folder compressed MF4 data is unpacked into (default: the per-user
+    /// cache folder); unpacked once, reused when the file is opened again.
+    #[arg(long = "unpack-dir", global = true, value_name = "DIR")]
+    unpack_dir: Option<PathBuf>,
     /// FIBEX file describing DLT non-verbose messages (repeatable): their
     /// payload is shown as text, and their APID / CTID / level come from it.
     #[arg(long, global = true, value_name = "FILE")]
@@ -42,6 +46,14 @@ struct Cli {
     /// NAME[(GROUP)][:num|enum]=QUERY, e.g. 'speed=/speed=(?<speed>\d+)/'.
     #[arg(long, global = true, value_name = "SPEC")]
     signal: Vec<String>,
+    /// Show times (DLT's time column, signals) in this computer's local
+    /// time and read times without a zone as local; default: UTC.
+    #[arg(long = "local-time", global = true)]
+    local_time: bool,
+    /// Read an MF4 start time marked as local time as UTC instead of in
+    /// this computer's zone.
+    #[arg(long = "mf4-utc", global = true)]
+    mf4_utc: bool,
     #[command(subcommand)]
     cmd: Cmd,
 }
@@ -305,6 +317,9 @@ fn run() -> Result<()> {
     if !cli.dlt_port.is_empty() {
         options.capture.dlt_udp_ports = cli.dlt_port.clone();
     }
+    options.capture.unpack.dir = cli.unpack_dir.clone().or_else(nerka_core::cache_dir);
+    options.capture.mf4_local_time = !cli.mf4_utc;
+    nerka_core::time::set_local(cli.local_time);
     if !cli.fibex.is_empty() {
         options.fibex = Some(std::sync::Arc::new(nerka_core::Fibex::load(&cli.fibex)?));
     }

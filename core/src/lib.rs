@@ -79,6 +79,21 @@ pub fn config_dir() -> Option<std::path::PathBuf> {
     base.map(|b| b.join("nerka"))
 }
 
+/// Per-user cache directory for nerka (`%LOCALAPPDATA%\nerka\cache`, or
+/// `$XDG_CACHE_HOME/nerka`, `~/.cache/nerka`), if one can be determined:
+/// where compressed captures are unpacked.
+pub fn cache_dir() -> Option<std::path::PathBuf> {
+    use std::path::PathBuf;
+    if cfg!(windows) {
+        std::env::var_os("LOCALAPPDATA").map(|b| PathBuf::from(b).join("nerka").join("cache"))
+    } else {
+        std::env::var_os("XDG_CACHE_HOME")
+            .map(PathBuf::from)
+            .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")))
+            .map(|b| b.join("nerka"))
+    }
+}
+
 /// Shared progress / cancellation handle for long operations
 /// (indexing, searching). Cheap to clone, safe to poll from a UI thread.
 #[derive(Debug, Clone, Default)]

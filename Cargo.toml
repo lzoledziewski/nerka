@@ -4,7 +4,7 @@ members = ["core", "cli", "ui"]
 default-members = ["core", "cli"]
 
 [workspace.package]
-version = "0.1.0-alpha.5"
+version = "0.1.0-alpha.6"
 edition = "2024"
 rust-version = "1.86"
 license = "MIT OR Apache-2.0"
@@ -20,6 +20,8 @@ regex = "1.13"
 thiserror = "2"
 # FIBEX (and later ARXML) databases: a streaming XML reader; needs only memchr.
 quick-xml = { version = "0.42", default-features = false }
+# Compressed MF4 data (DZ blocks: zlib deflate); pure Rust, already built for the GUI's images.
+miniz_oxide = "0.9"
 clap = { version = "4.6", features = ["derive"] }
 anyhow = "1"
 eframe = "0.37"

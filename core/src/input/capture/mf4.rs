@@ -6,8 +6,10 @@
 //! unsorted data groups (record ids of 1, 2, 4 or 8 bytes) and sorted ones;
 //! data in DT blocks, DL lists or HL headers (records may span data blocks:
 //! those are copied); variable-length data in VLSD channel groups (paired
-//! with their frame group by order) or SD blocks (by offset). Compressed DZ
-//! blocks are refused for now.
+//! with their frame group by order) or SD blocks (by offset). Compressed
+//! data (DZ blocks, deflate, transposed or not) is unpacked first
+//! ([`super::unpack`]): the tree is read from the file, the data from the
+//! unpacked bytes.
 //!
 //! Channel groups are recognised by their channels' names (ASAM bus
 //! logging: `ETH_Frame.EtherType`, `ETH_Frame.DataBytes`,
@@ -17,6 +19,7 @@
 //! conversion; without one, the raw value is the time in seconds.
 
 use super::Sink;
+use super::unpack::{Layout, Leaf, dz_header};
 use crate::{Error, Progress, Result};
 use std::borrow::Cow;
 use std::collections::{HashMap, VecDeque};
@@ -72,6 +75,20 @@ fn text(buf: &[u8], at: u64) -> &str {
         }
         _ => "",
     }
+}
+
+/// The header block's start time in ns since the epoch, UTC. With the
+/// "local time" flag (`hd_time_flags` bit 0) the stored value is the
+/// recorder's wall clock, its zone unknown: read in this computer's zone
+/// when `local` (as other MF4 tools do), else taken as UTC.
+fn start_time(hd: &[u8], local: bool) -> u64 {
+    let ns = le_u64(hd, 0);
+    if !local || hd.get(12).is_none_or(|f| f & 1 == 0) {
+        return ns;
+    }
+    let secs = (ns / 1_000_000_000) as f64;
+    let utc = crate::time::local_to_utc(secs);
+    (ns as i128 + ((utc - secs) as i128) * 1_000_000_000).max(0) as u64
 }
 
 fn le_u64(b: &[u8], at: usize) -> u64 {
@@ -218,24 +235,83 @@ fn channels(buf: &[u8], first: u64) -> Vec<Cn> {
     out
 }
 
-/// Data segments (offset, length) of the data blocks reached from `at`, in
-/// order. Errors on compressed blocks.
-fn segments(buf: &[u8], at: u64, out: &mut Vec<(usize, usize)>, depth: usize) -> Result<()> {
-    let Some(b) = block(buf, at) else { return Ok(()) };
+/// The data blocks (DT, SD, RD, DV, DZ) reached from `at`, in order.
+fn data_blocks(buf: &[u8], at: u64, out: &mut Vec<u64>, depth: usize) {
+    let Some(b) = block(buf, at) else { return };
     if depth > 64 {
-        return Ok(());
+        return;
     }
     match &b.id {
-        b"DT" | b"SD" | b"RD" | b"DV" => out.push((b.data_at, b.data.len())),
+        b"DT" | b"SD" | b"RD" | b"DV" | b"DZ" => out.push(at),
         b"DL" => {
             for i in 1..b.nlinks() {
-                segments(buf, b.link(i), out, depth + 1)?;
+                data_blocks(buf, b.link(i), out, depth + 1);
             }
-            segments(buf, b.link(0), out, depth + 1)?;
+            data_blocks(buf, b.link(0), out, depth + 1);
         }
-        b"HL" => segments(buf, b.link(0), out, depth + 1)?,
-        b"DZ" => return Err(Error::Format("compressed MF4 data (DZ blocks) isn't supported yet".into())),
+        b"HL" => data_blocks(buf, b.link(0), out, depth + 1),
         _ => {}
+    }
+}
+
+/// Every data block of the file, each once, in the order the block tree
+/// reaches them: each data group's records, then its channels' signal data.
+// Kept out of `read`'s caller: inlined there, it made indexing an
+// uncompressed MF4 4% slower (code layout; the walk itself takes < 1 ms).
+#[inline(never)]
+pub(crate) fn leaves(buf: &[u8]) -> Result<Vec<Leaf>> {
+    let mut at = Vec::new();
+    let Some(hd) = block(buf, 64).filter(|b| &b.id == b"HD") else { return Ok(Vec::new()) };
+    let (mut dg_at, mut guard) = (hd.link(0), 0);
+    while let Some(dg) = block(buf, dg_at).filter(|b| &b.id == b"DG") {
+        guard += 1;
+        if guard > 100_000 {
+            break;
+        }
+        data_blocks(buf, dg.link(2), &mut at, 0);
+        let mut cg_at = dg.link(1);
+        while let Some(cg) = block(buf, cg_at).filter(|b| &b.id == b"CG") {
+            for cn in channels(buf, cg.link(1)) {
+                if block(buf, cn.data_link).is_some_and(|b| &b.id != b"CG") {
+                    data_blocks(buf, cn.data_link, &mut at, 0);
+                }
+            }
+            cg_at = cg.link(0);
+        }
+        dg_at = dg.link(0);
+    }
+    let mut seen = std::collections::HashSet::new();
+    at.retain(|a| seen.insert(*a));
+    at.into_iter()
+        .map(|a| {
+            let b = block(buf, a).expect("walked above");
+            let dz = if &b.id == b"DZ" {
+                let (zip_type, param, org, _) = dz_header(b.data)?;
+                Some((zip_type, param, org))
+            } else {
+                None
+            };
+            Ok(Leaf { at: a, data_at: b.data_at, data_len: b.data.len(), dz })
+        })
+        .collect()
+}
+
+/// Data segments (offset, length) of the data blocks reached from `at`, in
+/// order: in the file, or where `layout` put them in the unpacked bytes.
+fn segments(buf: &[u8], layout: Option<&Layout>, at: u64, out: &mut Vec<(usize, usize)>) -> Result<()> {
+    let mut blocks = Vec::new();
+    data_blocks(buf, at, &mut blocks, 0);
+    for a in blocks {
+        match layout.and_then(|l| l.get(&a)) {
+            Some(&seg) => out.push(seg),
+            None => {
+                let b = block(buf, a).expect("walked above");
+                if &b.id == b"DZ" {
+                    return Err(Error::Format("MF4: compressed data that wasn't unpacked".into()));
+                }
+                out.push((b.data_at, b.data.len()));
+            }
+        }
     }
     Ok(())
 }
@@ -358,16 +434,23 @@ fn frame_group(
     Some((g, sd_link))
 }
 
-/// Read every DLT frame group of the file into `sink`. Returns the bytes
-/// that couldn't be read (none: MF4 has no slack between records).
-pub(crate) fn read<'a>(buf: &'a [u8], progress: &Progress, sink: &mut Sink<'a, '_>) -> Result<u64> {
-    progress.set_total(buf.len() as u64);
+/// Read every DLT frame group of the file `buf` into `sink`. The records
+/// are read from `data`: `buf` itself, or its unpacked data blocks where
+/// `layout` says. Adds `data`'s length to `progress`. Returns the bytes that
+/// couldn't be read (none: MF4 has no slack between records).
+pub(crate) fn read<'a>(
+    buf: &[u8],
+    data: &'a [u8],
+    layout: Option<&Layout>,
+    progress: &Progress,
+    sink: &mut Sink<'a, '_>,
+) -> Result<u64> {
     if buf.len() < 64 || !is_mf4(buf) {
         return Err(Error::Format("not an MDF 4 file".into()));
     }
     let hd =
         block(buf, 64).filter(|b| &b.id == b"HD").ok_or_else(|| Error::Format("MF4 without a header block".into()))?;
-    let start_ns = le_u64(hd.data, 0);
+    let start_ns = start_time(hd.data, sink.options.mf4_local_time);
     let mut reported = 0usize;
     let mut dg_at = hd.link(0);
     let mut guard = 0;
@@ -409,9 +492,9 @@ pub(crate) fn read<'a>(buf: &'a [u8], progress: &Progress, sink: &mut Sink<'a, '
             let Some((mut g, sd)) = frame_group(buf, &cns, acq, ethernet_bus, &addr_rid) else { continue };
             if let (Some(link), DataRef::Signal { field, .. }) = (sd, g.data) {
                 let mut segs = Vec::new();
-                segments(buf, link, &mut segs, 0)?;
+                segments(buf, layout, link, &mut segs)?;
                 g.data = DataRef::Signal { field, stream: sd_streams.len() };
-                sd_streams.push(Stream::new(buf, segs));
+                sd_streams.push(Stream::new(data, segs));
             }
             groups.insert(rid, g);
         }
@@ -420,8 +503,8 @@ pub(crate) fn read<'a>(buf: &'a [u8], progress: &Progress, sink: &mut Sink<'a, '
             continue;
         }
         let mut segs = Vec::new();
-        segments(buf, dg.link(2), &mut segs, 0)?;
-        let mut s = Stream::new(buf, segs);
+        segments(buf, layout, dg.link(2), &mut segs)?;
+        let mut s = Stream::new(data, segs);
         // Unsorted VLSD: a frame group's records and its VLSD group's come
         // in the same order; pair them by order (either may come first).
         let parent: HashMap<u64, u64> = groups
@@ -483,7 +566,7 @@ pub(crate) fn read<'a>(buf: &'a [u8], progress: &Progress, sink: &mut Sink<'a, '
         }
         dg_at = dg.link(0);
     }
-    progress.add((buf.len().saturating_sub(reported)) as u64);
+    progress.add((data.len().saturating_sub(reported)) as u64);
     Ok(0)
 }
 

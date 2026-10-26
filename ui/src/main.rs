@@ -587,6 +587,11 @@ struct LineDetail {
     signals: Vec<LineSignal>,
     /// A line the window asks to go to (an event that set a state).
     goto: Option<LineNo>,
+    /// ↑ / ↓ pressed over the window: step to the next (true) or previous
+    /// line of the view it follows.
+    step: Option<bool>,
+    /// It follows the search hits (opened or moved there), else the main view.
+    in_hits: bool,
 }
 
 /// One signal in the line window: its value on the line, and whether the
@@ -669,7 +674,12 @@ impl LineDetail {
     fn of(file: &dyn LogSource, line: LineNo) -> Option<Self> {
         let cells = file.line_detail(line)?;
         let names = file.columns().iter().map(|c| c.name).collect();
-        Some(LineDetail { line, cells, names, wrap: true, signals: Vec::new(), goto: None })
+        Some(LineDetail { line, cells, names, wrap: true, signals: Vec::new(), goto: None, step: None, in_hits: false })
+    }
+
+    /// The same window on another line, keeping Wrap and the view it follows.
+    fn moved(&self, file: &dyn LogSource, line: LineNo) -> Option<Self> {
+        Self::of(file, line).map(|d| LineDetail { wrap: self.wrap, in_hits: self.in_hits, ..d })
     }
 
     /// The window: the cells before the message as a name / value grid,
@@ -686,6 +696,25 @@ impl LineDetail {
             .collapsible(false)
             .default_size([640.0, 360.0])
             .show(ctx, |ui| {
+                // ↑ / ↓ over the window, or with a widget in it focused, step
+                // through the log, not through the window's widgets (egui
+                // moves focus with arrows). Taken before the widgets see them.
+                let layer = ui.layer_id();
+                let here = ctx.pointer_hover_pos().is_some_and(|p| ctx.layer_id_at(p) == Some(layer))
+                    || ctx
+                        .memory(|m| m.focused())
+                        .and_then(|id| ctx.read_response(id))
+                        .is_some_and(|r| r.layer_id == layer);
+                if here {
+                    let none = egui::Modifiers::NONE;
+                    let (up, down) = ctx.input_mut(|i| {
+                        (i.consume_key(none, egui::Key::ArrowUp), i.consume_key(none, egui::Key::ArrowDown))
+                    });
+                    if up || down {
+                        ctx.memory_mut(|m| m.move_focus(egui::FocusDirection::None));
+                        self.step = Some(down);
+                    }
+                }
                 let msg = self.cells.last().map_or("", String::as_str);
                 ui.horizontal(|ui| {
                     if table {
@@ -704,53 +733,57 @@ impl LineDetail {
                     let s = if lines == 1 { "" } else { "s" };
                     ui.weak(format!("{} characters, {lines} line{s}", msg.chars().count()));
                 });
-                if table {
-                    egui::Grid::new("line-detail-cells").num_columns(2).spacing([12.0, 2.0]).show(ui, |ui| {
-                        for (name, value) in self.names.iter().zip(&self.cells[..self.cells.len() - 1]) {
-                            ui.label(RichText::new(*name).strong());
-                            ui.monospace(value);
-                            ui.end_row();
-                        }
-                    });
-                }
-                if !self.signals.is_empty() {
-                    self.goto = signals_section(ui, self.line, &self.signals).or(self.goto);
-                }
-                ui.separator();
-                let mut shown = msg;
-                if shown.len() > DETAIL_MAX_BYTES {
-                    let mut end = DETAIL_MAX_BYTES;
-                    while !shown.is_char_boundary(end) {
-                        end -= 1;
-                    }
-                    shown = &shown[..end];
-                    ui.weak(format!("Showing the first {} KiB; Copy copies all of it.", DETAIL_MAX_BYTES >> 10));
-                }
+                // Everything below the buttons scrolls: many columns or
+                // signals pushed the message out of a window that couldn't.
                 let scroll = if self.wrap { egui::ScrollArea::vertical() } else { egui::ScrollArea::both() };
-                scroll.auto_shrink([false, false]).show(ui, |ui| {
-                    // A `&str` buffer: selectable and copyable, not editable.
-                    let mut text = shown;
-                    // A text box never gets wider than the space it is in, so
-                    // without Wrap the layout ignores that width and the box
-                    // takes the text's own width (the scroll area scrolls it).
-                    let wrap = self.wrap;
-                    let mut layouter = |ui: &egui::Ui, buf: &dyn egui::TextBuffer, wrap_width: f32| {
-                        let font = egui::TextStyle::Monospace.resolve(ui.style());
-                        let width = if wrap { wrap_width } else { f32::INFINITY };
-                        let job = egui::text::LayoutJob::simple(
-                            buf.as_str().to_owned(),
-                            font,
-                            ui.visuals().text_color(),
-                            width,
-                        );
-                        ui.fonts_mut(|f| f.layout_job(job))
-                    };
-                    let edit = egui::TextEdit::multiline(&mut text)
-                        .font(egui::TextStyle::Monospace)
-                        .desired_width(f32::INFINITY)
-                        .clip_text(false)
-                        .layouter(&mut layouter);
-                    ui.add(edit);
+                scroll.id_salt("line-detail-scroll").auto_shrink([false, false]).show(ui, |ui| {
+                    if table {
+                        egui::Grid::new("line-detail-cells").num_columns(2).spacing([12.0, 2.0]).show(ui, |ui| {
+                            for (name, value) in self.names.iter().zip(&self.cells[..self.cells.len() - 1]) {
+                                ui.label(RichText::new(*name).strong());
+                                ui.monospace(value);
+                                ui.end_row();
+                            }
+                        });
+                    }
+                    if !self.signals.is_empty() {
+                        self.goto = signals_section(ui, self.line, &self.signals).or(self.goto);
+                    }
+                    ui.separator();
+                    let mut shown = msg;
+                    if shown.len() > DETAIL_MAX_BYTES {
+                        let mut end = DETAIL_MAX_BYTES;
+                        while !shown.is_char_boundary(end) {
+                            end -= 1;
+                        }
+                        shown = &shown[..end];
+                        ui.weak(format!("Showing the first {} KiB; Copy copies all of it.", DETAIL_MAX_BYTES >> 10));
+                    }
+                    {
+                        // A `&str` buffer: selectable and copyable, not editable.
+                        let mut text = shown;
+                        // A text box never gets wider than the space it is in, so
+                        // without Wrap the layout ignores that width and the box
+                        // takes the text's own width (the scroll area scrolls it).
+                        let wrap = self.wrap;
+                        let mut layouter = |ui: &egui::Ui, buf: &dyn egui::TextBuffer, wrap_width: f32| {
+                            let font = egui::TextStyle::Monospace.resolve(ui.style());
+                            let width = if wrap { wrap_width } else { f32::INFINITY };
+                            let job = egui::text::LayoutJob::simple(
+                                buf.as_str().to_owned(),
+                                font,
+                                ui.visuals().text_color(),
+                                width,
+                            );
+                            ui.fonts_mut(|f| f.layout_job(job))
+                        };
+                        let edit = egui::TextEdit::multiline(&mut text)
+                            .font(egui::TextStyle::Monospace)
+                            .desired_width(f32::INFINITY)
+                            .clip_text(false)
+                            .layouter(&mut layouter);
+                        ui.add(edit);
+                    }
                 });
             });
         (open, copied)
@@ -872,7 +905,7 @@ impl Tab {
             mixed: None,
             file: None,
             loading: Some(Job::spawn(ctx, move |prog| nerka_core::open_many(&ps, &options, prog))),
-            main_view: ViewState::default(),
+            main_view: ViewState::with_free_keys(),
             hits_view: ViewState::default(),
             columns: Columns::default(),
             mode: prefs.mode,
@@ -1650,7 +1683,8 @@ impl Tab {
     }
 
     /// Status messages and context-menu actions from a log view.
-    fn view_output(&mut self, out: &ViewOutput, line_of_row: impl Fn(u64) -> LineNo) {
+    /// `hits`: the output is the search hits list's, else the main view's.
+    fn view_output(&mut self, out: &ViewOutput, hits: bool, line_of_row: impl Fn(u64) -> LineNo) {
         if let Some((n, cut)) = out.copied {
             self.status = if cut {
                 format!("Copied the first {n} lines (copy is limited to {n} lines)")
@@ -1664,16 +1698,45 @@ impl Tab {
         if let Some(row) = out.detail
             && let Some(file) = &self.file
         {
-            self.detail = LineDetail::of(&**file, line_of_row(row));
+            self.detail = LineDetail::of(&**file, line_of_row(row)).map(|d| LineDetail { in_hits: hits, ..d });
         }
         // An open line window follows the line selected in either view
         // (owner, 2026-10-24), keeping its Wrap setting.
         if let (Some(row), Some(d), Some(file)) = (out.moved_to, &self.detail, &self.file)
             && out.detail.is_none()
             && line_of_row(row) != d.line
-            && let Some(mut next) = LineDetail::of(&**file, line_of_row(row))
+            && let Some(next) = d.moved(&**file, line_of_row(row))
         {
-            next.wrap = d.wrap;
+            self.detail = Some(LineDetail { in_hits: hits, ..next });
+        }
+    }
+
+    /// ↑ / ↓ in the line window: the next or previous line of the view it
+    /// follows (the search hits, else the main view), which moves there too.
+    fn step_detail(&mut self, down: bool) {
+        let Some(d) = &self.detail else { return };
+        let hits = self.search.hits.clone().filter(|(_, h)| d.in_hits && !h.is_empty());
+        let line = if let Some((_, hits)) = hits {
+            let n = hits.len() as u64;
+            let i = hits.position_at_or_after(d.line) as u64;
+            let i = if down { (i + 1).min(n - 1) } else { i.saturating_sub(1) };
+            self.hits_view.select(i, n);
+            let line = hits.lines[i as usize];
+            self.goto_line(line);
+            line
+        } else {
+            let rows = self.main_rows();
+            if rows == 0 {
+                return;
+            }
+            let row = self.row_of_line(d.line);
+            let row = if down { (row + 1).min(rows - 1) } else { row.saturating_sub(1) };
+            self.main_view.select(row, rows);
+            self.line_of_row(row)
+        };
+        if let Some(file) = &self.file
+            && let Some(next) = self.detail.as_ref().and_then(|d| d.moved(&**file, line))
+        {
             self.detail = Some(next);
         }
     }
@@ -1706,14 +1769,27 @@ impl Tab {
         egui::ScrollArea::vertical().show(ui, |ui| {
             for (line, name, note) in self.bookmarks.iter_named() {
                 let open = self.marks_open.contains(&line);
-                ui.horizontal(|ui| {
+                // Right-to-left, as the note row below: the name field takes
+                // the width left after the link and the fold button, so it
+                // grows with the panel (issue #5).
+                let row = egui::vec2(ui.available_width(), ui.spacing().interact_size.y);
+                ui.allocate_ui_with_layout(row, egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let tip = if open { "Fold the line" } else { "Show the whole line" };
+                    if ui.small_button(if open { "▾" } else { "▸" }).on_hover_text(tip).clicked() {
+                        fold = Some(line);
+                    }
+                    if ui.link(format!("line {}", line + 1)).on_hover_text("Go to the line").clicked() {
+                        jump = Some(line);
+                    }
                     // The name (the plot shows it); edited in place.
                     let mut text = match &self.mark_rename {
                         Some((l, t)) if *l == line => t.clone(),
                         _ => name.to_owned(),
                     };
                     let r = ui.add(
-                        egui::TextEdit::singleline(&mut text).font(egui::TextStyle::Monospace).desired_width(80.0),
+                        egui::TextEdit::singleline(&mut text)
+                            .font(egui::TextStyle::Monospace)
+                            .desired_width(ui.available_width()),
                     );
                     if r.changed() {
                         self.mark_rename = Some((line, text));
@@ -1722,13 +1798,6 @@ impl Tab {
                         rename = self.mark_rename.take();
                     }
                     r.on_hover_text("The bookmark's name (the plot shows it); type to rename");
-                    if ui.link(format!("line {}", line + 1)).on_hover_text("Go to the line").clicked() {
-                        jump = Some(line);
-                    }
-                    let tip = if open { "Fold the line" } else { "Show the whole line" };
-                    if ui.small_button(if open { "▾" } else { "▸" }).on_hover_text(tip).clicked() {
-                        fold = Some(line);
-                    }
                 });
                 // The line wrapped to two rows ("…" if longer); unfolded, all
                 // of it. Wrapping uses the width the panel has, so it never
@@ -1930,7 +1999,7 @@ impl Tab {
                     lines: lines.as_ref(),
                 },
             );
-            self.view_output(&out, |row| hits.lines[row as usize]);
+            self.view_output(&out, true, |row| hits.lines[row as usize]);
             // Selecting a hit moves the main view to it.
             let picked = out.clicked.or(if out.has_focus { self.hits_view.selected } else { None });
             if let Some(row) = picked {
@@ -2064,7 +2133,7 @@ impl Tab {
                 lines: lines.as_ref(),
             },
         );
-        self.view_output(&out, line_of_row);
+        self.view_output(&out, false, line_of_row);
     }
 }
 
@@ -2257,6 +2326,8 @@ struct App {
     library_view: LibraryView,
     /// The ⚙ menu's ports field while it is edited.
     ports_text: Option<String>,
+    /// The unpack cache's limit as typed, while Settings is open.
+    limit_text: Option<String>,
     /// This window's name (title, Alt+Tab).
     window_name: Option<String>,
     /// The Settings window is open.
@@ -2281,12 +2352,54 @@ struct App {
     plot_win: Arc<std::sync::Mutex<plot::Detached>>,
 }
 
-/// The Settings window's fields: this window's name and the DLT ports
-/// (`ports` as typed). Returns the ports when they were changed to a
-/// valid list.
-fn settings_ui(ui: &mut egui::Ui, name: &mut String, ports: &mut String) -> Option<Vec<u16>> {
-    let mut save = None;
+/// What the Settings window changed.
+#[derive(Default)]
+struct SettingsChange {
+    /// The DLT ports, changed to a valid list.
+    ports: Option<Vec<u16>>,
+    /// The unpack cache's limit, changed to a valid number of GiB.
+    limit_gib: Option<u64>,
+    /// Empty the unpack cache.
+    clear: bool,
+    /// Local time or UTC, or how MF4 local times are read, changed.
+    times: bool,
+}
+
+/// What the Settings window shows: this window's name, the DLT ports
+/// (`ports` as typed), the unpack cache (`limit` as typed, in GiB) and the
+/// time settings.
+struct SettingsFields<'a> {
+    name: &'a mut String,
+    ports: &'a mut String,
+    limit: &'a mut String,
+    local_time: &'a mut bool,
+    mf4_local_time: &'a mut bool,
+}
+
+/// The Settings window's fields ([`SettingsFields`]).
+fn settings_ui(ui: &mut egui::Ui, f: SettingsFields<'_>) -> SettingsChange {
+    let SettingsFields { name, ports, limit, local_time, mf4_local_time } = f;
+    let mut save = SettingsChange::default();
     egui::Grid::new("settings-grid").num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| {
+        ui.label(RichText::new("Times").strong());
+        ui.end_row();
+        ui.label("Show");
+        ui.horizontal(|ui| {
+            let a = ui.radio_value(local_time, true, "Local time").on_hover_text(
+                "This computer's time zone, with the daylight saving time of each date (as DLT Viewer and \
+                 Wireshark show times). Times typed in queries without a zone are local too.",
+            );
+            let b = ui.radio_value(local_time, false, "UTC");
+            save.times |= a.changed() || b.changed();
+        });
+        ui.end_row();
+        ui.label("MF4");
+        let r = ui.checkbox(mf4_local_time, "Start time marked as local time: read in this zone").on_hover_text(
+            "An MF4 file can say its start time is the recorder's local time, without saying the zone. \
+             On: read it in this computer's zone. Off: read it as UTC.",
+        );
+        save.times |= r.changed();
+        ui.end_row();
         ui.label(RichText::new("This window").strong());
         ui.end_row();
         ui.label("Name");
@@ -2304,7 +2417,7 @@ fn settings_ui(ui: &mut egui::Ui, name: &mut String, ports: &mut String) -> Opti
         match prefs::parse_ports(ports) {
             Some(p) => {
                 if r.changed() {
-                    save = Some(p);
+                    save.ports = Some(p);
                 }
                 ui.weak("Used for captures opened from now on");
             }
@@ -2313,8 +2426,54 @@ fn settings_ui(ui: &mut egui::Ui, name: &mut String, ports: &mut String) -> Opti
             }
         }
         ui.end_row();
+        ui.label(RichText::new("Compressed MF4").strong()).on_hover_text(
+            "Compressed data is unpacked once into the unpack cache and read from there, as fast as an \
+             uncompressed file. Opening the file again uses it.",
+        );
+        ui.end_row();
+        ui.label("Unpack cache");
+        match nerka_core::cache_dir() {
+            Some(dir) => {
+                let (files, bytes) = nerka_core::input::capture::cache_usage(&dir);
+                ui.horizontal(|ui| {
+                    ui.label(format!("{files} file{}, {}", if files == 1 { "" } else { "s" }, size_text(bytes)))
+                        .on_hover_text(dir.display().to_string());
+                    let r = ui.add_enabled(files > 0, egui::Button::new("Clear"));
+                    save.clear = r.on_hover_text("Remove the unpacked files (those open in a tab stay)").clicked();
+                });
+            }
+            None => {
+                ui.weak("No cache folder: unpacked into memory");
+            }
+        }
+        ui.end_row();
+        ui.label("Size limit");
+        ui.horizontal(|ui| {
+            let r = ui
+                .add(egui::TextEdit::singleline(limit).desired_width(48.0))
+                .on_hover_text("The least recently used unpacked files are removed when the cache grows past this");
+            ui.label("GiB");
+            match prefs::parse_gib(limit) {
+                Some(n) if r.changed() => save.limit_gib = Some(n),
+                Some(_) => {}
+                None => {
+                    ui.colored_label(ui.visuals().error_fg_color, "1–1024");
+                }
+            }
+        });
+        ui.end_row();
     });
     save
+}
+
+/// A byte count for people: `512 B`, `3.4 MiB`, `1.2 GiB`.
+fn size_text(n: u64) -> String {
+    match n {
+        n if n >= 1 << 30 => format!("{:.1} GiB", n as f64 / (1u64 << 30) as f64),
+        n if n >= 1 << 20 => format!("{:.1} MiB", n as f64 / (1u64 << 20) as f64),
+        n if n >= 1 << 10 => format!("{:.1} KiB", n as f64 / 1024.0),
+        n => format!("{n} B"),
+    }
 }
 
 /// A window-style close button: a thin painted "×" with a square hover
@@ -2495,11 +2654,13 @@ impl App {
     }
 
     fn load_prefs(&mut self) {
-        let Some(path) = prefs_path() else { return };
-        match SearchPrefs::load(&path) {
-            Ok(p) => self.prefs = p,
-            Err(e) => self.status = format!("Could not read preferences: {e}"),
+        if let Some(path) = prefs_path() {
+            match SearchPrefs::load(&path) {
+                Ok(p) => self.prefs = p,
+                Err(e) => self.status = format!("Could not read preferences: {e}"),
+            }
         }
+        nerka_core::time::set_local(self.prefs.local_time);
     }
 
     /// Remember the active tab's mode and options if the user changed them.
@@ -2512,7 +2673,7 @@ impl App {
             return;
         }
         let mut open = true;
-        let mut save = None;
+        let mut save = SettingsChange::default();
         egui::Window::new("Settings")
             .id(egui::Id::unique("settings"))
             .open(&mut open)
@@ -2520,27 +2681,74 @@ impl App {
             .collapsible(false)
             .show(ctx, |ui| {
                 let ports = self.ports_text.get_or_insert_with(|| prefs::ports_text(&self.prefs.dlt_ports));
-                save = settings_ui(ui, self.window_name.get_or_insert_with(String::new), ports);
+                let limit = self.limit_text.get_or_insert_with(|| self.prefs.unpack_limit_gib.to_string());
+                save = settings_ui(
+                    ui,
+                    SettingsFields {
+                        name: self.window_name.get_or_insert_with(String::new),
+                        ports,
+                        limit,
+                        local_time: &mut self.prefs.local_time,
+                        mf4_local_time: &mut self.prefs.mf4_local_time,
+                    },
+                );
             });
         if !open {
             self.settings_open = false;
             self.ports_text = None;
+            self.limit_text = None;
         }
-        if let Some(ports) = save
+        if save.clear
+            && let Some(dir) = nerka_core::cache_dir()
+        {
+            let (removed, in_use) = nerka_core::input::capture::clear_cache(&dir);
+            self.status = match in_use {
+                0 => format!("Removed {removed} unpacked file{}", if removed == 1 { "" } else { "s" }),
+                n => format!("Removed {removed} unpacked files; {n} in use stay"),
+            };
+        }
+        let mut changed = false;
+        if let Some(ports) = save.ports
             && ports != self.prefs.dlt_ports
         {
             self.prefs.dlt_ports = ports;
-            if let Some(path) = prefs_path()
-                && let Err(e) = self.prefs.save(&path)
-            {
-                self.status = format!("Could not save preferences: {e}");
+            changed = true;
+        }
+        if let Some(n) = save.limit_gib
+            && n != self.prefs.unpack_limit_gib
+        {
+            self.prefs.unpack_limit_gib = n;
+            changed = true;
+        }
+        if save.times {
+            // Rendered lines and collected time values change: every tab
+            // reads its files again (filter, search and line stay).
+            nerka_core::time::set_local(self.prefs.local_time);
+            for t in &mut self.tabs {
+                if t.file.is_some() {
+                    t.reopen(ctx, &self.prefs, self.fibex.clone());
+                }
             }
+            changed = true;
+        }
+        if changed
+            && let Some(path) = prefs_path()
+            && let Err(e) = self.prefs.save(&path)
+        {
+            self.status = format!("Could not save preferences: {e}");
         }
     }
 
     fn save_prefs_from(&mut self, prefs: SearchPrefs) {
-        // A tab knows its search settings only; the ports stay.
-        let prefs = SearchPrefs { dlt_ports: self.prefs.dlt_ports.clone(), ..prefs };
+        // A tab knows its search settings only; the ports, the cache and
+        // the times stay.
+        let prefs = SearchPrefs {
+            dlt_ports: self.prefs.dlt_ports.clone(),
+            unpack_limit_gib: self.prefs.unpack_limit_gib,
+            local_time: self.prefs.local_time,
+            mf4_local_time: self.prefs.mf4_local_time,
+            ..prefs
+        };
         if prefs == self.prefs {
             return;
         }
@@ -3001,10 +3209,12 @@ impl App {
             if let Some(l) = t.detail.as_mut().and_then(|d| d.goto.take()) {
                 t.goto_line(l);
                 // The window goes along to that line.
-                let wrap = t.detail.as_ref().is_some_and(|d| d.wrap);
                 if let Some(file) = &t.file {
-                    t.detail = LineDetail::of(&**file, l).map(|d| LineDetail { wrap, ..d });
+                    t.detail = t.detail.as_ref().and_then(|d| d.moved(&**file, l));
                 }
+            }
+            if let Some(down) = t.detail.as_mut().and_then(|d| d.step.take()) {
+                t.step_detail(down);
             }
             if !open {
                 t.detail = None;
@@ -3534,10 +3744,68 @@ gear=D
         let file = tab.file.clone().unwrap();
         tab.detail = LineDetail::of(&*file, 0);
         tab.detail.as_mut().unwrap().wrap = false;
-        tab.view_output(&view::ViewOutput { moved_to: Some(3), ..Default::default() }, |r| r);
+        tab.view_output(&view::ViewOutput { moved_to: Some(3), ..Default::default() }, false, |r| r);
         let d = tab.detail.as_ref().unwrap();
         assert_eq!((d.line, d.wrap), (3, false), "keeps Wrap");
         assert_eq!(d.cells.last().map(String::as_str), Some("gear=D"));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// ↑ / ↓ over the line window step through the log (the filter result
+    /// here), not through the window's buttons.
+    #[test]
+    fn arrows_in_the_line_window_step_through_the_view() {
+        let dir = std::env::temp_dir().join(format!("nerka-gui-detail-keys-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("app.log");
+        std::fs::write(&log, "a ERROR\nb\nc ERROR\nd\ne ERROR\n").unwrap();
+        let ctx = egui::Context::default();
+        let mut tab = Tab::open(&ctx, log, &SearchPrefs::default());
+        settle(&mut tab, &ctx);
+        tab.pattern = "ERROR".into();
+        tab.start_search(&ctx);
+        settle(&mut tab, &ctx);
+        assert_eq!(tab.result.as_ref().unwrap().lines, [0, 2, 4]);
+        let file = tab.file.clone().unwrap();
+        tab.detail = LineDetail::of(&*file, 0);
+
+        // A key pressed with the pointer over the window asks for a step.
+        let key = |key| egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        };
+        let mut t = 0.0;
+        let mut frame = |events: Vec<egui::Event>, d: &mut LineDetail| {
+            t += 1.0 / 60.0;
+            let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1000.0, 800.0));
+            let input = egui::RawInput { screen_rect: Some(screen), time: Some(t), events, ..Default::default() };
+            let mut out = ctx.run_ui(input, |ui| {
+                d.show(ui.ctx());
+            });
+            out.textures_delta.clear();
+        };
+        let d = tab.detail.as_mut().unwrap();
+        frame(vec![], d);
+        frame(vec![], d);
+        let rect = ctx.memory(|m| m.area_rect(egui::Id::unique("line-detail"))).expect("the window");
+        frame(vec![egui::Event::PointerMoved(rect.center())], d);
+        frame(vec![key(egui::Key::ArrowDown)], d);
+        assert_eq!(d.step.take(), Some(true));
+        frame(vec![key(egui::Key::ArrowUp)], d);
+        assert_eq!(d.step.take(), Some(false));
+
+        // A step goes to the next kept line, and the main view goes along.
+        tab.step_detail(true);
+        assert_eq!(tab.detail.as_ref().unwrap().line, 2);
+        assert_eq!(tab.current_line(), 2);
+        tab.step_detail(true);
+        tab.step_detail(true);
+        assert_eq!(tab.detail.as_ref().unwrap().line, 4, "stops at the last line");
+        tab.step_detail(false);
+        assert_eq!((tab.detail.as_ref().unwrap().line, tab.current_line()), (2, 2));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -3838,7 +4106,14 @@ gear=D
                 let input = egui::RawInput { screen_rect: Some(screen), events, ..Default::default() };
                 let mut out = ctx.run_ui(input, |ui| {
                     egui::Window::new("Settings").show(ui.ctx(), |ui| {
-                        if let Some(p) = settings_ui(ui, name, ports) {
+                        let fields = SettingsFields {
+                            name,
+                            ports,
+                            limit: &mut "8".to_owned(),
+                            local_time: &mut true,
+                            mf4_local_time: &mut true,
+                        };
+                        if let Some(p) = settings_ui(ui, fields).ports {
                             saved = Some(p);
                         }
                     });
