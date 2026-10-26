@@ -4,7 +4,7 @@ members = ["core", "cli", "ui"]
 default-members = ["core", "cli"]
 
 [workspace.package]
-version = "0.1.0-alpha.5"
+version = "0.1.0-alpha.6"
 edition = "2024"
 rust-version = "1.86"
 license = "MIT OR Apache-2.0"
