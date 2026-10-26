@@ -905,7 +905,7 @@ impl Tab {
             mixed: None,
             file: None,
             loading: Some(Job::spawn(ctx, move |prog| nerka_core::open_many(&ps, &options, prog))),
-            main_view: ViewState::default(),
+            main_view: ViewState::with_free_keys(),
             hits_view: ViewState::default(),
             columns: Columns::default(),
             mode: prefs.mode,
