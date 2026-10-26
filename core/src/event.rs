@@ -95,7 +95,8 @@ pub fn detect_level(line: &[u8]) -> Option<Level> {
 pub enum FieldKind {
     /// Short byte string (DLT ECU / APID / CTID, …): `==`, `!=`, `~`, `!~`.
     Str,
-    /// Unsigned number (counters, timestamps, ids): all comparisons.
+    /// Unsigned number (counters, timestamps, ids): all comparisons, and
+    /// `~`, `!~` on its decimal text (a signal can capture it).
     U64,
 }
 

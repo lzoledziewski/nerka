@@ -30,7 +30,9 @@
 //! Source fields (DLT `ecu`, `apid`, …) are parsed generically and resolved
 //! by [`Query::bind`] against the source's schema, which also checks the
 //! operator and value against the field's kind: text fields take `==`,
-//! `!=`, `~`, `!~`; numeric fields take every comparison. A line without a
+//! `!=`, `~`, `!~`; numeric fields take every comparison, and `~`, `!~` on
+//! their decimal text (`tmsp ~ /(?<up>\d+)/`: a signal can capture a
+//! numeric field, e.g. one ECU's uptime). A line without a
 //! value for a field only satisfies `!=` and `!~`. As with `raw`, a STRING
 //! after `~` / `!~` is a literal substring. Fields marked
 //! [`FieldDef::costly`] (DLT `payload`, which decodes the message) are
@@ -191,6 +193,7 @@ impl Expr {
                 (Some(FieldValue::Str(v)), FieldTest::Str(op, want)) => op.test(&*v, want.as_slice()),
                 (Some(FieldValue::U64(v)), FieldTest::Num(op, want)) => op.test(v, *want),
                 (Some(FieldValue::Str(v)), FieldTest::Match(re)) => re.is_match(&v),
+                (Some(FieldValue::U64(v)), FieldTest::Match(re)) => re.is_match(v.to_string().as_bytes()),
                 (None, FieldTest::Str(op, _) | FieldTest::Num(op, _)) => *op == CmpOp::Ne,
                 _ => false,
             },
@@ -311,7 +314,7 @@ impl FieldCond {
         let test = std::mem::replace(&mut self.test, FieldTest::Num(CmpOp::Eq, 0));
         self.test = match (test, schema[id].kind) {
             (t @ (FieldTest::Match(_) | FieldTest::Str(..)), FieldKind::Str)
-            | (t @ FieldTest::Num(..), FieldKind::U64) => t,
+            | (t @ (FieldTest::Num(..) | FieldTest::Match(_)), FieldKind::U64) => t,
             (FieldTest::Literal(op @ (CmpOp::Eq | CmpOp::Ne), v, _), FieldKind::Str) => {
                 FieldTest::Str(op, v.into_bytes())
             }
@@ -329,11 +332,8 @@ impl FieldCond {
                 Some(n) => FieldTest::Num(op, n),
                 None => return fail(format!("'{name}' is a number but '{v}' isn't"), pos),
             },
-            (
-                FieldTest::Match(_) | FieldTest::Str(..) | FieldTest::Float(..) | FieldTest::Any | FieldTest::Time(..),
-                FieldKind::U64,
-            ) => {
-                return fail(format!("'{name}' is a number: use ==, !=, >=, <=, >, <"), self.op_pos);
+            (FieldTest::Str(..) | FieldTest::Float(..) | FieldTest::Any | FieldTest::Time(..), FieldKind::U64) => {
+                return fail(format!("'{name}' is a number: use ==, !=, >=, <=, >, <, ~ or !~"), self.op_pos);
             }
         };
         self.id = Some(id);
@@ -713,9 +713,15 @@ mod tests {
         let e = bind("mcnt == ten").unwrap_err();
         assert_eq!(e.pos, 8);
         assert!(e.msg.contains("'ten' isn't"), "{e}");
-        let e = bind("mcnt ~ /1/").unwrap_err();
-        assert_eq!(e.pos, 5);
-        assert!(e.msg.contains("is a number"), "{e}");
+        // A numeric field matches a regex on its decimal text.
+        let q = bind("mcnt ~ /^4[0-9]$/").unwrap();
+        let src = crate::input::mem::MemSource::new(vec![
+            crate::input::mem::Row { text: "a", apid: None, mcnt: Some(42), level: None },
+            crate::input::mem::Row { text: "b", apid: None, mcnt: Some(142), level: None },
+            crate::input::mem::Row { text: "c", apid: None, mcnt: None, level: None },
+        ]);
+        let hits: Vec<bool> = (0..3).map(|l| q.matches_event(&mut Event::from_source(&src, l))).collect();
+        assert_eq!(hits, [true, false, false]);
         let e = Query::compile("apid == (").unwrap_err();
         assert_eq!(e.pos, 8);
         let e = Query::compile("apid ~ NAV").unwrap_err();

@@ -1016,6 +1016,11 @@ fn capture(e: &Expr, group: &str, ev: &mut Event<'_>) -> Option<Vec<u8>> {
             (FieldTest::Match(re), Some(FieldValue::Str(v))) if has_group(re, group) => {
                 re.captures(&v).and_then(|c| c.name(group)).map(|m| m.as_bytes().to_vec())
             }
+            // A numeric field (DLT `tmsp`) is matched as its decimal text.
+            (FieldTest::Match(re), Some(FieldValue::U64(v))) if has_group(re, group) => {
+                let text = v.to_string();
+                re.captures(text.as_bytes()).and_then(|c| c.name(group)).map(|m| m.as_bytes().to_vec())
+            }
             _ => None,
         },
         Expr::Cond(_) => None,
@@ -1047,6 +1052,23 @@ mod tests {
         // Under OR, the branch that matched gives the value.
         assert_eq!(value(r"v=/a=(?<v>\d+)/ OR /b=(?<v>\d+)/", "b=7"), Some(SignalValue::Num(7.0)));
         assert_eq!(value(r"v=/v=(?<v>\d+)?/", "v="), None, "group took no part");
+    }
+
+    #[test]
+    fn values_from_a_numeric_field_per_group() {
+        use crate::input::mem::{MemSource, Row};
+        // `mcnt` stands in for DLT's `tmsp`, `apid` for `ecu`: one signal
+        // per ECU, so its resets show.
+        let row = |apid, mcnt| Row { text: "x", apid: Some(apid), mcnt: Some(mcnt), level: None };
+        let src = MemSource::new(vec![row("A", 10), row("B", 900), row("A", 20), row("B", 5), row("A", 3)]);
+        let d = SignalDef::parse_spec(r"up_a=apid == A AND mcnt ~ /(?<up_a>\d+)/").unwrap();
+        let series = d.series(&src, &Progress::new()).unwrap();
+        let events: Vec<(LineNo, String)> = series.iter().map(|(r, v)| (r, d.format(v))).collect();
+        assert_eq!(events, [(0, "10".into()), (2, "20".into()), (4, "3".into())]);
+        // Part of the digits, through the per-line path.
+        let d = SignalDef::parse_spec(r"hi=mcnt ~ /^(?<hi>\d)\d\d$/").unwrap().bind(crate::input::mem::SCHEMA).unwrap();
+        assert_eq!(d.value(&mut Event::from_source(&src, 1)), Some(SignalValue::Num(9.0)));
+        assert_eq!(d.value(&mut Event::from_source(&src, 0)), None);
     }
 
     #[test]
