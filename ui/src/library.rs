@@ -543,9 +543,11 @@ pub enum Action {
         target: Target,
         add: bool,
     },
-    /// The library was edited; `renamed` is `(old, new)` qualified ids.
+    /// The library was edited; `renamed` is `(old, new)` qualified ids,
+    /// `removed` the qualified id of a deleted query.
     Edited {
         renamed: Option<(String, String)>,
+        removed: Option<String>,
     },
 }
 
@@ -701,7 +703,11 @@ pub fn library_panel(
             EditOutcome::Closed => view.editing = None,
             EditOutcome::Saved(renamed) => {
                 view.editing = None;
-                action = Action::Edited { renamed };
+                action = Action::Edited { renamed, removed: None };
+            }
+            EditOutcome::Deleted(id) => {
+                view.editing = None;
+                action = Action::Edited { renamed: None, removed: Some(id) };
             }
         }
         ui.separator();
@@ -979,6 +985,8 @@ enum EditOutcome {
     Closed,
     /// Saved; `(old, new)` qualified ids if it was renamed.
     Saved(Option<(String, String)>),
+    /// Deleted from its pack (qualified id).
+    Deleted(String),
 }
 
 /// Edit a library query in place: Save writes its pack file.
@@ -1027,10 +1035,11 @@ fn library_editor(ui: &mut egui::Ui, lib: &mut Library, e: &mut LibEdit) -> Edit
         }
         if let Some(old) = e.old.clone() {
             let label = if e.confirm_delete { "Really delete?" } else { "Delete" };
-            if ui.button(label).on_hover_text("Remove it from the pack file").clicked() {
+            let tip = "Remove it from the pack file (and from the presets that pick it)";
+            if ui.button(label).on_hover_text(tip).clicked() {
                 if e.confirm_delete {
                     match lib.remove_query(&e.pack, &old) {
-                        Ok(()) => outcome = EditOutcome::Saved(None),
+                        Ok(()) => outcome = EditOutcome::Deleted(format!("{}.{old}", e.pack)),
                         Err(err) => e.node.error = Some(err.to_string()),
                     }
                 } else {
@@ -1208,7 +1217,7 @@ pub fn selection_panel(ui: &mut egui::Ui, lib: &mut Library, picks: &mut Picks) 
     }
     if let Some(key) = save {
         if let Some(renamed) = save_node(lib, picks, key) {
-            action = Action::Edited { renamed };
+            action = Action::Edited { renamed, removed: None };
         }
     }
     if create_pack {
@@ -1702,7 +1711,7 @@ mod tests {
         };
         assert!(matches!(run(&mut e, &mut lib, "Delete"), EditOutcome::Open));
         assert!(e.confirm_delete);
-        assert!(matches!(run(&mut e, &mut lib, "Really delete?"), EditOutcome::Saved(None)));
+        assert!(matches!(run(&mut e, &mut lib, "Really delete?"), EditOutcome::Deleted(id) if id == "v.fast"));
         assert_eq!(std::fs::read_to_string(&file).unwrap(), "pack v\n\nquery \"very slow\"\n    /very slow/\n");
         std::fs::remove_dir_all(&dir).unwrap();
     }
