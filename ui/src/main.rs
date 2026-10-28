@@ -1295,6 +1295,12 @@ impl Tab {
                             if let Some(line) = self.reopen_at.take() {
                                 self.goto_line(line);
                             }
+                            // Library picks put in the Search box before the
+                            // file was read couldn't know its fields (`apid`):
+                            // they run now (`--search-pick` at startup).
+                            if self.search.active.is_none() && !self.search.terms.is_empty() {
+                                self.run_search_box(ctx);
+                            }
                             if !self.pattern.trim().is_empty() {
                                 self.start_search(ctx);
                             } else {
@@ -4853,6 +4859,39 @@ gear=D
         two.use_preset(&ctx, &lib, &p);
         settle(&mut two, &ctx);
         assert_eq!(two.line_colors.clone().expect("after loading").1.lines, [3, 5]);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `--search-pick` at startup on a DLT file: the query names a DLT field,
+    /// unknown until the file is read; it runs once it is (it was lost).
+    #[test]
+    fn a_library_search_picked_before_the_file_is_read_runs_after() {
+        use nerka_core::input::dlt::writer::Msg;
+        let dir = std::env::temp_dir().join(format!("nerka-gui-early-search-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let dlt = dir.join("t.dlt");
+        let mut buf = Vec::new();
+        for apid in ["NAV", "DIAG", "NAV"] {
+            Msg::log(nerka_core::Level::Info, "ECU1", apid, "C", vec![]).encode(&mut buf);
+        }
+        std::fs::write(&dlt, buf).unwrap();
+        let mut lib = Library::new();
+        lib.add(
+            pack::parse_pack(
+                "p.nerka-pack",
+                "pack p
+query nav
+    apid == NAV
+",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let ctx = egui::Context::default();
+        let mut tab = Tab::open(&ctx, dlt, &SearchPrefs::default());
+        tab.search_for(&ctx, &lib, &Target::Library("p.nav".into()), true);
+        settle(&mut tab, &ctx);
+        assert_eq!(hits(&tab).iter().map(|(l, _)| *l).collect::<Vec<_>>(), [0, 2]);
         std::fs::remove_dir_all(&dir).ok();
     }
 
