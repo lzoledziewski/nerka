@@ -1044,13 +1044,35 @@ impl Tab {
     /// The tab's signals were edited: queries that use them run again.
     fn signals_changed(&mut self, ctx: &egui::Context) {
         self.signals_gen += 1;
-        plot::lock(&self.plot).retain(&self.signals);
         self.collect_signals(ctx);
         if self.pattern.contains('@') {
             self.start_search(ctx);
         } else if self.search.pattern.contains('@') {
             self.rerun_search(ctx);
         }
+    }
+
+    /// Plotted lanes whose signal the tab doesn't have but the FIBEX files
+    /// describe (a plot kept in another tab): their arguments become the
+    /// tab's signals, as ticking them in the Signals panel does. DLT tabs
+    /// only. Returns whether any was picked.
+    fn pick_plotted_arguments(&mut self, args: &[nerka_core::Argument]) -> bool {
+        if args.is_empty() || !self.file.as_ref().is_some_and(|f| !f.columns().is_empty()) {
+            return false;
+        }
+        let missing: Vec<String> = plot::lock(&self.plot)
+            .plotted
+            .iter()
+            .filter(|n| self.signals.get(n).is_none() && !self.arg_picks.iter().any(|a| a.name == **n))
+            .cloned()
+            .collect();
+        let found: Vec<_> = args.iter().filter(|a| missing.contains(&a.name)).cloned().collect();
+        if found.is_empty() {
+            return false;
+        }
+        self.arg_picks.extend(found);
+        self.choices_gen += 1;
+        true
     }
 
     /// Read the tab's files again (other FIBEX files): filter, search and
@@ -3030,6 +3052,16 @@ impl App {
 
     /// Use these FIBEX files (none: decode nothing); DLT tabs read their
     /// files again with them.
+    /// The FIBEX files' arguments, worked out once per catalog.
+    fn fibex_arguments(&mut self) -> Arc<Vec<nerka_core::Argument>> {
+        let key = self.fibex.as_ref().map_or(0, |f| Arc::as_ptr(f) as usize);
+        if self.fibex_args.as_ref().is_none_or(|(k, _)| *k != key) {
+            let args = self.fibex.as_ref().map(|f| f.arguments()).unwrap_or_default();
+            self.fibex_args = Some((key, Arc::new(args)));
+        }
+        self.fibex_args.as_ref().map(|(_, a)| a.clone()).unwrap_or_default()
+    }
+
     fn set_fibex(&mut self, ctx: &egui::Context, paths: Vec<PathBuf>) {
         if paths.is_empty() {
             self.fibex = None;
@@ -3379,13 +3411,7 @@ impl App {
             && let Some(d) = &mut t.detail
         {
             let line = d.line;
-            // The FIBEX arguments, worked out once per catalog.
-            let key = self.fibex.as_ref().map_or(0, |f| Arc::as_ptr(f) as usize);
-            if self.fibex_args.as_ref().is_none_or(|(k, _)| *k != key) {
-                let args = self.fibex.as_ref().map(|f| f.arguments()).unwrap_or_default();
-                self.fibex_args = Some((key, Arc::new(args)));
-            }
-            let args = self.fibex_args.as_ref().map(|(_, a)| a.clone()).unwrap_or_default();
+            let args = self.fibex_arguments();
             let t = self.tabs.get_mut(self.active).expect("checked");
             let signals = t.line_signals(line, &args);
             let d = t.detail.as_mut().expect("still there");
@@ -3481,7 +3507,11 @@ impl App {
             });
         });
 
-        if let Some(tab) = self.tabs.get_mut(self.active) {
+        if !self.tabs.is_empty() {
+            // A kept plot's lanes that the loaded FIBEX files describe.
+            let args = if self.fibex.is_some() { self.fibex_arguments() } else { Default::default() };
+            let tab = &mut self.tabs[self.active];
+            tab.pick_plotted_arguments(&args);
             tab.refresh_signals(&ctx, &self.library, &self.saved_signals, self.saved_gen);
         }
         // Saved after the tab is done with (the panel changed them), and
@@ -3568,7 +3598,8 @@ impl App {
             let fibex = self.fibex.clone();
             let out = egui::Panel::right("signals")
                 .resizable(true)
-                .default_size(360.0)
+                // Wide enough for a row's kind, scope, value and source.
+                .default_size(500.0)
                 .show(ui, |ui| {
                     let input = signals::Input {
                         signals: &tab.signals,
@@ -3874,25 +3905,9 @@ query timeouts  labels: vision
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
-    #[test]
-    fn fibex_arguments_become_signals_of_a_tab() {
-        use nerka_core::input::dlt::writer::{Msg, Payload};
-        let dir = std::env::temp_dir().join(format!("nerka-gui-fibex-args-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let (dlt, xml) = (dir.join("t.dlt"), dir.join("t.xml"));
-        let mut buf = Vec::new();
-        for size in [512u16, 64, 900, 32] {
-            let m = Msg {
-                ext: None,
-                payload: Payload::NonVerbose { id: 11, data: size.to_le_bytes().to_vec() },
-                ..Msg::log(nerka_core::Level::Info, "ECU1", "", "", vec![])
-            };
-            m.encode(&mut buf);
-        }
-        std::fs::write(&dlt, &buf).unwrap();
-        std::fs::write(
-            &xml,
-            r#"<fx:FIBEX xmlns:fx="f" xmlns:ho="h"><fx:ELEMENTS><fx:ECUS><fx:ECU ID="ECU1"/></fx:ECUS><fx:PDUS>
+    /// A FIBEX describing non-verbose message 11 of ECU1: "Queue almost
+    /// full. Free slots:" and a u16 (the argument `free_slots`).
+    pub(crate) const QUEUE_FIBEX: &str = r#"<fx:FIBEX xmlns:fx="f" xmlns:ho="h"><fx:ELEMENTS><fx:ECUS><fx:ECU ID="ECU1"/></fx:ECUS><fx:PDUS>
               <fx:PDU ID="t"><ho:DESC>Queue almost full. Free slots:</ho:DESC></fx:PDU>
               <fx:PDU ID="v"><fx:SIGNAL-INSTANCES><fx:SIGNAL-INSTANCE ID="s"><fx:SEQUENCE-NUMBER>0</fx:SEQUENCE-NUMBER>
                 <fx:SIGNAL-REF ID-REF="S_UINT16"/></fx:SIGNAL-INSTANCE></fx:SIGNAL-INSTANCES></fx:PDU>
@@ -3900,14 +3915,35 @@ query timeouts  labels: vision
               <fx:PDU-INSTANCE ID="1"><fx:PDU-REF ID-REF="t"/><fx:SEQUENCE-NUMBER>0</fx:SEQUENCE-NUMBER></fx:PDU-INSTANCE>
               <fx:PDU-INSTANCE ID="2"><fx:PDU-REF ID-REF="v"/><fx:SEQUENCE-NUMBER>1</fx:SEQUENCE-NUMBER></fx:PDU-INSTANCE>
             </fx:PDU-INSTANCES><fx:MANUFACTURER-EXTENSION><APPLICATION_ID>QUE</APPLICATION_ID></fx:MANUFACTURER-EXTENSION>
-            </fx:FRAME></fx:FRAMES></fx:ELEMENTS></fx:FIBEX>"#,
-        )
-        .unwrap();
+            </fx:FRAME></fx:FRAMES></fx:ELEMENTS></fx:FIBEX>"#;
+
+    /// A DLT of message 11 (see [`QUEUE_FIBEX`]), one per free-slots value.
+    fn queue_dlt(sizes: &[u16]) -> Vec<u8> {
+        use nerka_core::input::dlt::writer::{Msg, Payload};
+        let mut buf = Vec::new();
+        for size in sizes {
+            let m = Msg {
+                ext: None,
+                payload: Payload::NonVerbose { id: 11, data: size.to_le_bytes().to_vec() },
+                ..Msg::log(nerka_core::Level::Info, "ECU1", "", "", vec![])
+            };
+            m.encode(&mut buf);
+        }
+        buf
+    }
+
+    #[test]
+    fn fibex_arguments_become_signals_of_a_tab() {
+        let dir = std::env::temp_dir().join(format!("nerka-gui-fibex-args-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (dlt, xml) = (dir.join("t.dlt"), dir.join("t.xml"));
+        std::fs::write(&dlt, queue_dlt(&[512, 64, 900, 32])).unwrap();
+        std::fs::write(&xml, QUEUE_FIBEX).unwrap();
         let fibex = Arc::new(nerka_core::Fibex::load(&[&xml]).unwrap());
         let args = fibex.arguments();
         assert_eq!(args.iter().map(|a| a.name.as_str()).collect::<Vec<_>>(), ["free_slots"]);
         let ctx = egui::Context::default();
-        let mut tab = Tab::open_many(&ctx, vec![dlt], &SearchPrefs::default(), Some(fibex));
+        let mut tab = Tab::open_many(&ctx, vec![dlt], &SearchPrefs::default(), Some(fibex.clone()));
         settle(&mut tab, &ctx);
         // Not picked yet: the line window still lists the message's argument.
         let own = tab.line_signals(0, &args);
@@ -3932,6 +3968,63 @@ query timeouts  labels: vision
             own.iter().map(|s| (s.name.as_str(), s.origin)).collect::<Vec<_>>(),
             [("time", "built in"), ("free_slots", "FIBEX")]
         );
+
+        // Its − in the Signals panel unpicks it (owner, 2026-10-28: it only
+        // took it out of the plot), so the tab's signals lose it.
+        plot::lock(&tab.plot).toggle("free_slots");
+        let file = tab.file.clone().unwrap();
+        let mut minus = None;
+        for t in 0..3 {
+            let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(700.0, 900.0));
+            let events = match (t, minus) {
+                (2, Some(p)) => vec![
+                    egui::Event::PointerMoved(p),
+                    egui::Event::PointerButton {
+                        pos: p,
+                        button: egui::PointerButton::Primary,
+                        pressed: true,
+                        modifiers: Default::default(),
+                    },
+                    egui::Event::PointerButton {
+                        pos: p,
+                        button: egui::PointerButton::Primary,
+                        pressed: false,
+                        modifiers: Default::default(),
+                    },
+                ],
+                _ => vec![],
+            };
+            let input =
+                egui::RawInput { screen_rect: Some(screen), time: Some(t as f64), events, ..Default::default() };
+            let mut changed = false;
+            let mut out = ctx.run_ui(input, |ui| {
+                egui::CentralPanel::default().show(ui, |ui| {
+                    let input = signals::Input {
+                        signals: &tab.signals,
+                        generation: tab.signals_gen,
+                        saved: &mut Signals::default(),
+                        file: &*file,
+                        line: 0,
+                        plot: &mut plot::lock(&tab.plot),
+                        views: &mut tab.views,
+                        kept: None,
+                        fibex: Some(&*fibex),
+                        arg_picks: &mut tab.arg_picks,
+                    };
+                    changed = signals::signals_panel(ui, &mut tab.signals_ui, input).args_changed;
+                });
+            });
+            out.textures_delta.clear();
+            minus = out.shapes.iter().find_map(|s| match &s.shape {
+                egui::Shape::Text(t) if t.galley.text() == "−" => Some(t.pos + t.galley.size() / 2.0),
+                _ => None,
+            });
+            if t == 2 {
+                assert!(changed, "the panel says the picks changed");
+            }
+        }
+        assert!(tab.arg_picks.is_empty());
+        assert!(plot::lock(&tab.plot).plotted.is_empty());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -4213,6 +4306,67 @@ gear=D
             std::thread::sleep(Duration::from_millis(10));
         }
         panic!("jobs still running");
+    }
+
+    /// Owner, 2026-10-28: a plot kept in one tab opens in another with all
+    /// its lanes. One whose signal that tab lacks stays (it was dropped when
+    /// the tab's signals were built again); one the loaded FIBEX files
+    /// describe becomes the tab's signal.
+    #[test]
+    fn a_kept_plot_opens_in_another_tab_with_all_its_lanes() {
+        let dir = std::env::temp_dir().join(format!("nerka-gui-tabplots-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let fibex = dir.join("ecu.xml");
+        std::fs::write(&fibex, QUEUE_FIBEX).unwrap();
+        let dlt = |path: &Path| std::fs::write(path, queue_dlt(&[512, 64])).unwrap();
+        let (a, b) = (dir.join("a.dlt"), dir.join("b.dlt"));
+        dlt(&a);
+        dlt(&b);
+        let ctx = egui::Context::default();
+        let mut app = App::default();
+        app.set_fibex(&ctx, vec![fibex]);
+        app.show_signals = true;
+        let run = |app: &mut App, n: usize| {
+            for _ in 0..n {
+                let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1200.0, 800.0));
+                let input = egui::RawInput { screen_rect: Some(screen), ..Default::default() };
+                let mut out = ctx.run_ui(input, |ui| app.frame(ui));
+                out.textures_delta.clear();
+                settle_app(app, &ctx);
+            }
+        };
+        app.open(&ctx, a);
+        app.open(&ctx, b);
+        settle_app(&mut app, &ctx);
+        app.active = 0;
+        run(&mut app, 2);
+        let arg = app.fibex_arguments()[0].clone();
+        app.tabs[0].arg_picks.push(arg.clone());
+        app.tabs[0].choices_gen += 1;
+        {
+            let mut p = plot::lock(&app.tabs[0].plot);
+            p.toggle(&arg.name);
+            p.toggle("w"); // as if from tab A's own selection
+        }
+        run(&mut app, 2);
+        let keep = plot::PlotAction::Keep { name: "drive".into(), store: false };
+        app.plots.act(&mut plot::lock(&app.tabs[0].plot), keep).unwrap();
+
+        app.active = 1;
+        run(&mut app, 2);
+        assert!(app.tabs[1].arg_picks.is_empty());
+        app.plots.act(&mut plot::lock(&app.tabs[1].plot), plot::PlotAction::Use("drive".into())).unwrap();
+        run(&mut app, 3);
+        assert_eq!(app.tabs[1].arg_picks.iter().map(|a| a.name.as_str()).collect::<Vec<_>>(), [arg.name.as_str()]);
+        assert!(app.tabs[1].signals.get(&arg.name).is_some(), "the FIBEX argument is the tab's signal");
+        // The tab's signals are built again: the lanes stay.
+        app.tabs[1].choices_gen += 1;
+        run(&mut app, 3);
+        let p = plot::lock(&app.tabs[1].plot);
+        assert_eq!(p.plotted, [arg.name.as_str(), "w"]);
+        assert_eq!(p.name.as_deref(), Some("drive"));
+        drop(p);
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
