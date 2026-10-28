@@ -93,6 +93,33 @@ impl Presets {
         Ok(self.find(&name).expect("just added"))
     }
 
+    /// A library query was renamed (`renamed`, qualified ids) or deleted
+    /// (`removed`): every preset that picks it follows (issue #7), and the
+    /// saved ones are written again. Returns the names of the presets that
+    /// changed; write errors go to [`Presets::errors`].
+    pub fn query_changed(&mut self, renamed: Option<(&str, &str)>, removed: Option<&str>) -> Vec<String> {
+        let mut changed = Vec::new();
+        for e in &mut self.entries {
+            let mut c = false;
+            if let Some((old, new)) = renamed {
+                c |= e.preset.rename_query(old, new);
+            }
+            if let Some(id) = removed {
+                c |= e.preset.remove_query(id);
+            }
+            if !c {
+                continue;
+            }
+            if let Some(path) = &e.path
+                && let Err(err) = e.preset.save(path)
+            {
+                self.errors.push(format!("Preset: {err}"));
+            }
+            changed.push(e.preset.name.clone());
+        }
+        changed
+    }
+
     /// Remove preset `i` and its file.
     pub fn delete(&mut self, i: usize) -> Result<(), String> {
         if let Some(path) = &self.entries[i].path {
@@ -207,4 +234,39 @@ pub fn presets_bar(ui: &mut egui::Ui, presets: &mut Presets, current: Option<&st
         ui.colored_label(ui.visuals().error_fg_color, RichText::new(e).small());
     }
     action
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use nerka_core::pack::Role;
+    use nerka_core::preset::{NodeSource, PresetNode};
+
+    fn picking(name: &str, id: &str) -> Preset {
+        let node =
+            PresetNode { source: NodeSource::Library(id.into()), role: Role::Include, lit: false, detached: false };
+        Preset { name: name.into(), nodes: vec![node], ..Default::default() }
+    }
+
+    /// Issue #7: a renamed or deleted query changes the presets that pick
+    /// it, on disk too.
+    #[test]
+    fn presets_follow_library_edits() {
+        let dir = std::env::temp_dir().join(format!("nerka-gui-presets-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("a.nerka-preset");
+        let mut ps = Presets::default();
+        ps.entries.push(Entry { preset: picking("a", "v.x"), path: Some(path.clone()) });
+        ps.entries.push(Entry { preset: picking("b", "v.y"), path: None });
+
+        assert_eq!(ps.query_changed(Some(("v.x", "v.z")), None), ["a"]);
+        let saved = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(preset::parse_preset("a", &saved).unwrap().nodes[0].source, NodeSource::Library("v.z".into()));
+
+        assert_eq!(ps.query_changed(None, Some("v.y")), ["b"]);
+        assert!(ps.entries[1].preset.nodes.is_empty());
+        assert!(ps.query_changed(None, Some("v.nope")).is_empty());
+        assert!(ps.errors.is_empty());
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }

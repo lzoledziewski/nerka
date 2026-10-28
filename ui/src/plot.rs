@@ -10,12 +10,16 @@
 //! is shown (Δt). Bookmarks are cursors too (owner): a line at their line's
 //! time with their note, measured like the others; the plot's right-click
 //! menu bookmarks the nearest event's line with a note.
-//! The plot can move to a window of its own and back.
+//! The plot can move to a window of its own and back, and be closed (its
+//! lanes are kept for when it is shown again). Plots can be kept by name
+//! and switched between (`nerka_core::plot`, `crate::plots`).
 //!
 //! Drawn with egui's painter (no plot crate): lanes are decimated to one
 //! step per pixel column, so millions of events draw as fast as a few.
 
 use eframe::egui::{self, Align2, Color32, ColorImage, FontId, Pos2, Rect, Sense, Stroke, pos2, vec2};
+use nerka_core::plot::{Lane as LaneLayout, PlotLayout};
+pub use nerka_core::plot::{Marker, YAxis};
 use nerka_core::{Clock, LineNo, LogSource, SignalDef, SignalKind, SignalSeries, Signals, ValueRef, time::format_time};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -54,6 +58,32 @@ pub struct WindowInput {
     pub cursor: LineNo,
     pub kept: Option<Arc<nerka_core::SearchResult>>,
     pub bookmarks: Vec<Bookmark>,
+    pub saved: Vec<SavedPlot>,
+}
+
+/// A kept plot, as the plot's list shows it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SavedPlot {
+    pub name: String,
+    /// Kept for this session only (not on disk).
+    pub session: bool,
+    /// The tab's plot is this one, changed since it was saved or kept.
+    pub changed: bool,
+}
+
+/// What the plot's list and menu ask for.
+#[derive(Debug, Clone, PartialEq)]
+pub enum PlotAction {
+    /// Switch to the kept plot of this name (the current one is kept as it
+    /// is first).
+    Use(String),
+    /// Keep the plot by a name: this one, or a new empty one (`empty`);
+    /// `store` writes it to disk too.
+    New { name: String, store: bool, empty: bool },
+    /// Write the current plot to its kept entry (and its file).
+    Save,
+    /// Delete the kept plot of this name (and its file).
+    Delete(String),
 }
 
 /// A bookmark of the tab, as the plot shows it.
@@ -89,6 +119,7 @@ pub fn window_ui(ui: &mut egui::Ui, shared: &Mutex<Detached>) {
         series_of: &mut series_of,
         in_window: true,
         bookmarks: &i.bookmarks,
+        saved: &i.saved,
     };
     let mut plot = lock(&i.plot);
     let o = egui::CentralPanel::default().show(ui, |ui| plot_panel(ui, &mut plot, src)).inner;
@@ -96,26 +127,26 @@ pub fn window_ui(ui: &mut egui::Ui, shared: &Mutex<Detached>) {
     out.goto = o.goto.or(out.goto);
     out.toggle_window |= o.toggle_window;
     out.bookmark = o.bookmark.or(out.bookmark.take());
+    out.plots = o.plots.or(out.plots.take());
+    out.close |= o.close;
     *closed |= ui.input(|i| i.viewport().close_requested());
-    if out.goto.is_some() || out.toggle_window || out.bookmark.is_some() || *closed {
+    let asked = out.goto.is_some() || out.toggle_window || out.bookmark.is_some() || out.plots.is_some();
+    if asked || out.close || *closed {
         ui.ctx().request_repaint_of(egui::ViewportId::ROOT);
     }
-}
-
-/// A number lane's y axis.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum YAxis {
-    /// Every value of the signal fits.
-    All,
-    /// The values in the visible x range fit (changes while zooming).
-    Visible,
-    /// From, to.
-    Fixed(f64, f64),
 }
 
 /// Which signals are plotted and how, per tab.
 #[derive(Default)]
 pub struct PlotState {
+    /// The plot is shown (closed: its lanes are kept).
+    pub shown: bool,
+    /// The kept plot this is (`crate::plots`), if any.
+    pub name: Option<String>,
+    /// A name being typed for a kept plot, and whether it starts empty.
+    naming: Option<(String, bool)>,
+    /// Delete was clicked once for this kept plot.
+    confirm_delete: Option<String>,
     /// Plotted signals, in lane order.
     pub plotted: Vec<String>,
     /// Each plotted signal's colour (a palette slot, given when first
@@ -166,8 +197,47 @@ impl PlotState {
             Some(i) => {
                 self.plotted.remove(i);
             }
-            None => self.plotted.push(name.to_owned()),
+            None => {
+                self.plotted.push(name.to_owned());
+                self.shown = true;
+            }
         }
+        self.data = None;
+    }
+
+    /// The lanes and their settings, to keep by `name`.
+    pub fn layout(&self, name: &str) -> PlotLayout {
+        let lanes = self
+            .plotted
+            .iter()
+            .map(|n| LaneLayout {
+                signal: n.clone(),
+                events: self.events.contains(n),
+                y: self.y.get(n).copied().unwrap_or_default(),
+                markers: self.markers.get(n).cloned().unwrap_or_default(),
+            })
+            .collect();
+        PlotLayout {
+            name: name.to_owned(),
+            lanes,
+            names_width: (self.gutter > 0.0).then_some(self.gutter),
+            hide_bookmarks: self.hide_bookmarks,
+        }
+    }
+
+    /// Show `p` instead: its lanes and their settings. The time cursors and
+    /// the zoom stay (they belong to the file).
+    pub fn apply(&mut self, p: &PlotLayout) {
+        self.plotted = p.lanes.iter().map(|l| l.signal.clone()).collect();
+        self.events = p.lanes.iter().filter(|l| l.events).map(|l| l.signal.clone()).collect();
+        self.y = p.lanes.iter().filter(|l| l.y != YAxis::All).map(|l| (l.signal.clone(), l.y)).collect();
+        self.markers =
+            p.lanes.iter().filter(|l| !l.markers.is_empty()).map(|l| (l.signal.clone(), l.markers.clone())).collect();
+        self.gutter = p.names_width.unwrap_or(0.0);
+        self.hide_bookmarks = p.hide_bookmarks;
+        self.name = Some(p.name.clone());
+        self.shown = true;
+        self.scroll = 0.0;
         self.data = None;
     }
 
@@ -198,14 +268,6 @@ struct Lane {
     y_range: (f64, f64),
 }
 
-/// A horizontal line across a number lane (a limit, a threshold).
-#[derive(Debug, Clone, PartialEq)]
-pub struct Marker {
-    pub value: f64,
-    /// Shown next to the value; may be empty.
-    pub label: String,
-}
-
 /// The y range a lane shows: its values' range `(lo, hi)` widened to its
 /// markers (fitted axes only; a fixed axis is what it says).
 fn with_markers((lo, hi): (f64, f64), markers: &[Marker]) -> (f64, f64) {
@@ -220,6 +282,10 @@ pub struct Output {
     pub toggle_window: bool,
     /// Bookmark this line with this note (added, or its note replaced).
     pub bookmark: Option<(LineNo, String)>,
+    /// The kept plots' list or menu was used.
+    pub plots: Option<PlotAction>,
+    /// The plot was closed (its ✖).
+    pub close: bool,
 }
 
 const GUTTER: f32 = 120.0;
@@ -314,10 +380,12 @@ pub struct Source<'a> {
     pub in_window: bool,
     /// The tab's bookmarks.
     pub bookmarks: &'a [Bookmark],
+    /// The kept plots, to switch between.
+    pub saved: &'a [SavedPlot],
 }
 
 pub fn plot_panel(ui: &mut egui::Ui, state: &mut PlotState, src: Source<'_>) -> Output {
-    let Source { signals, generation, file, cursor, kept, series_of, in_window, bookmarks } = src;
+    let Source { signals, generation, file, cursor, kept, series_of, in_window, bookmarks, saved } = src;
     let mut out = Output::default();
     if let Some((from, to)) = state.reorder.take() {
         let names: Vec<String> =
@@ -327,30 +395,48 @@ pub fn plot_panel(ui: &mut egui::Ui, state: &mut PlotState, src: Source<'_>) -> 
     }
     let panel = ui.max_rect();
     ui.horizontal(|ui| {
-        let label = if in_window { "⧉ Back into the main window" } else { "⧉ Own window" };
-        out.toggle_window = ui.small_button(label).clicked();
-        if ui.small_button("📷").on_hover_text("Screenshot of the plot to the clipboard").clicked() {
-            state.capture = Some(Capture { back_to: state.scroll, settle: 2, ..Default::default() });
-            state.scroll = 0.0;
-        }
-        let fit = ui.add_enabled(state.range.is_some(), egui::Button::new("↔ Fit").small());
-        if fit.on_hover_text("Show the whole x range (also: double-click the plot)").clicked() {
-            state.range = None;
-        }
-        ui.weak(format!("x: {}", Clock::of(file, signals).describe())).on_hover_text(
-            "The file's own time, else the first signal of kind time that has events, else line numbers",
-        );
-        // The help is a hover, so the row never gets wider than the panel.
-        let mut show = !state.hide_bookmarks;
-        if ui.checkbox(&mut show, "🔖").on_hover_text("Show the bookmarks (with their notes) as cursors").changed() {
-            state.hide_bookmarks = !show;
-        }
-        ui.weak("ℹ").on_hover_text(
-            "Wheel: zoom (over the lane names: scroll). Drag: pan, up and down through the lanes (drag a time cursor to move it). Double-click: everything. Click: go to the \
-             nearest event. Right-click: place or remove time cursors (Δt between them). Right-click a lane's \
-             name: its y axis and markers.",
-        );
+        // ✖ first, at the right, so it stays in view however narrow.
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            let tip = "Close the plot (its lanes are kept: 📈 Plot in the Signals panel shows it again)";
+            out.close = crate::close_button(ui).on_hover_text(tip).clicked();
+            ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                if let Some(a) = plots_list(ui, state, saved) {
+                    out.plots = Some(a);
+                }
+                let label = if in_window { "⧉ Back into the main window" } else { "⧉ Own window" };
+                out.toggle_window = ui.small_button(label).clicked();
+                if ui.small_button("📷").on_hover_text("Screenshot of the plot to the clipboard").clicked() {
+                    state.capture = Some(Capture { back_to: state.scroll, settle: 2, ..Default::default() });
+                    state.scroll = 0.0;
+                }
+                let fit = ui.add_enabled(state.range.is_some(), egui::Button::new("↔ Fit").small());
+                if fit.on_hover_text("Show the whole x range (also: double-click the plot)").clicked() {
+                    state.range = None;
+                }
+                ui.weak(format!("x: {}", Clock::of(file, signals).describe())).on_hover_text(
+                    "The file's own time, else the first signal of kind time that has events, else line numbers",
+                );
+                // The help is a hover, so the row never gets wider than the panel.
+                let mut show = !state.hide_bookmarks;
+                if ui.checkbox(&mut show, "🔖").on_hover_text("Show the bookmarks (with their notes) as cursors").changed() {
+                    state.hide_bookmarks = !show;
+                }
+                ui.weak("ℹ").on_hover_text(
+                    "Wheel: zoom (over the lane names: scroll). Drag: pan, up and down through the lanes (drag a time cursor to move it). Double-click: everything. Click: go to the \
+                     nearest event. Right-click: place or remove time cursors (Δt between them). Right-click a lane's \
+                     name: its y axis and markers.",
+                );
+
+            });
+        });
     });
+    if let Some(a) = naming_row(ui, state, saved) {
+        out.plots = Some(a);
+    }
+    if state.plotted.is_empty() {
+        ui.weak("Nothing plotted yet: tick a signal in the Signals panel (📈 Signals).");
+        return out;
+    }
     let clock = Clock::of(file, signals);
     let clock_series = match &clock {
         Clock::Signal(d) => d.cached_series(file),
@@ -615,10 +701,7 @@ pub fn plot_panel(ui: &mut egui::Ui, state: &mut PlotState, src: Source<'_>) -> 
         // Long names are shortened to fit beside the y labels (hover: all).
         let name = format!("@{}", lane.name);
         let fit = (((gutter - Y_LABELS_W - 8.0) / CHAR_W) as usize).max(4);
-        let short = match name.char_indices().nth(fit - 1) {
-            Some((i, _)) if name.chars().count() > fit => format!("{}…", &name[..i]),
-            _ => name.clone(),
-        };
+        let short = name_tail(&name, fit);
         painter.text(pos2(rect.min.x + 4.0, top + 4.0), Align2::LEFT_TOP, short, font.clone(), color);
         // Right-click the name: the y axis.
         let name_rect = Rect::from_min_size(pos2(rect.min.x, top), vec2(gutter - 4.0, 18.0));
@@ -650,8 +733,8 @@ pub fn plot_panel(ui: &mut egui::Ui, state: &mut PlotState, src: Source<'_>) -> 
         let move_menu = |ui: &mut egui::Ui, moved: &mut Option<(usize, usize)>| {
             ui.label(egui::RichText::new("Lane").strong());
             for (label, to, ok) in [
-                ("⏶ Move up", k.saturating_sub(1), k > 0),
-                ("⏷ Move down", k + 1, k < last),
+                ("↑ Move up", k.saturating_sub(1), k > 0),
+                ("↓ Move down", k + 1, k < last),
                 ("To the top", 0, k > 0),
                 ("To the bottom", last, k < last),
             ] {
@@ -907,6 +990,128 @@ pub fn plot_panel(ui: &mut egui::Ui, state: &mut PlotState, src: Source<'_>) -> 
         }
     }
     out
+}
+
+/// The kept plots: a list to switch to one, and ⋮ to keep this one by a
+/// name, make a new empty one, save or delete (like presets).
+fn plots_list(ui: &mut egui::Ui, state: &mut PlotState, saved: &[SavedPlot]) -> Option<PlotAction> {
+    let mut action = None;
+    let cur = state.name.as_deref().and_then(|n| saved.iter().find(|p| p.name == n));
+    let label = |p: &SavedPlot| {
+        let mut l = p.name.clone();
+        if p.changed {
+            l.push_str(" *");
+        }
+        if p.session {
+            l.push_str(" •");
+        }
+        l
+    };
+    let selected = cur.map_or("(not kept)".to_owned(), label);
+    egui::ComboBox::from_id_salt("kept-plots").width(130.0).selected_text(selected).show_ui(ui, |ui| {
+        if saved.is_empty() {
+            ui.weak("No kept plots yet: ⋮ → Keep this plot as…");
+        }
+        for p in saved {
+            let tip = if p.session { "Switch to it\nKept for this session only (•)" } else { "Switch to it" };
+            if ui.selectable_label(cur.is_some_and(|c| c.name == p.name), label(p)).on_hover_text(tip).clicked() {
+                action = Some(PlotAction::Use(p.name.clone()));
+            }
+        }
+    });
+    ui.menu_button("⋮", |ui| {
+        if ui.button("Keep this plot as…").on_hover_text("Its lanes, y axes, markers and events").clicked() {
+            state.naming = Some((String::new(), false));
+            ui.close();
+        }
+        if ui.button("New empty plot…").clicked() {
+            state.naming = Some((String::new(), true));
+            ui.close();
+        }
+        if let Some(c) = cur {
+            let name = c.name.clone();
+            let (text, tip) = if c.session {
+                (format!("Save '{name}' to disk"), "To the plots folder, for later sessions")
+            } else {
+                (format!("Save '{name}'"), "Overwrites its file")
+            };
+            if ui.add_enabled(c.changed || c.session, egui::Button::new(text)).on_hover_text(tip).clicked() {
+                action = Some(PlotAction::Save);
+                ui.close();
+            }
+            let sure = state.confirm_delete.as_deref() == Some(&name);
+            let del = if sure { format!("Really delete '{name}'?") } else { format!("Delete '{name}'…") };
+            if ui.button(del).clicked() {
+                if sure {
+                    action = Some(PlotAction::Delete(name));
+                    state.confirm_delete = None;
+                    ui.close();
+                } else {
+                    state.confirm_delete = Some(name);
+                }
+            }
+        }
+    })
+    .response
+    .on_hover_text("Keep, save or delete plots");
+    action
+}
+
+/// The row where a kept plot's name is typed (after ⋮ → Keep… / New…).
+fn naming_row(ui: &mut egui::Ui, state: &mut PlotState, saved: &[SavedPlot]) -> Option<PlotAction> {
+    let (name, empty) = state.naming.as_mut()?;
+    let empty = *empty;
+    let (mut action, mut close) = (None, false);
+    ui.horizontal(|ui| {
+        ui.label(if empty { "New empty plot:" } else { "Keep this plot as:" });
+        let r = ui.add(egui::TextEdit::singleline(name).hint_text("plot name").desired_width(120.0));
+        r.request_focus();
+        let n = name.trim().to_owned();
+        let problem = if n.is_empty() {
+            Some("Type a name")
+        } else if !nerka_core::preset::valid_name(&n) {
+            Some("No . \" # : / \\ * ? < > | and no spaces at the ends")
+        } else if saved.iter().any(|p| p.name == n) {
+            Some("A plot with this name is kept: pick it and save")
+        } else {
+            None
+        };
+        let ok = problem.is_none();
+        let keep = ui.add_enabled(ok, egui::Button::new("Keep")).on_hover_text("For this session only");
+        let save = ui.add_enabled(ok, egui::Button::new("Save")).on_hover_text("To disk");
+        let enter = ok && r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+        if keep.clicked() || enter {
+            action = Some(PlotAction::New { name: n.clone(), store: false, empty });
+            close = true;
+        }
+        if save.clicked() {
+            action = Some(PlotAction::New { name: n.clone(), store: true, empty });
+            close = true;
+        }
+        if ui.button("Cancel").clicked() || ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+            close = true;
+        }
+        if let Some(p) = problem
+            && !n.is_empty()
+        {
+            ui.colored_label(ui.visuals().error_fg_color, p);
+        }
+    });
+    if close {
+        state.naming = None;
+    }
+    action
+}
+
+/// `name` cut to `fit` characters, keeping its end (owner, 2026-10-28:
+/// names differ at the end, `nav_speed_front` / `nav_speed_rear`).
+fn name_tail(name: &str, fit: usize) -> String {
+    let n = name.chars().count();
+    if n <= fit {
+        return name.to_owned();
+    }
+    let (i, _) = name.char_indices().nth(n - (fit - 1)).expect("n > fit");
+    format!("…{}", &name[i..])
 }
 
 /// A time cursor's name: A … Z, then C27 and so on.
@@ -1269,6 +1474,7 @@ mod tests {
                     series_of: &mut series_of,
                     in_window: false,
                     bookmarks: &[],
+                    saved: &[],
                 };
                 out = plot_panel(ui, st, src);
             });
@@ -1471,6 +1677,51 @@ mod tests {
         assert!(st.range.is_none(), "the view didn't pan");
         let moved = st.cursors[0] - 49.5;
         assert!((moved - 50.0 / w as f64 * 99.0).abs() < 0.5, "{moved}");
+    }
+
+    /// The plot's ✖ closes it; with nothing plotted it says how to plot.
+    #[test]
+    fn the_plot_closes_and_keeps_its_lanes() {
+        let file = nerka_core::TextFile::from_bytes(
+            "t",
+            b"v=1
+v=2
+"
+            .to_vec(),
+        );
+        let mut sig = Signals::default();
+        sig.set(nerka_core::SignalDef::parse_spec(r"v=/v=(?<v>\d+)/").unwrap());
+        let mut st = PlotState::default();
+        st.toggle("v");
+        assert!(st.shown, "plotting shows it");
+        let ctx = egui::Context::default();
+        let at = pos2(783.0, 17.0);
+        let click = |pressed| egui::Event::PointerButton {
+            pos: at,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        frame(&ctx, 0.0, vec![egui::Event::PointerMoved(at)], &mut st, &sig, &file);
+        frame(&ctx, 0.1, vec![click(true)], &mut st, &sig, &file);
+        let out = frame(&ctx, 0.2, vec![click(false)], &mut st, &sig, &file);
+        assert!(out.close, "✖ at the right of the header");
+        assert_eq!(st.plotted, ["v"]);
+
+        let layout = st.layout("p");
+        let mut empty = PlotState::default();
+        empty.apply(&PlotLayout { name: "e".into(), ..Default::default() });
+        assert!(empty.shown && empty.plotted.is_empty());
+        empty.apply(&layout);
+        assert_eq!(empty.layout("p"), layout);
+        assert_eq!(empty.name.as_deref(), Some("p"));
+    }
+
+    #[test]
+    fn long_names_keep_their_end() {
+        assert_eq!(name_tail("@speed", 6), "@speed");
+        assert_eq!(name_tail("@nav_speed_rear", 8), "…ed_rear");
+        assert_eq!(name_tail("@żółw_ćma", 4), "…ćma");
     }
 
     #[test]

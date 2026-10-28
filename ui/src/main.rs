@@ -37,6 +37,7 @@ mod instance;
 mod job;
 mod library;
 mod plot;
+mod plots;
 mod prefs;
 mod presets;
 mod recall;
@@ -235,6 +236,7 @@ fn main() -> eframe::Result {
             }
             app.load_library();
             app.presets.load();
+            app.plots.load();
             let mut picks = Picks::default();
             picks.params = params;
             for (role, id) in &startup {
@@ -571,7 +573,20 @@ struct Tab {
     reopen_at: Option<LineNo>,
     /// FIBEX arguments used as signals (picked in the Signals panel).
     arg_picks: Vec<nerka_core::Argument>,
+    /// The Files window: the tab's files as they are being edited.
+    files_edit: Option<Vec<PathBuf>>,
+    /// The files are being read in a new order or set.
+    files_undo: Option<FilesUndo>,
     status: String,
+}
+
+/// A tab's files being read in a new order or set (`Tab::set_files`).
+struct FilesUndo {
+    /// The files shown before: put back if the new ones can't be one view.
+    old: Vec<PathBuf>,
+    /// The current line's file and its line in that file: where the view
+    /// goes once the files are read.
+    at: Option<(PathBuf, LineNo)>,
 }
 
 /// One line shown whole: its cells as the source formats them (a DLT
@@ -944,6 +959,8 @@ impl Tab {
             views: signals::Views::default(),
             reopen_at: None,
             arg_picks: Vec::new(),
+            files_edit: None,
+            files_undo: None,
             status: String::new(),
         }
     }
@@ -1047,6 +1064,40 @@ impl Tab {
         self.file = None;
         self.result = None;
         self.reopen_at = Some(line);
+        self.loading = Some(Job::spawn(ctx, move |prog| nerka_core::open_many(&ps, &options, prog)));
+    }
+
+    /// Show `paths` in this tab instead (the Files window: reordered, added,
+    /// removed). The tab keeps its filter, search, selection and signals;
+    /// the view goes to the same line of the same file if it is still
+    /// there. The current files stay shown until the new set is read, and
+    /// stay if it can't be one view (files of different kinds).
+    fn set_files(
+        &mut self,
+        ctx: &egui::Context,
+        paths: Vec<PathBuf>,
+        prefs: &SearchPrefs,
+        fibex: Option<Arc<nerka_core::Fibex>>,
+    ) {
+        if paths.is_empty() || paths == self.paths {
+            return;
+        }
+        let line = self.current_line();
+        let at = self
+            .part_files
+            .iter()
+            .position(|&(first, n)| line >= first && line < first + n)
+            .and_then(|i| Some((self.paths.get(i)?.clone(), line - self.part_files[i].0)));
+        if let Some(j) = self.loading.take() {
+            j.cancel();
+        }
+        let ps = paths.clone();
+        let old = std::mem::replace(&mut self.paths, paths);
+        // A list changed twice before it was read goes back to the first.
+        let old = self.files_undo.take().map_or(old, |u| u.old);
+        self.files_undo = Some(FilesUndo { old, at });
+        let mut options = prefs.open_options();
+        options.fibex = fibex;
         self.loading = Some(Job::spawn(ctx, move |prog| nerka_core::open_many(&ps, &options, prog)));
     }
 
@@ -1185,6 +1236,26 @@ impl Tab {
                     self.loading = None;
                     match r {
                         Ok(f) => {
+                            if let Some(FilesUndo { at, .. }) = self.files_undo.take() {
+                                // Other files: what referred to the old lines goes.
+                                self.cancel_jobs();
+                                self.path = self.paths[0].clone();
+                                self.result = None;
+                                self.line_colors = None;
+                                self.search.hits = None;
+                                self.detail = None;
+                                self.main_view = ViewState::with_free_keys();
+                                self.hits_view = ViewState::default();
+                                let parts = f.part_files();
+                                self.reopen_at = Some(
+                                    at.and_then(|(path, off)| {
+                                        let i = self.paths.iter().position(|p| *p == path)?;
+                                        let (first, n) = *parts.get(i)?;
+                                        Some(first + off.min(n.saturating_sub(1)))
+                                    })
+                                    .unwrap_or(0),
+                                );
+                            }
                             self.status = match self.paths.len() {
                                 1 => format!("Indexed {} lines in {took:.2?}", f.line_count()),
                                 n => format!("Indexed {} lines of {n} files in {took:.2?}", f.line_count()),
@@ -1205,8 +1276,15 @@ impl Tab {
                             if !self.pattern.trim().is_empty() {
                                 self.start_search(ctx);
                             } else {
+                                self.recolor(ctx);
                                 self.rerun_search(ctx);
                             }
+                        }
+                        // The Files window's list can't be read: the files
+                        // shown stay.
+                        Err(e) if self.files_undo.is_some() && !matches!(e, nerka_core::Error::Cancelled) => {
+                            self.paths = self.files_undo.take().expect("checked").old;
+                            self.status = format!("Files not changed: {e}");
                         }
                         Err(nerka_core::Error::Cancelled) => return false,
                         // Several files of different kinds: opened as tabs.
@@ -1404,16 +1482,18 @@ impl Tab {
     }
 
     /// Work out (again) the whole-line colours: for the filter queries
-    /// switched on, which kept lines each one matches. Runs after the
-    /// filter result is in, and when a colour is switched on or off.
+    /// switched on, which kept lines each one matches (every line without
+    /// a filter: issue #8, a selection of only signal queries). Runs after
+    /// the filter result is in, and when a colour is switched on or off.
     fn recolor(&mut self, ctx: &egui::Context) {
         if let Some((_, j)) = self.colors_job.take() {
             j.cancel();
         }
         self.line_colors = None;
-        let (Some(a), Some(res), Some(file)) = (self.colors_exp.clone(), self.result.clone(), self.file.clone()) else {
+        let (Some(a), Some(file)) = (self.colors_exp.clone(), self.file.clone()) else {
             return;
         };
+        let res = self.result.clone();
         if self.searching.is_some() {
             return;
         }
@@ -1433,7 +1513,9 @@ impl Tab {
         let a =
             Arc::new(ActiveSearch { set: SearchSet { include, exclude: vec![] }, names, colors, highlighters: vec![] });
         let aa = a.clone();
-        let job = Job::spawn(ctx, move |prog| nerka_core::search_within(&*file, Some(&res.lines), &aa.set, prog));
+        let job = Job::spawn(ctx, move |prog| {
+            nerka_core::search_within(&*file, res.as_ref().map(|r| r.lines.as_slice()), &aa.set, prog)
+        });
         self.colors_job = Some((a, job));
     }
 
@@ -2337,6 +2419,8 @@ struct App {
     /// Tabs moved to new windows so far (temp file names).
     moves: u32,
     presets: presets::Presets,
+    /// Kept plots (every tab can switch to them).
+    plots: plots::Plots,
     /// Signals the user defined, for every tab; saved in
     /// `<config>/nerka/signals`. The generation changes with them.
     saved_signals: Signals,
@@ -2606,12 +2690,18 @@ impl App {
                     self.record_search_box(tag, &pattern);
                 }
             }
-            library::Action::Edited { renamed } => {
+            library::Action::Edited { renamed, removed } => {
                 for t in &mut self.tabs {
                     if let Some((old, new)) = &renamed {
                         t.picks.renamed(old, new);
                     }
                     t.picks.refresh(&self.library);
+                }
+                let changed = self
+                    .presets
+                    .query_changed(renamed.as_ref().map(|(o, n)| (o.as_str(), n.as_str())), removed.as_deref());
+                if !changed.is_empty() {
+                    self.status = format!("Presets updated: {}", changed.join(", "));
                 }
             }
         }
@@ -3021,6 +3111,7 @@ impl App {
 
     fn tab_bar(&mut self, ui: &mut egui::Ui) {
         let (mut select, mut close, mut close_others, mut moved, mut split) = (None, None, None, None, None);
+        let mut files = None;
         egui::ScrollArea::horizontal().show(ui, |ui| {
             ui.horizontal(|ui| {
                 for (i, t) in self.tabs.iter().enumerate() {
@@ -3052,6 +3143,10 @@ impl App {
                         if t.paths.len() > 1 && ui.button("Open the files as separate tabs").clicked() {
                             split = Some(i);
                         }
+                        if ui.button("Files…").on_hover_text("Reorder, add or remove the files of this tab").clicked()
+                        {
+                            files = Some(i);
+                        }
                     });
                     if close_button(ui).on_hover_text("Close (Ctrl+W)").clicked() {
                         close = Some(i);
@@ -3063,6 +3158,11 @@ impl App {
         if let Some(i) = select {
             self.active = i;
         }
+        if let Some(i) = files {
+            self.active = i;
+            let t = &mut self.tabs[i];
+            t.files_edit = Some(t.paths.clone());
+        }
         if let Some(i) = close {
             self.close(i);
         } else if let Some(i) = close_others {
@@ -3072,6 +3172,94 @@ impl App {
         } else if let Some(i) = split {
             let ctx = ui.ctx().clone();
             self.split_tab(&ctx, i);
+        }
+    }
+
+    /// The active tab's Files window (its menu → Files…): the files of the
+    /// view in order, to move up and down, remove and add to. Apply reads
+    /// them again as one view (`Tab::set_files`). Sorting the files by
+    /// their time is not done yet.
+    fn files_window(&mut self, ctx: &egui::Context) {
+        let Some(t) = self.tabs.get_mut(self.active) else { return };
+        if t.files_edit.is_none() {
+            return;
+        }
+        let title = t.title();
+        let Some(list) = &mut t.files_edit else { return };
+        let (mut open, mut apply, mut add, mut cancel) = (true, false, false, false);
+        egui::Window::new(format!("Files of {title}"))
+            .id(egui::Id::unique("files-window"))
+            .open(&mut open)
+            .collapsible(false)
+            .default_width(560.0)
+            .show(ctx, |ui| {
+                ui.weak(
+                    "The tab shows these files as one view, one after another in this order. They must be of one \
+                     kind: plain text with plain text, DLT with DLT and captures.",
+                );
+                ui.separator();
+                let (n, mut moved, mut removed) = (list.len(), None, None);
+                egui::ScrollArea::vertical().max_height(320.0).show(ui, |ui| {
+                    egui::Grid::new("files-grid").num_columns(5).striped(true).show(ui, |ui| {
+                        for (i, p) in list.iter().enumerate() {
+                            ui.weak(format!("{}", i + 1));
+                            let name =
+                                p.file_name().map_or_else(|| p.display().to_string(), |f| f.to_string_lossy().into());
+                            ui.label(name).on_hover_text(p.display().to_string());
+                            if ui.add_enabled(i > 0, egui::Button::new("↑").small()).on_hover_text("Move up").clicked()
+                            {
+                                moved = Some((i, i - 1));
+                            }
+                            if ui
+                                .add_enabled(i + 1 < n, egui::Button::new("↓").small())
+                                .on_hover_text("Move down")
+                                .clicked()
+                            {
+                                moved = Some((i, i + 1));
+                            }
+                            let rm = ui.add_enabled(n > 1, egui::Button::new("−").small());
+                            if rm
+                                .on_hover_text("Remove from this tab")
+                                .on_disabled_hover_text("A tab keeps one file")
+                                .clicked()
+                            {
+                                removed = Some(i);
+                            }
+                            ui.end_row();
+                        }
+                    });
+                });
+                if let Some((a, b)) = moved {
+                    list.swap(a, b);
+                }
+                if let Some(i) = removed {
+                    list.remove(i);
+                }
+                ui.separator();
+                ui.horizontal(|ui| {
+                    add = ui.button("+ Add files…").clicked();
+                    ui.separator();
+                    let changed = *list != t.paths;
+                    apply = ui
+                        .add_enabled(changed, egui::Button::new("Apply"))
+                        .on_hover_text("Read the files again in this order; filter, search and selection stay")
+                        .clicked();
+                    cancel = ui.button("Cancel").clicked();
+                });
+            });
+        if add && let Some(paths) = rfd::FileDialog::new().pick_files() {
+            for p in paths {
+                if !list.iter().any(|q| same_file(q, &p)) {
+                    list.push(p);
+                }
+            }
+        }
+        if apply {
+            let paths = list.clone();
+            t.set_files(ctx, paths, &self.prefs, self.fibex.clone());
+        }
+        if apply || cancel || !open {
+            t.files_edit = None;
         }
     }
 
@@ -3184,6 +3372,7 @@ impl App {
         self.handle_input(&ctx);
         self.update_title(&ctx);
         self.goto_dialog(&ctx);
+        self.files_window(&ctx);
         self.about_dialog(&ctx);
         self.settings_window(&ctx);
         if let Some(t) = self.tabs.get_mut(self.active)
@@ -3434,7 +3623,11 @@ impl App {
             .min_size(120.0)
             .show(ui, |ui| tab.search_panel(ui, &*file, search_history))
             .inner;
-        let plotted = !plot::lock(&tab.plot).plotted.is_empty();
+        let (plotted, saved_plots) = {
+            let p = plot::lock(&tab.plot);
+            (p.shown, self.plots.listed(&p))
+        };
+        let mut plot_out = plot::Output::default();
         if plotted && self.plot_window {
             // The plot's own window: what it draws now, and what it asked.
             let line = tab.current_line();
@@ -3448,12 +3641,15 @@ impl App {
                     cursor: line,
                     kept: tab.result.clone(),
                     bookmarks: plot::Bookmark::all(&tab.bookmarks),
+                    saved: saved_plots,
                 });
-                let out = std::mem::take(&mut d.out);
-                if let Some((l, note)) = out.bookmark {
+                let mut out = std::mem::take(&mut d.out);
+                if let Some((l, note)) = out.bookmark.take() {
                     tab.set_bookmark(l, note);
                 }
-                (out.goto, out.toggle_window, std::mem::take(&mut d.closed))
+                let asked = (out.goto, out.toggle_window, std::mem::take(&mut d.closed));
+                plot_out = out;
+                asked
             };
             let shared = self.plot_win.clone();
             let builder = egui::ViewportBuilder::default()
@@ -3485,9 +3681,10 @@ impl App {
                 series_of: &mut series_of,
                 in_window,
                 bookmarks: &marks,
+                saved: &saved_plots,
             };
             let shared = tab.plot.clone();
-            let out = egui::Panel::bottom("plot")
+            let mut out = egui::Panel::bottom("plot")
                 .resizable(true)
                 .default_size(220.0)
                 .min_size(80.0)
@@ -3496,12 +3693,37 @@ impl App {
             if out.toggle_window {
                 self.plot_window = !self.plot_window;
             }
-            if let Some((l, note)) = out.bookmark {
+            if let Some((l, note)) = out.bookmark.take() {
                 tab.set_bookmark(l, note);
             }
-            if let Some(line) = out.goto {
+            if let Some(line) = out.goto.take() {
                 tab.goto_line(line);
             }
+            plot_out = out;
+        }
+        if plot_out.close {
+            plot::lock(&tab.plot).shown = false;
+        }
+        if let Some(a) = plot_out.plots {
+            let res = self.plots.act(&mut plot::lock(&tab.plot), a);
+            match res {
+                Ok(deleted) => {
+                    self.plots.errors.clear();
+                    if let Some(name) = deleted {
+                        for t in &self.tabs {
+                            let mut p = plot::lock(&t.plot);
+                            if p.name.as_deref() == Some(name.as_str()) {
+                                p.name = None;
+                            }
+                        }
+                    }
+                }
+                Err(e) => tab.status = format!("Plot: {e}"),
+            }
+        }
+        let tab = &mut self.tabs[self.active];
+        for e in self.plots.errors.drain(..) {
+            tab.status = format!("Plots: {e}");
         }
         egui::CentralPanel::default().show(ui, |ui| tab.main_panel(ui, &*file));
         let after = tab.search_prefs();
@@ -4047,6 +4269,54 @@ gear=D
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// The Files window: the tab's files reordered, one removed and added
+    /// again; the view stays on the same line of the same file. Files of
+    /// another kind leave the tab as it was.
+    #[test]
+    fn a_tabs_files_are_reordered_removed_and_added() {
+        let dir = std::env::temp_dir().join(format!("nerka-gui-files-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (a, b, d) = (dir.join("a.log"), dir.join("b.log"), dir.join("d.dlt"));
+        std::fs::write(&a, "[INFO] a one\n[ERROR] a two\n").unwrap();
+        std::fs::write(&b, "[ERROR] b one\n[INFO] b two\n[ERROR] b three\n").unwrap();
+        let mut buf = Vec::new();
+        nerka_core::input::dlt::writer::Msg::log(nerka_core::Level::Info, "E", "A", "C", vec![]).encode(&mut buf);
+        std::fs::write(&d, buf).unwrap();
+        let ctx = egui::Context::default();
+        let prefs = SearchPrefs::default();
+        let mut t = Tab::open_many(&ctx, vec![a.clone(), b.clone()], &prefs, None);
+        settle(&mut t, &ctx);
+        t.pattern = "ERROR".into();
+        t.start_search(&ctx);
+        settle(&mut t, &ctx);
+        assert_eq!(t.result.as_ref().unwrap().lines, [1, 2, 4]);
+        t.goto_line(4); // b three
+
+        t.set_files(&ctx, vec![b.clone(), a.clone()], &prefs, None);
+        settle(&mut t, &ctx);
+        assert_eq!(t.part_files, [(0, 3), (3, 2)]);
+        assert_eq!(t.title(), "b.log + 1");
+        assert_eq!(t.current_line(), 2, "still b three");
+        assert_eq!(t.result.as_ref().unwrap().lines, [0, 2, 4], "the filter ran again");
+
+        t.set_files(&ctx, vec![b.clone()], &prefs, None);
+        settle(&mut t, &ctx);
+        assert_eq!(t.file.as_ref().unwrap().line_count(), 3);
+        assert_eq!(t.current_line(), 2);
+
+        // A DLT file with a text file: not one view, nothing changes.
+        t.set_files(&ctx, vec![b.clone(), d], &prefs, None);
+        settle(&mut t, &ctx);
+        assert_eq!(t.paths, std::slice::from_ref(&b));
+        assert!(t.status.starts_with("Files not changed"), "{}", t.status);
+        assert_eq!(t.file.as_ref().unwrap().line_count(), 3);
+
+        t.set_files(&ctx, vec![b, a], &prefs, None);
+        settle(&mut t, &ctx);
+        assert_eq!(t.part_files, [(0, 3), (3, 2)]);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     #[test]
     fn files_of_different_kinds_open_as_separate_tabs() {
         let dir = std::env::temp_dir().join(format!("nerka-gui-mixed-{}", std::process::id()));
@@ -4400,6 +4670,35 @@ gear=D
         tab.recolor_from(&ctx, &lib);
         settle(&mut tab, &ctx);
         assert!(tab.line_colors.is_none());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Issue #8: a selection of only signal queries leaves the filter
+    /// empty; their colours still go on the lines they match.
+    #[test]
+    fn signal_picks_colour_lines_without_a_filter() {
+        let dir = std::env::temp_dir().join(format!("nerka-gui-sigcolours-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("app.log");
+        std::fs::write(&log, LOG).unwrap();
+        let mut lib = Library::new();
+        lib.add(pack::parse_pack("vision.nerka-pack", PACK).unwrap()).unwrap();
+        let ctx = egui::Context::default();
+        let mut tab = Tab::open(&ctx, log.clone(), &SearchPrefs::default());
+        settle(&mut tab, &ctx);
+        tab.picks.add(&lib, "vision.timeouts", Use::Signal, None);
+        tab.picks.light_source("vision.timeouts");
+        tab.apply_filter_picks(&ctx, &lib);
+        settle(&mut tab, &ctx);
+        assert!(tab.result.is_none(), "no filter");
+        assert_eq!(tab.line_colors.clone().expect("line colours").1.lines, [3, 5]);
+
+        // A tab that opens with the selection (a preset) colours once loaded.
+        let p = tab.to_preset("p");
+        let mut two = Tab::open(&ctx, log, &SearchPrefs::default());
+        two.use_preset(&ctx, &lib, &p);
+        settle(&mut two, &ctx);
+        assert_eq!(two.line_colors.clone().expect("after loading").1.lines, [3, 5]);
         std::fs::remove_dir_all(&dir).ok();
     }
 

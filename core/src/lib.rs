@@ -24,6 +24,7 @@ pub mod event;
 pub mod history;
 pub mod input;
 pub mod pack;
+pub mod plot;
 pub mod preset;
 pub mod signal;
 pub mod time;

@@ -124,6 +124,11 @@ pub fn signals_panel(ui: &mut egui::Ui, st: &mut SignalsUi, input: Input<'_>) ->
         ui.heading("Signals");
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             out.close = crate::close_button(ui).on_hover_text("Close panel").clicked();
+            // The plot can be closed and shown again with its lanes.
+            let tip = if plot.shown { "Close the plot (its lanes are kept)" } else { "Show the plot" };
+            if ui.selectable_label(plot.shown, "📈 Plot").on_hover_text(tip).clicked() {
+                plot.shown = !plot.shown;
+            }
         });
     });
     // Scrolled both ways: content wider than the panel (long FIBEX argument

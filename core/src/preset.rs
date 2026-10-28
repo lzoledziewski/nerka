@@ -103,6 +103,58 @@ impl Preset {
         self.locals.iter().find(|q| q.id == id)
     }
 
+    /// Library query `old` (qualified id) is now `new` (issue #7): its
+    /// nodes, the copies made from it and the queries refining it follow.
+    /// Returns whether anything changed.
+    pub fn rename_query(&mut self, old: &str, new: &str) -> bool {
+        let mut changed = false;
+        let mut follow = |id: &mut String| {
+            if id == old {
+                *id = new.to_owned();
+                changed = true;
+            }
+        };
+        for n in &mut self.nodes {
+            match &mut n.source {
+                NodeSource::Library(id) => follow(id),
+                NodeSource::Local { from: Some(id), .. } => follow(id),
+                NodeSource::Local { from: None, .. } => {}
+            }
+        }
+        for q in &mut self.locals {
+            if let Some(p) = &mut q.parent {
+                follow(p);
+            }
+        }
+        changed
+    }
+
+    /// Library query `id` was deleted (issue #7): its nodes go; an edited
+    /// copy of it stays, as a query of its own. Returns whether anything
+    /// changed.
+    pub fn remove_query(&mut self, id: &str) -> bool {
+        let before = self.nodes.len();
+        self.nodes.retain(|n| !matches!(&n.source, NodeSource::Library(l) if l == id));
+        let mut changed = self.nodes.len() != before;
+        for n in &mut self.nodes {
+            if let NodeSource::Local { from, .. } = &mut n.source
+                && from.as_deref() == Some(id)
+            {
+                *from = None;
+                changed = true;
+            }
+        }
+        changed
+    }
+
+    /// Whether the preset picks library query `id` (or a copy of it).
+    pub fn uses_query(&self, id: &str) -> bool {
+        self.nodes.iter().any(|n| match &n.source {
+            NodeSource::Library(l) => l == id,
+            NodeSource::Local { from, .. } => from.as_deref() == Some(id),
+        })
+    }
+
     /// The file text.
     pub fn serialize(&self) -> String {
         let mut out = format!("preset {}\n", quote(&self.name));
@@ -207,7 +259,7 @@ pub fn load_dir(dir: &Path) -> (Vec<(PathBuf, Preset)>, Vec<PackError>) {
     (ok, bad)
 }
 
-fn quote(s: &str) -> String {
+pub(crate) fn quote(s: &str) -> String {
     let plain = !s.is_empty() && s.chars().all(|c| c.is_alphanumeric() || matches!(c, '_' | '.' | '-' | '$'));
     if plain {
         return s.to_owned();
@@ -225,7 +277,7 @@ fn quote(s: &str) -> String {
 
 /// Split a line into words; `"…"` is one word (`\"`, `\\` escapes).
 /// Returns `(word, char column)` pairs, or the column of an unclosed quote.
-fn words(line: &str) -> Result<Vec<(String, usize)>, usize> {
+pub(crate) fn words(line: &str) -> Result<Vec<(String, usize)>, usize> {
     let mut out = Vec::new();
     let mut it = line.char_indices().peekable();
     while let Some(&(i, c)) = it.peek() {
@@ -488,6 +540,30 @@ mod tests {
             search: Some(BoxText::Typed { tag: "auto".into(), text: "timeout AND level >= WARN".into() }),
             locals: vec![local("n1", "/timeout/ AND\n  level >= ERROR"), local("n2", "/$cam/")],
         }
+    }
+
+    /// Issue #7: presets follow a renamed or deleted library query.
+    #[test]
+    fn presets_follow_renamed_and_deleted_queries() {
+        let mut p = sample();
+        assert!(p.uses_query("vision.timeouts") && !p.uses_query("vision.nope"));
+        assert!(!p.rename_query("vision.nope", "vision.x"));
+        assert!(p.rename_query("vision.cam", "vision.camera"));
+        assert_eq!(p.nodes[0].source, NodeSource::Library("vision.camera".into()));
+        assert!(p.locals.iter().all(|q| q.parent.as_deref() == Some("vision.camera")));
+        assert!(p.rename_query("vision.timeouts", "vision.slow"));
+        assert!(matches!(&p.nodes[3].source, NodeSource::Local { from: Some(f), .. } if f == "vision.slow"));
+        // The file still reads back the same.
+        assert_eq!(parse_preset("t", &p.serialize()).unwrap().serialize(), p.serialize());
+
+        assert!(p.remove_query("vision.camera"));
+        assert_eq!(p.nodes.len(), 4);
+        assert!(!p.uses_query("vision.camera"));
+        assert!(p.remove_query("vision.slow"));
+        assert_eq!(p.nodes.len(), 4, "an edited copy stays");
+        assert!(matches!(&p.nodes[2].source, NodeSource::Local { from: None, .. }));
+        assert!(!p.remove_query("vision.slow"));
+        assert_eq!(parse_preset("t", &p.serialize()).unwrap().serialize(), p.serialize());
     }
 
     #[test]
