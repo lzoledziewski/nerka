@@ -10,7 +10,7 @@ decoded DLT headers you can filter on. It runs locally, with no backend, as a
 desktop viewer (`nerka-gui`) and a command-line tool (`nerka`) built on one
 UI-free engine (`nerka-core`).
 
-> Status: **alpha** (`0.1.0-alpha.7`). Windows is the main platform; Linux
+> Status: **alpha** (`0.1.0-alpha.8`). Windows is the main platform; Linux
 > builds come from CI. File formats and the GUI still change.
 
 ## Features

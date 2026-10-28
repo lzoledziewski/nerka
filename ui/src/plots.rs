@@ -1,6 +1,7 @@
 //! Kept plots, shared by the tabs (owner, 2026-10-28: switch between plots
-//! without building them again, save them and use them again). A plot is
-//! kept for the session (`•`) or saved to disk (`<config>/nerka/plots`,
+//! without building them again, save them and use them again). A plot has
+//! no name until it is kept for the session (Keep, `•`) or saved to disk
+//! (Save, (`<config>/nerka/plots`,
 //! format in `nerka_core::plot`). Switching keeps the current plot as it is
 //! in its entry first, so nothing is lost; a saved plot changed since it was
 //! written is marked `*` until it is saved.
@@ -80,17 +81,22 @@ impl Plots {
                 state.apply(&self.entries[i].layout);
                 Ok(None)
             }
-            PlotAction::New { name, store, empty } => {
+            PlotAction::Keep { name, store } => {
                 if self.find(&name).is_some() {
                     return Err(format!("a plot '{name}' is kept already"));
                 }
+                // A plot kept by another name before stays as it was.
                 self.keep_current(state);
-                let layout =
-                    if empty { PlotLayout { name: name.clone(), ..Default::default() } } else { state.layout(&name) };
+                let layout = state.layout(&name);
                 let file = if store { Some(self.write(&layout, None)?) } else { None };
-                self.entries.push(Entry { layout: layout.clone(), file });
+                self.entries.push(Entry { layout, file });
                 self.sort();
-                state.apply(&layout);
+                state.name = Some(name);
+                Ok(None)
+            }
+            PlotAction::Blank => {
+                self.keep_current(state);
+                state.blank();
                 Ok(None)
             }
             PlotAction::Save => {
@@ -149,11 +155,14 @@ mod tests {
         let mut plots = Plots::default();
         let mut s = state_with(&["speed", "rpm"]);
         s.events.insert("rpm".into());
-        plots.act(&mut s, PlotAction::New { name: "drive".into(), store: false, empty: false }).unwrap();
+        plots.act(&mut s, PlotAction::Keep { name: "drive".into(), store: false }).unwrap();
         assert_eq!(s.name.as_deref(), Some("drive"));
-        plots.act(&mut s, PlotAction::New { name: "temps".into(), store: false, empty: true }).unwrap();
-        assert!(s.plotted.is_empty() && s.shown);
+        // New plot: blank and unnamed (owner, 2026-10-28), until kept.
+        plots.act(&mut s, PlotAction::Blank).unwrap();
+        assert!(s.plotted.is_empty() && s.events.is_empty() && s.name.is_none() && s.shown);
+        assert_eq!(plots.entries.len(), 1, "a blank plot isn't kept by itself");
         s.toggle("temp");
+        plots.act(&mut s, PlotAction::Keep { name: "temps".into(), store: false }).unwrap();
         assert!(plots.listed(&s).iter().all(|p| p.session && !p.changed), "session plots aren't marked changed");
 
         // Back to "drive": as it was; "temps" kept with its lane.
@@ -165,7 +174,7 @@ mod tests {
 
         assert_eq!(plots.act(&mut s, PlotAction::Delete("temps".into())), Ok(Some("temps".into())));
         assert_eq!(plots.listed(&s).iter().map(|p| p.name.as_str()).collect::<Vec<_>>(), ["drive"]);
-        assert!(plots.act(&mut s, PlotAction::New { name: "drive".into(), store: false, empty: true }).is_err());
+        assert!(plots.act(&mut s, PlotAction::Keep { name: "drive".into(), store: false }).is_err());
     }
 
     #[test]
@@ -189,7 +198,7 @@ mod tests {
         assert_eq!(again.lanes.len(), 2);
         // Switched away unsaved: still marked.
         s.toggle("rpm");
-        plots.act(&mut s, PlotAction::New { name: "other".into(), store: false, empty: true }).unwrap();
+        plots.act(&mut s, PlotAction::Blank).unwrap();
         assert!(plots.listed(&s).iter().find(|p| p.name == "drive").unwrap().changed);
         plots.act(&mut s, PlotAction::Delete("drive".into())).unwrap();
         assert!(!path.exists());

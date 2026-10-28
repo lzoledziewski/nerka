@@ -11,8 +11,10 @@
 //! time with their note, measured like the others; the plot's right-click
 //! menu bookmarks the nearest event's line with a note.
 //! The plot can move to a window of its own and back, and be closed (its
-//! lanes are kept for when it is shown again). Plots can be kept by name
-//! and switched between (`nerka_core::plot`, `crate::plots`).
+//! lanes are kept for when it is shown again). A plot has no name until it
+//! is kept by one (Keep: this session, Save: on disk), so any tab can switch
+//! to it (`nerka_core::plot`, `crate::plots`); New plot starts a blank one.
+//! A lane whose signal the tab doesn't have stays, named above the lanes.
 //!
 //! Drawn with egui's painter (no plot crate): lanes are decimated to one
 //! step per pixel column, so millions of events draw as fast as a few.
@@ -77,9 +79,11 @@ pub enum PlotAction {
     /// Switch to the kept plot of this name (the current one is kept as it
     /// is first).
     Use(String),
-    /// Keep the plot by a name: this one, or a new empty one (`empty`);
-    /// `store` writes it to disk too.
-    New { name: String, store: bool, empty: bool },
+    /// Keep this plot by a name; `store` writes it to disk too.
+    Keep { name: String, store: bool },
+    /// A blank plot instead: no lanes, no name (a kept one is kept as it
+    /// is first).
+    Blank,
     /// Write the current plot to its kept entry (and its file).
     Save,
     /// Delete the kept plot of this name (and its file).
@@ -143,8 +147,8 @@ pub struct PlotState {
     pub shown: bool,
     /// The kept plot this is (`crate::plots`), if any.
     pub name: Option<String>,
-    /// A name being typed for a kept plot, and whether it starts empty.
-    naming: Option<(String, bool)>,
+    /// A name being typed to keep this plot by.
+    naming: Option<String>,
     /// Delete was clicked once for this kept plot.
     confirm_delete: Option<String>,
     /// Plotted signals, in lane order.
@@ -241,11 +245,11 @@ impl PlotState {
         self.data = None;
     }
 
-    /// Forget signals that are gone (their markers stay, for when a signal
-    /// of that name comes back).
-    pub fn retain(&mut self, signals: &Signals) {
-        self.plotted.retain(|n| signals.get(n).is_some());
-        self.events.retain(|n| signals.get(n).is_some());
+    /// A blank plot: no lanes and no name (the time cursors and the zoom
+    /// stay: they belong to the file).
+    pub fn blank(&mut self) {
+        self.apply(&PlotLayout::default());
+        self.name = None;
     }
 }
 
@@ -436,6 +440,23 @@ pub fn plot_panel(ui: &mut egui::Ui, state: &mut PlotState, src: Source<'_>) -> 
     if state.plotted.is_empty() {
         ui.weak("Nothing plotted yet: tick a signal in the Signals panel (📈 Signals).");
         return out;
+    }
+    // Lanes whose signal this tab doesn't have (a plot kept in another tab):
+    // they stay, so they are drawn once a signal of that name is, and are
+    // named here.
+    let missing: Vec<String> = state.plotted.iter().filter(|n| signals.get(n).is_none()).cloned().collect();
+    if !missing.is_empty() {
+        ui.horizontal_wrapped(|ui| {
+            ui.weak("Not in this tab:").on_hover_text(
+                "These lanes' signals aren't defined here (another tab's selection, or a FIBEX argument of \
+                 files not loaded). They are drawn once a signal of that name is.",
+            );
+            for n in &missing {
+                if ui.small_button(format!("@{n} ✖")).on_hover_text("Take the lane out of this plot").clicked() {
+                    state.toggle(n);
+                }
+            }
+        });
     }
     let clock = Clock::of(file, signals);
     let clock_series = match &clock {
@@ -1007,7 +1028,7 @@ fn plots_list(ui: &mut egui::Ui, state: &mut PlotState, saved: &[SavedPlot]) -> 
         }
         l
     };
-    let selected = cur.map_or("(not kept)".to_owned(), label);
+    let selected = cur.map_or("(unnamed)".to_owned(), label);
     egui::ComboBox::from_id_salt("kept-plots").width(130.0).selected_text(selected).show_ui(ui, |ui| {
         if saved.is_empty() {
             ui.weak("No kept plots yet: ⋮ → Keep this plot as…");
@@ -1020,12 +1041,13 @@ fn plots_list(ui: &mut egui::Ui, state: &mut PlotState, saved: &[SavedPlot]) -> 
         }
     });
     ui.menu_button("⋮", |ui| {
-        if ui.button("Keep this plot as…").on_hover_text("Its lanes, y axes, markers and events").clicked() {
-            state.naming = Some((String::new(), false));
+        if ui.button("New plot").on_hover_text("A blank plot, without a name (a kept one stays kept)").clicked() {
+            action = Some(PlotAction::Blank);
             ui.close();
         }
-        if ui.button("New empty plot…").clicked() {
-            state.naming = Some((String::new(), true));
+        let tip = "Its lanes, y axes, markers and events, by a name: Keep (this session) or Save (to disk)";
+        if ui.button("Keep this plot as…").on_hover_text(tip).clicked() {
+            state.naming = Some(String::new());
             ui.close();
         }
         if let Some(c) = cur {
@@ -1053,17 +1075,16 @@ fn plots_list(ui: &mut egui::Ui, state: &mut PlotState, saved: &[SavedPlot]) -> 
         }
     })
     .response
-    .on_hover_text("Keep, save or delete plots");
+    .on_hover_text("New plot, keep, save or delete plots");
     action
 }
 
-/// The row where a kept plot's name is typed (after ⋮ → Keep… / New…).
+/// The row where a name is typed to keep this plot by (⋮ → Keep…).
 fn naming_row(ui: &mut egui::Ui, state: &mut PlotState, saved: &[SavedPlot]) -> Option<PlotAction> {
-    let (name, empty) = state.naming.as_mut()?;
-    let empty = *empty;
+    let name = state.naming.as_mut()?;
     let (mut action, mut close) = (None, false);
     ui.horizontal(|ui| {
-        ui.label(if empty { "New empty plot:" } else { "Keep this plot as:" });
+        ui.label("Keep this plot as:");
         let r = ui.add(egui::TextEdit::singleline(name).hint_text("plot name").desired_width(120.0));
         r.request_focus();
         let n = name.trim().to_owned();
@@ -1081,11 +1102,11 @@ fn naming_row(ui: &mut egui::Ui, state: &mut PlotState, saved: &[SavedPlot]) -> 
         let save = ui.add_enabled(ok, egui::Button::new("Save")).on_hover_text("To disk");
         let enter = ok && r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
         if keep.clicked() || enter {
-            action = Some(PlotAction::New { name: n.clone(), store: false, empty });
+            action = Some(PlotAction::Keep { name: n.clone(), store: false });
             close = true;
         }
         if save.clicked() {
-            action = Some(PlotAction::New { name: n.clone(), store: true, empty });
+            action = Some(PlotAction::Keep { name: n.clone(), store: true });
             close = true;
         }
         if ui.button("Cancel").clicked() || ui.input(|i| i.key_pressed(egui::Key::Escape)) {
@@ -1105,7 +1126,7 @@ fn naming_row(ui: &mut egui::Ui, state: &mut PlotState, saved: &[SavedPlot]) -> 
 
 /// `name` cut to `fit` characters, keeping its end (owner, 2026-10-28:
 /// names differ at the end, `nav_speed_front` / `nav_speed_rear`).
-fn name_tail(name: &str, fit: usize) -> String {
+pub(crate) fn name_tail(name: &str, fit: usize) -> String {
     let n = name.chars().count();
     if n <= fit {
         return name.to_owned();
