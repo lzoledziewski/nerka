@@ -4,14 +4,17 @@ A fast, lightweight log viewer and analyser for big files: plain-text logs
 and automotive **DLT**, also when it was recorded inside **pcap / pcapng**
 network captures or **MF4** bus-logging files.
 
-Nerka started as "klogg, but on our own terms": klogg-class speed on
-multi-gigabyte files, plus a small filter language, reusable query packs and
-decoded DLT headers you can filter on. It runs locally, with no backend, as a
-desktop viewer (`nerka-gui`) and a command-line tool (`nerka`) built on one
-UI-free engine (`nerka-core`).
+Open a multi-gigabyte trace in a second, filter it with a small query
+language, keep the queries you use in shareable packs, and plot the values
+your logs carry. Everything runs locally, with no backend: a desktop viewer
+(`nerka-gui`) and a command-line tool (`nerka`) on one UI-free engine
+(`nerka-core`).
 
-> Status: **alpha** (`0.1.0-alpha.8`). Windows is the main platform; Linux
-> builds come from CI. File formats and the GUI still change.
+![nerka showing a DLT trace: a filter for warnings with timeouts coloured red, and a search for one application in the bottom pane](doc/img/nerka.png)
+
+> Status: **0.1.0**, the first public release. Windows is the main
+> platform; Linux builds come from CI; macOS isn't built yet. While nerka is
+> at 0.x, file formats, the filter language and the GUI can still change.
 
 ## Features
 
@@ -20,9 +23,9 @@ UI-free engine (`nerka-core`).
   build, Windows).
 - **Formats, detected by content:** plain text (UTF-8); DLT files with
   storage headers; DLT over UDP inside pcap / pcapng (VLAN, IPv4 / IPv6
-  fragment reassembly) and MF4 (Ethernet bus events). DLT is shown as a table
-  with resizable columns. Several files of one kind can be opened as one
-  view, one after another.
+  fragment reassembly) and MF4 (Ethernet bus events, compressed data too).
+  DLT is shown as a table with resizable columns. Several files of one kind
+  can be opened as one view, one after another, and reordered.
 - **Filter and Search:** the Filter decides which lines the main view shows;
   the Search finds lines among those, lists the hits in a bottom pane and
   colours them per query. Each box has an **Auto** mode (plain words are a
@@ -31,20 +34,28 @@ UI-free engine (`nerka-core`).
 - **NFD, the filter language:**
   `level >= ERROR AND raw ~ /SSL|CERT/i AND NOT /healthcheck/`, or on DLT
   `apid == NAV AND level >= WARN AND payload ~ "timeout"`.
-- **Query packs:** reusable queries in plain-text `.nerka-pack` files, with
-  parent → child refinement, labels, parameters (`$cam`) and colours. Pick
-  them in the library pane; they expand into plain NFD. Selections can be
-  saved as **presets**, and each picked query can colour the lines it keeps.
+- **Query packs and presets:** reusable queries in plain-text `.nerka-pack`
+  files, with parent → child refinement, labels, parameters (`$cam`) and
+  colours. Pick them in the library pane; they expand into plain NFD, and
+  each picked query can colour the lines it keeps. A selection can be saved
+  as a **preset**.
+- **Signals and plots:** a value captured by a named regex group is a
+  signal (`@speed > 100`, `@gear.changed`); plot signals over time in lanes,
+  with time cursors (Δt), value markers and bookmarks, and keep plots by
+  name to use them on other files.
+- **FIBEX:** DLT non-verbose messages decoded from FIBEX files; their
+  arguments can be picked as signals and plotted, from a searchable tree.
 - **Bookmarks with notes** (`m`, `b` / `B`), stored next to the log as
   `<log>.nerka-marks`.
-- **Tabs and windows:** one tab per file; opening a file from the shell hands
-  it to the nerka window focused last; windows can be named.
+- **Tabs and windows:** one tab per file (or set of files); opening a file
+  from the shell hands it to the nerka window focused last; windows can be
+  named.
 
 ## Install
 
-Pre-release builds for Windows (`.zip`) and Linux (`.tar.gz`, glibc 2.35+)
-are on the [Releases](https://github.com/lzoledziewski/nerka/releases) page.
-They are unsigned, so Windows SmartScreen may warn on first start.
+Builds for Windows (`.zip`) and Linux (`.tar.gz`, glibc 2.35+) are on the
+[Releases](https://github.com/lzoledziewski/nerka/releases) page. They are
+unsigned, so Windows SmartScreen may warn on first start.
 
 To build from source you need a stable Rust toolchain
 ([rustup.rs](https://rustup.rs)); on Windows, the MSVC toolchain with the
@@ -131,3 +142,7 @@ DCO sign-off (`git commit -s`). Security problems: please report them privately,
 Licensed under either of [Apache License 2.0](LICENSE-APACHE) or
 [MIT license](LICENSE-MIT), at your option. Unless you state otherwise, any contribution you submit
 is dual-licensed the same way, without additional terms.
+
+The core and the apps stay open source under these licences. Extensions
+(plugins) may also be offered separately, some possibly closed source; the
+plugin interface is the boundary between them.

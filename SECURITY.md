@@ -21,5 +21,5 @@ be made public, with credit if you want it.
 
 ## Supported versions
 
-nerka is pre-release software (`0.1.0-alpha.*`). Fixes go into the next
-release; older releases aren't patched.
+Fixes go into the next release; older releases aren't patched. While nerka
+is at 0.x, only the latest release is supported.

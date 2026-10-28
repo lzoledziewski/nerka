@@ -1,7 +1,7 @@
 # Checks on every push to main and every pull request: format, clippy,
 # tests, dependency licences / advisories (cargo deny), DCO sign-offs.
-# Builds and tests on Linux and Windows only; macOS runners cost 10x the minutes
-# (doc/status.md, "CI and releases").
+# Builds and tests on Linux and Windows; macOS isn't built yet (doc/status.md,
+# "CI and releases").
 name: CI
 
 on:
@@ -9,6 +9,10 @@ on:
     branches: [main]
   pull_request:
   workflow_dispatch:
+
+# Read-only token: CI only checks; nothing here writes to the repository.
+permissions:
+  contents: read
 
 concurrency:
   group: ci-${{ github.ref }}
