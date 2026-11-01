@@ -182,6 +182,14 @@ impl LogSource for View<'_> {
         self.part().line_count()
     }
 
+    fn anchor(&self, line: LineNo) -> Option<super::Anchor> {
+        self.part().anchor(line)
+    }
+
+    fn lines_at(&self, offsets: &[u64]) -> Vec<Option<LineNo>> {
+        self.part().lines_at(offsets)
+    }
+
     fn line_bytes(&self, line: LineNo) -> Option<Cow<'_, [u8]>> {
         self.part().line_bytes(line)
     }

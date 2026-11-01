@@ -80,6 +80,22 @@ impl LogSource for TextFile {
     fn line_start(&self, line: LineNo) -> u64 {
         self.index.line_start(line)
     }
+
+    fn anchor(&self, line: LineNo) -> Option<super::Anchor> {
+        let bytes = self.line_bytes(line)?;
+        Some(super::Anchor::of(Some(self.line_start(line)), &bytes))
+    }
+
+    fn lines_at(&self, offsets: &[u64]) -> Vec<Option<LineNo>> {
+        let n = self.line_count();
+        offsets
+            .iter()
+            .map(|&o| {
+                let l = self.line_of_offset(o);
+                (l < n && self.line_start(l) == o).then_some(l)
+            })
+            .collect()
+    }
 }
 
 #[cfg(test)]

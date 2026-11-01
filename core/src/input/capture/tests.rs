@@ -332,6 +332,11 @@ fn several_protocols_share_one_view() {
     assert_eq!(q("ecu == ECU1 OR (proto == SOMEIP AND rc != E_OK)"), [0, 3]);
     assert_eq!(q("payload ~ /failed|SD/"), [1, 4]);
     assert_eq!(q("proto != DLT AND /0x1234/"), [2, 3]);
+    // Protocol names compare without case.
+    for p in ["syslog", "SYSLOG", "Syslog"] {
+        assert_eq!(q(&format!("proto == {p}")), [4, 5], "{p}");
+    }
+    assert_eq!(q("proto != dlt AND proto != someip"), [4, 5]);
     // Other protocols' fields have no value on a line: only != holds.
     assert_eq!(q("apid != NAV"), [1, 2, 3, 4, 5]);
 }

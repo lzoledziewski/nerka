@@ -98,6 +98,9 @@ pub enum FieldKind {
     /// Unsigned number (counters, timestamps, ids): all comparisons, and
     /// `~`, `!~` on its decimal text (a signal can capture it).
     U64,
+    /// A name (`proto`: `DLT`, `SOMEIP`, `syslog`): text whose `==` and `!=`
+    /// ignore case; `~`, `!~` as for text.
+    Name,
 }
 
 /// One field a source supplies for every line, e.g. DLT's `apid`.

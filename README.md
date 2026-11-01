@@ -48,7 +48,9 @@ your logs carry. Everything runs locally, with no backend: a desktop viewer
 - **FIBEX:** DLT non-verbose messages decoded from FIBEX files; their
   arguments can be picked as signals and plotted, from a searchable tree.
 - **Bookmarks with notes** (`m`, `b` / `B`), stored next to the log as
-  `<log>.nerka-marks`. Notes show in the views (on the line before, at the
+  `<log>.nerka-marks`, anchored to their lines' content: they stay on their
+  lines when a capture is read with other ports or the file changes (one
+  that can't be found is marked `?`). Notes show in the views (on the line before, at the
   end of the line or as a column; copying takes them along as `// note`),
   and `bookmark` is a field in queries:
   `level >= ERROR OR bookmark` keeps your marked lines in a filter.

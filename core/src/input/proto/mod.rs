@@ -20,7 +20,7 @@
 pub mod someip;
 pub mod syslog;
 
-use super::{Bytes, ColumnDef, LogSource, new_data_id};
+use super::{ANCHOR_BYTES, Anchor, Bytes, ColumnDef, LogSource, new_data_id};
 use crate::LineNo;
 use crate::event::{FieldDef, FieldId, FieldKind, FieldValue, Level};
 use std::borrow::Cow;
@@ -182,7 +182,8 @@ pub const MIXED_COLUMNS: [ColumnDef; 4] = [
 ];
 
 const TIME: ColumnDef = ColumnDef { name: "time", width: 26 };
-const PROTO_FIELD: FieldDef = FieldDef { name: "proto", kind: FieldKind::Str, costly: false };
+/// The protocol's name; compared without case (`proto == syslog`, `SYSLOG`).
+const PROTO_FIELD: FieldDef = FieldDef { name: "proto", kind: FieldKind::Name, costly: false };
 
 impl View {
     /// The view for the protocols `present` (indexes into `protos`).
@@ -468,6 +469,43 @@ impl LogSource for Records {
     fn argument(&self, line: LineNo, index: usize) -> Option<crate::signal::SignalValue> {
         let (p, msg, at) = self.msg(line)?;
         self.protos[p].argument(msg, &at, index)
+    }
+
+    /// A `.dlt` file: the storage header's offset, the hash from there;
+    /// a capture: the message's offset in the file (none in the side
+    /// buffer), the hash of the message.
+    fn anchor(&self, line: LineNo) -> Option<Anchor> {
+        let i = usize::try_from(line).ok()?;
+        match &self.index {
+            Index::Stored { offsets, .. } => {
+                let at = *offsets.get(i)?;
+                let bytes = self.data.bytes().get(at as usize..)?;
+                Some(Anchor::of(Some(at), &bytes[..bytes.len().min(ANCHOR_BYTES)]))
+            }
+            Index::Framed { msgs, .. } => {
+                let f = msgs.get(i)?;
+                let (_, msg, _) = self.msg(line)?;
+                Some(Anchor::of((!f.in_side()).then_some(f.offset() as u64), msg))
+            }
+        }
+    }
+
+    fn lines_at(&self, offsets: &[u64]) -> Vec<Option<LineNo>> {
+        match &self.index {
+            Index::Stored { offsets: all, .. } => {
+                offsets.iter().map(|o| all.binary_search(o).ok().map(|i| i as LineNo)).collect()
+            }
+            Index::Framed { msgs, .. } => {
+                let mut want: std::collections::HashMap<u64, Option<LineNo>> =
+                    offsets.iter().map(|&o| (o, None)).collect();
+                for (i, f) in msgs.iter().enumerate().filter(|(_, f)| !f.in_side()) {
+                    if let Some(slot) = want.get_mut(&(f.offset() as u64)) {
+                        slot.get_or_insert(i as LineNo);
+                    }
+                }
+                offsets.iter().map(|o| want[o]).collect()
+            }
+        }
     }
 }
 

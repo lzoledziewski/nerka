@@ -40,7 +40,7 @@ pub use input::concat::open_many;
 pub use input::dlt::DltFile;
 pub use input::dlt::fibex::{ArgType, Argument, Fibex, FibexError};
 pub use input::text::TextFile;
-pub use input::{ColumnDef, LogSource, OpenOptions, open, open_with};
+pub use input::{Anchor, ColumnDef, LogSource, OpenOptions, open, open_with};
 pub use pack::{Library, Pack, PackError, PackQuery};
 pub use signal::{
     Clock, QueryPart, SignalDef, SignalKind, SignalScope, SignalSeries, SignalValue, SignalView, Signals, ValueRef,

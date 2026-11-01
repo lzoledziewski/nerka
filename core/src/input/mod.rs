@@ -205,6 +205,19 @@ pub trait LogSource: Send + Sync {
         None
     }
 
+    /// Where `line` is, to find it again when row numbers change
+    /// (bookmarks): see [`Anchor`]. `None` if the source can't say (a view
+    /// of several files: ask its [`Self::parts`]).
+    fn anchor(&self, _line: LineNo) -> Option<Anchor> {
+        None
+    }
+
+    /// The lines that start at these byte offsets of the file (an
+    /// [`Anchor::offset`]), in one pass; `None` where no line starts there.
+    fn lines_at(&self, offsets: &[u64]) -> Vec<Option<LineNo>> {
+        vec![None; offsets.len()]
+    }
+
     /// Identifies the data the source reads, for caches (signal events): a
     /// part of a [`concat::Concat`] answers its file's, so the part made
     /// for each scan is the same one. Files take a [`new_data_id`] when
@@ -212,6 +225,30 @@ pub trait LogSource: Send + Sync {
     /// the address, is for sources that live as long as their caches (tests).
     fn data_id(&self) -> usize {
         self as *const Self as *const () as usize
+    }
+}
+
+/// Where a line is in its file, to find it again when row numbers change
+/// (a capture indexed with other ports, a file that changed): the byte
+/// offset it starts at (`None` if its bytes aren't contiguous in the file,
+/// e.g. a reassembled datagram) and a hash of its first bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Anchor {
+    pub offset: Option<u64>,
+    pub hash: u32,
+}
+
+/// Bytes of a line that its [`Anchor::hash`] covers.
+pub const ANCHOR_BYTES: usize = 64;
+
+impl Anchor {
+    /// The anchor of a line starting at `offset` whose bytes are `bytes`.
+    pub fn of(offset: Option<u64>, bytes: &[u8]) -> Anchor {
+        // FNV-1a, 32 bits.
+        let hash = bytes[..bytes.len().min(ANCHOR_BYTES)]
+            .iter()
+            .fold(0x811c_9dc5u32, |h, &b| (h ^ u32::from(b)).wrapping_mul(0x0100_0193));
+        Anchor { offset, hash }
     }
 }
 

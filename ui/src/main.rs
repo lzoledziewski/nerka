@@ -1351,7 +1351,7 @@ impl Tab {
                                 n => format!("Indexed {} lines of {n} files in {took:.2?}", f.line_count()),
                             };
                             self.part_files = f.part_files();
-                            self.bookmarks = self.load_bookmarks().unwrap_or_else(|e| {
+                            self.bookmarks = self.load_bookmarks(&*f).unwrap_or_else(|e| {
                                 self.status = format!("Could not read bookmarks: {e}");
                                 Bookmarks::default()
                             });
@@ -1857,23 +1857,28 @@ impl Tab {
         self.save_bookmarks();
     }
 
-    /// Each file keeps its own sidecar; a view of several maps lines.
-    fn load_bookmarks(&self) -> std::io::Result<Bookmarks> {
-        if self.paths.len() == 1 {
-            return Bookmarks::load_for(&self.path);
-        }
-        let files: Vec<(&Path, LineNo)> =
-            self.paths.iter().zip(&self.part_files).map(|(p, &(first, _))| (p.as_path(), first)).collect();
+    /// Each file keeps its own sidecar, anchored on its own lines; a view
+    /// of several maps lines.
+    fn load_bookmarks(&self, file: &dyn LogSource) -> std::io::Result<Bookmarks> {
+        let Some(parts) = file.parts() else { return Bookmarks::load_for(&self.path, file) };
+        let files: Vec<(&Path, LineNo, &dyn LogSource)> =
+            self.paths.iter().zip(&parts).map(|(p, part)| (p.as_path(), part.first, part.source.as_ref())).collect();
         Bookmarks::load_for_parts(&files)
     }
 
     fn save_bookmarks(&mut self) {
-        let res = if self.paths.len() == 1 {
-            self.bookmarks.save_for(&self.path)
-        } else {
-            let files: Vec<(&Path, LineNo, LineNo)> =
-                self.paths.iter().zip(&self.part_files).map(|(p, &(first, n))| (p.as_path(), first, n)).collect();
-            self.bookmarks.save_for_parts(&files)
+        let Some(file) = self.file.clone() else { return };
+        let res = match file.parts() {
+            None => self.bookmarks.save_for(&self.path, &*file),
+            Some(parts) => {
+                let files: Vec<(&Path, LineNo, LineNo, &dyn LogSource)> = self
+                    .paths
+                    .iter()
+                    .zip(&parts)
+                    .map(|(p, part)| (p.as_path(), part.first, part.source.line_count(), part.source.as_ref()))
+                    .collect();
+                self.bookmarks.save_for_parts(&files)
+            }
         };
         if let Err(e) = res {
             self.status = format!("Could not save bookmarks: {e}");
@@ -1990,6 +1995,9 @@ impl Tab {
                     }
                     if ui.link(format!("line {}", line + 1)).on_hover_text("Go to the line").clicked() {
                         jump = Some(line);
+                    }
+                    if self.bookmarks.is_unsure(line) {
+                        ui.colored_label(ui.visuals().warn_fg_color, "?").on_hover_text(UNSURE_MARK);
                     }
                     // The name (the plot shows it); edited in place.
                     let mut text = match &self.mark_rename {
@@ -2350,6 +2358,11 @@ impl Tab {
         self.view_output(&out, false, line_of_row);
     }
 }
+
+/// Why a bookmark shows a `?`.
+const UNSURE_MARK: &str = "Not found where it was saved: the file changed, or a capture was read with other \
+                           ports. It stays on its old row, which may be another line now. Edit its name or note \
+                           to keep it here, or remove it.";
 
 /// Rows of a bookmark's line shown while it is folded.
 const BOOKMARK_ROWS: usize = 2;
@@ -4576,11 +4589,8 @@ gear=D
         assert_eq!(t.result.as_ref().unwrap().lines, [2, 4]);
         // A bookmark in b goes to b's own sidecar, as b numbers its lines.
         t.toggle_bookmark_at(3);
-        assert_eq!(
-            std::fs::read_to_string(Bookmarks::sidecar_path(&b)).unwrap(),
-            "2		B1
-"
-        );
+        let sidecar = std::fs::read_to_string(Bookmarks::sidecar_path(&b)).unwrap();
+        assert!(sidecar.starts_with("2\t\tB1\t@"), "with its anchor: {sidecar:?}");
         assert!(!Bookmarks::sidecar_path(&a).exists());
         // Opening the same files again switches to the view.
         app.open_files(&ctx, vec![a.clone(), b.clone()]);

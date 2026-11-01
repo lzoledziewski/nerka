@@ -33,7 +33,8 @@
 //! operator and value against the field's kind: text fields take `==`,
 //! `!=`, `~`, `!~`; numeric fields take every comparison, and `~`, `!~` on
 //! their decimal text (`tmsp ~ /(?<up>\d+)/`: a signal can capture a
-//! numeric field, e.g. one ECU's uptime). A line without a
+//! numeric field, e.g. one ECU's uptime); name fields (`proto`) are text
+//! whose `==` and `!=` ignore case. A line without a
 //! value for a field only satisfies `!=` and `!~`. As with `raw`, a STRING
 //! after `~` / `!~` is a literal substring. Fields marked
 //! [`FieldDef::costly`] (DLT `payload`, which decodes the message) are
@@ -198,6 +199,8 @@ pub enum FieldTest {
     Literal(CmpOp, String, usize),
     /// Text field, `==` or `!=`.
     Str(CmpOp, Vec<u8>),
+    /// A [`FieldKind::Name`], `==` or `!=` without case (the value lower case).
+    StrNoCase(CmpOp, Vec<u8>),
     Num(CmpOp, u64),
     /// A `num` signal.
     Float(CmpOp, f64),
@@ -231,10 +234,13 @@ impl Expr {
             },
             Expr::Cond(Cond::Field(f)) => match (f.id.and_then(|id| ev.field(id)), &f.test) {
                 (Some(FieldValue::Str(v)), FieldTest::Str(op, want)) => op.test(&*v, want.as_slice()),
+                (Some(FieldValue::Str(v)), FieldTest::StrNoCase(op, want)) => {
+                    op.test(v.to_ascii_lowercase().as_slice(), want.as_slice())
+                }
                 (Some(FieldValue::U64(v)), FieldTest::Num(op, want)) => op.test(v, *want),
                 (Some(FieldValue::Str(v)), FieldTest::Match(re)) => re.is_match(&v),
                 (Some(FieldValue::U64(v)), FieldTest::Match(re)) => re.is_match(v.to_string().as_bytes()),
-                (None, FieldTest::Str(op, _) | FieldTest::Num(op, _)) => *op == CmpOp::Ne,
+                (None, FieldTest::Str(op, _) | FieldTest::StrNoCase(op, _) | FieldTest::Num(op, _)) => *op == CmpOp::Ne,
                 _ => false,
             },
             Expr::Cond(Cond::Signal(s)) => s.eval(ev),
@@ -357,17 +363,31 @@ impl FieldCond {
         let test = std::mem::replace(&mut self.test, FieldTest::Num(CmpOp::Eq, 0));
         self.test = match (test, schema[id].kind) {
             (t @ (FieldTest::Match(_) | FieldTest::Str(..)), FieldKind::Str)
+            | (t @ (FieldTest::Match(_) | FieldTest::StrNoCase(..)), FieldKind::Name)
             | (t @ (FieldTest::Num(..) | FieldTest::Match(_)), FieldKind::U64) => t,
             (FieldTest::Literal(op @ (CmpOp::Eq | CmpOp::Ne), v, _), FieldKind::Str) => {
                 FieldTest::Str(op, v.into_bytes())
+            }
+            (FieldTest::Literal(op @ (CmpOp::Eq | CmpOp::Ne), v, _), FieldKind::Name) => {
+                FieldTest::StrNoCase(op, v.to_ascii_lowercase().into_bytes())
             }
             (
                 FieldTest::Literal(..)
                 | FieldTest::Num(..)
                 | FieldTest::Float(..)
                 | FieldTest::Any
-                | FieldTest::Time(..),
+                | FieldTest::Time(..)
+                | FieldTest::StrNoCase(..),
                 FieldKind::Str,
+            )
+            | (
+                FieldTest::Literal(..)
+                | FieldTest::Num(..)
+                | FieldTest::Float(..)
+                | FieldTest::Any
+                | FieldTest::Time(..)
+                | FieldTest::Str(..),
+                FieldKind::Name,
             ) => {
                 return fail(format!("'{name}' is text: use ==, !=, ~ or !~"), self.op_pos);
             }
@@ -375,7 +395,14 @@ impl FieldCond {
                 Some(n) => FieldTest::Num(op, n),
                 None => return fail(format!("'{name}' is a number but '{v}' isn't"), pos),
             },
-            (FieldTest::Str(..) | FieldTest::Float(..) | FieldTest::Any | FieldTest::Time(..), FieldKind::U64) => {
+            (
+                FieldTest::Str(..)
+                | FieldTest::StrNoCase(..)
+                | FieldTest::Float(..)
+                | FieldTest::Any
+                | FieldTest::Time(..),
+                FieldKind::U64,
+            ) => {
                 return fail(format!("'{name}' is a number: use ==, !=, >=, <=, >, <, ~ or !~"), self.op_pos);
             }
         };
@@ -413,6 +440,8 @@ impl SignalCond {
             | (t @ FieldTest::Float(..), SignalKind::Num)
             | (t @ FieldTest::Time(..), SignalKind::Time)
             | (t @ FieldTest::Any, _) => t,
+            // Only fields of kind Name bind to it; the parser never makes one.
+            (FieldTest::StrNoCase(..), _) => return fail(format!("'@{name}': no such comparison"), self.op_pos),
             (FieldTest::Literal(op @ (CmpOp::Eq | CmpOp::Ne), v, _), SignalKind::Enum) => {
                 FieldTest::Str(op, v.into_bytes())
             }

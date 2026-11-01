@@ -198,12 +198,14 @@ fn compile(query: &str, source: &dyn LogSource) -> Result<Query> {
     })
 }
 
-/// `bookmark` in a query: the bookmarks of the log (its `.nerka-marks`).
-fn with_marks(filter: Filter, file: &Path) -> Result<Filter> {
+/// `bookmark` in a query: the bookmarks of the log (its `.nerka-marks`),
+/// on the lines of `source` their anchors find.
+fn with_marks(filter: Filter, file: &Path, source: &dyn LogSource) -> Result<Filter> {
     if !filter.uses_bookmarks() {
         return Ok(filter);
     }
-    let marks = Bookmarks::load_for(file).with_context(|| format!("reading the bookmarks of {}", file.display()))?;
+    let marks =
+        Bookmarks::load_for(file, source).with_context(|| format!("reading the bookmarks of {}", file.display()))?;
     Ok(filter.with_bookmarks(&std::sync::Arc::new(marks)))
 }
 
@@ -216,7 +218,7 @@ fn run_filter(
     out: &mut impl Write,
 ) -> Result<()> {
     let (f, t_index) = open(file)?;
-    let filter = with_marks(build(&*f)?, file)?;
+    let filter = with_marks(build(&*f)?, file, &*f)?;
     let t = Instant::now();
     let res = search(&*f, &filter, &Progress::new())?;
     let t_search = t.elapsed();
@@ -254,10 +256,10 @@ fn run_search_within(
     out: &mut impl Write,
 ) -> Result<()> {
     let (f, t_index) = open(file)?;
-    let filter = within.map(|q| compile(q, &*f).and_then(|q| with_marks(Filter::Query(q), file))).transpose()?;
+    let filter = within.map(|q| compile(q, &*f).and_then(|q| with_marks(Filter::Query(q), file, &*f))).transpose()?;
     let set = SearchSet {
-        include: set.include.into_iter().map(|q| with_marks(q, file)).collect::<Result<_>>()?,
-        exclude: set.exclude.into_iter().map(|q| with_marks(q, file)).collect::<Result<_>>()?,
+        include: set.include.into_iter().map(|q| with_marks(q, file, &*f)).collect::<Result<_>>()?,
+        exclude: set.exclude.into_iter().map(|q| with_marks(q, file, &*f)).collect::<Result<_>>()?,
     };
     let t = Instant::now();
     let lines = match filter {
@@ -434,10 +436,12 @@ fn run() -> Result<()> {
             }
         }
         Cmd::Marks { file } => {
-            let marks = Bookmarks::load_for(&file)?;
             let (f, _) = open(&file)?;
+            let marks = Bookmarks::load_for(&file, &*f)?;
             for (l, name, note) in marks.iter_named() {
                 let text = f.line_text(l).unwrap_or_default();
+                // Its anchor didn't find its line: it may be elsewhere.
+                let name = if marks.is_unsure(l) { format!("{name}?") } else { name.to_owned() };
                 if note.is_empty() {
                     writeln!(out, "{name} {}: {text}", l + 1)?;
                 } else {

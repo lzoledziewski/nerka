@@ -130,10 +130,16 @@ impl NoteMode {
     }
 }
 
+/// A bookmark's name as the views show it: `?` after an unsure one's.
+fn shown_name(b: &Bookmarks, line: LineNo) -> Option<String> {
+    let name = b.name(line)?;
+    Some(if b.is_unsure(line) { format!("{name}?") } else { name.to_owned() })
+}
+
 /// A bookmark's note as the views show it (`name · note`); none without a note.
 fn shown_note(b: &Bookmarks, line: LineNo) -> Option<String> {
     let note = b.note(line).filter(|n| !n.is_empty())?;
-    Some(format!("{} · {note}", b.name(line).unwrap_or_default()))
+    Some(format!("{} · {note}", shown_name(b, line)?))
 }
 
 impl Columns {
@@ -935,7 +941,7 @@ pub fn log_view(
         && let Some(p) = response.hover_pos()
         && rows_rect.contains(p)
         && let line = line_of_row(hit(state, p).row)
-        && let Some(name) = b.name(line)
+        && let Some(name) = shown_name(b, line)
     {
         let tip = match b.note(line).unwrap_or_default() {
             "" => format!("🔖 {name}"),
