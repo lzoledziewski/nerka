@@ -1444,6 +1444,23 @@ impl Tab {
         }
     }
 
+    /// A search chip's click: the box without its `i`-th query (OR'ed with
+    /// the others), searched again; empty, the search is cleared.
+    fn remove_search_term(&mut self, ctx: &egui::Context, i: usize) {
+        let Some(terms) = self.search.current_terms() else { return };
+        let mut terms = terms.to_vec();
+        if i < terms.len() {
+            terms.remove(i);
+        }
+        if terms.is_empty() {
+            self.clear_search();
+            return;
+        }
+        self.search.pattern = SearchBox::text_of(&terms);
+        self.search.terms = terms;
+        self.run_search_box(ctx);
+    }
+
     /// What the Search box asks for: one query per picked library query, or
     /// the box's text as one query.
     fn build_search(&self) -> Result<ActiveSearch, String> {
@@ -2056,7 +2073,7 @@ impl Tab {
         if let Some(a) = self.filter_exp.clone().filter(|a| a.exp.nfd == self.pattern) {
             let picks = &self.picks;
             let lines = expansion_lines(&a, &|k| picks.is_lit(k));
-            if let Some(key) = chips_view(ui, &lines, &mut self.chips_open) {
+            if let Some(ChipClick::Lit(key)) = chips_view(ui, &lines, &mut self.chips_open) {
                 self.picks.toggle_lit(key);
                 self.recolor(ui.ctx());
             }
@@ -2196,7 +2213,9 @@ impl Tab {
         }
         if let Some(terms) = self.search.current_terms() {
             let lines = term_lines(terms);
-            chips_view(ui, &lines, &mut self.chips_open);
+            if let Some(ChipClick::Remove(i)) = chips_view(ui, &lines, &mut self.chips_open) {
+                self.remove_search_term(ui.ctx(), i);
+            }
         } else {
             let schema = self.file.as_ref().map(|f| f.schema()).unwrap_or_default();
             let s = &mut self.search;
@@ -2268,8 +2287,9 @@ fn short(id: &str) -> &str {
 }
 
 /// One picked query under a box: how it joins the others, its name chip
-/// and colour, its NFD, and (filter queries) the key of its selection node
-/// with whether its lines are coloured.
+/// and colour, its NFD, (filter queries) the key of its selection node
+/// with whether its lines are coloured, and (search queries) whether a
+/// click removes it from the box.
 struct ChipLine<'a> {
     joiner: &'static str,
     name: &'a str,
@@ -2277,16 +2297,26 @@ struct ChipLine<'a> {
     nfd: &'a str,
     origin: Cow<'a, str>,
     lit: Option<(u64, bool)>,
+    removable: bool,
+}
+
+/// A click on a chip: switch a filter node's line colour, or remove the
+/// `i`-th query from the box.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChipClick {
+    Lit(u64),
+    Remove(usize),
 }
 
 /// The picked queries under a box. Folded (the default): one row of name
 /// chips, the NFD on hover. Unfolded (▸ / ▾): one line per query with its
-/// NFD. A chip with `lit` switches its line colour (filled when on);
-/// returns the node whose chip was clicked.
-fn chips_view(ui: &mut egui::Ui, lines: &[ChipLine<'_>], open: &mut bool) -> Option<u64> {
+/// NFD. A chip with `lit` switches its line colour (filled when on); a
+/// removable one shows ✖ while hovered and a click removes it. Returns
+/// what was clicked.
+fn chips_view(ui: &mut egui::Ui, lines: &[ChipLine<'_>], open: &mut bool) -> Option<ChipClick> {
     const MAX_LINES: usize = 8;
     let mut clicked = None;
-    let mut chip = |ui: &mut egui::Ui, l: &ChipLine<'_>, folded: bool| {
+    let mut chip = |ui: &mut egui::Ui, i: usize, l: &ChipLine<'_>, folded: bool| {
         let tip = |extra: &str| {
             let nfd = if folded { format!("\n{}", l.nfd) } else { String::new() };
             format!("{}{nfd}{extra}", l.origin)
@@ -2296,7 +2326,13 @@ fn chips_view(ui: &mut egui::Ui, lines: &[ChipLine<'_>], open: &mut bool) -> Opt
                 let what = if on { "\nLines coloured: click to stop" } else { "\nClick to colour its lines" };
                 let r = library::chip(ui, l.name, l.color, on).interact(egui::Sense::click());
                 if r.on_hover_text(tip(what)).clicked() {
-                    clicked = Some(key);
+                    clicked = Some(ChipClick::Lit(key));
+                }
+            }
+            None if l.removable => {
+                let r = library::removable_chip(ui, l.name, l.color);
+                if r.on_hover_text(tip("\nClick to remove it from the search")).clicked() {
+                    clicked = Some(ChipClick::Remove(i));
                 }
             }
             None => {
@@ -2314,11 +2350,11 @@ fn chips_view(ui: &mut egui::Ui, lines: &[ChipLine<'_>], open: &mut bool) -> Opt
         ui.horizontal_wrapped(|ui| {
             ui.spacing_mut().item_spacing.x = 4.0;
             fold(ui, open);
-            for l in lines {
+            for (i, l) in lines.iter().enumerate() {
                 if !l.joiner.is_empty() {
                     ui.label(RichText::new(l.joiner).small().weak());
                 }
-                chip(ui, l, true);
+                chip(ui, i, l, true);
             }
         });
         return clicked;
@@ -2330,7 +2366,7 @@ fn chips_view(ui: &mut egui::Ui, lines: &[ChipLine<'_>], open: &mut bool) -> Opt
             }
             let w = if i == 0 { 38.0 } else { 52.0 };
             ui.add_sized([w, 14.0], egui::Label::new(RichText::new(l.joiner).small().weak()));
-            chip(ui, l, false);
+            chip(ui, i, l, false);
             ui.add(egui::Label::new(RichText::new(l.nfd).monospace().small()).truncate());
         });
     }
@@ -2385,6 +2421,7 @@ In '{by}', which is picked too: not repeated in the box"
                 nfd: a.exp.part_nfd(p),
                 origin,
                 lit: (p.role != Role::Exclude).then(|| (a.keys[i], lit(a.keys[i]))),
+                removable: false,
             }
         })
         .collect()
@@ -2402,6 +2439,7 @@ fn term_lines(terms: &[Term]) -> Vec<ChipLine<'_>> {
             nfd: &t.nfd,
             origin: "search query".into(),
             lit: None,
+            removable: true,
         })
         .collect()
 }
@@ -3478,6 +3516,14 @@ impl App {
                     if r.clicked() {
                         shot::request(ui.ctx(), None);
                     }
+                    // The plot at hand, not only in the Signals panel.
+                    if let Some(tab) = self.tabs.get(self.active) {
+                        let mut plot = plot::lock(&tab.plot);
+                        let tip = if plot.shown { "Close the plot (its lanes are kept)" } else { "Show the plot" };
+                        if ui.selectable_label(plot.shown, "📈 Plot").on_hover_text(tip).clicked() {
+                            plot.shown = !plot.shown;
+                        }
+                    }
                 });
             });
         });
@@ -4176,6 +4222,7 @@ gear=D
                 nfd: "(/SSL/)",
                 origin: "demo.ssl".into(),
                 lit: Some((1, true)),
+                removable: false,
             },
             ChipLine {
                 joiner: "OR",
@@ -4184,6 +4231,7 @@ gear=D
                 nfd: "(/disk/)",
                 origin: "demo.disk".into(),
                 lit: Some((2, false)),
+                removable: false,
             },
             ChipLine {
                 joiner: "AND NOT",
@@ -4192,6 +4240,7 @@ gear=D
                 nfd: "(/nav/)",
                 origin: "demo.noise".into(),
                 lit: None,
+                removable: false,
             },
         ];
         let ctx = egui::Context::default();
@@ -4892,6 +4941,41 @@ query nav
         tab.search_for(&ctx, &lib, &Target::Library("p.nav".into()), true);
         settle(&mut tab, &ctx);
         assert_eq!(hits(&tab).iter().map(|(l, _)| *l).collect::<Vec<_>>(), [0, 2]);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A search chip's click removes its query: the others are searched
+    /// again; removing the last one clears the search.
+    #[test]
+    fn removing_a_search_chip_drops_its_query() {
+        use nerka_core::input::dlt::writer::Msg;
+        let dir = std::env::temp_dir().join(format!("nerka-gui-chip-remove-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let dlt = dir.join("t.dlt");
+        let mut buf = Vec::new();
+        for apid in ["NAV", "DIAG", "NAV", "COM"] {
+            Msg::log(nerka_core::Level::Info, "ECU1", apid, "C", vec![]).encode(&mut buf);
+        }
+        std::fs::write(&dlt, buf).unwrap();
+        let mut lib = Library::new();
+        let pack = "pack p\nquery nav\n    apid == NAV\nquery diag\n    apid == DIAG\n";
+        lib.add(pack::parse_pack("p.nerka-pack", pack).unwrap()).unwrap();
+        let ctx = egui::Context::default();
+        let mut tab = Tab::open(&ctx, dlt, &SearchPrefs::default());
+        settle(&mut tab, &ctx);
+        tab.search_for(&ctx, &lib, &Target::Library("p.nav".into()), false);
+        tab.search_for(&ctx, &lib, &Target::Library("p.diag".into()), true);
+        settle(&mut tab, &ctx);
+        assert_eq!(hits(&tab).iter().map(|(l, _)| *l).collect::<Vec<_>>(), [0, 1, 2]);
+
+        tab.remove_search_term(&ctx, 0);
+        settle(&mut tab, &ctx);
+        assert_eq!(tab.search.terms.iter().map(|t| t.name.as_str()).collect::<Vec<_>>(), ["diag"]);
+        assert_eq!(tab.search.pattern, SearchBox::text_of(&tab.search.terms));
+        assert_eq!(hits(&tab).iter().map(|(l, _)| *l).collect::<Vec<_>>(), [1]);
+
+        tab.remove_search_term(&ctx, 0);
+        assert!(tab.search.active.is_none() && tab.search.pattern.is_empty());
         std::fs::remove_dir_all(&dir).ok();
     }
 

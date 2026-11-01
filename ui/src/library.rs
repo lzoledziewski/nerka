@@ -626,6 +626,34 @@ pub fn chip(ui: &mut egui::Ui, text: &str, color: Color32, strong: bool) -> egui
         .response
 }
 
+/// A chip a click removes: ✖ after the name while the pointer is over it
+/// (the room for it is always kept, so the chips don't move).
+pub fn removable_chip(ui: &mut egui::Ui, text: &str, color: Color32) -> egui::Response {
+    let id = ui.make_persistent_id(("removable chip", text));
+    let hot = ui.data(|d| d.get_temp::<bool>(id)).unwrap_or(false);
+    let r = egui::Frame::new()
+        .fill(color.gamma_multiply(if hot { 0.45 } else { 0.25 }))
+        .stroke(egui::Stroke::new(1.0, color))
+        .corner_radius(6.0)
+        .inner_margin(egui::Margin::symmetric(5, 0))
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 3.0;
+                ui.label(RichText::new(text).small());
+                let x = if hot { ui.visuals().strong_text_color() } else { Color32::TRANSPARENT };
+                ui.label(RichText::new("✖").small().color(x));
+            })
+        })
+        .response
+        .interact(egui::Sense::click());
+    let now = r.hovered();
+    if now != hot {
+        ui.data_mut(|d| d.insert_temp(id, now));
+        ui.ctx().request_repaint();
+    }
+    r
+}
+
 /// Why a query can't run on this file: the fields it needs that the file
 /// doesn't have.
 fn incompatible_text(missing: &[String], schema: &[FieldDef]) -> String {

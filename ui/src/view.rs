@@ -755,6 +755,22 @@ pub fn log_view(
     if has_focus {
         painter.rect_stroke(outer.shrink(0.5), 0.0, Stroke::new(1.0, vis.selection.stroke.color), StrokeKind::Inside);
     }
+    // Hovering a bookmarked line shows the bookmark's name and note.
+    if let Some(b) = hl.bookmarks
+        && response.hovered()
+        && !bar.hovered()
+        && rows > 0
+        && let Some(p) = response.hover_pos()
+        && rows_rect.contains(p)
+        && let line = line_of_row(hit(state, p).row)
+        && let Some(name) = b.name(line)
+    {
+        let tip = match b.note(line).unwrap_or_default() {
+            "" => format!("🔖 {name}"),
+            note => format!("🔖 {name}\n{note}"),
+        };
+        response.clone().on_hover_text_at_pointer(tip);
+    }
 
     let moved_to = state.selected.filter(|_| state.selected != selected_before);
     ViewOutput { clicked, has_focus, copied, toggle_bookmark, detail, moved_to }
