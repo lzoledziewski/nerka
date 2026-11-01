@@ -1071,6 +1071,18 @@ mod tests {
         assert_eq!(d.value(&mut Event::from_source(&src, 0)), None);
     }
 
+    /// A file opened after another was dropped can get its address, and
+    /// the same line count: its events must not come from the cache.
+    #[test]
+    fn the_cache_tells_files_apart_by_more_than_their_address() {
+        // Each made where the last one was (and is gone): one stack slot.
+        let ids: Vec<usize> =
+            (0..3).map(|_| source_key(&crate::TextFile::from_bytes("a", b"x\n".to_vec())).0).collect();
+        assert!(ids[0] != ids[1] && ids[1] != ids[2], "{ids:?}");
+        let dlt = |_| source_key(&crate::DltFile::from_bytes("d", Vec::new())).0;
+        assert_ne!(dlt(0), dlt(1));
+    }
+
     #[test]
     fn spec_round_trips() {
         for spec in [r"speed:num=/speed=(?<speed>\d+)/", r"gear(g):enum=/gear (?<g>\w)/"] {

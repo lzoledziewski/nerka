@@ -126,6 +126,21 @@ impl Filter {
         })
     }
 
+    /// Give a query's `bookmark` conditions the tab's bookmarks (see
+    /// [`Query::with_bookmarks`]).
+    pub fn with_bookmarks(self, marks: &std::sync::Arc<crate::Bookmarks>) -> Filter {
+        match self {
+            Filter::Query(q) => Filter::Query(q.with_bookmarks(marks)),
+            f => f,
+        }
+    }
+
+    /// Whether the result depends on the bookmarks (see
+    /// [`Query::uses_bookmarks`]).
+    pub fn uses_bookmarks(&self) -> bool {
+        matches!(self, Filter::Query(q) if q.uses_bookmarks())
+    }
+
     /// Progress units [`Self::prepare`] has to do.
     pub(crate) fn prepare_work(&self, source: &dyn LogSource) -> u64 {
         match self {
@@ -407,6 +422,40 @@ pub(crate) mod tests {
         // per-line path
         assert_eq!(run_filter(log, &q("level >= ERROR")), [1, 2, 3, 4]);
         assert_eq!(run_filter(log, &q("level == INFO OR /disk/")), [0, 2]);
+    }
+
+    #[test]
+    fn bookmarks_are_a_field() {
+        let log = "[INFO] boot
+[ERROR] disk
+[INFO] fan on
+[WARN] hot
+[ERROR] reset
+";
+        let mut marks = crate::Bookmarks::default();
+        marks.toggle(0);
+        marks.toggle(3);
+        marks.set_name(3, "hot spot");
+        marks.set_note(3, "compare with the fan log");
+        let marks = std::sync::Arc::new(marks);
+        let q = |s: &str| Filter::Query(Query::compile(s).unwrap()).with_bookmarks(&marks);
+        assert_eq!(run_filter(log, &q("bookmark")), [0, 3]);
+        assert_eq!(run_filter(log, &q("level >= ERROR OR bookmark")), [0, 1, 3, 4]);
+        assert_eq!(run_filter(log, &q("NOT bookmark AND level >= WARN")), [1, 4]);
+        // == / != on the name; ~ on the name or the note.
+        assert_eq!(run_filter(log, &q("bookmark == B1")), [0]);
+        assert_eq!(run_filter(log, &q("BOOKMARK == \"hot spot\"")), [3]);
+        assert_eq!(run_filter(log, &q("bookmark != B1")), [1, 2, 3, 4]);
+        assert_eq!(run_filter(log, &q("bookmark ~ /FAN/i")), [3]);
+        assert_eq!(run_filter(log, &q("bookmark ~ \"spot\"")), [3]);
+        assert_eq!(run_filter(log, &q("bookmark !~ /fan/")), [0, 1, 2, 4]);
+        // With a regex too: the prefilter path.
+        assert_eq!(run_filter(log, &q("/fan|hot/ AND NOT bookmark")), [2]);
+        // Without bookmarks given, no line has one.
+        let bare = Filter::Query(Query::compile("bookmark OR /disk/").unwrap());
+        assert!(bare.uses_bookmarks());
+        assert_eq!(run_filter(log, &bare), [1]);
+        assert!(!Filter::Query(Query::compile("level >= WARN").unwrap()).uses_bookmarks());
     }
 
     #[test]

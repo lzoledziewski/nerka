@@ -17,6 +17,7 @@
 //!          | STRING                     -- shorthand for  raw contains STRING
 //!          | FIELD OP VALUE
 //!          | SIGNAL OP VALUE
+//!          | "bookmark" [ OP VALUE ]    -- the line's bookmark
 //! FIELD   := raw | level | WORD         -- WORD: a field the source supplies
 //! SIGNAL  := "@" NAME [ "." VIEW ]      -- a signal the tab defines
 //! VIEW    := state | event | changed    -- default state; event and
@@ -50,6 +51,14 @@
 //! compared with the value's time of day). As with fields, a row without a value only satisfies `!=`
 //! and `!~`, and an unknown signal is an error.
 //!
+//! `bookmark` (case-insensitive, like every field name) is the line's
+//! bookmark, a regular field the tab supplies ([`Query::with_bookmarks`]):
+//! alone it holds on a bookmarked line (`level >= ERROR OR bookmark`);
+//! `==` / `!=` compare the bookmark's name (`bookmark == B2`), `~` / `!~`
+//! match its name or its note (`bookmark ~ /fan/`). A line without a
+//! bookmark only satisfies `!=` and `!~`; without bookmarks given, no line
+//! has one.
+//!
 //! The search boxes' Auto mode (`auto.rs`, `doc/search-modes.md`) reads plain
 //! words as text and rewrites them into this grammar; NFD itself has no
 //! bare text.
@@ -65,7 +74,7 @@ use crate::signal::{
     SignalDef, SignalKind, SignalScope, SignalSeries, SignalView, Signals, ValueRef, source_key, view_at,
 };
 use crate::time::{TIME_OF_DAY_END, parse_time};
-use crate::{LogSource, Progress};
+use crate::{Bookmarks, LineNo, LogSource, Progress};
 use regex::bytes::Regex;
 use std::sync::Arc;
 
@@ -118,6 +127,37 @@ pub enum Cond {
     Field(FieldCond),
     /// `@SIGNAL OP VALUE`.
     Signal(SignalCond),
+    /// `bookmark [OP VALUE]`.
+    Bookmark(BookmarkCond),
+}
+
+/// `bookmark` alone (`test` is [`FieldTest::Any`]), `==` / `!=` on the
+/// bookmark's name ([`FieldTest::Str`]) or `~` on its name or note
+/// ([`FieldTest::Match`]).
+#[derive(Debug, Clone)]
+pub struct BookmarkCond {
+    /// Byte offset of the word in the query.
+    pub pos: usize,
+    pub test: FieldTest,
+    /// Set by [`Query::with_bookmarks`]; without them no line has one.
+    pub marks: Option<Arc<Bookmarks>>,
+}
+
+impl BookmarkCond {
+    fn eval(&self, line: LineNo) -> bool {
+        let marks = self.marks.as_deref();
+        let name = marks.and_then(|m| m.name(line));
+        match (name, &self.test) {
+            (Some(_), FieldTest::Any) => true,
+            (Some(name), FieldTest::Str(op, want)) => op.test(name.as_bytes(), want.as_slice()),
+            (Some(name), FieldTest::Match(re)) => {
+                re.is_match(name.as_bytes())
+                    || marks.and_then(|m| m.note(line)).is_some_and(|n| re.is_match(n.as_bytes()))
+            }
+            (None, FieldTest::Str(op, _)) => *op == CmpOp::Ne,
+            _ => false,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -198,6 +238,7 @@ impl Expr {
                 _ => false,
             },
             Expr::Cond(Cond::Signal(s)) => s.eval(ev),
+            Expr::Cond(Cond::Bookmark(b)) => b.eval(ev.line()),
         }
     }
 
@@ -260,6 +301,8 @@ impl Expr {
                 }
             }
             Expr::Cond(Cond::Level(..)) => 2,
+            // A lookup in the tab's bookmarks.
+            Expr::Cond(Cond::Bookmark(_)) => 2,
             Expr::Cond(Cond::RawMatch(_)) => 10,
             // Runs the signal's whole query, then its capture.
             // A lookup in the signal's events (collected beforehand).
@@ -504,6 +547,34 @@ impl Query {
         Ok(self)
     }
 
+    /// Give `bookmark` conditions the tab's bookmarks (their line numbers
+    /// are the source's). Without, no line has a bookmark.
+    pub fn with_bookmarks(mut self, marks: &Arc<Bookmarks>) -> Query {
+        fn walk(e: &mut Expr, marks: &Arc<Bookmarks>) {
+            match e {
+                Expr::And(xs) | Expr::Or(xs) => xs.iter_mut().for_each(|x| walk(x, marks)),
+                Expr::Not(x) => walk(x, marks),
+                Expr::Cond(Cond::Bookmark(b)) => b.marks = Some(marks.clone()),
+                Expr::Cond(_) => {}
+            }
+        }
+        walk(&mut self.expr, marks);
+        self
+    }
+
+    /// Whether the query uses `bookmark`: its result changes with the
+    /// bookmarks.
+    pub fn uses_bookmarks(&self) -> bool {
+        fn walk(e: &Expr) -> bool {
+            match e {
+                Expr::And(xs) | Expr::Or(xs) => xs.iter().any(walk),
+                Expr::Not(x) => walk(x),
+                Expr::Cond(c) => matches!(c, Cond::Bookmark(_)),
+            }
+        }
+        walk(&self.expr)
+    }
+
     /// Collect the events of the signals the query uses in `source` (a
     /// pass per signal and file, unless cached), so rows only look them
     /// up. Comes after [`bind`](Self::bind).
@@ -698,6 +769,41 @@ mod tests {
         assert!(e.msg.contains("unknown field 'service'"), "{e}");
         assert_eq!(e.pos, 0);
         assert!(Query::compile("apid ~ 5").unwrap_err().msg.contains("regex"));
+    }
+
+    #[test]
+    fn bookmark_parses_alone_or_compared() {
+        let cond = |s: &str| match q(s).expr().clone() {
+            Expr::Cond(Cond::Bookmark(b)) => b.test,
+            Expr::Not(x) => match *x {
+                Expr::Cond(Cond::Bookmark(b)) => b.test,
+                e => panic!("{s}: {e:?}"),
+            },
+            e => panic!("{s}: {e:?}"),
+        };
+        assert!(matches!(cond("bookmark"), FieldTest::Any));
+        assert!(matches!(cond("Bookmark == B2"), FieldTest::Str(CmpOp::Eq, n) if n == b"B2"));
+        assert!(matches!(cond("bookmark != \"my mark\""), FieldTest::Str(CmpOp::Ne, n) if n == b"my mark"));
+        assert!(matches!(cond("bookmark ~ /fan/i"), FieldTest::Match(_)));
+        assert!(matches!(cond("bookmark !~ \"fan\""), FieldTest::Match(_)));
+        assert!(q("level >= ERROR OR bookmark").uses_bookmarks());
+        assert!(!q("level >= ERROR").uses_bookmarks());
+        // A field name for the binding: bookmark isn't one of the source's.
+        assert!(Query::compile_for("bookmark AND apid == NAV", &[]).is_err());
+        assert!(Query::compile_for("bookmark", &[]).is_ok());
+    }
+
+    #[test]
+    fn bookmark_errors_point_at_problem() {
+        let e = Query::compile("bookmark >= B1").unwrap_err();
+        assert_eq!((e.pos, e.msg.as_str()), (9, "bookmark supports ==, != (its name) and ~, !~ (name or note)"));
+        let e = Query::compile("bookmark ~ B1").unwrap_err();
+        assert_eq!((e.pos, e.msg.as_str()), (11, "expected /regex/ or \"text\" but found 'B1'"));
+        let e = Query::compile("bookmark == /x/").unwrap_err();
+        assert_eq!(e.pos, 12);
+        assert!(e.msg.starts_with("expected a bookmark name"), "{e}");
+        let e = Query::compile("bookmark AND").unwrap_err();
+        assert_eq!(e.pos, 12);
     }
 
     #[test]

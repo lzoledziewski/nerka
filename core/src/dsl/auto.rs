@@ -6,7 +6,9 @@
 //! A word is part of a phrase unless it's a field (followed by an
 //! operator), a value (after an operator) or an upper-case `AND` / `OR` /
 //! `NOT`. Each run of phrase words becomes one `"…"` (or `/…/i` with ignore
-//! case), spanning the words exactly as typed.
+//! case), spanning the words exactly as typed. A phrase that is just the
+//! word `bookmark` is the field when the box holds more than it
+//! (`level >= ERROR OR bookmark`); alone it is text.
 
 use super::parser::{OpTok, Tok, tokens};
 use super::{DslError, Query};
@@ -89,11 +91,15 @@ pub fn read_auto_in(src: &str, phrases: &MatcherOptions, schema: &[FieldDef], si
             i += 1;
             end = toks[i].1.end;
         }
+        phrases += 1;
+        i += 1;
+        // The bookmark field: kept as typed (alone, the box is text below).
+        if src[start..end].eq_ignore_ascii_case("bookmark") {
+            continue;
+        }
         nfd.push_str(&src[copied..start]);
         nfd.push_str(&text_to_nfd(&src[start..end], &options));
         copied = end;
-        phrases += 1;
-        i += 1;
     }
     nfd.push_str(&src[copied..]);
     let nfd = nfd.trim().to_owned();
@@ -175,6 +181,16 @@ mod tests {
         );
         // A phrase in double quotes or a regex is written out: kept as is.
         assert_eq!(read("\"a b\" OR c").unwrap(), "\"a b\" OR \"c\"");
+    }
+
+    #[test]
+    fn bookmark_is_the_field_next_to_nfd_and_text_alone() {
+        assert_eq!(read("bookmark"), text("bookmark"));
+        assert_eq!(read("level >= ERROR OR bookmark").unwrap(), "level >= ERROR OR bookmark");
+        assert_eq!(read("timeout AND NOT Bookmark").unwrap(), "\"timeout\" AND NOT Bookmark");
+        assert_eq!(read("bookmark ~ /fan/").unwrap(), "bookmark ~ /fan/");
+        // Part of a longer phrase, it is text.
+        assert_eq!(read("bookmark added AND level >= WARN").unwrap(), "\"bookmark added\" AND level >= WARN");
     }
 
     #[test]

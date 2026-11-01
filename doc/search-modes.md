@@ -26,7 +26,7 @@ The Filter and Search boxes had two modes, Text and Query. Both are useful, but 
 Auto rewrites the box into plain NFD, so what runs (and goes into the history) is ordinary NFD:
 
 1. Split it with the NFD lexer. If that fails (a character NFD doesn't know, such as `[` or `:`), it's text.
-2. A word is part of a phrase unless it is a field (a word followed by an operator), a value (the word after an operator) or an operator keyword. Only **upper-case** `AND`, `OR`, `NOT` are operators in Auto, so `error and timeout` stays a phrase; `&&`, `||`, `!` are operators too.
+2. A word is part of a phrase unless it is a field (a word followed by an operator), a value (the word after an operator) or an operator keyword. Only **upper-case** `AND`, `OR`, `NOT` are operators in Auto, so `error and timeout` stays a phrase; `&&`, `||`, `!` are operators too. The word `bookmark` on its own is the bookmark field when the box holds more than it (`level >= ERROR OR bookmark`); alone it is text (2026-11-01).
 3. Each run of phrase words becomes one phrase: the text from its first word to its last, exactly as typed (inner spacing kept), written as `"…"`, or as `/…/i` with Ignore case (`text_to_nfd`).
 4. If the whole box is one phrase, it is text (the fast literal search). Otherwise the rewritten NFD must compile for the open file (fields included); if it doesn't, the whole box is text, and the preview names the query error.
 

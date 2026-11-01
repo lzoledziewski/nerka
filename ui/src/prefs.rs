@@ -6,6 +6,7 @@
 //! bad values are ignored, so an old or hand-edited file never fails.
 
 use crate::Mode;
+use crate::view::NoteMode;
 use nerka_core::MatcherOptions;
 use std::path::Path;
 
@@ -27,6 +28,8 @@ pub struct SearchPrefs {
     /// An MF4 start time marked as local time is read in this computer's
     /// zone, else as UTC.
     pub mf4_local_time: bool,
+    /// Where bookmark notes show in the views.
+    pub bookmark_notes: NoteMode,
 }
 
 impl Default for SearchPrefs {
@@ -43,6 +46,7 @@ impl Default for SearchPrefs {
             // As DLT Viewer and Wireshark show them (owner, 2026-10-26).
             local_time: true,
             mf4_local_time: true,
+            bookmark_notes: NoteMode::default(),
         }
     }
 }
@@ -64,6 +68,11 @@ impl SearchPrefs {
                         && let Some(n) = parse_gib(v)
                     {
                         p.unpack_limit_gib = n;
+                    }
+                    if key.trim() == "bookmark_notes"
+                        && let Some(m) = NoteMode::parse(v)
+                    {
+                        p.bookmark_notes = m;
                     }
                     let mode = match v {
                         "auto" => Some(Mode::Auto),
@@ -100,7 +109,7 @@ impl SearchPrefs {
             Mode::Query => "query",
         };
         format!(
-            "mode={}\nregex={}\nignore_case={}\ninvert={}\nsearch_mode={}\nsearch_regex={}\nsearch_ignore_case={}\ndlt_ports={}\nunpack_limit_gib={}\nlocal_time={}\nmf4_local_time={}\n",
+            "mode={}\nregex={}\nignore_case={}\ninvert={}\nsearch_mode={}\nsearch_regex={}\nsearch_ignore_case={}\ndlt_ports={}\nunpack_limit_gib={}\nlocal_time={}\nmf4_local_time={}\nbookmark_notes={}\n",
             name(self.mode),
             !self.options.fixed_string,
             self.options.case_insensitive,
@@ -111,7 +120,8 @@ impl SearchPrefs {
             ports_text(&self.dlt_ports),
             self.unpack_limit_gib,
             self.local_time,
-            self.mf4_local_time
+            self.mf4_local_time,
+            self.bookmark_notes.key()
         )
     }
 
@@ -184,6 +194,7 @@ mod tests {
             unpack_limit_gib: 20,
             local_time: false,
             mf4_local_time: false,
+            bookmark_notes: NoteMode::Column,
         };
         assert_eq!(SearchPrefs::parse(&p.serialize()), p);
         assert_eq!(SearchPrefs::parse(&SearchPrefs::default().serialize()), SearchPrefs::default());
@@ -197,6 +208,8 @@ mod tests {
         assert!(p.options.fixed_string);
         assert!(p.options.case_insensitive);
         assert_eq!(p.dlt_ports, [3490]);
+        assert_eq!(SearchPrefs::parse("bookmark_notes=sideways\n").bookmark_notes, NoteMode::LineBefore);
+        assert_eq!(SearchPrefs::parse("bookmark_notes=end\n").bookmark_notes, NoteMode::EndOfLine);
         // Bad ports keep the default.
         assert_eq!(SearchPrefs::parse("dlt_ports=3490 x\n").dlt_ports, [3490]);
         assert_eq!(SearchPrefs::parse("dlt_ports=13400, 3489\n").dlt_ports, [13400, 3489]);

@@ -1,7 +1,7 @@
 # Release builds for Linux and Windows.
 #
-# Push a tag like v0.1.0-alpha.1 to build both and publish them as a
-# GitHub pre-release (tags with a '-' suffix are marked pre-release).
+# Push a tag like v0.1.0 to build both and publish them as a GitHub
+# release (a tag with a '-' suffix, like v0.1.0-alpha.1, is a pre-release).
 # Run it by hand (Actions tab, "Run workflow") to only build: the archives
 # are kept as workflow artifacts, nothing is published.
 name: Release
@@ -10,6 +10,10 @@ on:
   push:
     tags: ['v*']
   workflow_dispatch:
+
+# Read-only token by default; only the publish job writes (the release).
+permissions:
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
@@ -67,7 +71,8 @@ jobs:
           path: ${{ env.ASSET }}
 
   publish:
-    name: GitHub pre-release
+    # A pre-release for a tag with a `-` (v0.1.0-alpha.1), else a release.
+    name: GitHub release
     if: startsWith(github.ref, 'refs/tags/v')
     needs: build
     runs-on: ubuntu-latest

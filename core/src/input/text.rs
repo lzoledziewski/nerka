@@ -1,6 +1,6 @@
 //! Plain-text log files, memory-mapped.
 
-use super::Bytes;
+use super::{Bytes, new_data_id};
 use crate::{LineIndex, LineNo, LogSource, Progress, Result};
 use std::borrow::Cow;
 use std::path::{Path, PathBuf};
@@ -10,6 +10,7 @@ pub struct TextFile {
     path: Option<PathBuf>,
     data: Bytes,
     index: LineIndex,
+    data_id: usize,
 }
 
 impl TextFile {
@@ -18,13 +19,19 @@ impl TextFile {
         let path = path.as_ref();
         let data = Bytes::map(path)?;
         let index = LineIndex::build(data.bytes(), progress)?;
-        Ok(Self { name: path.display().to_string(), path: Some(path.to_path_buf()), data, index })
+        Ok(Self {
+            name: path.display().to_string(),
+            path: Some(path.to_path_buf()),
+            data,
+            index,
+            data_id: new_data_id(),
+        })
     }
 
     /// In-memory source, handy for tests and stdin.
     pub fn from_bytes(name: impl Into<String>, bytes: Vec<u8>) -> Self {
         let index = LineIndex::build(&bytes, &Progress::new()).expect("not cancelled");
-        Self { name: name.into(), path: None, data: Bytes::Owned(bytes), index }
+        Self { name: name.into(), path: None, data: Bytes::Owned(bytes), index, data_id: new_data_id() }
     }
 
     pub fn path(&self) -> Option<&Path> {
@@ -37,6 +44,10 @@ impl TextFile {
 }
 
 impl LogSource for TextFile {
+    fn data_id(&self) -> usize {
+        self.data_id
+    }
+
     fn name(&self) -> &str {
         &self.name
     }

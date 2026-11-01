@@ -60,7 +60,7 @@ use std::borrow::Cow;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
-use view::{Columns, Highlight, SearchMarks, ViewOutput, ViewState, log_view};
+use view::{Columns, Highlight, NoteMode, SearchMarks, ViewOutput, ViewState, log_view};
 
 fn main() -> eframe::Result {
     let mut initial: Vec<PathBuf> = Vec::new();
@@ -543,6 +543,12 @@ struct Tab {
     filter_preview: PreviewCache,
 
     bookmarks: Bookmarks,
+    /// The bookmarks changed since the last frame: what uses them runs again.
+    marks_changed: bool,
+    /// Where bookmark notes show in the views (the app's setting).
+    notes: NoteMode,
+    /// The filter behind `result` (rerun when it uses the bookmarks).
+    applied: Option<Arc<Filter>>,
     /// Bookmarks whose line is unfolded in the panel.
     marks_open: std::collections::HashSet<LineNo>,
     /// A bookmark's name being typed in the panel; set when the field
@@ -833,6 +839,23 @@ struct ActiveSearch {
     highlighters: Vec<Highlighter>,
 }
 
+impl ActiveSearch {
+    fn uses_bookmarks(&self) -> bool {
+        self.set.include.iter().chain(&self.set.exclude).any(Filter::uses_bookmarks)
+    }
+
+    /// The same search with `marks` for its `bookmark` conditions.
+    fn with_bookmarks(&self, marks: &Arc<Bookmarks>) -> ActiveSearch {
+        let bind = |fs: &[Filter]| fs.iter().map(|f| f.clone().with_bookmarks(marks)).collect();
+        ActiveSearch {
+            set: SearchSet { include: bind(&self.set.include), exclude: bind(&self.set.exclude) },
+            names: self.names.clone(),
+            colors: self.colors.clone(),
+            highlighters: self.highlighters.clone(),
+        }
+    }
+}
+
 impl SearchBox {
     /// History tag for the box: `auto`, `text`, `regex` or `query`.
     fn tag(&self) -> &'static str {
@@ -944,6 +967,9 @@ impl Tab {
             chips_open: false,
             filter_preview: PreviewCache::default(),
             bookmarks: Bookmarks::default(),
+            marks_changed: false,
+            notes: NoteMode::default(),
+            applied: None,
             marks_open: Default::default(),
             mark_rename: None,
             detail: None,
@@ -1221,6 +1247,7 @@ impl Tab {
         if self.pattern.trim().is_empty() {
             let cur = self.current_line();
             self.result = None;
+            self.applied = None;
             self.goto_line(cur);
             self.status.clear();
             self.recolor(ctx);
@@ -1229,10 +1256,7 @@ impl Tab {
         }
         match self.build_filter() {
             Ok(f) => {
-                let f = Arc::new(f);
-                let ff = f.clone();
-                let job = Job::spawn(ctx, move |prog| nerka_core::search(&*file, &ff, prog));
-                self.searching = Some((f, job));
+                self.run_filter(ctx, file, f.with_bookmarks(&self.marks()));
                 true
             }
             Err(e) => {
@@ -1242,9 +1266,52 @@ impl Tab {
         }
     }
 
+    fn run_filter(&mut self, ctx: &egui::Context, file: Arc<dyn LogSource>, f: Filter) {
+        let f = Arc::new(f);
+        let ff = f.clone();
+        let job = Job::spawn(ctx, move |prog| nerka_core::search(&*file, &ff, prog));
+        self.searching = Some((f, job));
+    }
+
+    /// The tab's bookmarks as queries take them.
+    fn marks(&self) -> Arc<Bookmarks> {
+        Arc::new(self.bookmarks.clone())
+    }
+
+    /// The bookmarks changed: a filter, search or line colour that uses
+    /// `bookmark` runs again with them (the filter's own, not the box's
+    /// text, which may have been edited since).
+    fn bookmarks_changed(&mut self, ctx: &egui::Context) {
+        let marks = self.marks();
+        let filter = match &self.searching {
+            Some((f, _)) => Some(f.clone()),
+            None => self.applied.clone(),
+        };
+        let refilter = filter.filter(|f| f.uses_bookmarks());
+        if let Some(a) = self.search.active.clone().filter(|a| a.uses_bookmarks()) {
+            self.search.active = Some(Arc::new(a.with_bookmarks(&marks)));
+            if refilter.is_none() {
+                self.rerun_search(ctx);
+            }
+        }
+        if let (Some(f), Some(file)) = (refilter, self.file.clone()) {
+            if let Some((_, j)) = self.searching.take() {
+                j.cancel();
+            }
+            // The search and the colours follow the new result.
+            self.run_filter(ctx, file, (*f).clone().with_bookmarks(&marks));
+        } else if self.colors_exp.as_ref().is_some_and(|a| Query::compile(&a.exp.nfd).is_ok_and(|q| q.uses_bookmarks()))
+        {
+            self.recolor(ctx);
+        }
+    }
+
     /// Advance background jobs. Returns `false` if the file failed to open
     /// (the tab should then be closed; `status` holds the reason).
     fn poll_jobs(&mut self, ctx: &egui::Context) -> bool {
+        if std::mem::take(&mut self.marks_changed) {
+            self.bookmarks_changed(ctx);
+        }
         if let Some(job) = &self.signals_job {
             match job.poll() {
                 Poll::Running => ctx.request_repaint_after(Duration::from_millis(50)),
@@ -1263,6 +1330,7 @@ impl Tab {
                                 self.cancel_jobs();
                                 self.path = self.paths[0].clone();
                                 self.result = None;
+                                self.applied = None;
                                 self.line_colors = None;
                                 self.search.hits = None;
                                 self.detail = None;
@@ -1295,6 +1363,12 @@ impl Tab {
                             if let Some(line) = self.reopen_at.take() {
                                 self.goto_line(line);
                             }
+                            // Library picks put in the Search box before the
+                            // file was read couldn't know its fields (`apid`):
+                            // they run now (`--search-pick` at startup).
+                            if self.search.active.is_none() && !self.search.terms.is_empty() {
+                                self.run_search_box(ctx);
+                            }
                             if !self.pattern.trim().is_empty() {
                                 self.start_search(ctx);
                             } else {
@@ -1323,12 +1397,14 @@ impl Tab {
                 }
             }
         }
-        if let Some((_, job)) = &self.searching {
+        if let Some((f, job)) = &self.searching {
+            let f = f.clone();
             match job.poll() {
                 Poll::Running => ctx.request_repaint_after(Duration::from_millis(50)),
                 Poll::Done(r, took) => {
                     match r {
                         Ok(res) => {
+                            self.applied = Some(f);
                             self.status = format!("Filter keeps {} lines ({took:.2?})", res.lines.len());
                             let cur = self.current_line();
                             self.result = Some(Arc::new(res));
@@ -1438,6 +1514,23 @@ impl Tab {
         }
     }
 
+    /// A search chip's click: the box without its `i`-th query (OR'ed with
+    /// the others), searched again; empty, the search is cleared.
+    fn remove_search_term(&mut self, ctx: &egui::Context, i: usize) {
+        let Some(terms) = self.search.current_terms() else { return };
+        let mut terms = terms.to_vec();
+        if i < terms.len() {
+            terms.remove(i);
+        }
+        if terms.is_empty() {
+            self.clear_search();
+            return;
+        }
+        self.search.pattern = SearchBox::text_of(&terms);
+        self.search.terms = terms;
+        self.run_search_box(ctx);
+    }
+
     /// What the Search box asks for: one query per picked library query, or
     /// the box's text as one query.
     fn build_search(&self) -> Result<ActiveSearch, String> {
@@ -1479,7 +1572,7 @@ impl Tab {
         }
         match self.build_search() {
             Ok(a) => {
-                self.search.active = Some(Arc::new(a));
+                self.search.active = Some(Arc::new(a.with_bookmarks(&self.marks())));
                 self.rerun_search(ctx);
             }
             Err(e) => self.status = e,
@@ -1519,13 +1612,14 @@ impl Tab {
         if self.searching.is_some() {
             return;
         }
+        let marks = self.marks();
         let (mut include, mut names, mut colors) = (Vec::new(), Vec::new(), Vec::new());
         for (i, p) in a.exp.parts.iter().enumerate() {
             if p.role == Role::Exclude || !self.picks.is_lit(a.keys[i]) {
                 continue;
             }
             let Ok(q) = Query::compile(a.exp.part_nfd(p)).and_then(|q| q.with_signals(&self.signals)) else { continue };
-            include.push(Filter::Query(q));
+            include.push(Filter::Query(q.with_bookmarks(&marks)));
             names.push(a.names[i].clone());
             colors.push(a.colors[i]);
         }
@@ -1784,6 +1878,7 @@ impl Tab {
         if let Err(e) = res {
             self.status = format!("Could not save bookmarks: {e}");
         }
+        self.marks_changed = true;
     }
 
     /// Status messages and context-menu actions from a log view.
@@ -1846,12 +1941,23 @@ impl Tab {
     }
 
     /// Returns true when the panel's close button was clicked.
-    fn bookmarks_panel(&mut self, ui: &mut egui::Ui, file: &dyn LogSource) -> bool {
+    /// `notes`: where the notes show in the views (the app's setting).
+    fn bookmarks_panel(&mut self, ui: &mut egui::Ui, file: &dyn LogSource, notes: &mut NoteMode) -> bool {
         let mut close = false;
         ui.horizontal(|ui| {
             ui.heading("Bookmarks");
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 close = close_button(ui).on_hover_text("Close panel").clicked();
+            });
+        });
+        ui.horizontal(|ui| {
+            ui.label("Notes in the views:").on_hover_text(
+                "Where a bookmark's note shows next to its line. Column: a last column in tables (DLT);                  plain text logs show it on the line before.",
+            );
+            egui::ComboBox::from_id_salt("note-mode").selected_text(notes.label()).show_ui(ui, |ui| {
+                for m in NoteMode::ALL {
+                    ui.selectable_value(notes, m, m.label());
+                }
             });
         });
         self.bookmarks_list(ui, file);
@@ -2050,7 +2156,7 @@ impl Tab {
         if let Some(a) = self.filter_exp.clone().filter(|a| a.exp.nfd == self.pattern) {
             let picks = &self.picks;
             let lines = expansion_lines(&a, &|k| picks.is_lit(k));
-            if let Some(key) = chips_view(ui, &lines, &mut self.chips_open) {
+            if let Some(ChipClick::Lit(key)) = chips_view(ui, &lines, &mut self.chips_open) {
                 self.picks.toggle_lit(key);
                 self.recolor(ui.ctx());
             }
@@ -2101,6 +2207,7 @@ impl Tab {
                     search: marks.as_ref(),
                     // The filter queries' line colours, as in the main view.
                     lines: lines.as_ref(),
+                    notes: self.notes,
                 },
             );
             self.view_output(&out, true, |row| hits.lines[row as usize]);
@@ -2190,7 +2297,9 @@ impl Tab {
         }
         if let Some(terms) = self.search.current_terms() {
             let lines = term_lines(terms);
-            chips_view(ui, &lines, &mut self.chips_open);
+            if let Some(ChipClick::Remove(i)) = chips_view(ui, &lines, &mut self.chips_open) {
+                self.remove_search_term(ui.ctx(), i);
+            }
         } else {
             let schema = self.file.as_ref().map(|f| f.schema()).unwrap_or_default();
             let s = &mut self.search;
@@ -2235,6 +2344,7 @@ impl Tab {
                 bookmarks: Some(&self.bookmarks),
                 search: marks.as_ref(),
                 lines: lines.as_ref(),
+                notes: self.notes,
             },
         );
         self.view_output(&out, false, line_of_row);
@@ -2262,8 +2372,9 @@ fn short(id: &str) -> &str {
 }
 
 /// One picked query under a box: how it joins the others, its name chip
-/// and colour, its NFD, and (filter queries) the key of its selection node
-/// with whether its lines are coloured.
+/// and colour, its NFD, (filter queries) the key of its selection node
+/// with whether its lines are coloured, and (search queries) whether a
+/// click removes it from the box.
 struct ChipLine<'a> {
     joiner: &'static str,
     name: &'a str,
@@ -2271,16 +2382,26 @@ struct ChipLine<'a> {
     nfd: &'a str,
     origin: Cow<'a, str>,
     lit: Option<(u64, bool)>,
+    removable: bool,
+}
+
+/// A click on a chip: switch a filter node's line colour, or remove the
+/// `i`-th query from the box.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChipClick {
+    Lit(u64),
+    Remove(usize),
 }
 
 /// The picked queries under a box. Folded (the default): one row of name
 /// chips, the NFD on hover. Unfolded (▸ / ▾): one line per query with its
-/// NFD. A chip with `lit` switches its line colour (filled when on);
-/// returns the node whose chip was clicked.
-fn chips_view(ui: &mut egui::Ui, lines: &[ChipLine<'_>], open: &mut bool) -> Option<u64> {
+/// NFD. A chip with `lit` switches its line colour (filled when on); a
+/// removable one shows ✖ while hovered and a click removes it. Returns
+/// what was clicked.
+fn chips_view(ui: &mut egui::Ui, lines: &[ChipLine<'_>], open: &mut bool) -> Option<ChipClick> {
     const MAX_LINES: usize = 8;
     let mut clicked = None;
-    let mut chip = |ui: &mut egui::Ui, l: &ChipLine<'_>, folded: bool| {
+    let mut chip = |ui: &mut egui::Ui, i: usize, l: &ChipLine<'_>, folded: bool| {
         let tip = |extra: &str| {
             let nfd = if folded { format!("\n{}", l.nfd) } else { String::new() };
             format!("{}{nfd}{extra}", l.origin)
@@ -2290,7 +2411,13 @@ fn chips_view(ui: &mut egui::Ui, lines: &[ChipLine<'_>], open: &mut bool) -> Opt
                 let what = if on { "\nLines coloured: click to stop" } else { "\nClick to colour its lines" };
                 let r = library::chip(ui, l.name, l.color, on).interact(egui::Sense::click());
                 if r.on_hover_text(tip(what)).clicked() {
-                    clicked = Some(key);
+                    clicked = Some(ChipClick::Lit(key));
+                }
+            }
+            None if l.removable => {
+                let r = library::removable_chip(ui, l.name, l.color);
+                if r.on_hover_text(tip("\nClick to remove it from the search")).clicked() {
+                    clicked = Some(ChipClick::Remove(i));
                 }
             }
             None => {
@@ -2308,11 +2435,11 @@ fn chips_view(ui: &mut egui::Ui, lines: &[ChipLine<'_>], open: &mut bool) -> Opt
         ui.horizontal_wrapped(|ui| {
             ui.spacing_mut().item_spacing.x = 4.0;
             fold(ui, open);
-            for l in lines {
+            for (i, l) in lines.iter().enumerate() {
                 if !l.joiner.is_empty() {
                     ui.label(RichText::new(l.joiner).small().weak());
                 }
-                chip(ui, l, true);
+                chip(ui, i, l, true);
             }
         });
         return clicked;
@@ -2324,7 +2451,7 @@ fn chips_view(ui: &mut egui::Ui, lines: &[ChipLine<'_>], open: &mut bool) -> Opt
             }
             let w = if i == 0 { 38.0 } else { 52.0 };
             ui.add_sized([w, 14.0], egui::Label::new(RichText::new(l.joiner).small().weak()));
-            chip(ui, l, false);
+            chip(ui, i, l, false);
             ui.add(egui::Label::new(RichText::new(l.nfd).monospace().small()).truncate());
         });
     }
@@ -2379,6 +2506,7 @@ In '{by}', which is picked too: not repeated in the box"
                 nfd: a.exp.part_nfd(p),
                 origin,
                 lit: (p.role != Role::Exclude).then(|| (a.keys[i], lit(a.keys[i]))),
+                removable: false,
             }
         })
         .collect()
@@ -2396,6 +2524,7 @@ fn term_lines(terms: &[Term]) -> Vec<ChipLine<'_>> {
             nfd: &t.nfd,
             origin: "search query".into(),
             lit: None,
+            removable: true,
         })
         .collect()
 }
@@ -2859,6 +2988,7 @@ impl App {
             unpack_limit_gib: self.prefs.unpack_limit_gib,
             local_time: self.prefs.local_time,
             mf4_local_time: self.prefs.mf4_local_time,
+            bookmark_notes: self.prefs.bookmark_notes,
             ..prefs
         };
         if prefs == self.prefs {
@@ -3401,6 +3531,10 @@ impl App {
         let ctx = ui.ctx().clone();
         self.poll_instance(&ctx);
         self.poll_jobs(&ctx);
+        for t in &mut self.tabs {
+            t.notes = self.prefs.bookmark_notes;
+            t.columns.note_column(t.notes == NoteMode::Column);
+        }
         self.handle_input(&ctx);
         self.update_title(&ctx);
         self.goto_dialog(&ctx);
@@ -3471,6 +3605,14 @@ impl App {
                     let r = ui.button("📷").on_hover_text("Screenshot of the window to the clipboard (Ctrl+Shift+S)");
                     if r.clicked() {
                         shot::request(ui.ctx(), None);
+                    }
+                    // The plot at hand, not only in the Signals panel.
+                    if let Some(tab) = self.tabs.get(self.active) {
+                        let mut plot = plot::lock(&tab.plot);
+                        let tip = if plot.shown { "Close the plot (its lanes are kept)" } else { "Show the plot" };
+                        if ui.selectable_label(plot.shown, "📈 Plot").on_hover_text(tip).clicked() {
+                            plot.shown = !plot.shown;
+                        }
                     }
                 });
             });
@@ -3583,13 +3725,22 @@ impl App {
         }
         let Some(tab) = self.tabs.get_mut(self.active) else { return };
         if show_bookmarks {
+            let mut notes = self.prefs.bookmark_notes;
             let close = egui::Panel::right("bookmarks")
                 .resizable(true)
                 .default_size(300.0)
-                .show(ui, |ui| tab.bookmarks_panel(ui, &*file))
+                .show(ui, |ui| tab.bookmarks_panel(ui, &*file, &mut notes))
                 .inner;
             if close {
                 self.show_bookmarks = false;
+            }
+            if notes != self.prefs.bookmark_notes {
+                self.prefs.bookmark_notes = notes;
+                if let Some(path) = prefs_path()
+                    && let Err(e) = self.prefs.save(&path)
+                {
+                    tab.status = format!("Could not save preferences: {e}");
+                }
             }
         }
         if self.show_signals {
@@ -4170,6 +4321,7 @@ gear=D
                 nfd: "(/SSL/)",
                 origin: "demo.ssl".into(),
                 lit: Some((1, true)),
+                removable: false,
             },
             ChipLine {
                 joiner: "OR",
@@ -4178,6 +4330,7 @@ gear=D
                 nfd: "(/disk/)",
                 origin: "demo.disk".into(),
                 lit: Some((2, false)),
+                removable: false,
             },
             ChipLine {
                 joiner: "AND NOT",
@@ -4186,6 +4339,7 @@ gear=D
                 nfd: "(/nav/)",
                 origin: "demo.noise".into(),
                 lit: None,
+                removable: false,
             },
         ];
         let ctx = egui::Context::default();
@@ -4853,6 +5007,110 @@ gear=D
         two.use_preset(&ctx, &lib, &p);
         settle(&mut two, &ctx);
         assert_eq!(two.line_colors.clone().expect("after loading").1.lines, [3, 5]);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `--search-pick` at startup on a DLT file: the query names a DLT field,
+    /// unknown until the file is read; it runs once it is (it was lost).
+    #[test]
+    fn a_library_search_picked_before_the_file_is_read_runs_after() {
+        use nerka_core::input::dlt::writer::Msg;
+        let dir = std::env::temp_dir().join(format!("nerka-gui-early-search-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let dlt = dir.join("t.dlt");
+        let mut buf = Vec::new();
+        for apid in ["NAV", "DIAG", "NAV"] {
+            Msg::log(nerka_core::Level::Info, "ECU1", apid, "C", vec![]).encode(&mut buf);
+        }
+        std::fs::write(&dlt, buf).unwrap();
+        let mut lib = Library::new();
+        lib.add(
+            pack::parse_pack(
+                "p.nerka-pack",
+                "pack p
+query nav
+    apid == NAV
+",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let ctx = egui::Context::default();
+        let mut tab = Tab::open(&ctx, dlt, &SearchPrefs::default());
+        tab.search_for(&ctx, &lib, &Target::Library("p.nav".into()), true);
+        settle(&mut tab, &ctx);
+        assert_eq!(hits(&tab).iter().map(|(l, _)| *l).collect::<Vec<_>>(), [0, 2]);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `bookmark` in the filter and the search: they run again when a
+    /// bookmark is added, removed or gets a note.
+    #[test]
+    fn bookmark_queries_follow_the_bookmarks() {
+        let dir = std::env::temp_dir().join(format!("nerka-gui-bookmark-query-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("app.log");
+        std::fs::write(&log, LOG).unwrap();
+        let ctx = egui::Context::default();
+        let mut tab = Tab::open(&ctx, log, &SearchPrefs::default());
+        settle(&mut tab, &ctx);
+        tab.set_filter("query", "level == WARN OR bookmark");
+        tab.start_search(&ctx);
+        tab.search.set("query", "bookmark ~ /look/");
+        tab.run_search_box(&ctx);
+        settle(&mut tab, &ctx);
+        assert_eq!(tab.result.as_ref().unwrap().lines, [3]);
+
+        tab.toggle_bookmark_at(1);
+        settle(&mut tab, &ctx);
+        assert_eq!(tab.result.as_ref().unwrap().lines, [1, 3]);
+        assert!(hits(&tab).is_empty());
+
+        tab.set_bookmark(5, "look here".into());
+        settle(&mut tab, &ctx);
+        assert_eq!(tab.result.as_ref().unwrap().lines, [1, 3, 5]);
+        assert_eq!(hits(&tab).iter().map(|(l, _)| *l).collect::<Vec<_>>(), [5]);
+
+        // The box's text changed since: the filter that ran is kept.
+        tab.pattern = "disk".into();
+        tab.toggle_bookmark_at(1);
+        settle(&mut tab, &ctx);
+        assert_eq!(tab.result.as_ref().unwrap().lines, [3, 5]);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A search chip's click removes its query: the others are searched
+    /// again; removing the last one clears the search.
+    #[test]
+    fn removing_a_search_chip_drops_its_query() {
+        use nerka_core::input::dlt::writer::Msg;
+        let dir = std::env::temp_dir().join(format!("nerka-gui-chip-remove-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let dlt = dir.join("t.dlt");
+        let mut buf = Vec::new();
+        for apid in ["NAV", "DIAG", "NAV", "COM"] {
+            Msg::log(nerka_core::Level::Info, "ECU1", apid, "C", vec![]).encode(&mut buf);
+        }
+        std::fs::write(&dlt, buf).unwrap();
+        let mut lib = Library::new();
+        let pack = "pack p\nquery nav\n    apid == NAV\nquery diag\n    apid == DIAG\n";
+        lib.add(pack::parse_pack("p.nerka-pack", pack).unwrap()).unwrap();
+        let ctx = egui::Context::default();
+        let mut tab = Tab::open(&ctx, dlt, &SearchPrefs::default());
+        settle(&mut tab, &ctx);
+        tab.search_for(&ctx, &lib, &Target::Library("p.nav".into()), false);
+        tab.search_for(&ctx, &lib, &Target::Library("p.diag".into()), true);
+        settle(&mut tab, &ctx);
+        assert_eq!(hits(&tab).iter().map(|(l, _)| *l).collect::<Vec<_>>(), [0, 1, 2]);
+
+        tab.remove_search_term(&ctx, 0);
+        settle(&mut tab, &ctx);
+        assert_eq!(tab.search.terms.iter().map(|t| t.name.as_str()).collect::<Vec<_>>(), ["diag"]);
+        assert_eq!(tab.search.pattern, SearchBox::text_of(&tab.search.terms));
+        assert_eq!(hits(&tab).iter().map(|(l, _)| *l).collect::<Vec<_>>(), [1]);
+
+        tab.remove_search_term(&ctx, 0);
+        assert!(tab.search.active.is_none() && tab.search.pattern.is_empty());
         std::fs::remove_dir_all(&dir).ok();
     }
 

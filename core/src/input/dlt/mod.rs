@@ -22,7 +22,7 @@ mod format;
 mod payload;
 pub mod writer;
 
-use super::{Bytes, ColumnDef};
+use super::{Bytes, ColumnDef, new_data_id};
 use crate::event::{FieldDef, FieldId, FieldKind, FieldValue, Level};
 use crate::{LineNo, LogSource, Progress, Result};
 use fibex::{Fibex, Frame};
@@ -146,6 +146,7 @@ pub struct DltFile {
     skipped: u64,
     /// Descriptions of non-verbose messages, if FIBEX files were given.
     fibex: Option<Arc<Fibex>>,
+    data_id: usize,
 }
 
 impl DltFile {
@@ -154,7 +155,15 @@ impl DltFile {
         let data = Bytes::map(path)?;
         let (offsets, skipped) = build_index(data.bytes(), progress)?;
         let name = path.display().to_string();
-        Ok(Self { name, path: Some(path.to_path_buf()), data, index: Index::Stored(offsets), skipped, fibex: None })
+        Ok(Self {
+            name,
+            path: Some(path.to_path_buf()),
+            data,
+            index: Index::Stored(offsets),
+            skipped,
+            fibex: None,
+            data_id: new_data_id(),
+        })
     }
 
     /// In-memory source, handy for tests.
@@ -167,6 +176,7 @@ impl DltFile {
             index: Index::Stored(offsets),
             skipped,
             fibex: None,
+            data_id: new_data_id(),
         }
     }
 
@@ -184,7 +194,15 @@ impl DltFile {
         channel_ecus: Vec<[u8; 4]>,
         skipped: u64,
     ) -> Self {
-        Self { name, path, data, index: Index::Framed { msgs, side, channel_ecus }, skipped, fibex: None }
+        Self {
+            name,
+            path,
+            data,
+            index: Index::Framed { msgs, side, channel_ecus },
+            skipped,
+            fibex: None,
+            data_id: new_data_id(),
+        }
     }
 
     /// Decode non-verbose messages with `fibex`: their payload as text, and
@@ -353,6 +371,10 @@ fn render_header(m: &Message<'_>, frame: Option<&Frame>, out: &mut Vec<u8>) {
 }
 
 impl LogSource for DltFile {
+    fn data_id(&self) -> usize {
+        self.data_id
+    }
+
     fn name(&self) -> &str {
         &self.name
     }
