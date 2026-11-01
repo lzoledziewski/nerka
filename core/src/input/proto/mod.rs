@@ -55,9 +55,9 @@ pub trait Protocol: Send + Sync {
     /// The fields [`Self::field`] answers, by index.
     fn schema(&self) -> &'static [FieldDef];
 
-    /// The messages in one datagram (several back to back are fine): calls
-    /// `found(offset)` for each and returns the bytes that weren't one.
-    fn split(&self, datagram: &[u8], found: &mut dyn FnMut(usize)) -> usize;
+    /// The messages in one datagram (several back to back are fine): adds
+    /// the offset of each to `found` and returns the bytes that weren't one.
+    fn split(&self, datagram: &[u8], found: &mut Vec<usize>) -> usize;
 
     /// Whether a message says where it ends (a length in its header). If
     /// not (syslog), a capture keeps a copy of each message behind its

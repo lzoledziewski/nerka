@@ -196,10 +196,10 @@ impl Protocol for SomeIp {
         SCHEMA
     }
 
-    fn split(&self, datagram: &[u8], found: &mut dyn FnMut(usize)) -> usize {
+    fn split(&self, datagram: &[u8], found: &mut Vec<usize>) -> usize {
         let mut pos = 0;
         while let Some(h) = Header::parse(&datagram[pos..]) {
-            found(pos);
+            found.push(pos);
             pos += h.bytes.len();
         }
         datagram.len() - pos

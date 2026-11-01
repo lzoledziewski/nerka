@@ -126,14 +126,14 @@ impl Protocol for Dlt {
 
     /// Several messages back to back; a storage header in front of one is
     /// skipped (the capture's time wins).
-    fn split(&self, bytes: &[u8], found: &mut dyn FnMut(usize)) -> usize {
+    fn split(&self, bytes: &[u8], found: &mut Vec<usize>) -> usize {
         let mut pos = 0;
         while pos < bytes.len() {
             if bytes[pos..].starts_with(MAGIC) && bytes.len() - pos > STORAGE_LEN {
                 pos += STORAGE_LEN;
             }
             let Some(len) = message_len(&bytes[pos..]) else { break };
-            found(pos);
+            found.push(pos);
             pos += len;
         }
         bytes.len() - pos

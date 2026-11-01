@@ -139,10 +139,12 @@ fn read(
         net: Net::default(),
         c: Collector {
             base: bytes,
+            delimited: protocols().iter().map(|p| p.delimited()).collect(),
             protos: protocols(),
             msgs: Vec::new(),
             side: Vec::new(),
             stats: CaptureStats::default(),
+            found: Vec::new(),
         },
         options,
         channel_ecus: Vec::new(),
@@ -256,22 +258,42 @@ struct Collector<'a> {
     msgs: Vec<Framed>,
     side: Vec<u8>,
     stats: CaptureStats,
+    /// Per protocol, whether its messages say where they end.
+    delimited: Vec<bool>,
+    /// Where `split` found the messages of the datagram at hand: one list
+    /// for all datagrams (an MF4 log has one per message).
+    found: Vec<usize>,
 }
 
 impl Collector<'_> {
     /// Index the messages of one datagram of protocol `proto`. Returns
     /// false if an offset doesn't fit the index.
     fn datagram(&mut self, payload: &Payload<'_>, proto: ProtoId, channel: usize, secs: u32, usecs: i32) -> bool {
+        let mut found = std::mem::take(&mut self.found);
+        found.clear();
+        let ok = self.index(payload, proto, channel, secs, usecs, &mut found);
+        self.found = found;
+        ok
+    }
+
+    fn index(
+        &mut self,
+        payload: &Payload<'_>,
+        proto: ProtoId,
+        channel: usize,
+        secs: u32,
+        usecs: i32,
+        found: &mut Vec<usize>,
+    ) -> bool {
         self.stats.datagrams += 1;
         let bytes = payload.bytes();
-        let mut found = Vec::new();
-        let skipped = self.protos[proto].split(bytes, &mut |at| found.push(at));
+        let skipped = self.protos[proto].split(bytes, found);
         self.stats.msg_skipped += skipped as u64;
         if found.is_empty() {
             return true;
         }
         let channel = channel.min(MAX_CHANNELS - 1);
-        if !self.protos[proto].delimited() {
+        if !self.delimited[proto] {
             // Each message behind its length, in the side buffer.
             let ends: Vec<usize> = found.iter().skip(1).copied().chain([bytes.len() - skipped]).collect();
             for (&at, end) in found.iter().zip(ends) {
@@ -302,7 +324,7 @@ impl Collector<'_> {
                 (true, at)
             }
         };
-        for at in found {
+        for &at in found.iter() {
             let Some(f) = Framed::new((base + at) as u64, in_side, proto, channel, secs, usecs) else { return false };
             self.msgs.push(f);
             self.stats.messages += 1;

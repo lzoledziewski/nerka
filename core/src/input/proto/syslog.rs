@@ -211,9 +211,9 @@ impl Protocol for Syslog {
     }
 
     /// One message per datagram.
-    fn split(&self, datagram: &[u8], found: &mut dyn FnMut(usize)) -> usize {
+    fn split(&self, datagram: &[u8], found: &mut Vec<usize>) -> usize {
         if parse(datagram).is_some() {
-            found(0);
+            found.push(0);
             0
         } else {
             datagram.len()

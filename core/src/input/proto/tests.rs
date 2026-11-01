@@ -8,7 +8,7 @@ const AT: Origin<'static> = Origin { secs: 0, usecs: 0, channel: NO_CHANNEL };
 
 fn split(p: &dyn Protocol, datagram: &[u8]) -> (Vec<usize>, usize) {
     let mut found = Vec::new();
-    let skipped = p.split(datagram, &mut |at| found.push(at));
+    let skipped = p.split(datagram, &mut found);
     (found, skipped)
 }
 
