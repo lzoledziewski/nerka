@@ -8,6 +8,7 @@ pub mod capture;
 pub mod concat;
 pub mod dlt;
 pub mod proto;
+pub mod records;
 
 use crate::event::{FieldDef, FieldId, FieldValue, Level};
 use crate::{LineNo, Progress, Result};
@@ -24,6 +25,8 @@ pub struct OpenOptions {
     pub capture: capture::CaptureOptions,
     /// Descriptions of DLT non-verbose messages (FIBEX).
     pub fibex: Option<std::sync::Arc<dlt::fibex::Fibex>>,
+    /// How a text file is split into rows: lines, or multi-line records.
+    pub records: records::RecordSplit,
 }
 
 /// Open `path` with the reader its content calls for (default
@@ -44,6 +47,8 @@ pub fn open_with(path: impl AsRef<Path>, options: &OpenOptions, progress: &Progr
         Box::new(dlt::DltFile::open(path, progress)?.with_fibex(options.fibex.clone()))
     } else if capture::is_capture(head) {
         Box::new(capture::open(path, &options.capture, progress)?.0.with_fibex(options.fibex.clone()))
+    } else if options.records != records::RecordSplit::Lines {
+        Box::new(records::RecordFile::open(path, options.records.clone(), progress)?)
     } else {
         Box::new(text::TextFile::open(path, progress)?)
     })
@@ -212,6 +217,13 @@ pub trait LogSource: Send + Sync {
         None
     }
 
+    /// The line that holds an anchor made in another view of the file (a
+    /// record holding a line anchored when the file was read as lines),
+    /// if the content there still matches.
+    fn line_holding(&self, _anchor: &Anchor) -> Option<LineNo> {
+        None
+    }
+
     /// The lines that start at these byte offsets of the file (an
     /// [`Anchor::offset`]), in one pass; `None` where no line starts there.
     fn lines_at(&self, offsets: &[u64]) -> Vec<Option<LineNo>> {
@@ -249,6 +261,15 @@ impl Anchor {
             .iter()
             .fold(0x811c_9dc5u32, |h, &b| (h ^ u32::from(b)).wrapping_mul(0x0100_0193));
         Anchor { offset, hash }
+    }
+
+    /// The anchor of text at `offset` whose bytes from there are `bytes`:
+    /// the hash covers its first line only (without its line break), so a
+    /// line and a record starting there have the same anchor.
+    pub fn of_text(offset: Option<u64>, bytes: &[u8]) -> Anchor {
+        let head = &bytes[..bytes.len().min(ANCHOR_BYTES)];
+        let line = head.split(|&b| b == b'\n').next().unwrap_or_default();
+        Anchor::of(offset, line.strip_suffix(b"\r").unwrap_or(line))
     }
 }
 

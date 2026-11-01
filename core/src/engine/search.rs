@@ -296,8 +296,11 @@ fn scan_buffer(
                 let content = source.line_bytes(line).unwrap_or_default();
                 let content_end = source.line_start(line) as usize + content.len();
                 // `a\s+b` or `\n` can reach into the terminator or next line;
-                // such a hit only counts if the line matches on its own.
-                let need_verify = always_verify || m.end() > content_end;
+                // such a hit only counts if the line matches on its own. So
+                // does one that starts before its line: between records
+                // (a separator, blank lines), not in one.
+                let need_verify =
+                    always_verify || m.end() > content_end || (m.start() as u64) < source.line_start(line);
                 let ok = !need_verify || verify(&mut Event::with_raw(source, line, &content));
                 if ok {
                     out.push(line);

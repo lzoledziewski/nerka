@@ -82,8 +82,9 @@ impl LogSource for TextFile {
     }
 
     fn anchor(&self, line: LineNo) -> Option<super::Anchor> {
-        let bytes = self.line_bytes(line)?;
-        Some(super::Anchor::of(Some(self.line_start(line)), &bytes))
+        let start = self.line_start(line);
+        self.line_bytes(line)?;
+        Some(super::Anchor::of_text(Some(start), self.data.bytes().get(start as usize..)?))
     }
 
     fn lines_at(&self, offsets: &[u64]) -> Vec<Option<LineNo>> {

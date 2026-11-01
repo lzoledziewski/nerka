@@ -41,6 +41,7 @@ mod plots;
 mod prefs;
 mod presets;
 mod recall;
+mod records;
 mod shot;
 mod signals;
 mod view;
@@ -581,6 +582,10 @@ struct Tab {
     arg_picks: Vec<nerka_core::Argument>,
     /// The Files window: the tab's files as they are being edited.
     files_edit: Option<Vec<PathBuf>>,
+    /// How the tab's text files are split into rows (remembered per file).
+    records: nerka_core::input::records::RecordSplit,
+    /// The Records window, while it is open.
+    records_edit: Option<records::Edit>,
     /// The files are being read in a new order or set.
     files_undo: Option<FilesUndo>,
     status: String,
@@ -936,6 +941,9 @@ impl Tab {
         let ps = paths.clone();
         let mut options = prefs.open_options();
         options.fibex = fibex;
+        // As the first file was read last time: lines or records.
+        let split = records::remembered(&paths[0]);
+        options.records = split.clone();
         Self {
             path: paths[0].clone(),
             paths,
@@ -986,6 +994,8 @@ impl Tab {
             reopen_at: None,
             arg_picks: Vec::new(),
             files_edit: None,
+            records: split,
+            records_edit: None,
             files_undo: None,
             status: String::new(),
         }
@@ -1109,6 +1119,7 @@ impl Tab {
         let ps = self.paths.clone();
         let mut options = prefs.open_options();
         options.fibex = fibex;
+        options.records = self.records.clone();
         self.file = None;
         self.result = None;
         self.reopen_at = Some(line);
@@ -1146,6 +1157,7 @@ impl Tab {
         self.files_undo = Some(FilesUndo { old, at });
         let mut options = prefs.open_options();
         options.fibex = fibex;
+        options.records = self.records.clone();
         self.loading = Some(Job::spawn(ctx, move |prog| nerka_core::open_many(&ps, &options, prog)));
     }
 
@@ -3302,7 +3314,7 @@ impl App {
 
     fn tab_bar(&mut self, ui: &mut egui::Ui) {
         let (mut select, mut close, mut close_others, mut moved, mut split) = (None, None, None, None, None);
-        let mut files = None;
+        let (mut files, mut records_edit) = (None, None);
         egui::ScrollArea::horizontal().show(ui, |ui| {
             ui.horizontal(|ui| {
                 for (i, t) in self.tabs.iter().enumerate() {
@@ -3338,6 +3350,14 @@ impl App {
                         {
                             files = Some(i);
                         }
+                        let text = t.file.as_ref().is_some_and(|f| f.columns().is_empty());
+                        if ui
+                            .add_enabled(text, egui::Button::new("Records…"))
+                            .on_hover_text("One row per line, or multi-line records (text files)")
+                            .clicked()
+                        {
+                            records_edit = Some(i);
+                        }
                     });
                     if close_button(ui).on_hover_text("Close (Ctrl+W)").clicked() {
                         close = Some(i);
@@ -3353,6 +3373,11 @@ impl App {
             self.active = i;
             let t = &mut self.tabs[i];
             t.files_edit = Some(t.paths.clone());
+        }
+        if let Some(i) = records_edit {
+            self.active = i;
+            let t = &mut self.tabs[i];
+            t.records_edit = Some(records::Edit::of(&t.records));
         }
         if let Some(i) = close {
             self.close(i);
@@ -3451,6 +3476,29 @@ impl App {
         }
         if apply || cancel || !open {
             t.files_edit = None;
+        }
+    }
+
+    /// The active tab's Records window: Apply reads its files again, split
+    /// as chosen, and remembers it for each file.
+    fn records_window(&mut self, ctx: &egui::Context) {
+        let (prefs, fibex) = (&self.prefs, self.fibex.clone());
+        let Some(t) = self.tabs.get_mut(self.active) else { return };
+        let title = t.title();
+        let Some(edit) = &mut t.records_edit else { return };
+        match records::window(ctx, &title, edit) {
+            records::Outcome::Open => {}
+            records::Outcome::Close => t.records_edit = None,
+            records::Outcome::Apply(split) => {
+                t.records_edit = None;
+                for p in &t.paths {
+                    if let Err(e) = records::remember(p, &split) {
+                        t.status = format!("Could not remember how {} is read: {e}", p.display());
+                    }
+                }
+                t.records = split;
+                t.reopen(ctx, prefs, fibex);
+            }
         }
     }
 
@@ -3568,6 +3616,7 @@ impl App {
         self.update_title(&ctx);
         self.goto_dialog(&ctx);
         self.files_window(&ctx);
+        self.records_window(&ctx);
         self.about_dialog(&ctx);
         self.settings_window(&ctx);
         if let Some(t) = self.tabs.get_mut(self.active)

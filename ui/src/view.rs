@@ -815,6 +815,12 @@ pub fn log_view(
         let bytes = source.line_bytes(line).unwrap_or_default();
         let cut = bytes.len() > MAX_DISPLAY_BYTES;
         let shown = String::from_utf8_lossy(&bytes[..bytes.len().min(MAX_DISPLAY_BYTES)]);
+        // A record's own line breaks, one character each as in the text
+        // (selections keep their columns; copying keeps the breaks).
+        let shown = match shown.contains(['\n', '\r']) {
+            true => std::borrow::Cow::Owned(shown.replace('\n', "⏎").replace('\r', " ")),
+            false => shown,
+        };
         if let Some((s, e)) = selection
             && (s.row..=e.row).contains(&row)
         {

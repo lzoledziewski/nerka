@@ -102,6 +102,12 @@ impl Bookmarks {
         Ok(())
     }
 
+    /// The sidecar's text, each bookmark (but the unsure ones) anchored on
+    /// its line of `source`.
+    pub fn serialize_anchored(&self, source: &dyn LogSource) -> String {
+        self.anchored(source).serialize()
+    }
+
     /// The same bookmarks, each (but the unsure ones) anchored on its line
     /// of `source`.
     fn anchored(&self, source: &dyn LogSource) -> Self {
@@ -134,6 +140,8 @@ impl Bookmarks {
                 continue;
             };
             let exact = a.offset.and_then(|o| at.get(&o).copied()).filter(|&l| hash(l) == Some(a.hash));
+            // Made in another view of the file (lines, records).
+            let exact = exact.or_else(|| source.line_holding(&a));
             let near = || {
                 let rows = (1..=NEAR_ROWS).flat_map(|d| [row.checked_sub(d), row.checked_add(d)]).flatten();
                 std::iter::once(row).chain(rows).filter(|&l| l < n).find(|&l| hash(l) == Some(a.hash))

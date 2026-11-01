@@ -26,7 +26,11 @@ your logs carry. Everything runs locally, with no backend: a desktop viewer
   reassembly) and MF4 (Ethernet bus events, compressed data too) with
   **DLT**, **SOME/IP** (headers) and **syslog** over UDP, picked by port.
   Messages are shown as a table with resizable columns; a capture with
-  several protocols shares one table (`proto == SOMEIP AND service == 0x1234`). Several files of one kind
+  several protocols shares one table (`proto == SOMEIP AND service == 0x1234`).
+- **Multi-line records:** a text log can be read as records instead of
+  lines (a tab's menu → Records…, remembered per file; CLI `--records`): a
+  line matching a pattern starts one (a timestamp: a stack trace stays with
+  its message), or blank lines or separator lines split them. Several files of one kind
   can be opened as one view, one after another, and reordered.
 - **Filter and Search:** the Filter decides which lines the main view shows;
   the Search finds lines among those, lists the hits in a bottom pane and
