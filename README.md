@@ -22,9 +22,11 @@ your logs carry. Everything runs locally, with no backend: a desktop viewer
   1 GiB log indexes in ~0.1 s and a typical filter runs in ~30 ms (release
   build, Windows).
 - **Formats, detected by content:** plain text (UTF-8); DLT files with
-  storage headers; DLT over UDP inside pcap / pcapng (VLAN, IPv4 / IPv6
-  fragment reassembly) and MF4 (Ethernet bus events, compressed data too).
-  DLT is shown as a table with resizable columns. Several files of one kind
+  storage headers; captures in pcap / pcapng (VLAN, IPv4 / IPv6 fragment
+  reassembly) and MF4 (Ethernet bus events, compressed data too) with
+  **DLT**, **SOME/IP** (headers) and **syslog** over UDP, picked by port.
+  Messages are shown as a table with resizable columns; a capture with
+  several protocols shares one table (`proto == SOMEIP AND service == 0x1234`). Several files of one kind
   can be opened as one view, one after another, and reordered.
 - **Filter and Search:** the Filter decides which lines the main view shows;
   the Search finds lines among those, lists the hits in a bottom pane and
@@ -103,6 +105,7 @@ nerka filter 'level >= ERROR AND raw ~ /SSL|CERT/' app.log
 nerka search -i 'timeout|refused' app.log
 nerka search --in 'level >= WARN' -c timeout app.log     # search inside a filter
 nerka filter 'apid == NAV AND level >= WARN' trace.dlt
+nerka --someip-port 30501 filter 'proto == SOMEIP AND type == ERROR' trace.pcap   # SOME/IP, syslog in captures, by UDP port
 nerka lines app.log 100 120
 nerka --pack packs/ expand -l ota -p cam=CAM1            # pack picks -> NFD
 nerka --signal 'gear:enum=/gear=(?<gear>\w+)/' filter '@gear == D' app.log   # signals
@@ -121,7 +124,7 @@ nerka --signal 'up1=ecu == ECU1 AND tmsp ~ /(?<up1>\d+)/' filter '@up1.changed A
 | Regex | `field ~ /re/`, `field !~ /re/`, `/re/i` ignores case |
 | Text | bare `/re/` and `"text"` match the whole line (`raw`) |
 | Logic | `AND OR NOT`, parentheses |
-| Fields | `raw`, `level`; DLT adds `ecu apid ctid type mcnt tmsp seid mid mode payload`; several files add `file` |
+| Fields | `raw`, `level`; DLT adds `ecu apid ctid type mcnt tmsp seid mid mode payload`, SOME/IP `service method client session iface type rc len payload`, syslog `facility host app pid msgid stamp payload`, captures `proto`; several files add `file` |
 | Bookmarks | `bookmark` alone: a bookmarked line (`level >= ERROR OR bookmark` keeps your marked lines); `bookmark == B2` its name; `bookmark ~ /fan/` its name or note |
 | Signals | `@name`: a value captured by a named regex group — of a picked query (include or the `~` signal role), or a signal you define (📈 Signals panel, `--signal`; saved). `@gear == D` is the state (held until the next event), `@gear.event == D` a line that carries it, `@gear.changed` a change. Kinds `num`, `enum`, `time`; DLT has `@time` (receive time): `@time >= "2025-10-18 10:00:00"` |
 

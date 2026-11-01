@@ -101,6 +101,8 @@ Constraints: the grammar comment in `dsl/mod.rs` and parser tests with error pos
 
 ## Plugin surface
 
+**Built so far (2026-11-01):** the decoder side as `input::proto::Protocol` (DLT, SOME/IP headers, syslog), routed by UDP port, with one source type for every container (`input::proto::Records`); see `status.md` → Next steps. Containers are still functions of `input::capture` (pcap, pcapng, MF4) and the `.dlt` reader, not a trait yet.
+
 The traits `Container`, `Decoder`, `SignalDbLoader` and `Extractor`. They exchange **batches** (of frames, events or samples), never single items, so a future WASM or C-ABI boundary stays cheap. Planned crates:
 
 | Crate | Contents |

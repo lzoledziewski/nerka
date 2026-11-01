@@ -2558,7 +2558,8 @@ struct App {
     show_library: bool,
     library_view: LibraryView,
     /// The ⚙ menu's ports field while it is edited.
-    ports_text: Option<String>,
+    /// The Settings window's UDP port fields as typed: DLT, SOME/IP, syslog.
+    ports_text: Option<[String; 3]>,
     /// The unpack cache's limit as typed, while Settings is open.
     limit_text: Option<String>,
     /// This window's name (title, Alt+Tab).
@@ -2590,8 +2591,8 @@ struct App {
 /// What the Settings window changed.
 #[derive(Default)]
 struct SettingsChange {
-    /// The DLT ports, changed to a valid list.
-    ports: Option<Vec<u16>>,
+    /// The UDP ports of DLT, SOME/IP and syslog, each changed to a valid list.
+    ports: [Option<Vec<u16>>; 3],
     /// The unpack cache's limit, changed to a valid number of GiB.
     limit_gib: Option<u64>,
     /// Empty the unpack cache.
@@ -2600,12 +2601,12 @@ struct SettingsChange {
     times: bool,
 }
 
-/// What the Settings window shows: this window's name, the DLT ports
-/// (`ports` as typed), the unpack cache (`limit` as typed, in GiB) and the
+/// What the Settings window shows: this window's name, the UDP ports of
+/// each protocol in captures (`ports` as typed: DLT, SOME/IP, syslog), the unpack cache (`limit` as typed, in GiB) and the
 /// time settings.
 struct SettingsFields<'a> {
     name: &'a mut String,
-    ports: &'a mut String,
+    ports: &'a mut [String; 3],
     limit: &'a mut String,
     local_time: &'a mut bool,
     mf4_local_time: &'a mut bool,
@@ -2641,26 +2642,33 @@ fn settings_ui(ui: &mut egui::Ui, f: SettingsFields<'_>) -> SettingsChange {
         ui.add(egui::TextEdit::singleline(name).hint_text("e.g. OTA crash").desired_width(200.0))
             .on_hover_text("Shown first in the title, so Alt+Tab tells windows apart");
         ui.end_row();
-        ui.label(RichText::new("DLT in captures").strong());
-        ui.end_row();
-        ui.label("UDP ports");
-        let r = ui.add(egui::TextEdit::singleline(ports).desired_width(200.0)).on_hover_text(
-            "Destination ports whose UDP payloads are DLT (pcap, pcapng, MF4), separated by spaces. Default: 3490",
+        ui.label(RichText::new("Captures: UDP ports").strong()).on_hover_text(
+            "Destination ports whose UDP payloads are read as each protocol (pcap, pcapng, MF4), separated by \
+             spaces. A port listed for two protocols goes to the first. Used for captures opened from now on.",
         );
         ui.end_row();
-        ui.label("");
-        match prefs::parse_ports(ports) {
-            Some(p) => {
-                if r.changed() {
-                    save.ports = Some(p);
+        let rows = [
+            ("DLT", "Default: 3490"),
+            ("SOME/IP", "Default: 30490 (service discovery); add your services' ports"),
+            ("syslog", "Default: 514"),
+        ];
+        for (k, (name, tip)) in rows.into_iter().enumerate() {
+            ui.label(name);
+            ui.horizontal(|ui| {
+                let r = ui.add(egui::TextEdit::singleline(&mut ports[k]).desired_width(200.0)).on_hover_text(tip);
+                match prefs::parse_ports(&ports[k]) {
+                    Some(p) => {
+                        if r.changed() {
+                            save.ports[k] = Some(p);
+                        }
+                    }
+                    None => {
+                        ui.colored_label(ui.visuals().error_fg_color, "Port numbers 1–65535, separated by spaces");
+                    }
                 }
-                ui.weak("Used for captures opened from now on");
-            }
-            None => {
-                ui.colored_label(ui.visuals().error_fg_color, "Port numbers 1–65535, separated by spaces");
-            }
+            });
+            ui.end_row();
         }
-        ui.end_row();
         ui.label(RichText::new("Compressed MF4").strong()).on_hover_text(
             "Compressed data is unpacked once into the unpack cache and read from there, as fast as an \
              uncompressed file. Opening the file again uses it.",
@@ -2921,7 +2929,10 @@ impl App {
             .resizable(false)
             .collapsible(false)
             .show(ctx, |ui| {
-                let ports = self.ports_text.get_or_insert_with(|| prefs::ports_text(&self.prefs.dlt_ports));
+                let p = &self.prefs;
+                let ports = self.ports_text.get_or_insert_with(|| {
+                    [&p.dlt_ports, &p.someip_ports, &p.syslog_ports].map(|v| prefs::ports_text(v))
+                });
                 let limit = self.limit_text.get_or_insert_with(|| self.prefs.unpack_limit_gib.to_string());
                 save = settings_ui(
                     ui,
@@ -2949,11 +2960,14 @@ impl App {
             };
         }
         let mut changed = false;
-        if let Some(ports) = save.ports
-            && ports != self.prefs.dlt_ports
-        {
-            self.prefs.dlt_ports = ports;
-            changed = true;
+        let p = &mut self.prefs;
+        for (new, ports) in save.ports.into_iter().zip([&mut p.dlt_ports, &mut p.someip_ports, &mut p.syslog_ports]) {
+            if let Some(new) = new
+                && new != *ports
+            {
+                *ports = new;
+                changed = true;
+            }
         }
         if let Some(n) = save.limit_gib
             && n != self.prefs.unpack_limit_gib
@@ -2985,6 +2999,8 @@ impl App {
         // the times stay.
         let prefs = SearchPrefs {
             dlt_ports: self.prefs.dlt_ports.clone(),
+            someip_ports: self.prefs.someip_ports.clone(),
+            syslog_ports: self.prefs.syslog_ports.clone(),
             unpack_limit_gib: self.prefs.unpack_limit_gib,
             local_time: self.prefs.local_time,
             mf4_local_time: self.prefs.mf4_local_time,
@@ -4675,11 +4691,12 @@ gear=D
     #[test]
     fn the_settings_window_takes_typing() {
         let ctx = egui::Context::default();
-        let (mut name, mut ports) = (String::new(), "3490".to_owned());
+        let mut name = String::new();
+        let mut ports = ["3490", "30490", "514"].map(str::to_owned);
         let mut saved = None;
         let mut rects = Vec::new();
         let mut frame =
-            |events: Vec<egui::Event>, name: &mut String, ports: &mut String, rects: &mut Vec<egui::Rect>| {
+            |events: Vec<egui::Event>, name: &mut String, ports: &mut [String; 3], rects: &mut Vec<egui::Rect>| {
                 let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0));
                 let input = egui::RawInput { screen_rect: Some(screen), events, ..Default::default() };
                 let mut out = ctx.run_ui(input, |ui| {
@@ -4691,7 +4708,9 @@ gear=D
                             local_time: &mut true,
                             mf4_local_time: &mut true,
                         };
-                        if let Some(p) = settings_ui(ui, fields).ports {
+                        let [dlt, someip, syslog] = settings_ui(ui, fields).ports;
+                        assert!(someip.is_none() && syslog.is_none(), "only the DLT ports were typed in");
+                        if let Some(p) = dlt {
                             saved = Some(p);
                         }
                     });
@@ -4736,7 +4755,7 @@ gear=D
         assert_eq!(name, "OTA crash");
         frame(click(ports_at), &mut name, &mut ports, &mut rects);
         frame(vec![egui::Event::Text(" 3489".into())], &mut name, &mut ports, &mut rects);
-        assert_eq!(ports, "3490 3489");
+        assert_eq!(ports[0], "3490 3489");
         assert_eq!(saved, Some(vec![3490, 3489]));
     }
 

@@ -229,7 +229,7 @@ fn ethernet_frames_in_vlsd_groups() {
                 let got = lines(&f);
                 assert_eq!(got.iter().map(|(a, _)| a.as_str()).collect::<Vec<_>>(), ["NAV", "VLAN", "BIG"], "{what}");
                 assert_eq!(got[2].1, "b".repeat(600), "{what}");
-                assert_eq!((s.net.reassembled, s.dlt_messages), (1, 3), "{what}");
+                assert_eq!((s.net.reassembled, s.messages), (1, 3), "{what}");
                 // Start time plus the master channel through its conversion.
                 assert!(
                     f.line_text(1).unwrap().starts_with("2023-11-14 22:13:20.002500\t"),
@@ -293,7 +293,7 @@ fn dlt_frames_with_signal_data_in(packed: bool) {
     w.link(hd, 0, dg);
     let (f, s) = from_bytes("t.mf4", w.0, &CaptureOptions::default()).unwrap();
     assert_eq!(lines(&f), pairs(&[("ONE", "first"), ("TWO", "second"), ("THR", "third"), ("NOE", "no ecu id")]));
-    assert_eq!(s.dlt_messages, 4);
+    assert_eq!(s.messages, 4);
     // Own ECU id (WEID) first; without one, the frame's.
     let ecus: Vec<String> = (0..4).map(|l| f.line_text(l).unwrap().split('\t').nth(2).unwrap().to_owned()).collect();
     assert_eq!(ecus, ["ECU1", "ECU1", "ECU1", "ECUC"]);

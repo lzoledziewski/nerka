@@ -3,12 +3,13 @@
 //! The layers of `doc/sources-and-signals.md`: a **container** turns the file
 //! into frames ([`pcap`], [`mf4`]), the **transport** turns frames into UDP
 //! payloads ([`net`]: VLAN, IPv4 / IPv6 with reassembly), a **router**
-//! picks the payloads that carry DLT (UDP destination ports,
-//! [`CaptureOptions`]), and the DLT **decoder** indexes every message where
-//! it is: in the mapped file, or, for bytes that aren't contiguous there
+//! picks each payload's protocol by its UDP destination port
+//! ([`CaptureOptions`]: DLT, SOME/IP, syslog), and the protocol
+//! ([`super::proto::Protocol`]) splits it into messages, indexed where they
+//! are: in the mapped file, or, for bytes that aren't contiguous there
 //! (reassembled datagrams, MF4 records spanning data blocks), in a side
-//! buffer ([`DltFile`] with [`Framed`] entries). Nothing is copied to a
-//! temporary `.dlt`; only compressed MF4 data is unpacked first, into a
+//! buffer ([`Records`] with [`Framed`] entries). Nothing is copied to a
+//! temporary file; only compressed MF4 data is unpacked first, into a
 //! cache file that is mapped the same way ([`unpack`]).
 //!
 //! A message gets the capture time of the frame that completed its
@@ -21,11 +22,13 @@ pub mod pcap;
 pub mod unpack;
 
 use super::Bytes;
-use super::dlt::{DltFile, Framed, MAX_CHANNELS};
+use super::dlt::Dlt;
+use super::proto::{Framed, MAX_CHANNELS, ProtoId, Protocol, Records, someip::SomeIp, syslog::Syslog};
 use crate::{Error, Progress, Result};
 use net::{Net, NetStats, Payload};
 use std::borrow::Cow;
 use std::path::Path;
+use std::sync::Arc;
 pub use unpack::{UnpackOptions, cache_usage, clear_cache};
 
 /// UDP destination ports that carry DLT by default: 3490, the port the
@@ -33,11 +36,32 @@ pub use unpack::{UnpackOptions, cache_usage, clear_cache};
 /// ([`CaptureOptions::dlt_udp_ports`]).
 pub const DEFAULT_DLT_PORTS: [u16; 1] = [3490];
 
-/// How DLT is found in a capture.
+/// UDP destination ports that carry SOME/IP by default: 30490, SOME/IP
+/// service discovery's. Services use ports of their own: configure them
+/// ([`CaptureOptions::someip_udp_ports`]).
+pub const DEFAULT_SOMEIP_PORTS: [u16; 1] = [30490];
+
+/// UDP destination ports that carry syslog by default: 514 (RFC 5426).
+pub const DEFAULT_SYSLOG_PORTS: [u16; 1] = [514];
+
+/// The protocols of a capture, by [`ProtoId`]: DLT, SOME/IP, syslog.
+pub const DLT: ProtoId = 0;
+pub const SOMEIP: ProtoId = 1;
+pub const SYSLOG: ProtoId = 2;
+
+fn protocols() -> Vec<Arc<dyn Protocol>> {
+    vec![Arc::new(Dlt::default()), Arc::new(SomeIp), Arc::new(Syslog)]
+}
+
+/// How messages are found in a capture.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CaptureOptions {
     /// UDP destination ports whose payloads are DLT messages.
     pub dlt_udp_ports: Vec<u16>,
+    /// UDP destination ports whose payloads are SOME/IP messages.
+    pub someip_udp_ports: Vec<u16>,
+    /// UDP destination ports whose payloads are syslog messages.
+    pub syslog_udp_ports: Vec<u16>,
     /// Where compressed MF4 data is unpacked.
     pub unpack: UnpackOptions,
     /// An MF4 file whose header says its start time is local time (the
@@ -47,7 +71,13 @@ pub struct CaptureOptions {
 
 impl Default for CaptureOptions {
     fn default() -> Self {
-        Self { dlt_udp_ports: DEFAULT_DLT_PORTS.to_vec(), unpack: UnpackOptions::default(), mf4_local_time: true }
+        Self {
+            dlt_udp_ports: DEFAULT_DLT_PORTS.to_vec(),
+            someip_udp_ports: DEFAULT_SOMEIP_PORTS.to_vec(),
+            syslog_udp_ports: DEFAULT_SYSLOG_PORTS.to_vec(),
+            unpack: UnpackOptions::default(),
+            mf4_local_time: true,
+        }
     }
 }
 
@@ -55,11 +85,12 @@ impl Default for CaptureOptions {
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct CaptureStats {
     pub net: NetStats,
-    /// Datagrams on a DLT port, or MF4 DLT frames.
-    pub dlt_datagrams: u64,
-    pub dlt_messages: u64,
-    /// Bytes of DLT datagrams that weren't whole messages.
-    pub dlt_skipped: u64,
+    /// Datagrams on a port of a protocol, or MF4 DLT frames.
+    pub datagrams: u64,
+    /// Messages in them, of every protocol.
+    pub messages: u64,
+    /// Bytes of those datagrams that weren't whole messages.
+    pub msg_skipped: u64,
     /// Bytes of the file that couldn't be read as records.
     pub file_skipped: u64,
 }
@@ -70,8 +101,8 @@ pub fn is_capture(head: &[u8]) -> bool {
     pcap::is_pcap(head) || pcap::is_pcapng(head) || mf4::is_mf4(head)
 }
 
-/// Open a capture and index the DLT messages in it.
-pub fn open(path: impl AsRef<Path>, options: &CaptureOptions, progress: &Progress) -> Result<(DltFile, CaptureStats)> {
+/// Open a capture and index the messages in it.
+pub fn open(path: impl AsRef<Path>, options: &CaptureOptions, progress: &Progress) -> Result<(Records, CaptureStats)> {
     let path = path.as_ref();
     let data = Bytes::map(path)?;
     read(path.display().to_string(), Some(path.to_path_buf()), data, options, progress)
@@ -82,7 +113,7 @@ pub fn from_bytes(
     name: impl Into<String>,
     bytes: Vec<u8>,
     options: &CaptureOptions,
-) -> Result<(DltFile, CaptureStats)> {
+) -> Result<(Records, CaptureStats)> {
     read(name.into(), None, Bytes::Owned(bytes), options, &Progress::new())
 }
 
@@ -92,7 +123,7 @@ fn read(
     data: Bytes,
     options: &CaptureOptions,
     progress: &Progress,
-) -> Result<(DltFile, CaptureStats)> {
+) -> Result<(Records, CaptureStats)> {
     let file = data.bytes();
     // Compressed MF4 data: unpacked, and the messages point into that.
     let unpacked = if mf4::is_mf4(file) {
@@ -106,7 +137,13 @@ fn read(
     };
     let mut sink = Sink {
         net: Net::default(),
-        c: Collector { base: bytes, msgs: Vec::new(), side: Vec::new(), stats: CaptureStats::default() },
+        c: Collector {
+            base: bytes,
+            protos: protocols(),
+            msgs: Vec::new(),
+            side: Vec::new(),
+            stats: CaptureStats::default(),
+        },
         options,
         channel_ecus: Vec::new(),
         too_far: false,
@@ -125,21 +162,22 @@ fn read(
     }
     sink.net.finish();
     let Sink { net, c, channel_ecus, .. } = sink;
+    let protos = c.protos;
     let mut stats = c.stats;
     stats.net = net.stats;
     stats.file_skipped = file_skipped;
     let (mut msgs, mut side) = (c.msgs, c.side);
     msgs.shrink_to_fit();
     side.shrink_to_fit();
-    let skipped = stats.dlt_skipped;
+    let skipped = stats.msg_skipped;
     let data = match unpacked {
         Some((b, _)) => b,
         None => data,
     };
-    Ok((DltFile::from_frames(name, path, data, msgs, side, channel_ecus, skipped), stats))
+    Ok((Records::framed(name, path, data, msgs, side, channel_ecus, protos, skipped), stats))
 }
 
-/// Where containers deliver frames: transport, router and DLT decoder.
+/// Where containers deliver frames: transport, router and protocols.
 pub(crate) struct Sink<'a, 'o> {
     net: Net,
     c: Collector<'a>,
@@ -150,30 +188,30 @@ pub(crate) struct Sink<'a, 'o> {
 }
 
 impl<'a> Sink<'a, '_> {
-    /// A link-layer frame (pcap): transport, then DLT ports.
+    /// A link-layer frame (pcap): transport, then the router.
     fn link_frame(&mut self, link: u32, data: &'a [u8], secs: u32, usecs: i32, channel: usize) {
-        let (c, ports, too_far) = (&mut self.c, &self.options.dlt_udp_ports, &mut self.too_far);
+        let (c, options, too_far) = (&mut self.c, self.options, &mut self.too_far);
         self.net.frame(link, data, secs, &mut |port, payload| {
-            if ports.contains(&port) {
-                *too_far |= !c.datagram(&payload, channel, secs, usecs);
+            if let Some(proto) = route(options, port) {
+                *too_far |= !c.datagram(&payload, proto, channel, secs, usecs);
             }
         });
     }
 
     /// An Ethernet frame's payload with its EtherType (MF4 `ETH_Frame`).
     fn ether(&mut self, ethertype: u16, data: Cow<'a, [u8]>, secs: u32, usecs: i32, channel: usize) {
-        let (c, ports, too_far) = (&mut self.c, &self.options.dlt_udp_ports, &mut self.too_far);
+        let (c, options, too_far) = (&mut self.c, self.options, &mut self.too_far);
         match data {
             Cow::Borrowed(d) => self.net.ether_frame(ethertype, d, secs, &mut |port, payload| {
-                if ports.contains(&port) {
-                    *too_far |= !c.datagram(&payload, channel, secs, usecs);
+                if let Some(proto) = route(options, port) {
+                    *too_far |= !c.datagram(&payload, proto, channel, secs, usecs);
                 }
             }),
             // Not in the file: whatever comes out of it is copied.
             Cow::Owned(v) => self.net.ether_frame(ethertype, &v, secs, &mut |port, payload| {
-                if ports.contains(&port) {
+                if let Some(proto) = route(options, port) {
                     let p = Payload::Assembled(payload.bytes().to_vec());
-                    *too_far |= !c.datagram(&p, channel, secs, usecs);
+                    *too_far |= !c.datagram(&p, proto, channel, secs, usecs);
                 }
             }),
         }
@@ -185,7 +223,7 @@ impl<'a> Sink<'a, '_> {
             Cow::Borrowed(d) => Payload::InFrame(d),
             Cow::Owned(v) => Payload::Assembled(v),
         };
-        self.too_far |= !self.c.datagram(&p, channel, secs, usecs);
+        self.too_far |= !self.c.datagram(&p, DLT, channel, secs, usecs);
     }
 
     /// The channel whose fallback ECU id is `ecu` (made on first use).
@@ -201,22 +239,52 @@ impl<'a> Sink<'a, '_> {
     }
 }
 
-/// The DLT decoder's side: indexes the messages of each DLT datagram.
+/// The protocol of a UDP payload by its destination port, if one is
+/// configured for it (the first protocol that lists the port).
+fn route(options: &CaptureOptions, port: u16) -> Option<ProtoId> {
+    [(&options.dlt_udp_ports, DLT), (&options.someip_udp_ports, SOMEIP), (&options.syslog_udp_ports, SYSLOG)]
+        .into_iter()
+        .find(|(ports, _)| ports.contains(&port))
+        .map(|(_, p)| p)
+}
+
+/// The protocols' side: indexes the messages of each routed datagram.
 struct Collector<'a> {
     /// The mapped file, to turn payload slices into file offsets.
     base: &'a [u8],
+    protos: Vec<Arc<dyn Protocol>>,
     msgs: Vec<Framed>,
     side: Vec<u8>,
     stats: CaptureStats,
 }
 
 impl Collector<'_> {
-    /// Index the DLT messages of one datagram (several back to back; a
-    /// storage header in front of one is skipped: the capture's time
-    /// wins). Returns false if an offset doesn't fit the index.
-    fn datagram(&mut self, payload: &Payload<'_>, channel: usize, secs: u32, usecs: i32) -> bool {
-        self.stats.dlt_datagrams += 1;
+    /// Index the messages of one datagram of protocol `proto`. Returns
+    /// false if an offset doesn't fit the index.
+    fn datagram(&mut self, payload: &Payload<'_>, proto: ProtoId, channel: usize, secs: u32, usecs: i32) -> bool {
+        self.stats.datagrams += 1;
         let bytes = payload.bytes();
+        let mut found = Vec::new();
+        let skipped = self.protos[proto].split(bytes, &mut |at| found.push(at));
+        self.stats.msg_skipped += skipped as u64;
+        if found.is_empty() {
+            return true;
+        }
+        let channel = channel.min(MAX_CHANNELS - 1);
+        if !self.protos[proto].delimited() {
+            // Each message behind its length, in the side buffer.
+            let ends: Vec<usize> = found.iter().skip(1).copied().chain([bytes.len() - skipped]).collect();
+            for (&at, end) in found.iter().zip(ends) {
+                let Some(f) = Framed::new(self.side.len() as u64, true, proto, channel, secs, usecs) else {
+                    return false;
+                };
+                self.side.extend_from_slice(&((end - at) as u32).to_le_bytes());
+                self.side.extend_from_slice(&bytes[at..end]);
+                self.msgs.push(f);
+                self.stats.messages += 1;
+            }
+            return true;
+        }
         // Where the payload is: in the file, or appended to the side buffer.
         let start = self.base.as_ptr() as usize;
         let in_file = match payload {
@@ -234,19 +302,11 @@ impl Collector<'_> {
                 (true, at)
             }
         };
-        let channel = channel.min(MAX_CHANNELS - 1);
-        let mut pos = 0;
-        while pos < bytes.len() {
-            if bytes[pos..].starts_with(b"DLT\x01") && bytes.len() - pos > 16 {
-                pos += 16;
-            }
-            let Some(len) = super::dlt::message_len(&bytes[pos..]) else { break };
-            let Some(f) = Framed::new((base + pos) as u64, in_side, channel, secs, usecs) else { return false };
+        for at in found {
+            let Some(f) = Framed::new((base + at) as u64, in_side, proto, channel, secs, usecs) else { return false };
             self.msgs.push(f);
-            self.stats.dlt_messages += 1;
-            pos += len;
+            self.stats.messages += 1;
         }
-        self.stats.dlt_skipped += (bytes.len() - pos) as u64;
         true
     }
 }

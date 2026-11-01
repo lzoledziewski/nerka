@@ -19,6 +19,7 @@ cargo run -p nerka-cli -- filter 'level >= ERROR AND raw ~ /SSL/' app.log
 cargo run -p nerka-gui -- app.log --query 'level >= ERROR'
 cargo run -p nerka-cli -- --signal 'v=/v=(?<v>\d+)/' filter '@v > 100' app.log   # signals (@name)
 cargo run -p nerka-cli -- --fibex ecu1.xml filter 'apid == NAV' trace.dlt        # DLT non-verbose via FIBEX
+cargo run -p nerka-cli -- --someip-port 30501 filter 'proto == SOMEIP AND type == ERROR' trace.pcap   # protocols by UDP port
 cargo run -p nerka-cli -- --pack packs/ expand -l ota -p cam=CAM1 --parts   # pack picks -> NFD
 cargo run -p nerka-cli -- --pack packs/ search --in 'level >= WARN' -l ota app.log
 cargo run --release -p nerka-core --example gen_log -- big.log 1024   # 1 GiB test log
@@ -43,6 +44,8 @@ before changing the UI, and update it when the state changes.
 - Line numbers are 0-based `LineNo` (u64) internally; add 1 only for display.
 - Never lose or modify the original line (`raw`); normalized fields are lazy.
 - New input formats implement `input::LogSource`; the engine must not care about formats.
+  A new protocol inside captures implements `input::proto::Protocol` and gets
+  a UDP port list in `CaptureOptions`; DLT is one of them.
 - Long operations take `&Progress` and check `is_cancelled()` per chunk.
 - Search changes: every engine test runs the fast path against the naive
   per-line path (`run_filter` in `engine/search.rs`). Keep that invariant and

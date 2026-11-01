@@ -34,6 +34,14 @@ struct Cli {
     /// MF4; repeatable). Default: 3490.
     #[arg(long = "dlt-port", global = true, value_name = "PORT")]
     dlt_port: Vec<u16>,
+    /// UDP destination port that carries SOME/IP in captures (repeatable).
+    /// Default: 30490 (service discovery); services use ports of their own.
+    #[arg(long = "someip-port", global = true, value_name = "PORT")]
+    someip_port: Vec<u16>,
+    /// UDP destination port that carries syslog in captures (repeatable).
+    /// Default: 514.
+    #[arg(long = "syslog-port", global = true, value_name = "PORT")]
+    syslog_port: Vec<u16>,
     /// Folder compressed MF4 data is unpacked into (default: the per-user
     /// cache folder); unpacked once, reused when the file is opened again.
     #[arg(long = "unpack-dir", global = true, value_name = "DIR")]
@@ -295,7 +303,7 @@ fn run_search_within(
 /// The `--signal` definitions, set once in `main`.
 static SIGNALS: std::sync::OnceLock<Signals> = std::sync::OnceLock::new();
 
-/// How files are opened (`--dlt-port`), set once in `main`.
+/// How files are opened (`--dlt-port`, `--someip-port`, …), set once in `main`.
 static OPEN_OPTIONS: std::sync::OnceLock<nerka_core::OpenOptions> = std::sync::OnceLock::new();
 
 fn open(path: &PathBuf) -> Result<(Box<dyn LogSource>, std::time::Duration)> {
@@ -329,6 +337,12 @@ fn run() -> Result<()> {
     let mut options = nerka_core::OpenOptions::default();
     if !cli.dlt_port.is_empty() {
         options.capture.dlt_udp_ports = cli.dlt_port.clone();
+    }
+    if !cli.someip_port.is_empty() {
+        options.capture.someip_udp_ports = cli.someip_port.clone();
+    }
+    if !cli.syslog_port.is_empty() {
+        options.capture.syslog_udp_ports = cli.syslog_port.clone();
     }
     options.capture.unpack.dir = cli.unpack_dir.clone().or_else(nerka_core::cache_dir);
     options.capture.mf4_local_time = !cli.mf4_utc;

@@ -7,6 +7,7 @@
 pub mod capture;
 pub mod concat;
 pub mod dlt;
+pub mod proto;
 
 use crate::event::{FieldDef, FieldId, FieldValue, Level};
 use crate::{LineNo, Progress, Result};

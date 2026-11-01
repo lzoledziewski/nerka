@@ -35,9 +35,13 @@ fn kind(s: &dyn LogSource) -> (Vec<&'static str>, Vec<(&'static str, FieldKind)>
     (s.columns().iter().map(|c| c.name).collect(), s.schema().iter().map(|f| (f.name, f.kind)).collect())
 }
 
-/// A readable kind for messages: "DLT" for table sources, else "plain text".
+/// A readable kind for messages: plain text, DLT, or another table.
 fn kind_name(s: &dyn LogSource) -> &'static str {
-    if s.columns().is_empty() { "plain text" } else { "DLT" }
+    match s.columns() {
+        [] => "plain text",
+        c if c == super::dlt::COLUMNS => "DLT",
+        _ => "a table of other columns",
+    }
 }
 
 /// The last path component of a source's name.

@@ -116,11 +116,6 @@ impl<'a> Message<'a> {
         self.bytes[at..at + 4].try_into().ok()
     }
 
-    /// Logger time: seconds and microseconds since the Unix epoch.
-    pub fn storage_time(&self) -> (u32, i32) {
-        (self.storage.secs, self.storage.usecs)
-    }
-
     /// ECU id from the standard header, else from the storage header.
     pub fn ecu(&self) -> &'a [u8] {
         trim_id(self.opt_field(HTYP_WEID).unwrap_or(self.storage.ecu))
