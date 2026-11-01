@@ -632,6 +632,25 @@ pub fn log_view(
         }
     });
 
+    // Notes go along with copied lines where the view shows them, as
+    // `// name · note` (the note alone, without the line's other fields):
+    // a line before, or after the text (End of line: two spaces; Column:
+    // one more cell). A partial line gets it only at the end it covers.
+    let note_after = match hl.notes {
+        NoteMode::EndOfLine => Some("  "),
+        NoteMode::Column if note_column => Some("\t"),
+        _ => None,
+    };
+    let with_note = |out: &mut String, text: &str, line: LineNo, from_start: bool, to_end: bool| {
+        let note = hl.bookmarks.and_then(|b| shown_note(b, line)).filter(|_| hl.notes != NoteMode::Off);
+        if let Some(n) = note.as_ref().filter(|_| note_rows.is_some() && from_start) {
+            out.push_str(&format!("// {n}\n"));
+        }
+        out.push_str(text);
+        if let (Some(n), Some(sep), true) = (&note, note_after, to_end) {
+            out.push_str(&format!("{sep}// {n}"));
+        }
+    };
     let mut copied = None;
     if copy && !state.picked.is_empty() {
         // Picked lines, whole, in file order.
@@ -641,7 +660,7 @@ pub fn log_view(
             if k > 0 {
                 out.push('\n');
             }
-            out.push_str(&source.line_text(line).unwrap_or_default());
+            with_note(&mut out, &source.line_text(line).unwrap_or_default(), line, true, true);
         }
         ui.ctx().copy_text(out);
         copied = Some((n as u64, n < state.picked.len()));
@@ -656,7 +675,7 @@ pub fn log_view(
             let s = line_str(row);
             let a = if row == start.row { col_to_byte(cells, &s, start.col) } else { 0 };
             let b = if row == end.row { col_to_byte(cells, &s, end.col) } else { s.len() };
-            out.push_str(&s[a..b.max(a)]);
+            with_note(&mut out, &s[a..b.max(a)], line_of_row(row), a == 0, b >= s.len());
             if row < end.row {
                 out.push('\n');
             }
@@ -1403,6 +1422,58 @@ mod tests {
         }
         step(click(3.0, row_h), &mut off, NoteMode::Off);
         assert_eq!(off.selected, Some(3));
+    }
+
+    /// Copied lines take their bookmark's note as the view shows it, as a
+    /// `// name · note` comment without the line's other fields.
+    #[test]
+    fn copied_lines_take_their_notes() {
+        let file = nerka_core::TextFile::from_bytes("t", b"line 0\nline 1\nline 2\n".to_vec());
+        let mut marks = Bookmarks::default();
+        marks.toggle(1);
+        marks.set_note(1, "look here");
+        let ctx = egui::Context::default();
+        let mut t = 0.0;
+        let mut copy = |notes: NoteMode, picked: &[LineNo]| {
+            let mut state = ViewState::default();
+            let mut copied = Vec::new();
+            // A Ctrl+click gives the view the focus; then the picks, copied.
+            let pos = pos2(200.0, 6.0);
+            let ctrl = egui::Modifiers::COMMAND;
+            let button = |pressed| egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: ctrl,
+            };
+            let click =
+                vec![egui::Event::ModifiersChanged(ctrl), egui::Event::PointerMoved(pos), button(true), button(false)];
+            for events in [vec![], click, vec![egui::Event::Copy]] {
+                if events.first() == Some(&egui::Event::Copy) {
+                    state.picked = picked.iter().copied().collect();
+                }
+                t += 1.0 / 60.0;
+                let screen = Rect::from_min_size(pos2(0.0, 0.0), vec2(600.0, 300.0));
+                let input = egui::RawInput { screen_rect: Some(screen), time: Some(t), events, ..Default::default() };
+                let hl = Highlight { highlighter: None, bookmarks: Some(&marks), search: None, lines: None, notes };
+                let mut out = ctx.run_ui(input, |ui| {
+                    egui::CentralPanel::default().frame(egui::Frame::NONE).show(ui, |ui| {
+                        log_view(ui, "v", &mut state, file.line_count(), &|r| r, &file, &mut Columns::default(), &hl);
+                    });
+                });
+                out.textures_delta.clear();
+                copied.extend(out.platform_output.commands.into_iter().filter_map(|c| match c {
+                    egui::OutputCommand::CopyText(s) => Some(s),
+                    _ => None,
+                }));
+            }
+            copied
+        };
+        assert_eq!(copy(NoteMode::LineBefore, &[0, 1, 2]), ["line 0\n// B1 · look here\nline 1\nline 2"]);
+        assert_eq!(copy(NoteMode::EndOfLine, &[1, 2]), ["line 1  // B1 · look here\nline 2"]);
+        // A plain text log has no columns: its notes go on the line before.
+        assert_eq!(copy(NoteMode::Column, &[1]), ["// B1 · look here\nline 1"]);
+        assert_eq!(copy(NoteMode::Off, &[1]), ["line 1"]);
     }
 
     /// ↑ / ↓ in a focused view move its cursor line, and the view keeps the

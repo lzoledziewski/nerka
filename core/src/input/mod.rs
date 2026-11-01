@@ -48,6 +48,12 @@ pub fn open_with(path: impl AsRef<Path>, options: &OpenOptions, progress: &Progr
     })
 }
 
+/// A [`LogSource::data_id`] no other source has had in this process.
+pub(crate) fn new_data_id() -> usize {
+    static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(1);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
 /// File contents: a read-only mapping, or owned bytes (tests, empty files).
 pub(crate) enum Bytes {
     Mapped(Mmap),
@@ -200,7 +206,9 @@ pub trait LogSource: Send + Sync {
 
     /// Identifies the data the source reads, for caches (signal events): a
     /// part of a [`concat::Concat`] answers its file's, so the part made
-    /// for each scan is the same one.
+    /// for each scan is the same one. Files take a [`new_data_id`] when
+    /// opened (an address could be reused by the next file); the default,
+    /// the address, is for sources that live as long as their caches (tests).
     fn data_id(&self) -> usize {
         self as *const Self as *const () as usize
     }

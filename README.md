@@ -12,7 +12,7 @@ your logs carry. Everything runs locally, with no backend: a desktop viewer
 
 ![nerka on a synthetic DLT drive: warnings filtered from a query pack, speed, temperature and battery voltage plotted with a throttling threshold, a text search (regex, ignoring case) for throttling messages in the bottom pane, and the library and selection panes on the right](doc/img/nerka.png)
 
-> Status: **0.1.0**, the first public release. Windows is the main
+> Status: **0.1.0-alpha.9**, a pre-release before 0.1.0. Windows is the main
 > platform; Linux builds come from CI; macOS isn't built yet. While nerka is
 > at 0.x, file formats, the filter language and the GUI can still change.
 
@@ -47,7 +47,8 @@ your logs carry. Everything runs locally, with no backend: a desktop viewer
   arguments can be picked as signals and plotted, from a searchable tree.
 - **Bookmarks with notes** (`m`, `b` / `B`), stored next to the log as
   `<log>.nerka-marks`. Notes show in the views (on the line before, at the
-  end of the line or as a column), and `bookmark` is a field in queries:
+  end of the line or as a column; copying takes them along as `// note`),
+  and `bookmark` is a field in queries:
   `level >= ERROR OR bookmark` keeps your marked lines in a filter.
 - **Tabs and windows:** one tab per file (or set of files); opening a file
   from the shell hands it to the nerka window focused last; windows can be
@@ -148,4 +149,5 @@ is dual-licensed the same way, without additional terms.
 
 The core and the apps stay open source under these licences. Extensions
 (plugins) may also be offered separately, some possibly closed source; the
-plugin interface is the boundary between them.
+plugin interface, once it exists (it isn't built yet), is the boundary
+between them.

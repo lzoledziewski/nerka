@@ -752,7 +752,10 @@ mod tests {
     use super::*;
 
     fn fibex() -> nerka_core::Fibex {
-        let dir = std::env::temp_dir().join(format!("nerka-gui-tree-{}", std::process::id()));
+        // A folder per call: tests run in parallel, and each removes its own.
+        static CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let n = CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("nerka-gui-tree-{}-{n}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let xml = dir.join("q.xml");
         std::fs::write(&xml, crate::tests::QUEUE_FIBEX).unwrap();
