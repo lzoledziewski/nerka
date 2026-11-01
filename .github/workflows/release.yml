@@ -11,6 +11,10 @@ on:
     tags: ['v*']
   workflow_dispatch:
 
+# Read-only token by default; only the publish job writes (the release).
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
 
