@@ -20,7 +20,7 @@ use nerka_core::{
     search_within,
 };
 use std::io::{BufWriter, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 #[derive(Parser)]
@@ -190,6 +190,15 @@ fn compile(query: &str, source: &dyn LogSource) -> Result<Query> {
     })
 }
 
+/// `bookmark` in a query: the bookmarks of the log (its `.nerka-marks`).
+fn with_marks(filter: Filter, file: &Path) -> Result<Filter> {
+    if !filter.uses_bookmarks() {
+        return Ok(filter);
+    }
+    let marks = Bookmarks::load_for(file).with_context(|| format!("reading the bookmarks of {}", file.display()))?;
+    Ok(filter.with_bookmarks(&std::sync::Arc::new(marks)))
+}
+
 /// `build` gets the opened source (its fields, its time), so query errors about
 /// unknown fields point into the query like syntax errors do.
 fn run_filter(
@@ -199,7 +208,7 @@ fn run_filter(
     out: &mut impl Write,
 ) -> Result<()> {
     let (f, t_index) = open(file)?;
-    let filter = build(&*f)?;
+    let filter = with_marks(build(&*f)?, file)?;
     let t = Instant::now();
     let res = search(&*f, &filter, &Progress::new())?;
     let t_search = t.elapsed();
@@ -237,10 +246,14 @@ fn run_search_within(
     out: &mut impl Write,
 ) -> Result<()> {
     let (f, t_index) = open(file)?;
-    let filter = within.map(|q| compile(q, &*f)).transpose()?;
+    let filter = within.map(|q| compile(q, &*f).and_then(|q| with_marks(Filter::Query(q), file))).transpose()?;
+    let set = SearchSet {
+        include: set.include.into_iter().map(|q| with_marks(q, file)).collect::<Result<_>>()?,
+        exclude: set.exclude.into_iter().map(|q| with_marks(q, file)).collect::<Result<_>>()?,
+    };
     let t = Instant::now();
     let lines = match filter {
-        Some(q) => Some(search(&*f, &Filter::Query(q), &Progress::new())?.lines),
+        Some(q) => Some(search(&*f, &q, &Progress::new())?.lines),
         None => None,
     };
     let t_filter = t.elapsed();

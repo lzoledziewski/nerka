@@ -46,7 +46,9 @@ your logs carry. Everything runs locally, with no backend: a desktop viewer
 - **FIBEX:** DLT non-verbose messages decoded from FIBEX files; their
   arguments can be picked as signals and plotted, from a searchable tree.
 - **Bookmarks with notes** (`m`, `b` / `B`), stored next to the log as
-  `<log>.nerka-marks`.
+  `<log>.nerka-marks`. Notes show in the views (on the line before, at the
+  end of the line or as a column), and `bookmark` is a field in queries:
+  `level >= ERROR OR bookmark` keeps your marked lines in a filter.
 - **Tabs and windows:** one tab per file (or set of files); opening a file
   from the shell hands it to the nerka window focused last; windows can be
   named.
@@ -119,6 +121,7 @@ nerka --signal 'up1=ecu == ECU1 AND tmsp ~ /(?<up1>\d+)/' filter '@up1.changed A
 | Text | bare `/re/` and `"text"` match the whole line (`raw`) |
 | Logic | `AND OR NOT`, parentheses |
 | Fields | `raw`, `level`; DLT adds `ecu apid ctid type mcnt tmsp seid mid mode payload`; several files add `file` |
+| Bookmarks | `bookmark` alone: a bookmarked line (`level >= ERROR OR bookmark` keeps your marked lines); `bookmark == B2` its name; `bookmark ~ /fan/` its name or note |
 | Signals | `@name`: a value captured by a named regex group — of a picked query (include or the `~` signal role), or a signal you define (📈 Signals panel, `--signal`; saved). `@gear == D` is the state (held until the next event), `@gear.event == D` a line that carries it, `@gear.changed` a change. Kinds `num`, `enum`, `time`; DLT has `@time` (receive time): `@time >= "2025-10-18 10:00:00"` |
 
 ## Documentation

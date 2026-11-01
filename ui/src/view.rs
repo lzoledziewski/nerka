@@ -40,6 +40,8 @@ const SCROLLBAR_W: f32 = 14.0;
 const TAB_COLS: usize = 4;
 /// Rows scrolled per mouse-wheel notch (klogg uses 3).
 const LINES_PER_NOTCH: u64 = 3;
+/// The stripe of a bookmarked line (and of its note).
+const BOOKMARK_COLOR: Color32 = Color32::from_rgb(230, 120, 40);
 
 /// A position in the view: row and display column (see [`Cells`]).
 /// `col == usize::MAX` means "end of line".
@@ -86,7 +88,71 @@ pub struct Columns {
     pub widths: Vec<usize>,
 }
 
+/// The header of the bookmark-note column ([`NoteMode::Column`]).
+const NOTE_COLUMN: &str = "🔖 note";
+
+/// Where bookmark notes show in the views (Bookmarks panel, saved in prefs).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum NoteMode {
+    Off,
+    /// On a row of its own above the line (never scrolled sideways).
+    #[default]
+    LineBefore,
+    /// Dimmed after the line's text.
+    EndOfLine,
+    /// A last column of tables; plain text shows it on the line before.
+    Column,
+}
+
+impl NoteMode {
+    pub const ALL: [NoteMode; 4] = [NoteMode::Off, NoteMode::LineBefore, NoteMode::EndOfLine, NoteMode::Column];
+
+    pub fn key(self) -> &'static str {
+        match self {
+            NoteMode::Off => "off",
+            NoteMode::LineBefore => "before",
+            NoteMode::EndOfLine => "end",
+            NoteMode::Column => "column",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<NoteMode> {
+        NoteMode::ALL.into_iter().find(|m| m.key() == s)
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            NoteMode::Off => "Off",
+            NoteMode::LineBefore => "Line before",
+            NoteMode::EndOfLine => "End of line",
+            NoteMode::Column => "Column",
+        }
+    }
+}
+
+/// A bookmark's note as the views show it (`name · note`); none without a note.
+fn shown_note(b: &Bookmarks, line: LineNo) -> Option<String> {
+    let note = b.note(line).filter(|n| !n.is_empty())?;
+    Some(format!("{} · {note}", b.name(line).unwrap_or_default()))
+}
+
 impl Columns {
+    /// Add or remove the last column for bookmark notes (tables only). The
+    /// column before it, unbounded until then, gets a width of its own.
+    pub fn note_column(&mut self, on: bool) {
+        let has = self.names.last() == Some(&NOTE_COLUMN);
+        if on && !has && !self.names.is_empty() {
+            if let Some(w) = self.widths.last_mut() {
+                *w = (*w).max(60);
+            }
+            self.names.push(NOTE_COLUMN);
+            self.widths.push(NOTE_COLUMN.chars().count() + 1);
+        } else if !on && has {
+            self.names.pop();
+            self.widths.pop();
+        }
+    }
+
     pub fn from_defs(defs: &[ColumnDef]) -> Self {
         Columns {
             names: defs.iter().map(|d| d.name).collect(),
@@ -154,6 +220,8 @@ pub struct Highlight<'a> {
     pub search: Option<&'a SearchMarks<'a>>,
     /// Whole-line colours: the last matching query (in pick order) wins.
     pub lines: Option<&'a SearchMarks<'a>>,
+    /// Where the bookmarks' notes show.
+    pub notes: NoteMode,
 }
 
 /// Search hits to mark, coloured per search query.
@@ -233,7 +301,39 @@ pub fn log_view(
         Rect::from_min_max(pos2(text_clip.min.x, text_rect.min.y), pos2(text_rect.max.x, rows_rect.min.y));
     let text_x0 = text_clip.min.x + char_w * 0.5;
 
-    state.page = ((rows_rect.height() / row_h).floor() as u64).max(1);
+    // Notes on rows of their own ([`NoteMode::LineBefore`]; a text log's
+    // Column too) take a slot above their line. `slots(top, until)`: the
+    // rows (and note slots) that fit from `top`, with their y; a note slot
+    // belongs to the row after it, so a click there picks that line.
+    let note_column = table && columns.names.last() == Some(&NOTE_COLUMN);
+    let note_rows = match hl.notes {
+        NoteMode::LineBefore => hl.bookmarks,
+        NoteMode::Column if !note_column => hl.bookmarks,
+        _ => None,
+    };
+    let slots = |top: u64, until: u64| -> Vec<(f32, u64, Option<String>)> {
+        let mut out = Vec::new();
+        let (mut y, mut row) = (snap(rows_rect.top()), top);
+        while y < rows_rect.bottom() && row < until {
+            let note = note_rows.filter(|_| row < rows).and_then(|b| shown_note(b, line_of_row(row)));
+            if let Some(note) = note {
+                out.push((y, row, Some(note)));
+                y += row_h;
+                if y >= rows_rect.bottom() {
+                    break;
+                }
+            }
+            out.push((y, row, None));
+            y += row_h;
+            row += 1;
+        }
+        out
+    };
+    // Rows that fit whole, counted as if the file went on past its end.
+    let fits = |top: u64| {
+        slots(top, u64::MAX).iter().filter(|(y, _, note)| note.is_none() && y + row_h <= rows_rect.bottom()).count()
+    };
+    state.page = (fits(state.top) as u64).max(1);
     let max_top = rows.saturating_sub(state.page);
     let line_str = |row: u64| source.line_text(line_of_row(row)).unwrap_or_default();
 
@@ -308,8 +408,17 @@ pub fn log_view(
 
     // Mouse → text position (row clamped to the rows that exist).
     let hit = |state: &ViewState, p: egui::Pos2| -> TextPos {
-        let r = ((p.y - rows_rect.top()) / row_h).floor();
-        let row = if r < 0.0 { state.top.saturating_sub(1) } else { state.top + r as u64 };
+        let row = if p.y < rows_rect.top() {
+            state.top.saturating_sub(1)
+        } else if note_rows.is_none() {
+            state.top + ((p.y - rows_rect.top()) / row_h).floor() as u64
+        } else {
+            match slots(state.top, rows).iter().rev().find(|(y, ..)| *y <= p.y) {
+                Some(&(y, row, _)) if p.y < y + row_h => row,
+                Some(&(_, row, _)) => row + 1,
+                None => state.top,
+            }
+        };
         let col = ((p.x - text_x0 + state.x_off) / char_w).round().max(0.0) as usize;
         TextPos { row: row.min(rows.saturating_sub(1)), col }
     };
@@ -615,11 +724,34 @@ pub fn log_view(
     let sel_bg = vis.selection.bg_fill;
     let selection = state.selection();
 
+    // Note slots can push a row that just moved into view below it.
+    if note_rows.is_some()
+        && let Some(sel) = state.selected.filter(|_| state.selected != selected_before)
+    {
+        for _ in 0..state.page {
+            let shown = slots(state.top, rows)
+                .iter()
+                .any(|(y, r, n)| *r == sel && n.is_none() && y + row_h <= rows_rect.bottom());
+            if shown || state.top >= sel.min(max_top) {
+                break;
+            }
+            state.top += 1;
+        }
+    }
+    let note_job = |text: String| {
+        let format = TextFormat { font_id: font.clone(), color: dim, italics: true, ..Default::default() };
+        LayoutJob::single_section(text, format)
+    };
+
     let mut max_w = 0.0f32;
-    let last = (state.top + state.page + 1).min(rows);
-    for (i, row) in (state.top..last).enumerate() {
-        let y = snap(rows_rect.top()) + i as f32 * row_h;
+    // Painted last, over the table's column lines.
+    let mut note_slots = Vec::new();
+    for (y, row, note) in slots(state.top, rows) {
         let line = line_of_row(row);
+        if let Some(note) = note {
+            note_slots.push((y, note));
+            continue;
+        }
         let row_rect = Rect::from_min_size(pos2(text_rect.min.x, y), vec2(text_rect.width(), row_h));
         if let Some(lc) = hl.lines
             && let Some(&q) = lc.matched(line).as_deref().and_then(<[usize]>::last)
@@ -646,11 +778,7 @@ pub fn log_view(
             }
         }
         if hl.bookmarks.is_some_and(|b| b.contains(line)) {
-            painter.rect_filled(
-                Rect::from_min_size(row_rect.min, vec2(char_w * 0.6, row_h)),
-                0.0,
-                Color32::from_rgb(230, 120, 40),
-            );
+            painter.rect_filled(Rect::from_min_size(row_rect.min, vec2(char_w * 0.6, row_h)), 0.0, BOOKMARK_COLOR);
         }
         painter.text(
             pos2(text_rect.min.x + gutter_w - char_w * 0.75, snap(y + 1.0)),
@@ -675,6 +803,11 @@ pub fn log_view(
                 painter.with_clip_rect(text_clip).rect_filled(r, 0.0, sel_bg);
             }
         }
+        // The note column: the note as one more cell (shown only, not copied).
+        let shown = match hl.bookmarks.and_then(|b| b.note(line)).filter(|n| note_column && !n.is_empty()) {
+            Some(note) => std::borrow::Cow::Owned(format!("{shown}	{note}")),
+            None => shown,
+        };
         let mut spans: Vec<(Range<usize>, Color32)> = Vec::new();
         if let Some(h) = hl.highlighter {
             spans.extend(h.spans(shown.as_bytes()).into_iter().map(|r| (r, match_bg)));
@@ -687,13 +820,23 @@ pub fn log_view(
         }
         let job = line_job(&shown, cells, cut, &spans, &font, text_color, dim);
         let galley = painter.layout_job(job);
+        let mut width = galley.size().x;
+        let x = snap(text_x0 - state.x_off);
+        painter.with_clip_rect(text_clip).galley(pos2(x, snap(y + 1.0)), galley, text_color);
+        if hl.notes == NoteMode::EndOfLine
+            && let Some(note) = hl.bookmarks.and_then(|b| shown_note(b, line))
+        {
+            let galley = painter.layout_job(note_job(format!("◂ {note}")));
+            let at = width + char_w * 2.0;
+            width = at + galley.size().x;
+            painter.with_clip_rect(text_clip).galley(pos2(x + at, snap(y + 1.0)), galley, dim);
+        }
         // Only rows that stay in view under a horizontal scrollbar count:
         // the cut-off last row would show the bar, which then covers it, so
         // the bar would go again — and flicker on every repaint.
         if y < outer.max.y - SCROLLBAR_W {
-            max_w = max_w.max(galley.size().x);
+            max_w = max_w.max(width);
         }
-        painter.with_clip_rect(text_clip).galley(pos2(snap(text_x0 - state.x_off), snap(y + 1.0)), galley, text_color);
     }
     state.content_w = max_w;
     state.x_off = state.x_off.min(max_x(max_w));
@@ -724,6 +867,16 @@ pub fn log_view(
                 stroke,
             );
         }
+    }
+
+    for (y, note) in note_slots {
+        // The note above its line: no number, never scrolled sideways.
+        let r = Rect::from_min_size(pos2(text_rect.min.x, y), vec2(text_rect.width(), row_h));
+        painter.rect_filled(r, 0.0, vis.extreme_bg_color);
+        painter.rect_filled(r, 0.0, vis.faint_bg_color);
+        painter.rect_filled(Rect::from_min_size(r.min, vec2(char_w * 0.6, row_h)), 0.0, BOOKMARK_COLOR);
+        let galley = painter.layout_job(note_job(format!("🔖 {note}")));
+        painter.with_clip_rect(text_clip).galley(pos2(snap(text_x0), snap(y + 1.0)), galley, dim);
     }
 
     // scrollbar paint
@@ -1024,7 +1177,7 @@ mod tests {
         let rows: Vec<u64> = (0..file.line_count()).step_by(2).collect();
         let screen = Rect::from_min_size(pos2(0.0, 0.0), vec2(1000.0, 800.0));
         let input = egui::RawInput { screen_rect: Some(screen), time: Some(t), events, ..Default::default() };
-        let hl = Highlight { highlighter: None, bookmarks: None, search: None, lines: None };
+        let hl = Highlight { highlighter: None, bookmarks: None, search: None, lines: None, notes: NoteMode::Off };
         let mut rect = Rect::NOTHING;
         let mut out = ctx.run_ui(input, |ui| {
             egui::Panel::bottom("filter").resizable(true).default_size(260.0).min_size(120.0).show(ui, |ui| {
@@ -1092,7 +1245,7 @@ mod tests {
         let ctx = egui::Context::default();
         let (mut state, mut columns) =
             (ViewState::default(), Columns { names: vec!["a", "b", "rest"], widths: vec![4, 3, 0] });
-        let hl = Highlight { highlighter: None, bookmarks: None, search: None, lines: None };
+        let hl = Highlight { highlighter: None, bookmarks: None, search: None, lines: None, notes: NoteMode::Off };
         let mut t = 0.0;
         let mut step = |events: Vec<egui::Event>, state: &mut ViewState, columns: &mut Columns| {
             t += 1.0 / 60.0;
@@ -1140,7 +1293,7 @@ mod tests {
         let file = nerka_core::TextFile::from_bytes("t", long.into_bytes());
         let short = nerka_core::TextFile::from_bytes("s", b"short\nlines\n".to_vec());
         let ctx = egui::Context::default();
-        let hl = Highlight { highlighter: None, bookmarks: None, search: None, lines: None };
+        let hl = Highlight { highlighter: None, bookmarks: None, search: None, lines: None, notes: NoteMode::Off };
         let mut t = 0.0;
         let mut step = |events: Vec<egui::Event>, state: &mut ViewState, file: &nerka_core::TextFile| {
             t += 1.0 / 60.0;
@@ -1199,6 +1352,59 @@ mod tests {
         assert_eq!(out.detail, Some(0));
     }
 
+    /// A note on the line before takes a row of the view: fewer lines fit,
+    /// and a click on the note picks its line.
+    #[test]
+    fn notes_on_the_line_before_take_a_row() {
+        let text: String = (0..100).map(|i| format!("line {i}\n")).collect();
+        let file = nerka_core::TextFile::from_bytes("t", text.into_bytes());
+        let mut marks = Bookmarks::default();
+        marks.toggle(2);
+        marks.set_note(2, "look here");
+        marks.toggle(4); // no note: no row of its own
+        let ctx = egui::Context::default();
+        let mut t = 0.0;
+        let mut step = |events: Vec<egui::Event>, state: &mut ViewState, notes: NoteMode| {
+            t += 1.0 / 60.0;
+            let screen = Rect::from_min_size(pos2(0.0, 0.0), vec2(600.0, 300.0));
+            let input = egui::RawInput { screen_rect: Some(screen), time: Some(t), events, ..Default::default() };
+            let hl = Highlight { highlighter: None, bookmarks: Some(&marks), search: None, lines: None, notes };
+            let mut out = ctx.run_ui(input, |ui| {
+                egui::CentralPanel::default().frame(egui::Frame::NONE).show(ui, |ui| {
+                    log_view(ui, "v", state, file.line_count(), &|r| r, &file, &mut Columns::default(), &hl);
+                });
+            });
+            out.textures_delta.clear();
+        };
+        let click = |k: f32, row_h: f32| {
+            let pos = pos2(300.0, (k + 0.5) * row_h);
+            let button = |pressed| egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            };
+            vec![egui::Event::PointerMoved(pos), button(true), button(false)]
+        };
+
+        let mut off = ViewState::default();
+        step(vec![], &mut off, NoteMode::Off);
+        step(vec![], &mut off, NoteMode::Off);
+        let row_h = (ctx.fonts_mut(|f| f.row_height(&FontId::monospace(13.0))) + 2.0).round();
+        let mut before = ViewState::default();
+        step(vec![], &mut before, NoteMode::LineBefore);
+        step(vec![], &mut before, NoteMode::LineBefore);
+        assert_eq!(before.page + 1, off.page);
+
+        // Slots: line 0, 1, the note, line 2, 3, 4 (no note), 5…
+        for (slot, line) in [(1.0, 1), (2.0, 2), (3.0, 2), (4.0, 3), (6.0, 5)] {
+            step(click(slot, row_h), &mut before, NoteMode::LineBefore);
+            assert_eq!(before.selected, Some(line), "slot {slot}");
+        }
+        step(click(3.0, row_h), &mut off, NoteMode::Off);
+        assert_eq!(off.selected, Some(3));
+    }
+
     /// ↑ / ↓ in a focused view move its cursor line, and the view keeps the
     /// focus: egui moved it to the nearest button in that direction too, so
     /// the next press went through buttons instead of the log.
@@ -1207,7 +1413,7 @@ mod tests {
         let text: String = (0..100).map(|i| format!("line {i}\n")).collect();
         let file = nerka_core::TextFile::from_bytes("t", text.into_bytes());
         let ctx = egui::Context::default();
-        let hl = Highlight { highlighter: None, bookmarks: None, search: None, lines: None };
+        let hl = Highlight { highlighter: None, bookmarks: None, search: None, lines: None, notes: NoteMode::Off };
         let mut t = 0.0;
         let mut step = |events: Vec<egui::Event>, state: &mut ViewState| {
             t += 1.0 / 60.0;
@@ -1280,7 +1486,7 @@ mod tests {
     #[test]
     fn a_long_last_row_does_not_make_the_scrollbar_flicker() {
         let ctx = egui::Context::default();
-        let hl = Highlight { highlighter: None, bookmarks: None, search: None, lines: None };
+        let hl = Highlight { highlighter: None, bookmarks: None, search: None, lines: None, notes: NoteMode::Off };
         let mut t = 0.0;
         // Wherever the long line is, one of these rows is the cut-off last one.
         for long in 0..30 {
@@ -1312,7 +1518,7 @@ mod tests {
         // Every second line, as a filtered view shows them.
         let rows: Vec<u64> = (0..20).step_by(2).collect();
         let ctx = egui::Context::default();
-        let hl = Highlight { highlighter: None, bookmarks: None, search: None, lines: None };
+        let hl = Highlight { highlighter: None, bookmarks: None, search: None, lines: None, notes: NoteMode::Off };
         let mut t = 0.0;
         let mut step = |events: Vec<egui::Event>, state: &mut ViewState| {
             t += 1.0 / 60.0;

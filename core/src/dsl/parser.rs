@@ -1,6 +1,6 @@
 //! Lexer + recursive-descent parser for NFD.
 
-use super::{CmpOp, Cond, DslError, Expr, FieldCond, FieldTest, SignalCond};
+use super::{BookmarkCond, CmpOp, Cond, DslError, Expr, FieldCond, FieldTest, SignalCond};
 use crate::event::Level;
 use crate::signal::SignalView;
 use regex::bytes::RegexBuilder;
@@ -255,6 +255,7 @@ impl Parser<'_> {
             }
             Tok::Regex { pat, ci } => Ok(Expr::Cond(Cond::RawMatch(regex(&pat, ci, pos)?))),
             Tok::Str(s) => Ok(Expr::Cond(Cond::RawMatch(regex(&regex::escape(&s), false, pos)?))),
+            Tok::Word(field) if field.eq_ignore_ascii_case("bookmark") => self.bookmark_condition(pos),
             Tok::Word(field) => self.condition(&field, pos),
             Tok::Signal(name, view) => self.signal_condition(name, view, pos),
             t => err(format!("expected a condition but found {}", describe(&t)), pos),
@@ -366,6 +367,35 @@ impl Parser<'_> {
             (OpTok::Cmp(_), t) => return err(format!("expected a value but found {}", describe(&t)), val_pos),
         };
         let e = Expr::Cond(Cond::Signal(SignalCond { name, view, pos, op_pos, def: None, test, series: None }));
+        Ok(if op == OpTok::NotMatch { Expr::Not(Box::new(e)) } else { e })
+    }
+}
+
+impl Parser<'_> {
+    /// `bookmark` alone, or `bookmark OP VALUE` (`==`, `!=` on its name;
+    /// `~`, `!~` on its name or note).
+    fn bookmark_condition(&mut self, pos: usize) -> Result<Expr, DslError> {
+        let op_pos = self.pos;
+        let Tok::Op(op) = self.tok else {
+            return Ok(Expr::Cond(Cond::Bookmark(BookmarkCond { pos, test: FieldTest::Any, marks: None })));
+        };
+        self.bump()?;
+        let val_pos = self.pos;
+        let test = match (op, self.bump()?) {
+            (OpTok::Match | OpTok::NotMatch, Tok::Regex { pat, ci }) => FieldTest::Match(regex(&pat, ci, val_pos)?),
+            (OpTok::Match | OpTok::NotMatch, Tok::Str(s)) => {
+                FieldTest::Match(regex(&regex::escape(&s), false, val_pos)?)
+            }
+            (OpTok::Match | OpTok::NotMatch, t) => {
+                return err(format!("expected /regex/ or \"text\" but found {}", describe(&t)), val_pos);
+            }
+            (OpTok::Cmp(c @ (CmpOp::Eq | CmpOp::Ne)), Tok::Word(w) | Tok::Str(w)) => FieldTest::Str(c, w.into_bytes()),
+            (OpTok::Cmp(CmpOp::Eq | CmpOp::Ne), t) => {
+                return err(format!("expected a bookmark name but found {}", describe(&t)), val_pos);
+            }
+            (OpTok::Cmp(_), _) => return err("bookmark supports ==, != (its name) and ~, !~ (name or note)", op_pos),
+        };
+        let e = Expr::Cond(Cond::Bookmark(BookmarkCond { pos, test, marks: None }));
         Ok(if op == OpTok::NotMatch { Expr::Not(Box::new(e)) } else { e })
     }
 }
