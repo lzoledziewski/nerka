@@ -131,6 +131,18 @@ fn epoch_seconds(n: f64) -> f64 {
     }
 }
 
+/// A weekday's name (`Fri`, `friday`) before a date.
+fn weekday(s: &str) -> bool {
+    const NAMES: [&str; 7] = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"];
+    s.len() >= 3 && s.bytes().all(|c| c.is_ascii_alphabetic()) && NAMES.iter().any(|n| n.eq_ignore_ascii_case(&s[..3]))
+}
+
+/// The year it is now (UTC), for dates written without one.
+fn this_year() -> i64 {
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+    civil_from_days((now / 86_400) as i64).0
+}
+
 /// A month's name (its first three letters, any case) as 1–12.
 fn month(s: &str) -> Option<i64> {
     const NAMES: [&str; 12] = ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"];
@@ -169,9 +181,7 @@ fn date(s: &str) -> Option<(i64, &str, Option<(i64, i64)>)> {
     // Names of months, a weekday first or not: `Fri, 17 Oct 2025`,
     // `Oct 17, 2025`, `17-Oct-2025`, `17/Oct/2025`, `Fri Oct 17 10:00:01 2025`.
     let words: Vec<&str> = s.split([' ', '-', '/', ',']).filter(|w| !w.is_empty()).collect();
-    let skip = usize::from(
-        words.first().is_some_and(|w| w.len() >= 3 && month(w).is_none() && w.bytes().all(|c| c.is_ascii_alphabetic())),
-    );
+    let skip = usize::from(words.first().is_some_and(|w| weekday(w)));
     let w = words.get(skip..)?;
     let after = |n: usize| -> &str {
         // What follows the first `n` words (after the weekday) in `s`.
@@ -184,9 +194,8 @@ fn date(s: &str) -> Option<(i64, &str, Option<(i64, i64)>)> {
     };
     let year = |w: &str| num(w.get(..4)?).filter(|_| w.len() == 4 || w.as_bytes()[4] == b':');
     match w {
-        [d, m, y, ..] if num(d).is_some() && month(m).is_some() => {
-            let y = year(y)?;
-            Some((ymd(y, month(m)?, num(d)?)?, after(2).get(4..)?, None))
+        [d, m, y, ..] if num(d).is_some() && month(m).is_some() && year(y).is_some() => {
+            Some((ymd(year(y)?, month(m)?, num(d)?)?, after(2).get(4..)?, None))
         }
         [m, d, y, ..] if month(m).is_some() && num(d).is_some() && year(y).is_some() => {
             Some((ymd(year(y)?, month(m)?, num(d)?)?, after(2).get(4..)?, None))
@@ -194,6 +203,13 @@ fn date(s: &str) -> Option<(i64, &str, Option<(i64, i64)>)> {
         [m, d, _, y] if month(m).is_some() && num(d).is_some() && year(y).is_some() => {
             let (m, d) = (month(m)?, num(d)?);
             Some((0, after(2), Some((m, d))))
+        }
+        // No year (BSD syslog: `Oct 17 10:00:01`): this year (owner, 2026-11-02).
+        [m, d, ..] if month(m).is_some() && num(d).is_some() => {
+            Some((ymd(this_year(), month(m)?, num(d)?)?, after(2), None))
+        }
+        [d, m, ..] if num(d).is_some() && month(m).is_some() => {
+            Some((ymd(this_year(), month(m)?, num(d)?)?, after(2), None))
         }
         _ => None,
     }
@@ -497,9 +513,15 @@ mod tests {
         for s in ["1760695201250", "1760695201250000", "1760695201250000000"] {
             assert!((parse_time(s).unwrap() - 1_760_695_201.25).abs() < 1e-6, "{s}");
         }
+        // No year: this year's (BSD syslog).
+        let this = days_from_civil(this_year(), 10, 17) as f64 * 86_400.0 + 36_001.0;
+        assert_eq!(parse_time("Oct 17 10:00:01"), Some(this));
+        assert_eq!(parse_time("Fri Oct 17 12:00:01 +0200"), Some(this));
+        assert_eq!(parse_time("17 Oct 10:00:01"), Some(this));
         // Ambiguous or broken: not read.
         for bad in [
-            "Oct 17 10:00:01",
+            "Oct 17 25:00:00",
+            "ERROR Oct 17 10:00:01",
             "10/17/2025 10:00:01",
             "17/10/2025",
             "32 Oct 2025",
