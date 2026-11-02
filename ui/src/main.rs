@@ -3401,7 +3401,7 @@ impl App {
 
     fn tab_bar(&mut self, ui: &mut egui::Ui) {
         let (mut select, mut close, mut close_others, mut moved, mut split) = (None, None, None, None, None);
-        let (mut files, mut records_edit) = (None, None);
+        let (mut files, mut records_edit, mut unfold) = (None, None, None);
         egui::ScrollArea::horizontal().show(ui, |ui| {
             ui.horizontal(|ui| {
                 for (i, t) in self.tabs.iter().enumerate() {
@@ -3445,6 +3445,14 @@ impl App {
                         {
                             records_edit = Some(i);
                         }
+                        let (label, tip) = if t.main_view.unfold_all {
+                            ("Fold all records", "Each record of several lines on one row again")
+                        } else {
+                            ("Unfold all records", "Every record of several lines shown whole (→ / ← one record)")
+                        };
+                        if ui.add_enabled(text, egui::Button::new(label)).on_hover_text(tip).clicked() {
+                            unfold = Some(i);
+                        }
                     });
                     if close_button(ui).on_hover_text("Close (Ctrl+W)").clicked() {
                         close = Some(i);
@@ -3460,6 +3468,14 @@ impl App {
             self.active = i;
             let t = &mut self.tabs[i];
             t.files_edit = Some(t.paths.clone());
+        }
+        if let Some(i) = unfold {
+            let t = &mut self.tabs[i];
+            let all = !t.main_view.unfold_all;
+            for v in [&mut t.main_view, &mut t.hits_view] {
+                v.unfold_all = all;
+                v.unfolded.clear();
+            }
         }
         if let Some(i) = records_edit {
             self.active = i;

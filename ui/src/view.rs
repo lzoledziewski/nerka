@@ -34,6 +34,9 @@ use std::ops::Range;
 
 /// Lines longer than this are cut for display (search still sees them).
 const MAX_DISPLAY_BYTES: usize = 4096;
+/// An unfolded record shows this much of itself at most, in this many lines.
+const MAX_UNFOLD_BYTES: usize = 64 * 1024;
+const MAX_UNFOLD_LINES: usize = 500;
 /// Copying more lines than this is cut short (the clipboard is not a file).
 const MAX_COPY_LINES: u64 = 100_000;
 const SCROLLBAR_W: f32 = 14.0;
@@ -69,6 +72,11 @@ pub struct ViewState {
     /// or other log view has the focus — after a click on a button, or
     /// before any click (the main view).
     pub free_keys: bool,
+    /// Records of several lines shown whole, one row per line, as file
+    /// lines; the others show their first line and `▸ +N lines`.
+    pub unfolded: std::collections::BTreeSet<LineNo>,
+    /// Every record of several lines shown whole.
+    pub unfold_all: bool,
     dragging: bool,
     /// Fraction of a row scrolled but not applied yet (trackpads).
     scroll_acc: f32,
@@ -128,6 +136,14 @@ impl NoteMode {
             NoteMode::Column => "Column",
         }
     }
+}
+
+/// A row of the view on screen: a note above a line, or a line of a row (a
+/// record of several lines unfolded takes one per line).
+#[derive(Debug, Clone, PartialEq)]
+enum Slot {
+    Note(String),
+    Line(usize),
 }
 
 /// A bookmark's name as the views show it: `?` after an unsure one's.
@@ -317,29 +333,51 @@ pub fn log_view(
         NoteMode::Column if !note_column => hl.bookmarks,
         _ => None,
     };
-    let slots = |top: u64, until: u64| -> Vec<(f32, u64, Option<String>)> {
+    // A record of several lines unfolded takes a slot per line (`Line(k)`);
+    // folded, or one line, a slot. `open` says which rows are unfolded.
+    let line_count = |row: u64| {
+        let bytes = source.line_bytes(line_of_row(row)).unwrap_or_default();
+        let head = &bytes[..bytes.len().min(MAX_UNFOLD_BYTES)];
+        (head.iter().filter(|&&b| b == b'\n').count() + 1).min(MAX_UNFOLD_LINES)
+    };
+    let slots = |top: u64, until: u64, open: &dyn Fn(u64) -> bool| -> Vec<(f32, u64, Slot)> {
         let mut out = Vec::new();
         let (mut y, mut row) = (snap(rows_rect.top()), top);
-        while y < rows_rect.bottom() && row < until {
+        'rows: while y < rows_rect.bottom() && row < until {
             let note = note_rows.filter(|_| row < rows).and_then(|b| shown_note(b, line_of_row(row)));
             if let Some(note) = note {
-                out.push((y, row, Some(note)));
+                out.push((y, row, Slot::Note(note)));
                 y += row_h;
                 if y >= rows_rect.bottom() {
                     break;
                 }
             }
-            out.push((y, row, None));
-            y += row_h;
+            let n = if row < rows && open(row) { line_count(row) } else { 1 };
+            for k in 0..n {
+                out.push((y, row, Slot::Line(k)));
+                y += row_h;
+                if y >= rows_rect.bottom() {
+                    break 'rows;
+                }
+            }
             row += 1;
         }
         out
     };
-    // Rows that fit whole, counted as if the file went on past its end.
-    let fits = |top: u64| {
-        slots(top, u64::MAX).iter().filter(|(y, _, note)| note.is_none() && y + row_h <= rows_rect.bottom()).count()
+    let is_open = |state: &ViewState| {
+        let (all, set) = (state.unfold_all, state.unfolded.clone());
+        move |row: u64| all || set.contains(&line_of_row(row))
     };
-    state.page = (fits(state.top) as u64).max(1);
+    // Rows that fit whole, counted as if the file went on past its end.
+    let fits = |top: u64, open: &dyn Fn(u64) -> bool| {
+        let slots = slots(top, u64::MAX, open);
+        let last_whole =
+            |r: u64| slots.iter().filter(|(_, row, _)| *row == r).all(|(y, ..)| y + row_h <= rows_rect.bottom());
+        let mut whole: Vec<u64> = slots.iter().map(|(_, r, _)| *r).collect();
+        whole.dedup();
+        whole.into_iter().filter(|&r| last_whole(r)).count()
+    };
+    state.page = (fits(state.top, &is_open(state)) as u64).max(1);
     let max_top = rows.saturating_sub(state.page);
     let line_str = |row: u64| source.line_text(line_of_row(row)).unwrap_or_default();
 
@@ -413,20 +451,33 @@ pub fn log_view(
     }
 
     // Mouse → text position (row clamped to the rows that exist).
+    // The columns as they are now (the header may resize them below).
+    let widths_now = columns.widths.clone();
+    let cells_now = Cells { widths: &widths_now };
     let hit = |state: &ViewState, p: egui::Pos2| -> TextPos {
-        let row = if p.y < rows_rect.top() {
-            state.top.saturating_sub(1)
-        } else if note_rows.is_none() {
-            state.top + ((p.y - rows_rect.top()) / row_h).floor() as u64
+        let col = ((p.x - text_x0 + state.x_off) / char_w).round().max(0.0) as usize;
+        let simple = note_rows.is_none() && !state.unfold_all && state.unfolded.is_empty();
+        let (row, k) = if p.y < rows_rect.top() {
+            (state.top.saturating_sub(1), 0)
+        } else if simple {
+            (state.top + ((p.y - rows_rect.top()) / row_h).floor() as u64, 0)
         } else {
-            match slots(state.top, rows).iter().rev().find(|(y, ..)| *y <= p.y) {
-                Some(&(y, row, _)) if p.y < y + row_h => row,
-                Some(&(_, row, _)) => row + 1,
-                None => state.top,
+            match slots(state.top, rows, &is_open(state)).iter().rev().find(|(y, ..)| *y <= p.y) {
+                Some((y, row, slot)) if p.y < y + row_h => (*row, if let Slot::Line(k) = slot { *k } else { 0 }),
+                Some((_, row, _)) => (row + 1, 0),
+                None => (state.top, 0),
             }
         };
-        let col = ((p.x - text_x0 + state.x_off) / char_w).round().max(0.0) as usize;
-        TextPos { row: row.min(rows.saturating_sub(1)), col }
+        let row = row.min(rows.saturating_sub(1));
+        // The columns before the record's k-th line.
+        let before = if k == 0 {
+            0
+        } else {
+            let text = line_str(row);
+            let start = text.match_indices('\n').nth(k - 1).map_or(text.len(), |(i, _)| i + 1);
+            cells_now.width(&text[..start])
+        };
+        TextPos { row, col: before + col }
     };
     let mut clicked = None;
     let (pressed, released, shift, command, pointer) = ui.input(|i| {
@@ -567,11 +618,24 @@ pub fn log_view(
             if i.key_pressed(Key::End) && ctrl {
                 target = Some(rows - 1)
             }
+            // On a record of several lines → unfolds it and ← folds it;
+            // elsewhere they scroll sideways.
+            let line = line_of_row(sel.min(rows - 1));
+            let several = || source.line_bytes(line).is_some_and(|b| b.contains(&b'\n'));
+            let open = state.unfold_all || state.unfolded.contains(&line);
             if i.key_pressed(Key::ArrowRight) {
-                state.x_off += char_w * 8.0
+                if !open && several() {
+                    state.unfolded.insert(line);
+                } else {
+                    state.x_off += char_w * 8.0
+                }
             }
             if i.key_pressed(Key::ArrowLeft) {
-                state.x_off = (state.x_off - char_w * 8.0).max(0.0)
+                if state.unfolded.contains(&line) {
+                    state.unfolded.remove(&line);
+                } else {
+                    state.x_off = (state.x_off - char_w * 8.0).max(0.0)
+                }
             }
             if i.key_pressed(Key::Escape) {
                 state.sel = None;
@@ -749,14 +813,12 @@ pub fn log_view(
     let sel_bg = vis.selection.bg_fill;
     let selection = state.selection();
 
-    // Note slots can push a row that just moved into view below it.
-    if note_rows.is_some()
-        && let Some(sel) = state.selected.filter(|_| state.selected != selected_before)
-    {
+    // Note and unfolded slots can push a row that just moved into view below it.
+    if let Some(sel) = state.selected.filter(|_| state.selected != selected_before) {
         for _ in 0..state.page {
-            let shown = slots(state.top, rows)
+            let shown = slots(state.top, rows, &is_open(state))
                 .iter()
-                .any(|(y, r, n)| *r == sel && n.is_none() && y + row_h <= rows_rect.bottom());
+                .any(|(y, r, n)| *r == sel && *n == Slot::Line(0) && y + row_h <= rows_rect.bottom());
             if shown || state.top >= sel.min(max_top) {
                 break;
             }
@@ -771,12 +833,17 @@ pub fn log_view(
     let mut max_w = 0.0f32;
     // Painted last, over the table's column lines.
     let mut note_slots = Vec::new();
-    for (y, row, note) in slots(state.top, rows) {
+    // Fold markers clicked: (file line, unfold).
+    let mut folds: Vec<(LineNo, bool)> = Vec::new();
+    for (y, row, slot) in slots(state.top, rows, &is_open(state)) {
         let line = line_of_row(row);
-        if let Some(note) = note {
-            note_slots.push((y, note));
-            continue;
-        }
+        let k = match slot {
+            Slot::Note(note) => {
+                note_slots.push((y, note));
+                continue;
+            }
+            Slot::Line(k) => k,
+        };
         let row_rect = Rect::from_min_size(pos2(text_rect.min.x, y), vec2(text_rect.width(), row_h));
         if let Some(lc) = hl.lines
             && let Some(&q) = lc.matched(line).as_deref().and_then(<[usize]>::last)
@@ -805,30 +872,39 @@ pub fn log_view(
         if hl.bookmarks.is_some_and(|b| b.contains(line)) {
             painter.rect_filled(Rect::from_min_size(row_rect.min, vec2(char_w * 0.6, row_h)), 0.0, BOOKMARK_COLOR);
         }
-        painter.text(
-            pos2(text_rect.min.x + gutter_w - char_w * 0.75, snap(y + 1.0)),
-            Align2::RIGHT_TOP,
-            (line + 1).to_string(),
-            font.clone(),
-            dim,
-        );
+        if k == 0 {
+            painter.text(
+                pos2(text_rect.min.x + gutter_w - char_w * 0.75, snap(y + 1.0)),
+                Align2::RIGHT_TOP,
+                (line + 1).to_string(),
+                font.clone(),
+                dim,
+            );
+        }
+        let open = state.unfold_all || state.unfolded.contains(&line);
         let bytes = source.line_bytes(line).unwrap_or_default();
-        let cut = bytes.len() > MAX_DISPLAY_BYTES;
-        let shown = String::from_utf8_lossy(&bytes[..bytes.len().min(MAX_DISPLAY_BYTES)]);
-        // A record's own line breaks, one character each as in the text
-        // (selections keep their columns; copying keeps the breaks).
-        let shown = match shown.contains(['\n', '\r']) {
-            true => std::borrow::Cow::Owned(shown.replace('\n', "⏎").replace('\r', " ")),
-            false => shown,
-        };
+        let limit = if open { MAX_UNFOLD_BYTES } else { MAX_DISPLAY_BYTES };
+        let cut = bytes.len() > limit;
+        let whole = String::from_utf8_lossy(&bytes[..bytes.len().min(limit)]);
+        // A record of several lines: this slot's line of it (byte range in
+        // `whole`), and how many there are.
+        let breaks: Vec<usize> = whole.match_indices('\n').map(|(i, _)| i).collect();
+        let lines_in = breaks.len() + 1;
+        let start = if k == 0 { 0 } else { breaks.get(k - 1).map_or(whole.len(), |i| i + 1) };
+        let end = breaks.get(k).copied().unwrap_or(whole.len());
+        let last = k + 1 >= lines_in.min(if open { MAX_UNFOLD_LINES } else { 1 });
+        let shown = std::borrow::Cow::Borrowed(whole[start..end].strip_suffix('\r').unwrap_or(&whole[start..end]));
         if let Some((s, e)) = selection
             && (s.row..=e.row).contains(&row)
         {
+            // The selection in this line's columns (columns count the whole
+            // record, a line break as one).
+            let before = cells.width(&whole[..start]);
             let width = cells.width(&shown);
-            let c0 = if row == s.row { s.col.min(width) } else { 0 };
-            // Selected line breaks show as one extra column.
-            let c1 = if row == e.row { e.col.min(width) } else { width + 1 };
-            if c1 > c0 {
+            let c0 = if row == s.row { s.col.saturating_sub(before).min(width) } else { 0 };
+            let c1 = if row == e.row && e.col < before + width + 1 { e.col.saturating_sub(before) } else { width + 1 };
+            let inside = row != s.row || s.col <= before + width;
+            if inside && c1 > c0 {
                 let x = snap(text_x0 - state.x_off);
                 let r = Rect::from_min_max(pos2(x + c0 as f32 * char_w, y), pos2(x + c1 as f32 * char_w, y + row_h));
                 painter.with_clip_rect(text_clip).rect_filled(r, 0.0, sel_bg);
@@ -839,22 +915,46 @@ pub fn log_view(
             Some(note) => std::borrow::Cow::Owned(format!("{shown}	{note}")),
             None => shown,
         };
+        // Highlights over the whole record, then this line's share of them.
         let mut spans: Vec<(Range<usize>, Color32)> = Vec::new();
         if let Some(h) = hl.highlighter {
-            spans.extend(h.spans(shown.as_bytes()).into_iter().map(|r| (r, match_bg)));
+            spans.extend(h.spans(whole.as_bytes()).into_iter().map(|r| (r, match_bg)));
         }
         if let (Some(qs), Some(s)) = (&matched, hl.search) {
             for &q in qs {
                 let (Some(h), Some(&c)) = (s.highlighters.get(q), s.colors.get(q)) else { continue };
-                spans.extend(h.spans(shown.as_bytes()).into_iter().map(|r| (r, hit_bg(c, vis.dark_mode))));
+                spans.extend(h.spans(whole.as_bytes()).into_iter().map(|r| (r, hit_bg(c, vis.dark_mode))));
             }
         }
-        let job = line_job(&shown, cells, cut, &spans, &font, text_color, dim);
+        let spans: Vec<(Range<usize>, Color32)> = spans
+            .into_iter()
+            .filter(|(r, _)| r.start < start + shown.len() && r.end > start)
+            .map(|(r, c)| (r.start.max(start) - start..r.end.min(start + shown.len()) - start, c))
+            .collect();
+        let job = line_job(&shown, cells, cut && last, &spans, &font, text_color, dim);
         let galley = painter.layout_job(job);
         let mut width = galley.size().x;
         let x = snap(text_x0 - state.x_off);
         painter.with_clip_rect(text_clip).galley(pos2(x, snap(y + 1.0)), galley, text_color);
+        // A record of several lines: `▸ +N lines` after its first line
+        // (folded), `▾` (unfolded); a click folds or unfolds it.
+        if k == 0 && lines_in > 1 {
+            let text = if open { "  ▾".to_owned() } else { format!("  ▸ +{} lines", lines_in - 1) };
+            let galley = painter.layout_job(note_job(text));
+            let at = pos2(x + width, snap(y + 1.0));
+            let r = Rect::from_min_size(at, galley.size()).intersect(text_clip);
+            width += galley.size().x;
+            painter.with_clip_rect(text_clip).galley(at, galley, dim);
+            if r.is_positive() {
+                let tip = if open { "Fold the record (←)" } else { "Show the whole record (→)" };
+                let click = ui.interact(r, response.id.with(("fold", line)), Sense::click()).on_hover_text(tip);
+                if click.clicked() {
+                    folds.push((line, !open));
+                }
+            }
+        }
         if hl.notes == NoteMode::EndOfLine
+            && last
             && let Some(note) = hl.bookmarks.and_then(|b| shown_note(b, line))
         {
             let galley = painter.layout_job(note_job(format!("◂ {note}")));
@@ -871,6 +971,16 @@ pub fn log_view(
     }
     state.content_w = max_w;
     state.x_off = state.x_off.min(max_x(max_w));
+    for (line, open) in folds {
+        if open {
+            state.unfolded.insert(line);
+        } else {
+            state.unfolded.remove(&line);
+            // A record folded with "unfold all" on stays folded: the rest
+            // stay unfolded.
+            state.unfold_all = false;
+        }
+    }
 
     if table {
         let full = Rect::from_min_max(text_rect.min, header_rect.max);
@@ -1381,6 +1491,87 @@ mod tests {
         };
         let out = step(vec![enter], &mut s, &file);
         assert_eq!(out.detail, Some(0));
+    }
+
+    /// A record of several lines starts folded (one row, `▸ +N lines`); →
+    /// unfolds it into a row per line, ← folds it. A click on one of its
+    /// lines is a column of that line.
+    #[test]
+    fn records_fold_and_unfold() {
+        use nerka_core::input::records::{RecordFile, RecordSplit};
+        let mut text = String::new();
+        for i in 0..40 {
+            text.push_str(&format!("2025-10-17 rec {i}\n  first {i}\n  second {i}\n  third {i}\n"));
+        }
+        let file = RecordFile::from_bytes("t", text.into_bytes(), RecordSplit::parse(r"start=/\d{4}-/").unwrap());
+        let ctx = egui::Context::default();
+        let mut t = 0.0;
+        let mut step = |events: Vec<egui::Event>, state: &mut ViewState| -> Vec<String> {
+            t += 1.0 / 60.0;
+            let screen = Rect::from_min_size(pos2(0.0, 0.0), vec2(600.0, 300.0));
+            let input = egui::RawInput { screen_rect: Some(screen), time: Some(t), events, ..Default::default() };
+            let hl = Highlight { highlighter: None, bookmarks: None, search: None, lines: None, notes: NoteMode::Off };
+            let mut out = ctx.run_ui(input, |ui| {
+                egui::CentralPanel::default().frame(egui::Frame::NONE).show(ui, |ui| {
+                    log_view(ui, "v", state, file.line_count(), &|r| r, &file, &mut Columns::default(), &hl);
+                });
+            });
+            out.textures_delta.clear();
+            out.platform_output
+                .commands
+                .into_iter()
+                .filter_map(|c| match c {
+                    egui::OutputCommand::CopyText(s) => Some(s),
+                    _ => None,
+                })
+                .collect()
+        };
+        let key = |key| egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        };
+        let click = |y: f32| {
+            let pos = pos2(200.0, y);
+            let b = |pressed| egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            };
+            vec![egui::Event::PointerMoved(pos), b(true), b(false)]
+        };
+        let mut s = ViewState::default();
+        step(vec![], &mut s);
+        step(vec![], &mut s);
+        let row_h = (ctx.fonts_mut(|f| f.row_height(&FontId::monospace(13.0))) + 2.0).round();
+        let folded_page = s.page;
+        assert!(folded_page >= 10, "a row per record: {folded_page}");
+        // Select record 0 (a click on its row), unfold it with →.
+        step(click(row_h * 0.5), &mut s);
+        step(vec![key(Key::ArrowRight)], &mut s);
+        step(vec![], &mut s);
+        assert!(s.unfolded.contains(&0));
+        assert_eq!(s.page, folded_page - 3, "its four lines take four rows");
+        // A click on its third line (`  second 0`): the column there.
+        step(click(row_h * 2.5), &mut s);
+        assert_eq!(s.selected, Some(0));
+        let (a, _) = s.sel.unwrap();
+        assert!(a.col > "2025-10-17 rec 0\n  first 0\n".len(), "{a:?}");
+        // Copy: the whole record, its lines included.
+        let copied = step(vec![egui::Event::Copy], &mut s);
+        assert_eq!(copied, ["2025-10-17 rec 0\n  first 0\n  second 0\n  third 0"]);
+        // ← folds it.
+        step(vec![key(Key::ArrowLeft)], &mut s);
+        step(vec![], &mut s);
+        assert!(s.unfolded.is_empty() && s.page == folded_page);
+        // Unfold all.
+        s.unfold_all = true;
+        step(vec![], &mut s);
+        step(vec![], &mut s);
+        assert!(s.page <= folded_page / 4 + 1, "{}", s.page);
     }
 
     /// A note on the line before takes a row of the view: fewer lines fit,
