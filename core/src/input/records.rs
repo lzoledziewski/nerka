@@ -9,7 +9,9 @@
 //! separators and blank lines, belong to none). The level is detected from
 //! the record's start, as for a line.
 
+use super::json::{self, Json};
 use super::{Anchor, Bytes, LogSource, new_data_id};
+use crate::event::{FieldDef, FieldId, FieldKind, FieldValue, Level};
 use crate::{Error, LineNo, Progress, Result};
 use regex::bytes::Regex;
 use std::borrow::Cow;
@@ -30,6 +32,10 @@ pub enum RecordSplit {
     /// Records are separated by lines matching the regex (not part of
     /// either record).
     Separator(Regex),
+    /// JSON: each top-level value is a record (JSON Lines, objects one
+    /// after another), or each element if the file is one array. Keys are
+    /// fields ([`JsonFields`]).
+    Json,
 }
 
 impl PartialEq for RecordSplit {
@@ -41,8 +47,8 @@ impl PartialEq for RecordSplit {
 impl Eq for RecordSplit {}
 
 impl RecordSplit {
-    /// Read a spec: `lines`, `blank`, `start=REGEX`, `sep=REGEX` (a regex
-    /// may be written `/…/`).
+    /// Read a spec: `lines`, `blank`, `json`, `start=REGEX`, `sep=REGEX`
+    /// (a regex may be written `/…/`).
     pub fn parse(spec: &str) -> Result<RecordSplit> {
         let spec = spec.trim();
         let regex = |s: &str| {
@@ -58,15 +64,32 @@ impl RecordSplit {
         Ok(match spec {
             "" | "lines" => RecordSplit::Lines,
             "blank" => RecordSplit::Blank,
+            "json" => RecordSplit::Json,
             _ => match spec.split_once('=') {
                 Some(("start", re)) => RecordSplit::Start(regex(re)?),
                 Some(("sep", re)) => RecordSplit::Separator(regex(re)?),
                 _ => {
-                    let msg = format!("records: '{spec}' isn't lines, blank, start=REGEX or sep=REGEX");
+                    let msg = format!("records: '{spec}' isn't lines, blank, json, start=REGEX or sep=REGEX");
                     return Err(Error::Format(msg));
                 }
             },
         })
+    }
+
+    /// A choice as the CLI and the Records window take it: a spec, or
+    /// `auto` (`None`: JSON if the file looks like JSON, else lines).
+    pub fn parse_choice(spec: &str) -> Result<Option<RecordSplit>> {
+        if spec.trim() == "auto" { Ok(None) } else { RecordSplit::parse(spec).map(Some) }
+    }
+
+    /// The split for a file whose first bytes are `head`, given a choice
+    /// (`None`: JSON if it looks like JSON, else lines).
+    pub fn choose(choice: Option<&RecordSplit>, head: &[u8]) -> RecordSplit {
+        match choice {
+            Some(s) => s.clone(),
+            None if json::looks_like_json(head) => RecordSplit::Json,
+            None => RecordSplit::Lines,
+        }
     }
 
     /// The spec [`Self::parse`] reads back.
@@ -78,6 +101,7 @@ impl RecordSplit {
         match self {
             RecordSplit::Lines => "lines".into(),
             RecordSplit::Blank => "blank".into(),
+            RecordSplit::Json => "json".into(),
             RecordSplit::Start(r) => format!("start=/{}/", re(r)),
             RecordSplit::Separator(r) => format!("sep=/{}/", re(r)),
         }
@@ -93,7 +117,83 @@ pub struct RecordFile {
     starts: Vec<u64>,
     ends: Vec<u64>,
     split: RecordSplit,
+    /// JSON records: the fields their keys give.
+    json: Option<JsonFields>,
     data_id: usize,
+}
+
+/// The fields of JSON records: every key path with a value in the first
+/// [`SAMPLE`] records (lower case, nested keys joined by `.`: `ctx.user`),
+/// typed by what they hold (whole numbers `U64`, other numbers `F64`, the
+/// rest text; arrays and objects as their text). A `level`, `severity`,
+/// `lvl` or `loglevel` key gives the row's level (names, or numbers on the
+/// 10–60 scale of bunyan / pino); `raw`, `level` and `bookmark` are NFD's own
+/// and aren't fields.
+#[derive(Debug, Clone, Default)]
+pub struct JsonFields {
+    schema: Vec<FieldDef>,
+    paths: Vec<Vec<String>>,
+    level: Option<Vec<String>>,
+}
+
+/// Records read for the JSON fields.
+const SAMPLE: usize = 1000;
+
+/// Keys whose value is the level, in this order.
+const LEVEL_KEYS: [&str; 4] = ["level", "severity", "lvl", "loglevel"];
+
+impl JsonFields {
+    fn of(buf: &[u8], starts: &[u64], ends: &[u64]) -> JsonFields {
+        let mut seen: Vec<(String, FieldKind)> = Vec::new();
+        for (&s, &e) in starts.iter().zip(ends).take(SAMPLE) {
+            json::flatten(&buf[s as usize..e as usize], &mut |path, v| {
+                let kind = match v {
+                    Json::Null => return,
+                    Json::Num(n) if n.iter().all(u8::is_ascii_digit) => FieldKind::U64,
+                    Json::Num(_) => FieldKind::F64,
+                    _ => FieldKind::Str,
+                };
+                match seen.iter_mut().find(|(p, _)| p == path) {
+                    Some((_, k)) => {
+                        *k = match (*k, kind) {
+                            (a, b) if a == b => a,
+                            (FieldKind::U64 | FieldKind::F64, FieldKind::U64 | FieldKind::F64) => FieldKind::F64,
+                            _ => FieldKind::Str,
+                        }
+                    }
+                    None => seen.push((path.to_owned(), kind)),
+                }
+            });
+        }
+        let level = LEVEL_KEYS.iter().find(|k| seen.iter().any(|(p, _)| p == *k)).map(|k| vec![k.to_string()]);
+        // Names a query can write (a WORD of NFD), and not NFD's own.
+        let usable = |p: &str| {
+            p.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-'))
+                && !matches!(p, "raw" | "level" | "bookmark")
+        };
+        let (mut schema, mut paths) = (Vec::new(), Vec::new());
+        for (p, kind) in seen.into_iter().filter(|(p, _)| usable(p)) {
+            paths.push(p.split('.').map(str::to_owned).collect());
+            schema.push(FieldDef::owned(p, kind, false));
+        }
+        JsonFields { schema, paths, level }
+    }
+}
+
+/// A level written as a name (`warn`, `ERROR`) or a number (bunyan / pino:
+/// 10 trace … 60 fatal).
+fn level_of(v: &Json<'_>) -> Option<Level> {
+    match v {
+        Json::Num(n) => Some(match std::str::from_utf8(n).ok()?.parse::<f64>().ok()? as u32 {
+            0..=19 => Level::Trace,
+            20..=29 => Level::Debug,
+            30..=39 => Level::Info,
+            40..=49 => Level::Warn,
+            50..=59 => Level::Error,
+            _ => Level::Fatal,
+        }),
+        v => Level::parse(std::str::from_utf8(&v.text()).ok()?.trim()),
+    }
 }
 
 /// Lines of `buf` as (start, end without its line break, next line's start),
@@ -145,6 +245,10 @@ fn split(buf: &[u8], how: &RecordSplit, progress: &Progress) -> Result<(Vec<u64>
         }
     }
     match how {
+        RecordSplit::Json => {
+            let found = json::records(buf, progress)?;
+            return Ok(found.into_iter().unzip());
+        }
         RecordSplit::Lines => {
             for (s, e, next) in lines(buf, 0) {
                 starts.push(s as u64);
@@ -238,12 +342,15 @@ impl RecordFile {
         let data = Bytes::map(path)?;
         let (starts, ends) = split(data.bytes(), &how, progress)?;
         let name = path.display().to_string();
-        Ok(Self { name, path: Some(path.to_path_buf()), data, starts, ends, split: how, data_id: new_data_id() })
+        let json = (how == RecordSplit::Json).then(|| JsonFields::of(data.bytes(), &starts, &ends));
+        let path = Some(path.to_path_buf());
+        Ok(Self { name, path, data, starts, ends, split: how, json, data_id: new_data_id() })
     }
 
     /// In-memory text, handy for tests.
     pub fn from_bytes(name: impl Into<String>, bytes: Vec<u8>, how: RecordSplit) -> Self {
         let (starts, ends) = split(&bytes, &how, &Progress::new()).expect("not cancelled");
+        let json = (how == RecordSplit::Json).then(|| JsonFields::of(&bytes, &starts, &ends));
         Self {
             name: name.into(),
             path: None,
@@ -251,6 +358,7 @@ impl RecordFile {
             starts,
             ends,
             split: how,
+            json,
             data_id: new_data_id(),
         }
     }
@@ -263,11 +371,43 @@ impl RecordFile {
     pub fn split(&self) -> &RecordSplit {
         &self.split
     }
+
+    fn record(&self, line: LineNo) -> Option<&[u8]> {
+        let i = usize::try_from(line).ok()?;
+        Some(&self.data.bytes()[*self.starts.get(i)? as usize..self.ends[i] as usize])
+    }
 }
 
 impl LogSource for RecordFile {
     fn data_id(&self) -> usize {
         self.data_id
+    }
+
+    fn schema(&self) -> &[FieldDef] {
+        self.json.as_ref().map_or(&[], |j| &j.schema)
+    }
+
+    fn field(&self, line: LineNo, id: FieldId) -> Option<FieldValue<'_>> {
+        let j = self.json.as_ref()?;
+        let v = json::get(self.record(line)?, j.paths.get(id)?)?;
+        let num = |v: &Json<'_>| match v {
+            Json::Num(n) => std::str::from_utf8(n).ok().map(str::to_owned),
+            _ => None,
+        };
+        match (j.schema[id].kind, v) {
+            (_, Json::Null) => None,
+            (FieldKind::U64, v) => num(&v)?.parse().ok().map(FieldValue::U64),
+            (FieldKind::F64, v) => num(&v)?.parse().ok().map(FieldValue::F64),
+            (_, Json::Str(std::borrow::Cow::Borrowed(s))) => Some(FieldValue::Str(s.as_bytes().into())),
+            (_, v) => Some(FieldValue::Str(v.text().into_owned().into())),
+        }
+    }
+
+    /// JSON records with a level key: its value (none if it has no level
+    /// a query knows); other records: detected from the text.
+    fn supplied_level(&self, line: LineNo) -> Option<Option<Level>> {
+        let path = self.json.as_ref()?.level.as_ref()?;
+        Some(json::get(self.record(line)?, path).as_ref().and_then(level_of))
     }
 
     fn name(&self) -> &str {

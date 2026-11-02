@@ -7,6 +7,7 @@
 pub mod capture;
 pub mod concat;
 pub mod dlt;
+pub mod json;
 pub mod proto;
 pub mod records;
 
@@ -25,8 +26,9 @@ pub struct OpenOptions {
     pub capture: capture::CaptureOptions,
     /// Descriptions of DLT non-verbose messages (FIBEX).
     pub fibex: Option<std::sync::Arc<dlt::fibex::Fibex>>,
-    /// How a text file is split into rows: lines, or multi-line records.
-    pub records: records::RecordSplit,
+    /// How a text file is split into rows: lines, multi-line records or
+    /// JSON; `None`: JSON if the file looks like JSON, else lines.
+    pub records: Option<records::RecordSplit>,
 }
 
 /// Open `path` with the reader its content calls for (default
@@ -47,10 +49,14 @@ pub fn open_with(path: impl AsRef<Path>, options: &OpenOptions, progress: &Progr
         Box::new(dlt::DltFile::open(path, progress)?.with_fibex(options.fibex.clone()))
     } else if capture::is_capture(head) {
         Box::new(capture::open(path, &options.capture, progress)?.0.with_fibex(options.fibex.clone()))
-    } else if options.records != records::RecordSplit::Lines {
-        Box::new(records::RecordFile::open(path, options.records.clone(), progress)?)
     } else {
-        Box::new(text::TextFile::open(path, progress)?)
+        // JSON is told from the start of the file (a first value whole).
+        let mut start = vec![0u8; 64 * 1024];
+        let n = File::open(path)?.read(&mut start)?;
+        match records::RecordSplit::choose(options.records.as_ref(), &start[..n]) {
+            records::RecordSplit::Lines => Box::new(text::TextFile::open(path, progress)?),
+            split => Box::new(records::RecordFile::open(path, split, progress)?),
+        }
     })
 }
 

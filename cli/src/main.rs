@@ -62,9 +62,10 @@ struct Cli {
     /// this computer's zone.
     #[arg(long = "mf4-utc", global = true)]
     mf4_utc: bool,
-    /// Read text files as multi-line records: `start=/REGEX/` (a line
-    /// matching it starts a record), `blank` (blank lines separate them),
-    /// `sep=/REGEX/` (lines matching it separate them) or `lines`.
+    /// Read text files as records: `start=/REGEX/` (a line matching it
+    /// starts a record), `blank` (blank lines separate them), `sep=/REGEX/`
+    /// (lines matching it separate them), `json` (keys are fields), `lines`,
+    /// or `auto` (the default: JSON if the file looks like JSON, else lines).
     #[arg(long, global = true, value_name = "SPEC")]
     records: Option<String>,
     #[command(subcommand)]
@@ -354,7 +355,7 @@ fn run() -> Result<()> {
     options.capture.unpack.dir = cli.unpack_dir.clone().or_else(nerka_core::cache_dir);
     options.capture.mf4_local_time = !cli.mf4_utc;
     if let Some(spec) = &cli.records {
-        options.records = nerka_core::input::records::RecordSplit::parse(spec)?;
+        options.records = nerka_core::input::records::RecordSplit::parse_choice(spec)?;
     }
     nerka_core::time::set_local(cli.local_time);
     if !cli.fibex.is_empty() {

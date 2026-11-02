@@ -133,3 +133,76 @@ fn the_parallel_split_matches_a_plain_one() {
         assert_eq!(f.line_text(l as u64).unwrap().replace("\r\n", "\n"), *w, "record {l}");
     }
 }
+
+const JSONL: &str = r#"{"ts": "10:00:00", "level": "info", "msg": "start", "ctx": {"user": "alice", "id": 7}, "latency": 1.25, "status": 200}
+{"ts": "10:00:01", "level": "ERROR", "msg": "db \"down\"", "ctx": {"user": "bob", "id": 8}, "latency": 30, "status": 503, "tags": ["db", "retry"]}
+{"ts": "10:00:02", "level": "warn", "msg": "slow", "ctx": {"user": "alice"}, "latency": 4.5, "status": 200}
+not json at all
+{"ts": "10:00:03", "msg": "no level", "status": "n/a"}
+"#;
+
+fn json(text: &str) -> RecordFile {
+    RecordFile::from_bytes("t", text.into(), RecordSplit::Json)
+}
+
+#[test]
+fn json_keys_are_fields() {
+    let f = json(JSONL);
+    assert_eq!(f.line_count(), 4, "the line that isn't JSON is skipped");
+    let names: Vec<(&str, crate::FieldKind)> = f.schema().iter().map(|d| (d.name.as_ref(), d.kind)).collect();
+    use crate::FieldKind::{F64, Str, U64};
+    assert_eq!(
+        names,
+        [
+            ("ts", Str),
+            ("msg", Str),
+            ("ctx.user", Str),
+            ("ctx.id", U64),
+            ("latency", F64),
+            ("status", Str),
+            ("tags", Str)
+        ],
+        "level is the row's level; a key holding a number and text is text"
+    );
+    let q = |s: &str| run_on(&f, &Filter::Query(Query::compile(s).unwrap()));
+    assert_eq!(q("level >= WARN"), [1, 2]);
+    assert_eq!(q("ctx.user == alice"), [0, 2]);
+    assert_eq!(q("latency > 2 AND latency < 10"), [2]);
+    assert_eq!(q("ctx.id >= 8"), [1]);
+    assert_eq!(q("msg ~ /\"down\"/"), [1], "strings are unescaped");
+    assert_eq!(q("tags ~ /retry/"), [1], "arrays as their text");
+    assert_eq!(q(r#"status == "n/a""#), [3]);
+    assert_eq!(q("ctx.id != 7"), [1, 2, 3], "a missing key only satisfies !=");
+    assert_eq!(q("/alice/ AND latency > 4"), [2], "raw is the record's text");
+    assert!(Query::compile_for("nope == 1", f.schema()).is_err());
+
+    // Pretty JSON, one array; numeric levels (bunyan / pino).
+    let pretty = "[\n  {\n    \"level\": 30,\n    \"msg\": \"hi\"\n  },\n  {\"level\": 50, \"msg\": \"bad\"}\n]\n";
+    let f = json(pretty);
+    assert_eq!(f.line_count(), 2);
+    assert_eq!(f.line_text(0).unwrap().lines().count(), 4, "a record keeps its lines");
+    let q = |s: &str| run_on(&f, &Filter::Query(Query::compile(s).unwrap()));
+    assert_eq!(q("level >= ERROR"), [1]);
+    assert_eq!(q("level == INFO"), [0]);
+}
+
+/// A file opened without a choice is read as JSON if it looks like JSON;
+/// a choice of lines reads it as lines.
+#[test]
+fn json_is_found_unless_lines_are_asked_for() {
+    let dir = std::env::temp_dir().join(format!("nerka-json-auto-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let (j, t) = (dir.join("a.log"), dir.join("b.log"));
+    std::fs::write(&j, JSONL).unwrap();
+    std::fs::write(&t, "[INFO] {\"a\": 1}\n[WARN] x\n").unwrap();
+    let p = Progress::new();
+    let auto = crate::OpenOptions::default();
+    let lines = crate::OpenOptions { records: Some(RecordSplit::Lines), ..Default::default() };
+    let open = |path: &Path, o: &crate::OpenOptions| crate::open_with(path, o, &p).unwrap();
+    assert_eq!((open(&j, &auto).line_count(), open(&j, &auto).schema().len()), (4, 7));
+    assert_eq!((open(&j, &lines).line_count(), open(&j, &lines).schema().len()), (5, 0));
+    assert_eq!((open(&t, &auto).line_count(), open(&t, &auto).schema().len()), (2, 0), "[INFO] is text");
+    assert_eq!(RecordSplit::parse_choice("auto").unwrap(), None);
+    assert_eq!(RecordSplit::parse_choice("json").unwrap(), Some(RecordSplit::Json));
+    std::fs::remove_dir_all(&dir).ok();
+}

@@ -30,7 +30,10 @@ your logs carry. Everything runs locally, with no backend: a desktop viewer
 - **Multi-line records:** a text log can be read as records instead of
   lines (a tab's menu → Records…, remembered per file; CLI `--records`): a
   line matching a pattern starts one (a timestamp: a stack trace stays with
-  its message), or blank lines or separator lines split them. Several files of one kind
+  its message), or blank lines or separator lines split them.
+- **JSON logs:** JSON Lines and pretty JSON are found automatically; each
+  value is a row and its keys are fields: `level >= WARN AND ctx.user == bob
+  AND latency > 2.5`. Several files of one kind
   can be opened as one view, one after another, and reordered.
 - **Filter and Search:** the Filter decides which lines the main view shows;
   the Search finds lines among those, lists the hits in a bottom pane and

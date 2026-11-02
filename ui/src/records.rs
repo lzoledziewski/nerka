@@ -1,7 +1,8 @@
-//! A tab's records: how its text files are split into rows (one per line,
-//! or multi-line records), chosen per tab (its menu → Records…) and
-//! remembered per file in `<config>/nerka/records` (`spec<TAB>path` per
-//! line; a file read as lines isn't listed).
+//! A tab's records: how its text files are split into rows (automatic: JSON
+//! if a file looks like JSON, else one row per line; or lines, multi-line
+//! records, JSON), chosen per tab (its menu → Records…) and remembered per
+//! file in `<config>/nerka/records` (`spec<TAB>path` per line; a file read
+//! automatically isn't listed, so "lines" can turn JSON off for a file).
 
 use eframe::egui;
 use nerka_core::input::records::RecordSplit;
@@ -17,20 +18,16 @@ fn read_memo() -> Vec<(PathBuf, String)> {
     text.lines().filter_map(|l| l.split_once('\t')).map(|(spec, path)| (PathBuf::from(path), spec.to_owned())).collect()
 }
 
-/// How `path` was last read: its remembered split, else lines.
-pub fn remembered(path: &Path) -> RecordSplit {
-    read_memo()
-        .into_iter()
-        .find(|(p, _)| p == path)
-        .and_then(|(_, spec)| RecordSplit::parse(&spec).ok())
-        .unwrap_or_default()
+/// How `path` was last read: its remembered split; `None`: automatic.
+pub fn remembered(path: &Path) -> Option<RecordSplit> {
+    read_memo().into_iter().find(|(p, _)| p == path).and_then(|(_, spec)| RecordSplit::parse(&spec).ok())
 }
 
-/// Remember how `path` is read (lines: forget it).
-pub fn remember(path: &Path, split: &RecordSplit) -> std::io::Result<()> {
+/// Remember how `path` is read (`None`, automatic: forget it).
+pub fn remember(path: &Path, split: Option<&RecordSplit>) -> std::io::Result<()> {
     let Some(file) = memo_path() else { return Ok(()) };
     let mut memo: Vec<(PathBuf, String)> = read_memo().into_iter().filter(|(p, _)| p != path).collect();
-    if *split != RecordSplit::Lines {
+    if let Some(split) = split {
         memo.push((path.to_path_buf(), split.spec()));
     }
     if let Some(dir) = file.parent() {
@@ -41,10 +38,12 @@ pub fn remember(path: &Path, split: &RecordSplit) -> std::io::Result<()> {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Kind {
+    Auto,
     Lines,
     Start,
     Blank,
     Separator,
+    Json,
 }
 
 /// The Records window's fields, as typed.
@@ -57,15 +56,17 @@ pub struct Edit {
 }
 
 impl Edit {
-    /// The window for a tab read as `split`.
-    pub fn of(split: &RecordSplit) -> Edit {
-        let spec = split.spec();
+    /// The window for a tab read as `split` (`None`: automatic).
+    pub fn of(split: Option<&RecordSplit>) -> Edit {
+        let spec = split.map(RecordSplit::spec).unwrap_or_default();
         let re = |prefix: &str| spec.strip_prefix(prefix).map(|s| s.trim_matches('/').to_owned()).unwrap_or_default();
         let kind = match split {
-            RecordSplit::Lines => Kind::Lines,
-            RecordSplit::Start(_) => Kind::Start,
-            RecordSplit::Blank => Kind::Blank,
-            RecordSplit::Separator(_) => Kind::Separator,
+            None => Kind::Auto,
+            Some(RecordSplit::Lines) => Kind::Lines,
+            Some(RecordSplit::Start(_)) => Kind::Start,
+            Some(RecordSplit::Blank) => Kind::Blank,
+            Some(RecordSplit::Separator(_)) => Kind::Separator,
+            Some(RecordSplit::Json) => Kind::Json,
         };
         let start = Some(re("start=")).filter(|s| !s.is_empty()).unwrap_or_else(|| r"\d{4}-\d\d-\d\d".to_owned());
         Edit { kind, start, sep: re("sep="), error: None }
@@ -73,8 +74,10 @@ impl Edit {
 
     fn spec(&self) -> String {
         match self.kind {
+            Kind::Auto => "auto".into(),
             Kind::Lines => "lines".into(),
             Kind::Blank => "blank".into(),
+            Kind::Json => "json".into(),
             Kind::Start => format!("start={}", self.start),
             Kind::Separator => format!("sep={}", self.sep),
         }
@@ -84,7 +87,8 @@ impl Edit {
 /// What the window asks for.
 pub enum Outcome {
     Open,
-    Apply(RecordSplit),
+    /// Read the files this way (`None`: automatic).
+    Apply(Option<RecordSplit>),
     Close,
 }
 
@@ -99,6 +103,7 @@ pub fn window(ctx: &egui::Context, title: &str, edit: &mut Edit) -> Outcome {
         .show(ctx, |ui| {
             ui.weak("How the tab's text files are split into rows. A record of several lines is one row: filters and searches see all of it, and Enter shows it whole.");
             ui.separator();
+            ui.radio_value(&mut edit.kind, Kind::Auto, "Automatic: JSON if the file looks like JSON, else one row per line");
             ui.radio_value(&mut edit.kind, Kind::Lines, "One row per line");
             ui.horizontal(|ui| {
                 ui.radio_value(&mut edit.kind, Kind::Start, "A line matching this starts a record:");
@@ -119,6 +124,8 @@ pub fn window(ctx: &egui::Context, title: &str, edit: &mut Edit) -> Outcome {
                         .desired_width(220.0),
                 );
             });
+            ui.radio_value(&mut edit.kind, Kind::Json, "JSON: each value a record, its keys fields (ctx.user)")
+                .on_hover_text("JSON Lines, objects one after another, or one array of them");
             if let Some(e) = &edit.error {
                 ui.colored_label(ui.visuals().error_fg_color, e);
             }
@@ -129,7 +136,7 @@ pub fn window(ctx: &egui::Context, title: &str, edit: &mut Edit) -> Outcome {
             });
         });
     if apply {
-        match RecordSplit::parse(&edit.spec()) {
+        match RecordSplit::parse_choice(&edit.spec()) {
             Ok(split) => return Outcome::Apply(split),
             Err(e) => edit.error = Some(e.to_string()),
         }
@@ -143,12 +150,12 @@ mod tests {
 
     #[test]
     fn the_window_reads_back_what_it_shows() {
-        for spec in ["lines", "blank", r"start=/\d{4}-/", "sep=/----/"] {
-            let split = RecordSplit::parse(spec).unwrap();
-            let e = Edit::of(&split);
-            assert_eq!(RecordSplit::parse(&e.spec()).unwrap(), split, "{spec}");
+        for spec in ["auto", "lines", "blank", "json", r"start=/\d{4}-/", "sep=/----/"] {
+            let split = RecordSplit::parse_choice(spec).unwrap();
+            let e = Edit::of(split.as_ref());
+            assert_eq!(RecordSplit::parse_choice(&e.spec()).unwrap(), split, "{spec}");
         }
-        // A tab read as lines offers a timestamp as the start pattern.
-        assert_eq!(Edit::of(&RecordSplit::Lines).start, r"\d{4}-\d\d-\d\d");
+        // A tab read automatically offers a timestamp as the start pattern.
+        assert_eq!(Edit::of(None).start, r"\d{4}-\d\d-\d\d");
     }
 }

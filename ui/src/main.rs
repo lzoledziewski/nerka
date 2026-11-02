@@ -582,8 +582,9 @@ struct Tab {
     arg_picks: Vec<nerka_core::Argument>,
     /// The Files window: the tab's files as they are being edited.
     files_edit: Option<Vec<PathBuf>>,
-    /// How the tab's text files are split into rows (remembered per file).
-    records: nerka_core::input::records::RecordSplit,
+    /// How the tab's text files are split into rows (remembered per file;
+    /// `None`: automatic, JSON if a file looks like JSON).
+    records: Option<nerka_core::input::records::RecordSplit>,
     /// The Records window, while it is open.
     records_edit: Option<records::Edit>,
     /// The files are being read in a new order or set.
@@ -3377,7 +3378,7 @@ impl App {
         if let Some(i) = records_edit {
             self.active = i;
             let t = &mut self.tabs[i];
-            t.records_edit = Some(records::Edit::of(&t.records));
+            t.records_edit = Some(records::Edit::of(t.records.as_ref()));
         }
         if let Some(i) = close {
             self.close(i);
@@ -3492,7 +3493,7 @@ impl App {
             records::Outcome::Apply(split) => {
                 t.records_edit = None;
                 for p in &t.paths {
-                    if let Err(e) = records::remember(p, &split) {
+                    if let Err(e) = records::remember(p, split.as_ref()) {
                         t.status = format!("Could not remember how {} is read: {e}", p.display());
                     }
                 }
