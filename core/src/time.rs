@@ -13,6 +13,7 @@
 //! way. A time of day is never converted. The offset at each instant comes
 //! from the OS (its zone rules, past years' DST included).
 
+use std::borrow::Cow;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Values below this are a time of day (day 0), not a date.
@@ -64,10 +65,25 @@ pub fn shown(t: f64) -> f64 {
     if is_local() && t >= DATES_FROM { t + local_offset(t) } else { t }
 }
 
-/// Read a time: `YYYY-MM-DD[T ]HH:MM:SS[.frac][Z|±HH[:MM]]` (also with `/`
-/// in the date), `HH:MM:SS[.frac]` (a time of day), or a plain number of
-/// seconds. A date-time without a zone is UTC, or local time if
-/// [`is_local`].
+/// Read a time, as logs write them:
+///
+/// - a date: `2025-10-17`, `2025/10/17`, `2025.10.17`, `17.10.2025`,
+///   `20251017`, or with the month's name (`17 Oct 2025`, `Oct 17, 2025`,
+///   `17-Oct-2025`, Apache's `17/Oct/2025`, a weekday first: `Fri, 17 Oct
+///   2025`; `Fri Oct 17 10:00:01 2025` with the year last);
+/// - then (after `T`, a space, or `:` as Apache writes it) or alone, a
+///   time of day: `10:00:01`, `9:05:01`, `10:00`, `100001` (after a
+///   compact date), seconds with a fraction after `.` or `,`
+///   (`10:00:01,250`), `AM` / `PM`, and a zone: `Z`, `UTC`, `GMT`,
+///   `+02:00`, `-0200`, `+02`;
+/// - or a plain number: seconds since the Unix epoch, or milliseconds,
+///   microseconds, nanoseconds when it is too large for seconds (an epoch
+///   stamp in ms is ~1.7e12).
+///
+/// A date-time without a zone is UTC, or local time if [`is_local`]; a time
+/// of day alone stays a time of day. Not read (ambiguous): a date without a
+/// year (`Oct 17 10:00:01`), and slashed dates with the year last
+/// (`10/17/2025` or `17/10/2025`).
 pub fn parse_time(s: &str) -> Option<f64> {
     parse_in(s, &|t| if is_local() { local_to_utc(t) } else { t })
 }
@@ -77,37 +93,158 @@ pub fn parse_time(s: &str) -> Option<f64> {
 fn parse_in(s: &str, zoneless: &dyn Fn(f64) -> f64) -> Option<f64> {
     let s = s.trim();
     if let Ok(n) = s.parse::<f64>() {
-        return n.is_finite().then_some(n);
+        return n.is_finite().then(|| epoch_seconds(n));
     }
-    let b = s.as_bytes();
-    let (day, rest) = if b.len() >= 10 && b[4] == b[7] && (b[4] == b'-' || b[4] == b'/') {
-        let (y, m, d) = (num(&s[..4])?, num(&s[5..7])?, num(&s[8..10])?);
-        if !(1..=12).contains(&m) || !(1..=31).contains(&d) {
-            return None;
-        }
-        let rest = &s[10..];
-        match rest.as_bytes().first() {
-            None => return Some(zoneless(days_from_civil(y, m, d) as f64 * 86_400.0)),
-            Some(b'T' | b't' | b' ') => (Some(days_from_civil(y, m, d)), &rest[1..]),
-            _ => return None,
-        }
-    } else {
-        (None, s)
+    let Some((day, rest, year_after)) = date(s) else {
+        // A time of day.
+        let (t, _) = clock(s, false)?;
+        return Some(t);
     };
-    let (clock, zone) = split_zone(rest)?;
-    let mut it = clock.splitn(3, ':');
-    let (h, m, sec) = (num(it.next()?)?, num(it.next()?)?, it.next()?);
-    let sec_whole = sec.split('.').next()?;
-    if sec_whole.len() != 2 || h > 23 || m > 59 {
+    let compact = s.as_bytes().get(..8).is_some_and(|b| b.iter().all(u8::is_ascii_digit));
+    let rest = rest.trim_start_matches(['T', 't', ' ', ':']);
+    if rest.is_empty() {
+        return Some(zoneless(day as f64 * 86_400.0));
+    }
+    // `Fri Oct 17 10:00:01 2025`: the year after the time.
+    let (rest, day) = match year_after {
+        Some((m, d)) => {
+            let (clock_part, year) = rest.trim_end().rsplit_once(' ')?;
+            (clock_part, days_from_civil(num(year).filter(|_| year.len() == 4)?, m, d))
+        }
+        None => (rest, day),
+    };
+    let (t, zone) = clock(rest, compact)?;
+    Some(match zone {
+        Some(zone) => day as f64 * 86_400.0 + t - zone,
+        None => zoneless(day as f64 * 86_400.0 + t),
+    })
+}
+
+/// A plain number as seconds: one too large for seconds (after the year
+/// 5000) is milliseconds, microseconds or nanoseconds since the epoch.
+fn epoch_seconds(n: f64) -> f64 {
+    match n.abs() {
+        a if a >= 1e17 => n / 1e9,
+        a if a >= 1e14 => n / 1e6,
+        a if a >= 1e11 => n / 1e3,
+        _ => n,
+    }
+}
+
+/// A month's name (its first three letters, any case) as 1–12.
+fn month(s: &str) -> Option<i64> {
+    const NAMES: [&str; 12] = ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"];
+    let s = s.get(..3)?;
+    NAMES.iter().position(|n| n.eq_ignore_ascii_case(s)).map(|i| i as i64 + 1)
+}
+
+/// The date at the start of `s`: its day (since the epoch) and what follows
+/// it; for `Oct 17 10:00:01 2025` (the year after the time) the month and
+/// day instead, the caller reading the year.
+#[allow(clippy::type_complexity)]
+fn date(s: &str) -> Option<(i64, &str, Option<(i64, i64)>)> {
+    let ymd =
+        |y: i64, m: i64, d: i64| ((1..=12).contains(&m) && (1..=31).contains(&d)).then(|| days_from_civil(y, m, d));
+    let b = s.as_bytes();
+    // 2025-10-17, 2025/10/17, 2025.10.17
+    if b.len() >= 10 && b[4] == b[7] && matches!(b[4], b'-' | b'/' | b'.') {
+        if let (Some(y), Some(m), Some(d)) = (num(&s[..4]), num(&s[5..7]), num(&s[8..10])) {
+            return Some((ymd(y, m, d)?, &s[10..], None));
+        }
+    }
+    // 17.10.2025
+    if let [d, m, rest] = s.splitn(3, '.').collect::<Vec<_>>()[..]
+        && d.len() <= 2
+        && m.len() <= 2
+        && rest.len() >= 4
+        && let (Some(d), Some(m), Some(y)) = (num(d), num(m), num(&rest[..4]))
+    {
+        return Some((ymd(y, m, d)?, &rest[4..], None));
+    }
+    // 20251017, then T100001 or nothing
+    if b.len() >= 8 && b[..8].iter().all(u8::is_ascii_digit) && b.get(8).is_none_or(|c| matches!(c, b'T' | b't' | b' '))
+    {
+        return Some((ymd(num(&s[..4])?, num(&s[4..6])?, num(&s[6..8])?)?, &s[8..], None));
+    }
+    // Names of months, a weekday first or not: `Fri, 17 Oct 2025`,
+    // `Oct 17, 2025`, `17-Oct-2025`, `17/Oct/2025`, `Fri Oct 17 10:00:01 2025`.
+    let words: Vec<&str> = s.split([' ', '-', '/', ',']).filter(|w| !w.is_empty()).collect();
+    let skip = usize::from(
+        words.first().is_some_and(|w| w.len() >= 3 && month(w).is_none() && w.bytes().all(|c| c.is_ascii_alphabetic())),
+    );
+    let w = words.get(skip..)?;
+    let after = |n: usize| -> &str {
+        // What follows the first `n` words (after the weekday) in `s`.
+        let mut rest = s;
+        for word in words.iter().take(skip + n) {
+            let at = rest.find(word).map_or(rest.len(), |i| i + word.len());
+            rest = &rest[at..];
+        }
+        rest.trim_start_matches([',', ' ', '-', '/'])
+    };
+    let year = |w: &str| num(w.get(..4)?).filter(|_| w.len() == 4 || w.as_bytes()[4] == b':');
+    match w {
+        [d, m, y, ..] if num(d).is_some() && month(m).is_some() => {
+            let y = year(y)?;
+            Some((ymd(y, month(m)?, num(d)?)?, after(2).get(4..)?, None))
+        }
+        [m, d, y, ..] if month(m).is_some() && num(d).is_some() && year(y).is_some() => {
+            Some((ymd(year(y)?, month(m)?, num(d)?)?, after(2).get(4..)?, None))
+        }
+        [m, d, _, y] if month(m).is_some() && num(d).is_some() && year(y).is_some() => {
+            let (m, d) = (month(m)?, num(d)?);
+            Some((0, after(2), Some((m, d))))
+        }
+        _ => None,
+    }
+}
+
+/// A time of day at the start of `s` (the rest is its zone): seconds into
+/// the day, and the zone's offset if it has one. `compact`: `HHMMSS` too.
+fn clock(s: &str, compact: bool) -> Option<(f64, Option<f64>)> {
+    let s = s.trim();
+    // A zone written as a word, the 12-hour clock: only a value that ends
+    // in a letter has them (a value per event: keep the common case short).
+    let (mut s, mut word_zone, mut pm) = (s, None, None);
+    if s.as_bytes().last().is_some_and(u8::is_ascii_alphabetic) {
+        if let Some((c, z)) = s.rsplit_once(' ')
+            && (z.eq_ignore_ascii_case("UTC") || z.eq_ignore_ascii_case("GMT"))
+        {
+            (s, word_zone) = (c.trim_end(), Some(0.0));
+        }
+        match s.len().checked_sub(2).and_then(|i| s.get(i..)) {
+            Some(t) if t.eq_ignore_ascii_case("PM") => (s, pm) = (s[..s.len() - 2].trim_end(), Some(true)),
+            Some(t) if t.eq_ignore_ascii_case("AM") => (s, pm) = (s[..s.len() - 2].trim_end(), Some(false)),
+            _ => {}
+        }
+    }
+    let (clock, zone) = split_zone(s.trim_end())?;
+    let zone = zone.or(word_zone);
+    let clock = clock.trim_end();
+    let mut parts = clock.split(':');
+    let (h, m, sec) = match (parts.next(), parts.next(), parts.next(), parts.next()) {
+        (Some(h), Some(m), sec, None) => (h, m, sec),
+        (Some(c), None, None, None) if compact && c.len() >= 6 => (&c[..2], &c[2..4], Some(&c[4..])),
+        _ => return None,
+    };
+    let (mut h, m) = (num(h).filter(|_| h.len() <= 2)?, num(m).filter(|_| m.len() == 2)?);
+    // Seconds: two digits, a fraction after `.` or `,` (log4j).
+    if sec.is_some_and(|s| s.split(['.', ',']).next().map(str::len) != Some(2)) || m > 59 {
         return None;
     }
+    let sec = match sec {
+        None => Cow::Borrowed("0"),
+        Some(s) if s.contains(',') => Cow::Owned(s.replace(',', ".")),
+        Some(s) => Cow::Borrowed(s),
+    };
+    match pm {
+        Some(pm) if (1..=12).contains(&h) => h = h % 12 + if pm { 12 } else { 0 },
+        Some(_) => return None,
+        None if h > 23 => return None,
+        None => {}
+    }
     let secs: f64 = sec.parse().ok().filter(|v: &f64| (0.0..61.0).contains(v))?;
-    let t = (h * 3600 + m * 60) as f64 + secs;
-    Some(match (day, zone) {
-        (Some(d), Some(zone)) => d as f64 * 86_400.0 + t - zone,
-        (Some(d), None) => zoneless(d as f64 * 86_400.0 + t),
-        (None, _) => t,
-    })
+    Some(((h * 3600 + m * 60) as f64 + secs, zone))
 }
 
 /// `"10:00:01+02:00"` → (`"10:00:01"`, 7200 s); no zone → `None`.
@@ -323,7 +460,53 @@ mod tests {
         assert_eq!(parse_time("2025-10-17T08:00:01-0200"), Some(day + 36_001.0));
         assert_eq!(parse_time("10:00:01.250"), Some(36_001.25));
         assert_eq!(parse_time(" 1729771200.5 "), Some(1_729_771_200.5));
-        for bad in ["", "10:00", "25:00:00", "10:61:00", "10:00:1", "2025-13-01", "2025-10-17X10:00:00", "now"] {
+        for bad in ["", "25:00:00", "10:61:00", "10:00:1", "10:00:0", "2025-13-01", "2025-10-17X10:00:00", "now"] {
+            assert_eq!(parse_time(bad), None, "{bad}");
+        }
+    }
+
+    /// The forms logs write besides ISO: each the same instant.
+    #[test]
+    fn parses_the_forms_logs_write() {
+        let at = 20_378.0 * 86_400.0 + 36_001.25; // 2025-10-17 10:00:01.25 UTC
+        for s in [
+            "2025-10-17 10:00:01,250",
+            "2025.10.17 10:00:01.250",
+            "17.10.2025 10:00:01.25",
+            "20251017T100001.25",
+            "20251017 100001,25",
+            "17 Oct 2025 10:00:01.25",
+            "Fri, 17 Oct 2025 12:00:01.25 +0200",
+            "17-Oct-2025 10:00:01.25 UTC",
+            "17/Oct/2025:12:00:01.25 +0200",
+            "Oct 17, 2025 10:00:01.25 AM",
+            "october 17 2025 10:00:01.25 GMT",
+            "Fri Oct 17 10:00:01.25 2025",
+            "2025-10-17T05:00:01.25-05",
+        ] {
+            assert_eq!(parse_time(s), Some(at), "{s}");
+        }
+        assert_eq!(parse_time("Oct 17, 2025 10:00:01 PM"), Some(at - 0.25 + 12.0 * 3600.0));
+        assert_eq!(parse_time("12:30 AM"), Some(30.0 * 60.0));
+        // Times of day.
+        assert_eq!(parse_time("9:05:01"), Some(32_701.0));
+        assert_eq!(parse_time("10:00"), Some(36_000.0));
+        assert_eq!(parse_time("10:00:01,5"), Some(36_001.5));
+        // Epoch stamps in ms, µs and ns.
+        // (A nanosecond stamp is as exact as an f64 of it: ~0.2 µs here.)
+        for s in ["1760695201250", "1760695201250000", "1760695201250000000"] {
+            assert!((parse_time(s).unwrap() - 1_760_695_201.25).abs() < 1e-6, "{s}");
+        }
+        // Ambiguous or broken: not read.
+        for bad in [
+            "Oct 17 10:00:01",
+            "10/17/2025 10:00:01",
+            "17/10/2025",
+            "32 Oct 2025",
+            "17 Foo 2025",
+            "13:00 PM",
+            "ERROR 10:00:01",
+        ] {
             assert_eq!(parse_time(bad), None, "{bad}");
         }
     }
