@@ -31,13 +31,17 @@ pub struct Concat {
 }
 
 /// What kind of source this is, for "same kind": columns and fields.
-fn kind(s: &dyn LogSource) -> (Vec<&'static str>, Vec<(&'static str, FieldKind)>) {
-    (s.columns().iter().map(|c| c.name).collect(), s.schema().iter().map(|f| (f.name, f.kind)).collect())
+fn kind(s: &dyn LogSource) -> (Vec<&'static str>, Vec<(&str, FieldKind)>) {
+    (s.columns().iter().map(|c| c.name).collect(), s.schema().iter().map(|f| (f.name.as_ref(), f.kind)).collect())
 }
 
-/// A readable kind for messages: "DLT" for table sources, else "plain text".
+/// A readable kind for messages: plain text, DLT, or another table.
 fn kind_name(s: &dyn LogSource) -> &'static str {
-    if s.columns().is_empty() { "plain text" } else { "DLT" }
+    match s.columns() {
+        [] => "plain text",
+        c if c == super::dlt::COLUMNS => "DLT",
+        _ => "a table of other columns",
+    }
 }
 
 /// The last path component of a source's name.
@@ -60,7 +64,7 @@ impl Concat {
             )));
         }
         let mut schema = first.schema().to_vec();
-        schema.push(FieldDef { name: FILE_FIELD, kind: FieldKind::Str, costly: false });
+        schema.push(FieldDef::new(FILE_FIELD, FieldKind::Str, false));
         let (mut starts, mut total) = (Vec::with_capacity(parts.len()), 0);
         for p in &parts {
             starts.push(total);
@@ -110,6 +114,16 @@ impl LogSource for Concat {
 
     fn index_memory_bytes(&self) -> usize {
         self.parts.iter().map(|p| p.index_memory_bytes()).sum::<usize>() + self.starts.capacity() * 8
+    }
+
+    fn format(&self) -> String {
+        let mut formats: Vec<String> = Vec::new();
+        for f in self.parts.iter().map(|p| p.format()) {
+            if !formats.contains(&f) {
+                formats.push(f);
+            }
+        }
+        formats.join(" + ")
     }
 
     fn columns(&self) -> &[ColumnDef] {
@@ -176,6 +190,14 @@ impl LogSource for View<'_> {
 
     fn line_count(&self) -> LineNo {
         self.part().line_count()
+    }
+
+    fn anchor(&self, line: LineNo) -> Option<super::Anchor> {
+        self.part().anchor(line)
+    }
+
+    fn lines_at(&self, offsets: &[u64]) -> Vec<Option<LineNo>> {
+        self.part().lines_at(offsets)
     }
 
     fn line_bytes(&self, line: LineNo) -> Option<Cow<'_, [u8]>> {

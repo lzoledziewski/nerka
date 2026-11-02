@@ -1,7 +1,8 @@
 use super::writer::{Arg, Extended, Msg, Payload, Value, id};
 use super::*;
 use crate::engine::search::tests::run_on;
-use crate::{Filter, Matcher, Query};
+use crate::input::proto::{Framed, MAX_CHANNELS, MAX_PROTOCOLS};
+use crate::{Filter, LineNo, LogSource, Matcher, Query};
 use fibex::Fibex;
 
 fn file(msgs: &[Msg]) -> DltFile {
@@ -278,11 +279,18 @@ fn engine_queries_match_naive_evaluation() {
 /// odd ones in the side buffer, junk between the others in the file; the
 /// storage ECU becomes the channel's.
 fn framed_copy(f: &DltFile) -> DltFile {
-    let Index::Stored(offsets) = &f.index else { panic!("a .dlt file") };
+    let bytes = f.file_bytes();
+    let mut offsets = Vec::new();
+    let mut pos = 0;
+    while let Some(m) = Message::parse(&bytes[pos..]) {
+        offsets.push(pos);
+        pos += STORAGE_LEN + m.len();
+    }
+    assert_eq!(offsets.len() as u64, f.line_count());
     let (mut data, mut side, mut msgs) = (b"capture header".to_vec(), Vec::new(), Vec::new());
     let mut channel_ecus: Vec<[u8; 4]> = Vec::new();
     for (i, &off) in offsets.iter().enumerate() {
-        let buf = &f.data.bytes()[off as usize..];
+        let buf = &bytes[off..];
         let s = format::Storage::parse(buf).unwrap();
         let m = Message::parse(buf).unwrap();
         let bytes = &buf[format::STORAGE_LEN..format::STORAGE_LEN + m.len()];
@@ -293,10 +301,11 @@ fn framed_copy(f: &DltFile) -> DltFile {
         let in_side = i % 2 == 1;
         let target = if in_side { &mut side } else { &mut data };
         target.extend_from_slice(b"\xffjunk");
-        msgs.push(Framed::new(target.len() as u64, in_side, ch, s.secs, s.usecs).unwrap());
+        msgs.push(Framed::new(target.len() as u64, in_side, 0, ch, s.secs, s.usecs).unwrap());
         target.extend_from_slice(bytes);
     }
-    DltFile::from_frames("t.pcap".into(), None, crate::input::Bytes::Owned(data), msgs, side, channel_ecus, 0)
+    let protos: Vec<Arc<dyn Protocol>> = vec![Arc::new(Dlt::default())];
+    Records::framed("t.pcap".into(), None, crate::input::Bytes::Owned(data), msgs, side, channel_ecus, protos, 0)
 }
 
 #[test]
@@ -317,11 +326,13 @@ fn messages_read_in_place_match_the_dlt_file() {
     for s in ["ecu == ECU1", "ecu == GW AND apid == NAV", "level >= ERROR AND raw ~ /failed/", "mode == non-verbose"] {
         assert_eq!(run_on(&g, &q(s)), run_on(&f, &q(s)), "{s}");
     }
-    // Out-of-range offsets and channels are refused.
-    assert!(Framed::new(1 << 48, false, 0, 0, 0).is_none());
-    assert!(Framed::new(0, false, MAX_CHANNELS, 0, 0).is_none());
-    let x = Framed::new((1 << 48) - 1, true, MAX_CHANNELS - 1, 1, 2).unwrap();
-    assert_eq!((x.offset(), x.in_side(), x.channel()), ((1 << 48) - 1, true, MAX_CHANNELS - 1));
+    // Out-of-range offsets, protocols and channels are refused.
+    assert!(Framed::new(1 << 48, false, 0, 0, 0, 0).is_none());
+    assert!(Framed::new(0, false, 0, MAX_CHANNELS, 0, 0).is_none());
+    assert!(Framed::new(0, false, MAX_PROTOCOLS, 0, 0, 0).is_none());
+    let x = Framed::new((1 << 48) - 1, true, MAX_PROTOCOLS - 1, MAX_CHANNELS - 1, 1, 2).unwrap();
+    let got = (x.offset(), x.in_side(), x.proto(), x.channel());
+    assert_eq!(got, ((1 << 48) - 1, true, MAX_PROTOCOLS - 1, MAX_CHANNELS - 1));
 }
 
 #[test]
@@ -335,7 +346,8 @@ fn open_picks_reader_from_content() {
     std::fs::write(&txt, "plain\ntext\n").unwrap();
     let p = Progress::new();
     let (a, b) = (crate::open(&dlt, &p).unwrap(), crate::open(&txt, &p).unwrap());
-    assert_eq!((a.line_count(), a.schema().len()), (1, SCHEMA.len()));
+    // DLT's fields, and `proto`.
+    assert_eq!((a.line_count(), a.schema().len()), (1, SCHEMA.len() + 1));
     assert_eq!((b.line_count(), b.schema().len()), (2, 0));
     drop((a, b));
     let _ = std::fs::remove_dir_all(dir);

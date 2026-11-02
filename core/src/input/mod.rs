@@ -7,6 +7,9 @@
 pub mod capture;
 pub mod concat;
 pub mod dlt;
+pub mod json;
+pub mod proto;
+pub mod records;
 
 use crate::event::{FieldDef, FieldId, FieldValue, Level};
 use crate::{LineNo, Progress, Result};
@@ -23,6 +26,9 @@ pub struct OpenOptions {
     pub capture: capture::CaptureOptions,
     /// Descriptions of DLT non-verbose messages (FIBEX).
     pub fibex: Option<std::sync::Arc<dlt::fibex::Fibex>>,
+    /// How a text file is split into rows: lines, multi-line records or
+    /// JSON; `None`: JSON if the file looks like JSON, else lines.
+    pub records: Option<records::RecordSplit>,
 }
 
 /// Open `path` with the reader its content calls for (default
@@ -44,7 +50,13 @@ pub fn open_with(path: impl AsRef<Path>, options: &OpenOptions, progress: &Progr
     } else if capture::is_capture(head) {
         Box::new(capture::open(path, &options.capture, progress)?.0.with_fibex(options.fibex.clone()))
     } else {
-        Box::new(text::TextFile::open(path, progress)?)
+        // JSON is told from the start of the file (a first value whole).
+        let mut start = vec![0u8; 64 * 1024];
+        let n = File::open(path)?.read(&mut start)?;
+        match records::RecordSplit::choose(options.records.as_ref(), &start[..n]) {
+            records::RecordSplit::Lines => Box::new(text::TextFile::open(path, progress)?),
+            split => Box::new(records::RecordFile::open(path, split, progress)?),
+        }
     })
 }
 
@@ -132,6 +144,12 @@ pub trait LogSource: Send + Sync {
         0
     }
 
+    /// What the source is read as, for people: `text`, `JSON`,
+    /// `pcap: DLT + SOMEIP`.
+    fn format(&self) -> String {
+        "text".into()
+    }
+
     /// Columns of the rendered lines, if they are tab-separated cells. UIs
     /// show such sources as a table; plain text has none.
     fn columns(&self) -> &[ColumnDef] {
@@ -204,6 +222,26 @@ pub trait LogSource: Send + Sync {
         None
     }
 
+    /// Where `line` is, to find it again when row numbers change
+    /// (bookmarks): see [`Anchor`]. `None` if the source can't say (a view
+    /// of several files: ask its [`Self::parts`]).
+    fn anchor(&self, _line: LineNo) -> Option<Anchor> {
+        None
+    }
+
+    /// The line that holds an anchor made in another view of the file (a
+    /// record holding a line anchored when the file was read as lines),
+    /// if the content there still matches.
+    fn line_holding(&self, _anchor: &Anchor) -> Option<LineNo> {
+        None
+    }
+
+    /// The lines that start at these byte offsets of the file (an
+    /// [`Anchor::offset`]), in one pass; `None` where no line starts there.
+    fn lines_at(&self, offsets: &[u64]) -> Vec<Option<LineNo>> {
+        vec![None; offsets.len()]
+    }
+
     /// Identifies the data the source reads, for caches (signal events): a
     /// part of a [`concat::Concat`] answers its file's, so the part made
     /// for each scan is the same one. Files take a [`new_data_id`] when
@@ -211,6 +249,39 @@ pub trait LogSource: Send + Sync {
     /// the address, is for sources that live as long as their caches (tests).
     fn data_id(&self) -> usize {
         self as *const Self as *const () as usize
+    }
+}
+
+/// Where a line is in its file, to find it again when row numbers change
+/// (a capture indexed with other ports, a file that changed): the byte
+/// offset it starts at (`None` if its bytes aren't contiguous in the file,
+/// e.g. a reassembled datagram) and a hash of its first bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Anchor {
+    pub offset: Option<u64>,
+    pub hash: u32,
+}
+
+/// Bytes of a line that its [`Anchor::hash`] covers.
+pub const ANCHOR_BYTES: usize = 64;
+
+impl Anchor {
+    /// The anchor of a line starting at `offset` whose bytes are `bytes`.
+    pub fn of(offset: Option<u64>, bytes: &[u8]) -> Anchor {
+        // FNV-1a, 32 bits.
+        let hash = bytes[..bytes.len().min(ANCHOR_BYTES)]
+            .iter()
+            .fold(0x811c_9dc5u32, |h, &b| (h ^ u32::from(b)).wrapping_mul(0x0100_0193));
+        Anchor { offset, hash }
+    }
+
+    /// The anchor of text at `offset` whose bytes from there are `bytes`:
+    /// the hash covers its first line only (without its line break), so a
+    /// line and a record starting there have the same anchor.
+    pub fn of_text(offset: Option<u64>, bytes: &[u8]) -> Anchor {
+        let head = &bytes[..bytes.len().min(ANCHOR_BYTES)];
+        let line = head.split(|&b| b == b'\n').next().unwrap_or_default();
+        Anchor::of(offset, line.strip_suffix(b"\r").unwrap_or(line))
     }
 }
 

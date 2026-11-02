@@ -41,6 +41,7 @@ mod plots;
 mod prefs;
 mod presets;
 mod recall;
+mod records;
 mod shot;
 mod signals;
 mod view;
@@ -581,6 +582,11 @@ struct Tab {
     arg_picks: Vec<nerka_core::Argument>,
     /// The Files window: the tab's files as they are being edited.
     files_edit: Option<Vec<PathBuf>>,
+    /// How the tab's text files are split into rows (remembered per file;
+    /// `None`: automatic, JSON if a file looks like JSON).
+    records: Option<nerka_core::input::records::RecordSplit>,
+    /// The Records window, while it is open.
+    records_edit: Option<records::Edit>,
     /// The files are being read in a new order or set.
     files_undo: Option<FilesUndo>,
     status: String,
@@ -602,6 +608,9 @@ struct LineDetail {
     cells: Vec<String>,
     /// Column names of a table source; empty for plain text.
     names: Vec<&'static str>,
+    /// Every field the source supplies for the line: name, value (`None`:
+    /// the line has none), kind. Shown with the Fields checkbox.
+    fields: Vec<(String, Option<String>, &'static str)>,
     wrap: bool,
     /// The tab's signals on this line (filled by the tab every frame:
     /// values appear once their events are collected).
@@ -688,6 +697,62 @@ fn signals_section(ui: &mut egui::Ui, line: LineNo, signals: &[LineSignal]) -> O
     goto
 }
 
+/// Every field `file` supplies for `line`: name, value as text (`None`
+/// if the line has none), kind. Numbers show in hex too where that's how
+/// they're written (SOME/IP ids).
+fn field_values(file: &dyn LogSource, line: LineNo) -> Vec<(String, Option<String>, &'static str)> {
+    file.schema()
+        .iter()
+        .enumerate()
+        .map(|(id, def)| {
+            let value = file.field(line, id).map(|v| match v {
+                nerka_core::FieldValue::Str(b) => String::from_utf8_lossy(&b).into_owned(),
+                nerka_core::FieldValue::U64(n) if n > 9 => format!("{n} (0x{n:x})"),
+                nerka_core::FieldValue::U64(n) => n.to_string(),
+                nerka_core::FieldValue::F64(x) => x.to_string(),
+            });
+            let kind = match def.kind {
+                nerka_core::FieldKind::Str => "text",
+                nerka_core::FieldKind::Name => "name",
+                nerka_core::FieldKind::U64 => "number",
+                nerka_core::FieldKind::F64 => "number",
+            };
+            (def.name.to_string(), value, kind)
+        })
+        .collect()
+}
+
+/// The line window's Fields section: every field, its value and kind; a
+/// field the line has no value for is dimmed.
+fn fields_section(ui: &mut egui::Ui, fields: &[(String, Option<String>, &'static str)]) {
+    egui::CollapsingHeader::new(RichText::new(format!("Fields ({})", fields.len())).strong())
+        .id_salt("line-detail-fields")
+        .default_open(true)
+        .show(ui, |ui| {
+            egui::Grid::new("line-detail-fields-grid").num_columns(3).spacing([12.0, 2.0]).striped(true).show(
+                ui,
+                |ui| {
+                    for (name, value, kind) in fields {
+                        match value {
+                            Some(v) => {
+                                ui.label(RichText::new(name).monospace().strong());
+                                // Long values (a payload) are cut: the message below has all of it.
+                                let shown: String = v.chars().take(200).collect();
+                                ui.monospace(if v.chars().count() > 200 { format!("{shown}…") } else { shown });
+                            }
+                            None => {
+                                ui.label(RichText::new(name).monospace().weak());
+                                ui.weak("—");
+                            }
+                        }
+                        ui.weak(*kind);
+                        ui.end_row();
+                    }
+                },
+            );
+        });
+}
+
 /// Text shown in the line window at most; Copy still copies all of it.
 const DETAIL_MAX_BYTES: usize = 1 << 20;
 
@@ -695,7 +760,18 @@ impl LineDetail {
     fn of(file: &dyn LogSource, line: LineNo) -> Option<Self> {
         let cells = file.line_detail(line)?;
         let names = file.columns().iter().map(|c| c.name).collect();
-        Some(LineDetail { line, cells, names, wrap: true, signals: Vec::new(), goto: None, step: None, in_hits: false })
+        let fields = field_values(file, line);
+        Some(LineDetail {
+            line,
+            cells,
+            names,
+            fields,
+            wrap: true,
+            signals: Vec::new(),
+            goto: None,
+            step: None,
+            in_hits: false,
+        })
     }
 
     /// The same window on another line, keeping Wrap and the view it follows.
@@ -750,6 +826,15 @@ impl LineDetail {
                         copied = Some(msg.to_owned());
                     }
                     ui.checkbox(&mut self.wrap, "Wrap");
+                    if !self.fields.is_empty() {
+                        let id = egui::Id::unique("line-detail-all-fields");
+                        let mut all = ctx.data(|d| d.get_temp::<bool>(id)).unwrap_or(false);
+                        let tip = "Every field of the line (what queries can use), not only the columns";
+                        if ui.checkbox(&mut all, format!("Fields ({})", self.fields.len())).on_hover_text(tip).changed()
+                        {
+                            ctx.data_mut(|d| d.insert_temp(id, all));
+                        }
+                    }
                     let lines = msg.lines().count().max(1);
                     let s = if lines == 1 { "" } else { "s" };
                     ui.weak(format!("{} characters, {lines} line{s}", msg.chars().count()));
@@ -766,6 +851,9 @@ impl LineDetail {
                                 ui.end_row();
                             }
                         });
+                    }
+                    if ctx.data(|d| d.get_temp::<bool>(egui::Id::unique("line-detail-all-fields"))).unwrap_or(false) {
+                        fields_section(ui, &self.fields);
                     }
                     if !self.signals.is_empty() {
                         self.goto = signals_section(ui, self.line, &self.signals).or(self.goto);
@@ -936,6 +1024,9 @@ impl Tab {
         let ps = paths.clone();
         let mut options = prefs.open_options();
         options.fibex = fibex;
+        // As the first file was read last time: lines or records.
+        let split = records::remembered(&paths[0]);
+        options.records = split.clone();
         Self {
             path: paths[0].clone(),
             paths,
@@ -986,6 +1077,8 @@ impl Tab {
             reopen_at: None,
             arg_picks: Vec::new(),
             files_edit: None,
+            records: split,
+            records_edit: None,
             files_undo: None,
             status: String::new(),
         }
@@ -1109,6 +1202,7 @@ impl Tab {
         let ps = self.paths.clone();
         let mut options = prefs.open_options();
         options.fibex = fibex;
+        options.records = self.records.clone();
         self.file = None;
         self.result = None;
         self.reopen_at = Some(line);
@@ -1146,6 +1240,7 @@ impl Tab {
         self.files_undo = Some(FilesUndo { old, at });
         let mut options = prefs.open_options();
         options.fibex = fibex;
+        options.records = self.records.clone();
         self.loading = Some(Job::spawn(ctx, move |prog| nerka_core::open_many(&ps, &options, prog)));
     }
 
@@ -1351,7 +1446,7 @@ impl Tab {
                                 n => format!("Indexed {} lines of {n} files in {took:.2?}", f.line_count()),
                             };
                             self.part_files = f.part_files();
-                            self.bookmarks = self.load_bookmarks().unwrap_or_else(|e| {
+                            self.bookmarks = self.load_bookmarks(&*f).unwrap_or_else(|e| {
                                 self.status = format!("Could not read bookmarks: {e}");
                                 Bookmarks::default()
                             });
@@ -1857,23 +1952,28 @@ impl Tab {
         self.save_bookmarks();
     }
 
-    /// Each file keeps its own sidecar; a view of several maps lines.
-    fn load_bookmarks(&self) -> std::io::Result<Bookmarks> {
-        if self.paths.len() == 1 {
-            return Bookmarks::load_for(&self.path);
-        }
-        let files: Vec<(&Path, LineNo)> =
-            self.paths.iter().zip(&self.part_files).map(|(p, &(first, _))| (p.as_path(), first)).collect();
+    /// Each file keeps its own sidecar, anchored on its own lines; a view
+    /// of several maps lines.
+    fn load_bookmarks(&self, file: &dyn LogSource) -> std::io::Result<Bookmarks> {
+        let Some(parts) = file.parts() else { return Bookmarks::load_for(&self.path, file) };
+        let files: Vec<(&Path, LineNo, &dyn LogSource)> =
+            self.paths.iter().zip(&parts).map(|(p, part)| (p.as_path(), part.first, part.source.as_ref())).collect();
         Bookmarks::load_for_parts(&files)
     }
 
     fn save_bookmarks(&mut self) {
-        let res = if self.paths.len() == 1 {
-            self.bookmarks.save_for(&self.path)
-        } else {
-            let files: Vec<(&Path, LineNo, LineNo)> =
-                self.paths.iter().zip(&self.part_files).map(|(p, &(first, n))| (p.as_path(), first, n)).collect();
-            self.bookmarks.save_for_parts(&files)
+        let Some(file) = self.file.clone() else { return };
+        let res = match file.parts() {
+            None => self.bookmarks.save_for(&self.path, &*file),
+            Some(parts) => {
+                let files: Vec<(&Path, LineNo, LineNo, &dyn LogSource)> = self
+                    .paths
+                    .iter()
+                    .zip(&parts)
+                    .map(|(p, part)| (p.as_path(), part.first, part.source.line_count(), part.source.as_ref()))
+                    .collect();
+                self.bookmarks.save_for_parts(&files)
+            }
         };
         if let Err(e) = res {
             self.status = format!("Could not save bookmarks: {e}");
@@ -1990,6 +2090,9 @@ impl Tab {
                     }
                     if ui.link(format!("line {}", line + 1)).on_hover_text("Go to the line").clicked() {
                         jump = Some(line);
+                    }
+                    if self.bookmarks.is_unsure(line) {
+                        ui.colored_label(ui.visuals().warn_fg_color, "?").on_hover_text(UNSURE_MARK);
                     }
                     // The name (the plot shows it); edited in place.
                     let mut text = match &self.mark_rename {
@@ -2211,8 +2314,10 @@ impl Tab {
                 },
             );
             self.view_output(&out, true, |row| hits.lines[row as usize]);
-            // Selecting a hit moves the main view to it.
-            let picked = out.clicked.or(if out.has_focus { self.hits_view.selected } else { None });
+            // Selecting a hit (a click, the keys) moves the main view to it;
+            // only then: a hit selected earlier doesn't pull the main view
+            // back (it still has the focus while a click there is pressed).
+            let picked = out.clicked.or(out.moved_to);
             if let Some(row) = picked {
                 let line = hits.lines[row as usize];
                 if self.current_line() != line {
@@ -2350,6 +2455,11 @@ impl Tab {
         self.view_output(&out, false, line_of_row);
     }
 }
+
+/// Why a bookmark shows a `?`.
+const UNSURE_MARK: &str = "Not found where it was saved: the file changed, or a capture was read with other \
+                           ports. It stays on its old row, which may be another line now. Edit its name or note \
+                           to keep it here, or remove it.";
 
 /// Rows of a bookmark's line shown while it is folded.
 const BOOKMARK_ROWS: usize = 2;
@@ -2558,7 +2668,8 @@ struct App {
     show_library: bool,
     library_view: LibraryView,
     /// The ⚙ menu's ports field while it is edited.
-    ports_text: Option<String>,
+    /// The Settings window's UDP port fields as typed: DLT, SOME/IP, syslog.
+    ports_text: Option<[String; 3]>,
     /// The unpack cache's limit as typed, while Settings is open.
     limit_text: Option<String>,
     /// This window's name (title, Alt+Tab).
@@ -2590,8 +2701,8 @@ struct App {
 /// What the Settings window changed.
 #[derive(Default)]
 struct SettingsChange {
-    /// The DLT ports, changed to a valid list.
-    ports: Option<Vec<u16>>,
+    /// The UDP ports of DLT, SOME/IP and syslog, each changed to a valid list.
+    ports: [Option<Vec<u16>>; 3],
     /// The unpack cache's limit, changed to a valid number of GiB.
     limit_gib: Option<u64>,
     /// Empty the unpack cache.
@@ -2600,12 +2711,12 @@ struct SettingsChange {
     times: bool,
 }
 
-/// What the Settings window shows: this window's name, the DLT ports
-/// (`ports` as typed), the unpack cache (`limit` as typed, in GiB) and the
+/// What the Settings window shows: this window's name, the UDP ports of
+/// each protocol in captures (`ports` as typed: DLT, SOME/IP, syslog), the unpack cache (`limit` as typed, in GiB) and the
 /// time settings.
 struct SettingsFields<'a> {
     name: &'a mut String,
-    ports: &'a mut String,
+    ports: &'a mut [String; 3],
     limit: &'a mut String,
     local_time: &'a mut bool,
     mf4_local_time: &'a mut bool,
@@ -2641,26 +2752,33 @@ fn settings_ui(ui: &mut egui::Ui, f: SettingsFields<'_>) -> SettingsChange {
         ui.add(egui::TextEdit::singleline(name).hint_text("e.g. OTA crash").desired_width(200.0))
             .on_hover_text("Shown first in the title, so Alt+Tab tells windows apart");
         ui.end_row();
-        ui.label(RichText::new("DLT in captures").strong());
-        ui.end_row();
-        ui.label("UDP ports");
-        let r = ui.add(egui::TextEdit::singleline(ports).desired_width(200.0)).on_hover_text(
-            "Destination ports whose UDP payloads are DLT (pcap, pcapng, MF4), separated by spaces. Default: 3490",
+        ui.label(RichText::new("Captures: UDP ports").strong()).on_hover_text(
+            "Destination ports whose UDP payloads are read as each protocol (pcap, pcapng, MF4), separated by \
+             spaces. A port listed for two protocols goes to the first. Used for captures opened from now on.",
         );
         ui.end_row();
-        ui.label("");
-        match prefs::parse_ports(ports) {
-            Some(p) => {
-                if r.changed() {
-                    save.ports = Some(p);
+        let rows = [
+            ("DLT", "Default: 3490"),
+            ("SOME/IP", "Default: 30490 (service discovery); add your services' ports"),
+            ("syslog", "Default: 514"),
+        ];
+        for (k, (name, tip)) in rows.into_iter().enumerate() {
+            ui.label(name);
+            ui.horizontal(|ui| {
+                let r = ui.add(egui::TextEdit::singleline(&mut ports[k]).desired_width(200.0)).on_hover_text(tip);
+                match prefs::parse_ports(&ports[k]) {
+                    Some(p) => {
+                        if r.changed() {
+                            save.ports[k] = Some(p);
+                        }
+                    }
+                    None => {
+                        ui.colored_label(ui.visuals().error_fg_color, "Port numbers 1–65535, separated by spaces");
+                    }
                 }
-                ui.weak("Used for captures opened from now on");
-            }
-            None => {
-                ui.colored_label(ui.visuals().error_fg_color, "Port numbers 1–65535, separated by spaces");
-            }
+            });
+            ui.end_row();
         }
-        ui.end_row();
         ui.label(RichText::new("Compressed MF4").strong()).on_hover_text(
             "Compressed data is unpacked once into the unpack cache and read from there, as fast as an \
              uncompressed file. Opening the file again uses it.",
@@ -2921,7 +3039,10 @@ impl App {
             .resizable(false)
             .collapsible(false)
             .show(ctx, |ui| {
-                let ports = self.ports_text.get_or_insert_with(|| prefs::ports_text(&self.prefs.dlt_ports));
+                let p = &self.prefs;
+                let ports = self.ports_text.get_or_insert_with(|| {
+                    [&p.dlt_ports, &p.someip_ports, &p.syslog_ports].map(|v| prefs::ports_text(v))
+                });
                 let limit = self.limit_text.get_or_insert_with(|| self.prefs.unpack_limit_gib.to_string());
                 save = settings_ui(
                     ui,
@@ -2949,11 +3070,14 @@ impl App {
             };
         }
         let mut changed = false;
-        if let Some(ports) = save.ports
-            && ports != self.prefs.dlt_ports
-        {
-            self.prefs.dlt_ports = ports;
-            changed = true;
+        let p = &mut self.prefs;
+        for (new, ports) in save.ports.into_iter().zip([&mut p.dlt_ports, &mut p.someip_ports, &mut p.syslog_ports]) {
+            if let Some(new) = new
+                && new != *ports
+            {
+                *ports = new;
+                changed = true;
+            }
         }
         if let Some(n) = save.limit_gib
             && n != self.prefs.unpack_limit_gib
@@ -2985,6 +3109,8 @@ impl App {
         // the times stay.
         let prefs = SearchPrefs {
             dlt_ports: self.prefs.dlt_ports.clone(),
+            someip_ports: self.prefs.someip_ports.clone(),
+            syslog_ports: self.prefs.syslog_ports.clone(),
             unpack_limit_gib: self.prefs.unpack_limit_gib,
             local_time: self.prefs.local_time,
             mf4_local_time: self.prefs.mf4_local_time,
@@ -3220,9 +3346,13 @@ impl App {
 
     fn pick_files(&mut self, ctx: &egui::Context) {
         if let Some(paths) = rfd::FileDialog::new()
-            .add_filter("Logs and traces", &["log", "txt", "out", "dlt", "pcap", "pcapng", "mf4"])
+            .add_filter(
+                "Logs and traces",
+                &["log", "txt", "out", "json", "jsonl", "ndjson", "dlt", "pcap", "pcapng", "cap", "mf4"],
+            )
+            .add_filter("JSON logs", &["json", "jsonl", "ndjson"])
             .add_filter("DLT traces", &["dlt"])
-            .add_filter("Network captures (DLT over UDP)", &["pcap", "pcapng"])
+            .add_filter("Network captures (DLT, SOME/IP, syslog)", &["pcap", "pcapng", "cap"])
             .add_filter("MF4 bus logs (DLT)", &["mf4"])
             .add_filter("All files", &["*"])
             .pick_files()
@@ -3273,7 +3403,7 @@ impl App {
 
     fn tab_bar(&mut self, ui: &mut egui::Ui) {
         let (mut select, mut close, mut close_others, mut moved, mut split) = (None, None, None, None, None);
-        let mut files = None;
+        let (mut files, mut records_edit, mut unfold) = (None, None, None);
         egui::ScrollArea::horizontal().show(ui, |ui| {
             ui.horizontal(|ui| {
                 for (i, t) in self.tabs.iter().enumerate() {
@@ -3309,6 +3439,22 @@ impl App {
                         {
                             files = Some(i);
                         }
+                        let text = t.file.as_ref().is_some_and(|f| f.columns().is_empty());
+                        if ui
+                            .add_enabled(text, egui::Button::new("Records…"))
+                            .on_hover_text("One row per line, or multi-line records (text files)")
+                            .clicked()
+                        {
+                            records_edit = Some(i);
+                        }
+                        let (label, tip) = if t.main_view.unfold_all {
+                            ("Fold all records", "Each record of several lines on one row again")
+                        } else {
+                            ("Unfold all records", "Every record of several lines shown whole (→ / ← one record)")
+                        };
+                        if ui.add_enabled(text, egui::Button::new(label)).on_hover_text(tip).clicked() {
+                            unfold = Some(i);
+                        }
                     });
                     if close_button(ui).on_hover_text("Close (Ctrl+W)").clicked() {
                         close = Some(i);
@@ -3324,6 +3470,19 @@ impl App {
             self.active = i;
             let t = &mut self.tabs[i];
             t.files_edit = Some(t.paths.clone());
+        }
+        if let Some(i) = unfold {
+            let t = &mut self.tabs[i];
+            let all = !t.main_view.unfold_all;
+            for v in [&mut t.main_view, &mut t.hits_view] {
+                v.unfold_all = all;
+                v.unfolded.clear();
+            }
+        }
+        if let Some(i) = records_edit {
+            self.active = i;
+            let t = &mut self.tabs[i];
+            t.records_edit = Some(records::Edit::of(t.records.as_ref()));
         }
         if let Some(i) = close {
             self.close(i);
@@ -3422,6 +3581,29 @@ impl App {
         }
         if apply || cancel || !open {
             t.files_edit = None;
+        }
+    }
+
+    /// The active tab's Records window: Apply reads its files again, split
+    /// as chosen, and remembers it for each file.
+    fn records_window(&mut self, ctx: &egui::Context) {
+        let (prefs, fibex) = (&self.prefs, self.fibex.clone());
+        let Some(t) = self.tabs.get_mut(self.active) else { return };
+        let title = t.title();
+        let Some(edit) = &mut t.records_edit else { return };
+        match records::window(ctx, &title, edit) {
+            records::Outcome::Open => {}
+            records::Outcome::Close => t.records_edit = None,
+            records::Outcome::Apply(split) => {
+                t.records_edit = None;
+                for p in &t.paths {
+                    if let Err(e) = records::remember(p, split.as_ref()) {
+                        t.status = format!("Could not remember how {} is read: {e}", p.display());
+                    }
+                }
+                t.records = split;
+                t.reopen(ctx, prefs, fibex);
+            }
         }
     }
 
@@ -3539,6 +3721,7 @@ impl App {
         self.update_title(&ctx);
         self.goto_dialog(&ctx);
         self.files_window(&ctx);
+        self.records_window(&ctx);
         self.about_dialog(&ctx);
         self.settings_window(&ctx);
         if let Some(t) = self.tabs.get_mut(self.active)
@@ -3593,7 +3776,16 @@ impl App {
                 );
                 if let Some(f) = self.tabs.get(self.active).and_then(|t| t.file.as_ref()) {
                     ui.separator();
-                    ui.label(format!("{} lines · {:.1} MiB", f.line_count(), f.size_bytes() as f64 / 1048576.0));
+                    let indexes: usize =
+                        self.tabs.iter().filter_map(|t| t.file.as_ref()).map(|f| f.index_memory_bytes()).sum();
+                    let text = format!("{} lines · {} · {}", f.line_count(), size_text(f.size_bytes()), f.format());
+                    let tip = format!(
+                        "Read as: {}\nIndex of this tab: {}; of all tabs: {}",
+                        f.format(),
+                        size_text(f.index_memory_bytes() as u64),
+                        size_text(indexes as u64)
+                    );
+                    ui.label(text).on_hover_text(tip);
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui.button("ℹ About").on_hover_text("F1").clicked() {
@@ -4382,6 +4574,86 @@ gear=D
         }
     }
 
+    /// Bug (owner, 2026-11-02): after a click on a search hit, a click on a
+    /// line of the main view jumped back to the hit. The hits pane (drawn
+    /// first, still focused on the press) moved the main view to its hit
+    /// whenever they differed, not only when its selection moved.
+    #[test]
+    fn a_click_in_the_main_view_after_a_hit_stays() {
+        let dir = std::env::temp_dir().join(format!("nerka-gui-hitclick-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("app.log");
+        let text: String =
+            (0..300).map(|i| if i % 50 == 0 { format!("needle {i}\n") } else { format!("line {i}\n") }).collect();
+        std::fs::write(&log, text).unwrap();
+        let ctx = egui::Context::default();
+        let mut app = App::default();
+        app.open(&ctx, log);
+        settle(&mut app.tabs[0], &ctx);
+        app.tabs[0].search.pattern = "needle".into();
+        app.tabs[0].run_search_box(&ctx);
+        settle_app(&mut app, &ctx);
+        let mut t = 0.0;
+        let mut frame = |app: &mut App, events: Vec<egui::Event>| {
+            t += 1.0 / 60.0;
+            let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1200.0, 800.0));
+            let input = egui::RawInput { screen_rect: Some(screen), time: Some(t), events, ..Default::default() };
+            let mut out = ctx.run_ui(input, |ui| app.frame(ui));
+            out.textures_delta.clear();
+            out.shapes
+        };
+        let find = |shapes: &[egui::epaint::ClippedShape], label: &str, lowest: bool| {
+            let at = shapes.iter().filter_map(|s| match &s.shape {
+                egui::Shape::Text(t) if t.galley.text() == label => Some(t.pos + egui::vec2(20.0, 5.0)),
+                _ => None,
+            });
+            if lowest { at.max_by(|a, b| a.y.total_cmp(&b.y)) } else { at.min_by(|a, b| a.y.total_cmp(&b.y)) }
+        };
+        let button = |p: egui::Pos2, pressed| egui::Event::PointerButton {
+            pos: p,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        let mut shapes = Vec::new();
+        for _ in 0..3 {
+            shapes = frame(&mut app, vec![]);
+        }
+        // A click on the hit `needle 150` (the lowest: the hits pane).
+        let hit = find(&shapes, "needle 150", true).expect("the hit");
+        frame(&mut app, vec![egui::Event::PointerMoved(hit), button(hit, true)]);
+        frame(&mut app, vec![button(hit, false)]);
+        for _ in 0..2 {
+            shapes = frame(&mut app, vec![]);
+        }
+        assert_eq!(app.tabs[0].current_line(), 150);
+        // Then scroll the main view away and click a line there: press, a
+        // frame, release.
+        let main = find(&shapes, "line 145", false).expect("line 145 in the main view");
+        let wheel = egui::Event::MouseWheel {
+            unit: egui::MouseWheelUnit::Line,
+            delta: egui::vec2(0.0, -10.0),
+            phase: egui::TouchPhase::Move,
+            source: egui::MouseWheelSource::Wheel,
+            modifiers: egui::Modifiers::NONE,
+        };
+        frame(&mut app, vec![egui::Event::PointerMoved(main), wheel]);
+        for _ in 0..2 {
+            shapes = frame(&mut app, vec![]);
+        }
+        let target = app.tabs[0].main_view.top + 5;
+        assert!(target > 160, "scrolled: {target}");
+        let other = find(&shapes, &format!("line {target}"), false).expect("a line of the main view, scrolled");
+        frame(&mut app, vec![egui::Event::PointerMoved(other), button(other, true)]);
+        frame(&mut app, vec![]);
+        frame(&mut app, vec![button(other, false)]);
+        for _ in 0..3 {
+            frame(&mut app, vec![]);
+        }
+        assert_eq!(app.tabs[0].current_line(), target, "the cursor stays on the line clicked");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     /// Bug: ticking the Search box's Regex / Ignore case wasn't saved, as
     /// the settings were compared before the Search box was drawn.
     #[test]
@@ -4560,11 +4832,8 @@ gear=D
         assert_eq!(t.result.as_ref().unwrap().lines, [2, 4]);
         // A bookmark in b goes to b's own sidecar, as b numbers its lines.
         t.toggle_bookmark_at(3);
-        assert_eq!(
-            std::fs::read_to_string(Bookmarks::sidecar_path(&b)).unwrap(),
-            "2		B1
-"
-        );
+        let sidecar = std::fs::read_to_string(Bookmarks::sidecar_path(&b)).unwrap();
+        assert!(sidecar.starts_with("2\t\tB1\t@"), "with its anchor: {sidecar:?}");
         assert!(!Bookmarks::sidecar_path(&a).exists());
         // Opening the same files again switches to the view.
         app.open_files(&ctx, vec![a.clone(), b.clone()]);
@@ -4675,11 +4944,12 @@ gear=D
     #[test]
     fn the_settings_window_takes_typing() {
         let ctx = egui::Context::default();
-        let (mut name, mut ports) = (String::new(), "3490".to_owned());
+        let mut name = String::new();
+        let mut ports = ["3490", "30490", "514"].map(str::to_owned);
         let mut saved = None;
         let mut rects = Vec::new();
         let mut frame =
-            |events: Vec<egui::Event>, name: &mut String, ports: &mut String, rects: &mut Vec<egui::Rect>| {
+            |events: Vec<egui::Event>, name: &mut String, ports: &mut [String; 3], rects: &mut Vec<egui::Rect>| {
                 let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0));
                 let input = egui::RawInput { screen_rect: Some(screen), events, ..Default::default() };
                 let mut out = ctx.run_ui(input, |ui| {
@@ -4691,7 +4961,9 @@ gear=D
                             local_time: &mut true,
                             mf4_local_time: &mut true,
                         };
-                        if let Some(p) = settings_ui(ui, fields).ports {
+                        let [dlt, someip, syslog] = settings_ui(ui, fields).ports;
+                        assert!(someip.is_none() && syslog.is_none(), "only the DLT ports were typed in");
+                        if let Some(p) = dlt {
                             saved = Some(p);
                         }
                     });
@@ -4736,7 +5008,7 @@ gear=D
         assert_eq!(name, "OTA crash");
         frame(click(ports_at), &mut name, &mut ports, &mut rects);
         frame(vec![egui::Event::Text(" 3489".into())], &mut name, &mut ports, &mut rects);
-        assert_eq!(ports, "3490 3489");
+        assert_eq!(ports[0], "3490 3489");
         assert_eq!(saved, Some(vec![3490, 3489]));
     }
 
@@ -5081,6 +5353,36 @@ query nav
 
     /// A search chip's click removes its query: the others are searched
     /// again; removing the last one clears the search.
+    /// The line window's Fields: every field of the line, with its value
+    /// (DLT's ten and `proto`; a JSON record's keys, missing ones empty).
+    #[test]
+    fn the_line_window_lists_every_field() {
+        use nerka_core::input::dlt::writer::{Msg, Value};
+        let mut buf = Vec::new();
+        Msg::log(nerka_core::Level::Warn, "ECU1", "NAV", "CTX", vec![Value::Str("hi".into()).into()]).encode(&mut buf);
+        let dlt = nerka_core::DltFile::from_bytes("t.dlt", buf);
+        let d = LineDetail::of(&dlt, 0).unwrap();
+        let get = |d: &LineDetail, n: &str| d.fields.iter().find(|f| f.0 == n).and_then(|f| f.1.clone());
+        assert_eq!(d.fields.len(), 11);
+        assert_eq!(
+            (get(&d, "ecu"), get(&d, "apid"), get(&d, "proto")),
+            (Some("ECU1".into()), Some("NAV".into()), Some("DLT".into()))
+        );
+        assert_eq!(get(&d, "mid"), None, "a verbose message has no message id");
+
+        use nerka_core::input::records::{RecordFile, RecordSplit};
+        let text = b"{\"a\": 1, \"b\": {\"c\": \"x\"}}
+{\"a\": 20}
+"
+        .to_vec();
+        let json = RecordFile::from_bytes("t", text, RecordSplit::Json);
+        let d = LineDetail::of(&json, 1).unwrap();
+        assert_eq!(
+            d.fields.iter().map(|f| (f.0.as_str(), f.1.clone())).collect::<Vec<_>>(),
+            [("a", Some("20 (0x14)".into())), ("b.c", None)]
+        );
+    }
+
     #[test]
     fn removing_a_search_chip_drops_its_query() {
         use nerka_core::input::dlt::writer::Msg;

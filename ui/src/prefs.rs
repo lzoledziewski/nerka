@@ -21,6 +21,10 @@ pub struct SearchPrefs {
     pub search_ignore_case: bool,
     /// UDP destination ports that carry DLT in captures (pcap, MF4).
     pub dlt_ports: Vec<u16>,
+    /// UDP destination ports that carry SOME/IP in captures.
+    pub someip_ports: Vec<u16>,
+    /// UDP destination ports that carry syslog in captures.
+    pub syslog_ports: Vec<u16>,
     /// The unpack cache's size limit (compressed MF4), in GiB.
     pub unpack_limit_gib: u64,
     /// Times shown (and typed) in this computer's local time, else UTC.
@@ -42,6 +46,8 @@ impl Default for SearchPrefs {
             search_regex: false,
             search_ignore_case: false,
             dlt_ports: nerka_core::input::capture::DEFAULT_DLT_PORTS.to_vec(),
+            someip_ports: nerka_core::input::capture::DEFAULT_SOMEIP_PORTS.to_vec(),
+            syslog_ports: nerka_core::input::capture::DEFAULT_SYSLOG_PORTS.to_vec(),
             unpack_limit_gib: nerka_core::input::capture::unpack::DEFAULT_UNPACK_LIMIT >> 30,
             // As DLT Viewer and Wireshark show them (owner, 2026-10-26).
             local_time: true,
@@ -59,10 +65,13 @@ impl SearchPrefs {
                 "true" => true,
                 "false" => false,
                 v => {
-                    if key.trim() == "dlt_ports"
-                        && let Some(ports) = parse_ports(v)
-                    {
-                        p.dlt_ports = ports;
+                    if let Some(ports) = parse_ports(v) {
+                        match key.trim() {
+                            "dlt_ports" => p.dlt_ports = ports,
+                            "someip_ports" => p.someip_ports = ports,
+                            "syslog_ports" => p.syslog_ports = ports,
+                            _ => {}
+                        }
                     }
                     if key.trim() == "unpack_limit_gib"
                         && let Some(n) = parse_gib(v)
@@ -109,7 +118,7 @@ impl SearchPrefs {
             Mode::Query => "query",
         };
         format!(
-            "mode={}\nregex={}\nignore_case={}\ninvert={}\nsearch_mode={}\nsearch_regex={}\nsearch_ignore_case={}\ndlt_ports={}\nunpack_limit_gib={}\nlocal_time={}\nmf4_local_time={}\nbookmark_notes={}\n",
+            "mode={}\nregex={}\nignore_case={}\ninvert={}\nsearch_mode={}\nsearch_regex={}\nsearch_ignore_case={}\ndlt_ports={}\nsomeip_ports={}\nsyslog_ports={}\nunpack_limit_gib={}\nlocal_time={}\nmf4_local_time={}\nbookmark_notes={}\n",
             name(self.mode),
             !self.options.fixed_string,
             self.options.case_insensitive,
@@ -118,6 +127,8 @@ impl SearchPrefs {
             self.search_regex,
             self.search_ignore_case,
             ports_text(&self.dlt_ports),
+            ports_text(&self.someip_ports),
+            ports_text(&self.syslog_ports),
             self.unpack_limit_gib,
             self.local_time,
             self.mf4_local_time,
@@ -129,6 +140,8 @@ impl SearchPrefs {
     pub fn open_options(&self) -> nerka_core::OpenOptions {
         let mut o = nerka_core::OpenOptions::default();
         o.capture.dlt_udp_ports = self.dlt_ports.clone();
+        o.capture.someip_udp_ports = self.someip_ports.clone();
+        o.capture.syslog_udp_ports = self.syslog_ports.clone();
         o.capture.unpack.dir = nerka_core::cache_dir();
         o.capture.unpack.limit = self.unpack_limit_gib << 30;
         o.capture.mf4_local_time = self.mf4_local_time;
@@ -191,6 +204,8 @@ mod tests {
             search_regex: true,
             search_ignore_case: true,
             dlt_ports: vec![3490, 3489],
+            someip_ports: vec![30490, 30501],
+            syslog_ports: vec![514, 1514],
             unpack_limit_gib: 20,
             local_time: false,
             mf4_local_time: false,

@@ -34,6 +34,14 @@ struct Cli {
     /// MF4; repeatable). Default: 3490.
     #[arg(long = "dlt-port", global = true, value_name = "PORT")]
     dlt_port: Vec<u16>,
+    /// UDP destination port that carries SOME/IP in captures (repeatable).
+    /// Default: 30490 (service discovery); services use ports of their own.
+    #[arg(long = "someip-port", global = true, value_name = "PORT")]
+    someip_port: Vec<u16>,
+    /// UDP destination port that carries syslog in captures (repeatable).
+    /// Default: 514.
+    #[arg(long = "syslog-port", global = true, value_name = "PORT")]
+    syslog_port: Vec<u16>,
     /// Folder compressed MF4 data is unpacked into (default: the per-user
     /// cache folder); unpacked once, reused when the file is opened again.
     #[arg(long = "unpack-dir", global = true, value_name = "DIR")]
@@ -54,6 +62,12 @@ struct Cli {
     /// this computer's zone.
     #[arg(long = "mf4-utc", global = true)]
     mf4_utc: bool,
+    /// Read text files as records: `start=/REGEX/` (a line matching it
+    /// starts a record), `blank` (blank lines separate them), `sep=/REGEX/`
+    /// (lines matching it separate them), `json` (keys are fields), `lines`,
+    /// or `auto` (the default: JSON if the file looks like JSON, else lines).
+    #[arg(long, global = true, value_name = "SPEC")]
+    records: Option<String>,
     #[command(subcommand)]
     cmd: Cmd,
 }
@@ -190,12 +204,14 @@ fn compile(query: &str, source: &dyn LogSource) -> Result<Query> {
     })
 }
 
-/// `bookmark` in a query: the bookmarks of the log (its `.nerka-marks`).
-fn with_marks(filter: Filter, file: &Path) -> Result<Filter> {
+/// `bookmark` in a query: the bookmarks of the log (its `.nerka-marks`),
+/// on the lines of `source` their anchors find.
+fn with_marks(filter: Filter, file: &Path, source: &dyn LogSource) -> Result<Filter> {
     if !filter.uses_bookmarks() {
         return Ok(filter);
     }
-    let marks = Bookmarks::load_for(file).with_context(|| format!("reading the bookmarks of {}", file.display()))?;
+    let marks =
+        Bookmarks::load_for(file, source).with_context(|| format!("reading the bookmarks of {}", file.display()))?;
     Ok(filter.with_bookmarks(&std::sync::Arc::new(marks)))
 }
 
@@ -208,7 +224,7 @@ fn run_filter(
     out: &mut impl Write,
 ) -> Result<()> {
     let (f, t_index) = open(file)?;
-    let filter = with_marks(build(&*f)?, file)?;
+    let filter = with_marks(build(&*f)?, file, &*f)?;
     let t = Instant::now();
     let res = search(&*f, &filter, &Progress::new())?;
     let t_search = t.elapsed();
@@ -246,10 +262,10 @@ fn run_search_within(
     out: &mut impl Write,
 ) -> Result<()> {
     let (f, t_index) = open(file)?;
-    let filter = within.map(|q| compile(q, &*f).and_then(|q| with_marks(Filter::Query(q), file))).transpose()?;
+    let filter = within.map(|q| compile(q, &*f).and_then(|q| with_marks(Filter::Query(q), file, &*f))).transpose()?;
     let set = SearchSet {
-        include: set.include.into_iter().map(|q| with_marks(q, file)).collect::<Result<_>>()?,
-        exclude: set.exclude.into_iter().map(|q| with_marks(q, file)).collect::<Result<_>>()?,
+        include: set.include.into_iter().map(|q| with_marks(q, file, &*f)).collect::<Result<_>>()?,
+        exclude: set.exclude.into_iter().map(|q| with_marks(q, file, &*f)).collect::<Result<_>>()?,
     };
     let t = Instant::now();
     let lines = match filter {
@@ -295,7 +311,7 @@ fn run_search_within(
 /// The `--signal` definitions, set once in `main`.
 static SIGNALS: std::sync::OnceLock<Signals> = std::sync::OnceLock::new();
 
-/// How files are opened (`--dlt-port`), set once in `main`.
+/// How files are opened (`--dlt-port`, `--someip-port`, …), set once in `main`.
 static OPEN_OPTIONS: std::sync::OnceLock<nerka_core::OpenOptions> = std::sync::OnceLock::new();
 
 fn open(path: &PathBuf) -> Result<(Box<dyn LogSource>, std::time::Duration)> {
@@ -330,8 +346,17 @@ fn run() -> Result<()> {
     if !cli.dlt_port.is_empty() {
         options.capture.dlt_udp_ports = cli.dlt_port.clone();
     }
+    if !cli.someip_port.is_empty() {
+        options.capture.someip_udp_ports = cli.someip_port.clone();
+    }
+    if !cli.syslog_port.is_empty() {
+        options.capture.syslog_udp_ports = cli.syslog_port.clone();
+    }
     options.capture.unpack.dir = cli.unpack_dir.clone().or_else(nerka_core::cache_dir);
     options.capture.mf4_local_time = !cli.mf4_utc;
+    if let Some(spec) = &cli.records {
+        options.records = nerka_core::input::records::RecordSplit::parse_choice(spec)?;
+    }
     nerka_core::time::set_local(cli.local_time);
     if !cli.fibex.is_empty() {
         options.fibex = Some(std::sync::Arc::new(nerka_core::Fibex::load(&cli.fibex)?));
@@ -352,7 +377,7 @@ fn run() -> Result<()> {
             writeln!(out, "size:        {} bytes", f.size_bytes())?;
             writeln!(out, "lines:       {}", f.line_count())?;
             if !f.schema().is_empty() {
-                let names: Vec<&str> = f.schema().iter().map(|d| d.name).collect();
+                let names: Vec<&str> = f.schema().iter().map(|d| d.name.as_ref()).collect();
                 writeln!(out, "fields:      {}", names.join(", "))?;
             }
             writeln!(out, "index mem:   {} KiB", f.index_memory_bytes() / 1024)?;
@@ -420,10 +445,12 @@ fn run() -> Result<()> {
             }
         }
         Cmd::Marks { file } => {
-            let marks = Bookmarks::load_for(&file)?;
             let (f, _) = open(&file)?;
+            let marks = Bookmarks::load_for(&file, &*f)?;
             for (l, name, note) in marks.iter_named() {
                 let text = f.line_text(l).unwrap_or_default();
+                // Its anchor didn't find its line: it may be elsewhere.
+                let name = if marks.is_unsure(l) { format!("{name}?") } else { name.to_owned() };
                 if note.is_empty() {
                     writeln!(out, "{name} {}: {text}", l + 1)?;
                 } else {

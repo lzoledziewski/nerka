@@ -1,4 +1,5 @@
 use super::*;
+use crate::DltFile;
 use crate::LogSource;
 use crate::engine::search::tests::run_on;
 use crate::input::dlt::writer::{Msg, Value};
@@ -157,7 +158,7 @@ fn dlt_over_udp_is_read_in_place() {
     let frames = vec![
         (100, eth(0x0800, &ipv4(17, 1, 0, &udp(3490, &two)))),
         (101, vlan(0x0800, &ipv4(17, 2, 0, &udp(3490, &dlt("DIAG", "tagged"))))),
-        (102, eth(0x0800, &ipv4(17, 3, 0, &udp(30490, &dlt("XXX", "other port"))))),
+        (102, eth(0x0800, &ipv4(17, 3, 0, &udp(3491, &dlt("XXX", "other port"))))),
         (103, eth(0x0806, &[0; 28])),
         (104, eth(0x0800, &ipv4(17, 4, 0, &udp(3489, &dlt("ALT", "another port"))))),
         (105, eth(0x0800, &ipv4(17, 5, 0, &udp(3490, &[dlt("COM", "then junk"), vec![0xff; 5]].concat())))),
@@ -168,13 +169,13 @@ fn dlt_over_udp_is_read_in_place() {
     // Capture time and the message's own ECU.
     assert!(f.line_text(2).unwrap().starts_with("1970-01-01 00:01:41.250000\t"), "{:?}", f.line_text(2));
     assert_eq!(f.field(0, 0), Some(crate::FieldValue::Str(b"ECU1".as_slice().into())));
-    assert_eq!((s.dlt_datagrams, s.dlt_messages, s.dlt_skipped), (3, 4, 5));
+    assert_eq!((s.datagrams, s.messages, s.msg_skipped), (3, 4, 5));
     assert_eq!((s.net.frames, s.net.udp, s.net.other, s.file_skipped), (6, 5, 1, 0));
     // Nothing was copied: every message is in the file.
     assert_eq!(f.index_memory_bytes(), 4 * 16);
 
     // Other ports when configured.
-    let o = CaptureOptions { dlt_udp_ports: vec![30490, 3489], ..Default::default() };
+    let o = CaptureOptions { dlt_udp_ports: vec![3491, 3489], ..Default::default() };
     let got = lines(&from_bytes("t", pcap_file(1, &frames), &o).unwrap().0);
     assert_eq!(got, pairs(&[("XXX", "other port"), ("ALT", "another port")]));
 }
@@ -289,4 +290,77 @@ fn truncated_files_and_detection() {
     assert_eq!(crate::open(&p1, &p).unwrap().line_count(), 1);
     assert_eq!(crate::open(&p2, &p).unwrap().columns().len(), 7);
     std::fs::remove_dir_all(&dir).ok();
+}
+
+/// One capture with DLT, SOME/IP and syslog: one table with shared
+/// columns, every protocol's fields, and queries across them.
+#[test]
+fn several_protocols_share_one_view() {
+    use crate::input::proto::{MIXED_COLUMNS, someip};
+    let sd = someip::encode(0xFFFF, 0x8100, 0, 1, 0x02, 0, &[0xc0, 0, 0, 0]);
+    let two =
+        [someip::encode(0x1234, 0x8001, 0, 7, 0x02, 0, &[1, 2]), someip::encode(0x1234, 1, 0x10, 8, 0x81, 3, &[])]
+            .concat();
+    let frames = vec![
+        (100, eth(0x0800, &ipv4(17, 1, 0, &udp(3490, &dlt("NAV", "position ok"))))),
+        (101, eth(0x0800, &ipv4(17, 2, 0, &udp(30490, &sd)))),
+        (102, eth(0x0800, &ipv4(17, 3, 0, &udp(30501, &two)))),
+        (103, eth(0x0800, &ipv4(17, 4, 0, &udp(514, b"<11>1 - gw nav 42 - - disk failed\n")))),
+        (104, eth(0x0800, &ipv4(17, 5, 0, &udp(514, b"<30>Oct 18 02:00:00 gw sshd[7]: login ok")))),
+        (105, eth(0x0800, &ipv4(17, 6, 0, &udp(514, b"not syslog")))),
+    ];
+    let o = CaptureOptions { someip_udp_ports: vec![30490, 30501], ..Default::default() };
+    let (f, s) = from_bytes("t.pcap", pcap_file(1, &frames), &o).unwrap();
+    assert_eq!(f.protocols(), ["DLT", "SOMEIP", "syslog"]);
+    assert_eq!((s.datagrams, s.messages, s.msg_skipped), (6, 6, 10));
+    let names: Vec<&str> = f.columns().iter().map(|c| c.name).collect();
+    assert_eq!(names, MIXED_COLUMNS.iter().map(|c| c.name).collect::<Vec<_>>());
+    let cells = |l| f.line_text(l).unwrap().split('\t').skip(1).map(str::to_owned).collect::<Vec<_>>();
+    assert_eq!(cells(0), ["DLT", "0.0000 ECU1 NAV CTX info", "position ok"]);
+    assert_eq!(cells(1), ["SOMEIP", "0xffff 0x8100 0x0000 0x0001 NOTIFICATION E_OK", "SD [4] c0 00 00 00"]);
+    assert_eq!(cells(3), ["SOMEIP", "0x1234 0x0001 0x0010 0x0008 ERROR E_UNKNOWN_METHOD", "[0]"]);
+    assert_eq!(cells(4), ["syslog", "user err gw nav 42", "disk failed"]);
+    assert_eq!(cells(5), ["syslog", "daemon info gw sshd 7", "login ok"]);
+    // The line window has the same cells, the payload with its line breaks.
+    assert_eq!(f.line_detail(4).unwrap()[1..], cells(4));
+
+    let q = |s: &str| run_on(&f, &Filter::Query(Query::compile(s).unwrap()));
+    assert_eq!(q("proto == SOMEIP AND service == 0x1234"), [2, 3]);
+    assert_eq!(q("level >= ERROR"), [3, 4]);
+    assert_eq!(q("type == NOTIFICATION"), [1, 2]);
+    assert_eq!(q("host == gw AND app ~ /ssh/"), [5]);
+    assert_eq!(q("ecu == ECU1 OR (proto == SOMEIP AND rc != E_OK)"), [0, 3]);
+    assert_eq!(q("payload ~ /failed|SD/"), [1, 4]);
+    assert_eq!(q("proto != DLT AND /0x1234/"), [2, 3]);
+    // Protocol names compare without case.
+    for p in ["syslog", "SYSLOG", "Syslog"] {
+        assert_eq!(q(&format!("proto == {p}")), [4, 5], "{p}");
+    }
+    assert_eq!(q("proto != dlt AND proto != someip"), [4, 5]);
+    // Other protocols' fields have no value on a line: only != holds.
+    assert_eq!(q("apid != NAV"), [1, 2, 3, 4, 5]);
+}
+
+/// A capture of one protocol shows that protocol's own columns.
+#[test]
+fn one_protocol_shows_its_own_columns() {
+    use crate::input::proto::someip;
+    let frames = vec![(100, eth(0x0800, &ipv4(17, 1, 0, &udp(30490, &someip::encode(0x10, 0x20, 1, 2, 0, 0, &[9])))))];
+    let (f, _) = from_bytes("t.pcap", pcap_file(1, &frames), &CaptureOptions::default()).unwrap();
+    let names: Vec<&str> = f.columns().iter().map(|c| c.name).collect();
+    assert_eq!(names, ["time", "service", "method", "client", "session", "type", "rc", "payload"]);
+    assert_eq!(
+        f.line_text(0).unwrap().split_once('\t').unwrap().1,
+        "0x0010\t0x0020\t0x0001\t0x0002\tREQUEST\tE_OK\t[1] 09"
+    );
+    assert_eq!(f.supplied_level(0), Some(Some(Level::Info)));
+    let q = |s: &str| run_on(&f, &Filter::Query(Query::compile(s).unwrap()));
+    assert_eq!(q("proto == SOMEIP AND method == 32 AND len == 1"), [0]);
+
+    let frames = vec![(100, eth(0x0800, &ipv4(17, 1, 0, &udp(514, b"<12>x"))))];
+    let (f, _) = from_bytes("t.pcap", pcap_file(1, &frames), &CaptureOptions::default()).unwrap();
+    assert_eq!(f.columns().len(), 7);
+    assert_eq!(f.supplied_level(0), Some(Some(Level::Warn)));
+    // Kept behind its length in the side buffer.
+    assert!(f.index_memory_bytes() >= 16 + 4 + 5);
 }

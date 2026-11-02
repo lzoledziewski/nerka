@@ -11,28 +11,31 @@
 //! reader resyncs on the next `DLT\x01`) and counted in
 //! [`DltFile::skipped_bytes`].
 //!
-//! DLT found inside other files (pcap, MF4) is read in place: those readers
-//! index every message's standard header with the capture's time
-//! ([`Framed`]), and bytes that aren't contiguous in the file (a reassembled
-//! datagram) live in a side buffer. No temporary `.dlt` is written. A
-//! message without an ECU id takes its capture channel's.
+//! DLT is one [`Protocol`] ([`Dlt`]) of the [`Records`] source: a `.dlt`
+//! file is a container whose storage headers give each message its time
+//! and ECU id; DLT found inside captures (pcap, MF4) is read in place with
+//! the capture's time, and a message without an ECU id takes its capture
+//! channel's. No temporary `.dlt` is written.
 
 pub mod fibex;
 mod format;
 mod payload;
 pub mod writer;
 
-use super::{Bytes, ColumnDef, new_data_id};
+use super::proto::{Origin, Protocol, Records};
+use super::{Bytes, ColumnDef};
 use crate::event::{FieldDef, FieldId, FieldKind, FieldValue, Level};
-use crate::{LineNo, LogSource, Progress, Result};
+use crate::{Progress, Result};
 use fibex::{Fibex, Frame};
 use format::{MAGIC, MSTP_APP_TRACE, MSTP_CONTROL, MSTP_LOG, MSTP_NW_TRACE, Message, NO_ECU, STORAGE_LEN, Storage};
-use std::borrow::Cow;
 use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 
-/// Columns of a rendered line, separated by tabs.
+/// A `.dlt` file, or DLT in a capture: a [`Records`] source.
+pub type DltFile = Records;
+
+/// Columns of a rendered line, separated by tabs: `time`, then [`Dlt`]'s.
 pub const COLUMNS: [ColumnDef; 7] = [
     ColumnDef { name: "time", width: 26 },
     ColumnDef { name: "tmsp", width: 11 },
@@ -55,23 +58,23 @@ const MODE: FieldId = 8;
 const PAYLOAD: FieldId = 9;
 
 const SCHEMA: &[FieldDef] = &[
-    FieldDef { name: "ecu", kind: FieldKind::Str, costly: false },
-    FieldDef { name: "apid", kind: FieldKind::Str, costly: false },
-    FieldDef { name: "ctid", kind: FieldKind::Str, costly: false },
+    FieldDef::new("ecu", FieldKind::Str, false),
+    FieldDef::new("apid", FieldKind::Str, false),
+    FieldDef::new("ctid", FieldKind::Str, false),
     // log, app_trace, nw_trace, control
-    FieldDef { name: "type", kind: FieldKind::Str, costly: false },
+    FieldDef::new("type", FieldKind::Str, false),
     // message counter
-    FieldDef { name: "mcnt", kind: FieldKind::U64, costly: false },
+    FieldDef::new("mcnt", FieldKind::U64, false),
     // ECU uptime in 0.1 ms units
-    FieldDef { name: "tmsp", kind: FieldKind::U64, costly: false },
+    FieldDef::new("tmsp", FieldKind::U64, false),
     // session id
-    FieldDef { name: "seid", kind: FieldKind::U64, costly: false },
+    FieldDef::new("seid", FieldKind::U64, false),
     // message id of non-verbose messages (none on verbose ones: 0 is a valid id)
-    FieldDef { name: "mid", kind: FieldKind::U64, costly: false },
+    FieldDef::new("mid", FieldKind::U64, false),
     // verbose, non-verbose
-    FieldDef { name: "mode", kind: FieldKind::Str, costly: false },
+    FieldDef::new("mode", FieldKind::Str, false),
     // the decoded payload, i.e. the `payload` column
-    FieldDef { name: "payload", kind: FieldKind::Str, costly: true },
+    FieldDef::new("payload", FieldKind::Str, true),
 ];
 
 /// Length of the well-formed DLT message whose standard header is at
@@ -85,131 +88,20 @@ pub fn is_dlt(head: &[u8]) -> bool {
     head.starts_with(MAGIC)
 }
 
-/// A DLT message inside another file (a capture): where its standard
-/// header is, the capture channel it came from and the storage time the
-/// capture gives it. 16 bytes.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Framed {
-    /// Bits 0–47: offset of the standard header, in the file or (bit 63)
-    /// in the side buffer; bits 48–62: channel.
-    at: u64,
-    secs: u32,
-    usecs: i32,
-}
-
-const OFFSET_MASK: u64 = (1 << 48) - 1;
-const IN_SIDE: u64 = 1 << 63;
-const CHANNEL_SHIFT: u32 = 48;
-/// Channels a capture can name (15 bits).
-pub const MAX_CHANNELS: usize = 1 << 15;
-
-impl Framed {
-    /// A message at `offset` (in the side buffer if `side`), from capture
-    /// channel `channel` (an index into the source's channel ECU table),
-    /// stored at `secs` + `usecs`. `None` if the offset or channel don't fit.
-    pub fn new(offset: u64, side: bool, channel: usize, secs: u32, usecs: i32) -> Option<Framed> {
-        if offset > OFFSET_MASK || channel >= MAX_CHANNELS {
-            return None;
-        }
-        let at = offset | ((channel as u64) << CHANNEL_SHIFT) | if side { IN_SIDE } else { 0 };
-        Some(Framed { at, secs, usecs })
-    }
-
-    fn offset(&self) -> usize {
-        (self.at & OFFSET_MASK) as usize
-    }
-
-    fn in_side(&self) -> bool {
-        self.at & IN_SIDE != 0
-    }
-
-    fn channel(&self) -> usize {
-        ((self.at & !IN_SIDE) >> CHANNEL_SHIFT) as usize
-    }
-}
-
-/// Where the messages are.
-enum Index {
-    /// A `.dlt` file: the offset of each message's storage header.
-    Stored(Vec<u64>),
-    /// DLT inside a capture: each message's place and capture time, the
-    /// bytes that aren't contiguous in the file, and per channel the ECU id
-    /// for messages that don't carry one.
-    Framed { msgs: Vec<Framed>, side: Vec<u8>, channel_ecus: Vec<[u8; 4]> },
-}
-
-pub struct DltFile {
-    name: String,
-    path: Option<PathBuf>,
-    data: Bytes,
-    index: Index,
-    skipped: u64,
-    /// Descriptions of non-verbose messages, if FIBEX files were given.
+/// The DLT protocol: messages from their standard header on. Non-verbose
+/// messages are decoded with FIBEX descriptions, if given.
+#[derive(Default)]
+pub struct Dlt {
     fibex: Option<Arc<Fibex>>,
-    data_id: usize,
 }
 
-impl DltFile {
-    pub fn open(path: impl AsRef<Path>, progress: &Progress) -> Result<Self> {
-        let path = path.as_ref();
-        let data = Bytes::map(path)?;
-        let (offsets, skipped) = build_index(data.bytes(), progress)?;
-        let name = path.display().to_string();
-        Ok(Self {
-            name,
-            path: Some(path.to_path_buf()),
-            data,
-            index: Index::Stored(offsets),
-            skipped,
-            fibex: None,
-            data_id: new_data_id(),
-        })
+impl Dlt {
+    pub fn new(fibex: Option<Arc<Fibex>>) -> Dlt {
+        Dlt { fibex }
     }
 
-    /// In-memory source, handy for tests.
-    pub fn from_bytes(name: impl Into<String>, bytes: Vec<u8>) -> Self {
-        let (offsets, skipped) = build_index(&bytes, &Progress::new()).expect("not cancelled");
-        Self {
-            name: name.into(),
-            path: None,
-            data: Bytes::Owned(bytes),
-            index: Index::Stored(offsets),
-            skipped,
-            fibex: None,
-            data_id: new_data_id(),
-        }
-    }
-
-    /// DLT messages found inside another file (`data`, e.g. a mapped pcap):
-    /// `msgs` in display order, `side` holding the messages placed there,
-    /// `channel_ecus` the ECU id per capture channel (for messages without
-    /// one; NUL-padded, all zero for none). `skipped` counts bytes of DLT
-    /// traffic that weren't messages.
-    pub(crate) fn from_frames(
-        name: String,
-        path: Option<PathBuf>,
-        data: Bytes,
-        msgs: Vec<Framed>,
-        side: Vec<u8>,
-        channel_ecus: Vec<[u8; 4]>,
-        skipped: u64,
-    ) -> Self {
-        Self {
-            name,
-            path,
-            data,
-            index: Index::Framed { msgs, side, channel_ecus },
-            skipped,
-            fibex: None,
-            data_id: new_data_id(),
-        }
-    }
-
-    /// Decode non-verbose messages with `fibex`: their payload as text, and
-    /// the APID, CTID, type and level they don't carry themselves.
-    pub fn with_fibex(mut self, fibex: Option<Arc<Fibex>>) -> Self {
-        self.fibex = fibex;
-        self
+    fn message<'m>(msg: &'m [u8], at: &Origin<'m>) -> Option<Message<'m>> {
+        Message::parse_std(msg, Storage { secs: at.secs, usecs: at.usecs, ecu: at.channel })
     }
 
     /// The FIBEX description of a non-verbose message, if there is one.
@@ -217,27 +109,132 @@ impl DltFile {
         let fibex = self.fibex.as_ref()?;
         fibex.frame(non_verbose_id(m)?, m.ecu(), m.apid(), m.ctid())
     }
+}
 
-    pub fn path(&self) -> Option<&Path> {
-        self.path.as_deref()
+impl Protocol for Dlt {
+    fn name(&self) -> &'static str {
+        "DLT"
     }
 
-    /// Bytes that were not part of any well-formed message.
-    pub fn skipped_bytes(&self) -> u64 {
-        self.skipped
+    fn columns(&self) -> &'static [ColumnDef] {
+        &COLUMNS[1..]
     }
 
-    fn msg(&self, line: LineNo) -> Option<Message<'_>> {
-        let i = usize::try_from(line).ok()?;
-        match &self.index {
-            Index::Stored(offsets) => Message::parse(&self.data.bytes()[*offsets.get(i)? as usize..]),
-            Index::Framed { msgs, side, channel_ecus } => {
-                let f = msgs.get(i)?;
-                let buf = if f.in_side() { side.as_slice() } else { self.data.bytes() };
-                let ecu = channel_ecus.get(f.channel()).unwrap_or(NO_ECU);
-                let storage = Storage { secs: f.secs, usecs: f.usecs, ecu };
-                Message::parse_std(buf.get(f.offset()..)?, storage)
+    fn schema(&self) -> &'static [FieldDef] {
+        SCHEMA
+    }
+
+    /// Several messages back to back; a storage header in front of one is
+    /// skipped (the capture's time wins).
+    fn split(&self, bytes: &[u8], found: &mut Vec<usize>) -> usize {
+        let mut pos = 0;
+        while pos < bytes.len() {
+            if bytes[pos..].starts_with(MAGIC) && bytes.len() - pos > STORAGE_LEN {
+                pos += STORAGE_LEN;
             }
+            let Some(len) = message_len(&bytes[pos..]) else { break };
+            found.push(pos);
+            pos += len;
+        }
+        bytes.len() - pos
+    }
+
+    fn render(&self, msg: &[u8], at: &Origin<'_>, out: &mut Vec<u8>) {
+        let Some(m) = Dlt::message(msg, at) else { return };
+        let frame = self.frame(&m);
+        render_header(&m, frame, out);
+        out.push(b'\t');
+        payload::render(&m, frame, out);
+    }
+
+    fn detail(&self, msg: &[u8], at: &Origin<'_>) -> Vec<String> {
+        let Some(m) = Dlt::message(msg, at) else { return Vec::new() };
+        let frame = self.frame(&m);
+        let mut head = Vec::new();
+        render_header(&m, frame, &mut head);
+        let mut cells: Vec<String> = String::from_utf8_lossy(&head).split('\t').map(str::to_owned).collect();
+        let mut payload = Vec::new();
+        payload::render_formatted(&m, frame, &mut payload);
+        cells.push(String::from_utf8_lossy(&payload).into_owned());
+        cells
+    }
+
+    fn field<'m>(&self, msg: &'m [u8], at: &Origin<'m>, id: FieldId) -> Option<FieldValue<'m>> {
+        let m = Dlt::message(msg, at)?;
+        let s = |b: &'static str| FieldValue::Str(b.as_bytes().into());
+        let owned = |b: &str| FieldValue::Str(b.as_bytes().to_vec().into());
+        match id {
+            ECU => Some(FieldValue::Str(m.ecu().into())),
+            // A non-verbose message without them: from its FIBEX description.
+            APID => match m.apid() {
+                Some(b) => Some(FieldValue::Str(b.into())),
+                None => self.frame(&m)?.apid.as_deref().map(owned),
+            },
+            CTID => match m.ctid() {
+                Some(b) => Some(FieldValue::Str(b.into())),
+                None => self.frame(&m)?.ctid.as_deref().map(owned),
+            },
+            TYPE => type_of(&m, if m.mstp().is_none() { self.frame(&m) } else { None }).map(s),
+            MCNT => Some(FieldValue::U64(m.mcnt().into())),
+            TMSP => m.timestamp().map(|t| FieldValue::U64(t.into())),
+            SEID => m.session_id().map(|t| FieldValue::U64(t.into())),
+            MID => non_verbose_id(&m).map(|t| FieldValue::U64(t.into())),
+            // Without an extended header a message is non-verbose.
+            MODE => Some(s(if m.verbose() { "verbose" } else { "non-verbose" })),
+            PAYLOAD => {
+                let mut out = Vec::new();
+                payload::render(&m, self.frame(&m), &mut out);
+                Some(FieldValue::Str(out.into()))
+            }
+            _ => None,
+        }
+    }
+
+    fn level(&self, msg: &[u8], at: &Origin<'_>) -> Option<Level> {
+        let m = Dlt::message(msg, at)?;
+        let frame = if m.mstp().is_none() { self.frame(&m) } else { None };
+        level_with(&m, frame)
+    }
+
+    fn argument(&self, msg: &[u8], at: &Origin<'_>, index: usize) -> Option<crate::signal::SignalValue> {
+        let m = Dlt::message(msg, at)?;
+        let frame = self.frame(&m)?;
+        frame.arg(m.payload().get(4..)?, m.big_endian(), index)
+    }
+}
+
+/// A `.dlt` file's storage header: the message's time and ECU id, and the
+/// message right behind it.
+fn storage_header(buf: &[u8]) -> Option<(Origin<'_>, usize)> {
+    let s = Storage::parse(buf)?;
+    Some((Origin { secs: s.secs, usecs: s.usecs, channel: s.ecu }, STORAGE_LEN))
+}
+
+impl Records {
+    /// Open a `.dlt` file: one sequential pass records the offset of every
+    /// message (8 bytes per message).
+    pub fn open(path: impl AsRef<Path>, progress: &Progress) -> Result<Records> {
+        let path = path.as_ref();
+        let data = Bytes::map(path)?;
+        let (offsets, skipped) = build_index(data.bytes(), progress)?;
+        let name = path.display().to_string();
+        let dlt = Arc::new(Dlt::default());
+        Ok(Records::stored(name, Some(path.to_path_buf()), data, offsets, storage_header, dlt, skipped))
+    }
+
+    /// An in-memory `.dlt` file, handy for tests.
+    pub fn from_bytes(name: impl Into<String>, bytes: Vec<u8>) -> Records {
+        let (offsets, skipped) = build_index(&bytes, &Progress::new()).expect("not cancelled");
+        let dlt = Arc::new(Dlt::default());
+        Records::stored(name.into(), None, Bytes::Owned(bytes), offsets, storage_header, dlt, skipped)
+    }
+
+    /// Decode DLT non-verbose messages with `fibex`: their payload as text,
+    /// and the APID, CTID, type and level they don't carry themselves.
+    pub fn with_fibex(self, fibex: Option<Arc<Fibex>>) -> Records {
+        match (0..crate::input::proto::MAX_PROTOCOLS).find(|&i| self.protocol(i).is_some_and(|p| p.name() == "DLT")) {
+            Some(i) => self.with_protocol(i, Arc::new(Dlt::new(fibex))),
+            None => self,
         }
     }
 }
@@ -328,35 +325,9 @@ fn non_verbose_id(m: &Message<'_>) -> Option<u32> {
     Some(if m.big_endian() { u32::from_be_bytes(b) } else { u32::from_le_bytes(b) })
 }
 
-/// `YYYY-MM-DD HH:MM:SS.uuuuuu`, UTC or local time (`crate::time::set_local`).
-fn write_time(out: &mut Vec<u8>, secs: u32, usecs: i32) {
-    // Offsets are whole seconds.
-    let secs = crate::time::shown(f64::from(secs)).max(0.0) as i64;
-    let (y, m, d) = crate::time::civil_from_days(secs / 86_400);
-    let t = secs % 86_400;
-    let _ = write!(
-        out,
-        "{y:04}-{m:02}-{d:02} {:02}:{:02}:{:02}.{:06}",
-        t / 3600,
-        t / 60 % 60,
-        t % 60,
-        usecs.clamp(0, 999_999)
-    );
-}
-
-fn render_line(m: &Message<'_>, frame: Option<&Frame>) -> Vec<u8> {
-    let mut out = Vec::with_capacity(80 + m.payload().len() * 3);
-    render_header(m, frame, &mut out);
-    out.push(b'\t');
-    payload::render(m, frame, &mut out);
-    out
-}
-
-/// The columns before the payload, tab-separated (no trailing tab).
+/// The columns after `time` and before the payload, tab-separated (no
+/// trailing tab).
 fn render_header(m: &Message<'_>, frame: Option<&Frame>, out: &mut Vec<u8>) {
-    let (secs, usecs) = m.storage_time();
-    write_time(out, secs, usecs);
-    out.push(b'\t');
     if let Some(t) = m.timestamp() {
         let _ = write!(out, "{}.{:04}", t / 10_000, t % 10_000);
     }
@@ -368,107 +339,6 @@ fn render_header(m: &Message<'_>, frame: Option<&Frame>, out: &mut Vec<u8>) {
     }
     out.push(b'\t');
     out.extend_from_slice(type_column(m, frame).as_bytes());
-}
-
-impl LogSource for DltFile {
-    fn data_id(&self) -> usize {
-        self.data_id
-    }
-
-    fn name(&self) -> &str {
-        &self.name
-    }
-
-    fn line_count(&self) -> LineNo {
-        match &self.index {
-            Index::Stored(o) => o.len() as LineNo,
-            Index::Framed { msgs, .. } => msgs.len() as LineNo,
-        }
-    }
-
-    fn line_bytes(&self, line: LineNo) -> Option<Cow<'_, [u8]>> {
-        self.msg(line).map(|m| Cow::Owned(render_line(&m, self.frame(&m))))
-    }
-
-    fn line_detail(&self, line: LineNo) -> Option<Vec<String>> {
-        let m = self.msg(line)?;
-        let frame = self.frame(&m);
-        let mut head = Vec::new();
-        render_header(&m, frame, &mut head);
-        let mut cells: Vec<String> = String::from_utf8_lossy(&head).split('\t').map(str::to_owned).collect();
-        let mut payload = Vec::new();
-        payload::render_formatted(&m, frame, &mut payload);
-        cells.push(String::from_utf8_lossy(&payload).into_owned());
-        Some(cells)
-    }
-
-    fn size_bytes(&self) -> u64 {
-        self.data.bytes().len() as u64
-    }
-
-    fn index_memory_bytes(&self) -> usize {
-        match &self.index {
-            Index::Stored(o) => o.capacity() * size_of::<u64>(),
-            Index::Framed { msgs, side, channel_ecus } => {
-                msgs.capacity() * size_of::<Framed>() + side.capacity() + channel_ecus.capacity() * 4
-            }
-        }
-    }
-
-    fn columns(&self) -> &[ColumnDef] {
-        &COLUMNS
-    }
-
-    fn schema(&self) -> &[FieldDef] {
-        SCHEMA
-    }
-
-    fn field(&self, line: LineNo, id: FieldId) -> Option<FieldValue<'_>> {
-        let m = self.msg(line)?;
-        let s = |b: &'static str| FieldValue::Str(b.as_bytes().into());
-        match id {
-            ECU => Some(FieldValue::Str(m.ecu().into())),
-            // A non-verbose message without them: from its FIBEX description.
-            APID => match m.apid() {
-                Some(b) => Some(FieldValue::Str(b.into())),
-                None => self.frame(&m)?.apid.as_deref().map(|a| FieldValue::Str(a.as_bytes().into())),
-            },
-            CTID => match m.ctid() {
-                Some(b) => Some(FieldValue::Str(b.into())),
-                None => self.frame(&m)?.ctid.as_deref().map(|c| FieldValue::Str(c.as_bytes().into())),
-            },
-            TYPE => type_of(&m, if m.mstp().is_none() { self.frame(&m) } else { None }).map(s),
-            MCNT => Some(FieldValue::U64(m.mcnt().into())),
-            TMSP => m.timestamp().map(|t| FieldValue::U64(t.into())),
-            SEID => m.session_id().map(|t| FieldValue::U64(t.into())),
-            MID => non_verbose_id(&m).map(|t| FieldValue::U64(t.into())),
-            // Without an extended header a message is non-verbose.
-            MODE => Some(s(if m.verbose() { "verbose" } else { "non-verbose" })),
-            PAYLOAD => {
-                let mut out = Vec::new();
-                payload::render(&m, self.frame(&m), &mut out);
-                Some(FieldValue::Str(out.into()))
-            }
-            _ => None,
-        }
-    }
-
-    fn supplied_level(&self, line: LineNo) -> Option<Option<Level>> {
-        let m = self.msg(line)?;
-        let frame = if m.mstp().is_none() { self.frame(&m) } else { None };
-        Some(level_with(&m, frame))
-    }
-
-    fn time(&self, line: LineNo) -> Option<f64> {
-        let (secs, usecs) = self.msg(line)?.storage_time();
-        Some(f64::from(secs) + f64::from(usecs) / 1e6)
-    }
-
-    fn argument(&self, line: LineNo, index: usize) -> Option<crate::signal::SignalValue> {
-        let m = self.msg(line)?;
-        let frame = self.frame(&m)?;
-        frame.arg(m.payload().get(4..)?, m.big_endian(), index)
-    }
 }
 
 #[cfg(test)]

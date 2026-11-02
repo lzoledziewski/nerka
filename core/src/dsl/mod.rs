@@ -31,9 +31,11 @@
 //! Source fields (DLT `ecu`, `apid`, …) are parsed generically and resolved
 //! by [`Query::bind`] against the source's schema, which also checks the
 //! operator and value against the field's kind: text fields take `==`,
-//! `!=`, `~`, `!~`; numeric fields take every comparison, and `~`, `!~` on
+//! `!=`, `~`, `!~`; numeric fields (whole numbers, or with a fraction: a
+//! JSON number, `temp > 20.5`) take every comparison, and `~`, `!~` on
 //! their decimal text (`tmsp ~ /(?<up>\d+)/`: a signal can capture a
-//! numeric field, e.g. one ECU's uptime). A line without a
+//! numeric field, e.g. one ECU's uptime); name fields (`proto`) are text
+//! whose `==` and `!=` ignore case. A line without a
 //! value for a field only satisfies `!=` and `!~`. As with `raw`, a STRING
 //! after `~` / `!~` is a literal substring. Fields marked
 //! [`FieldDef::costly`] (DLT `payload`, which decodes the message) are
@@ -50,6 +52,13 @@
 //! (`@time >= "2026-10-17 10:00:01.5"`) or time of day (`"10:00:00"`:
 //! compared with the value's time of day). As with fields, a row without a value only satisfies `!=`
 //! and `!~`, and an unknown signal is an error.
+//!
+//! NFD's own fields (`raw`, `level`, `bookmark`) may be written `nfd.raw`,
+//! `nfd.level`, `nfd.bookmark`; a source's field may be written with the
+//! source's prefix (`json.msg`, a JSON record's key). A source field named
+//! like one of NFD's own (a JSON key `raw`) is only `json.raw`, and a plain
+//! `raw` or `bookmark` on that source is an error saying so (`level` isn't:
+//! a JSON level key is the row's level, and `json.level` its text).
 //!
 //! `bookmark` (case-insensitive, like every field name) is the line's
 //! bookmark, a regular field the tab supplies ([`Query::with_bookmarks`]):
@@ -198,6 +207,8 @@ pub enum FieldTest {
     Literal(CmpOp, String, usize),
     /// Text field, `==` or `!=`.
     Str(CmpOp, Vec<u8>),
+    /// A [`FieldKind::Name`], `==` or `!=` without case (the value lower case).
+    StrNoCase(CmpOp, Vec<u8>),
     Num(CmpOp, u64),
     /// A `num` signal.
     Float(CmpOp, f64),
@@ -231,10 +242,21 @@ impl Expr {
             },
             Expr::Cond(Cond::Field(f)) => match (f.id.and_then(|id| ev.field(id)), &f.test) {
                 (Some(FieldValue::Str(v)), FieldTest::Str(op, want)) => op.test(&*v, want.as_slice()),
+                (Some(FieldValue::Str(v)), FieldTest::StrNoCase(op, want)) => {
+                    op.test(v.to_ascii_lowercase().as_slice(), want.as_slice())
+                }
                 (Some(FieldValue::U64(v)), FieldTest::Num(op, want)) => op.test(v, *want),
                 (Some(FieldValue::Str(v)), FieldTest::Match(re)) => re.is_match(&v),
                 (Some(FieldValue::U64(v)), FieldTest::Match(re)) => re.is_match(v.to_string().as_bytes()),
-                (None, FieldTest::Str(op, _) | FieldTest::Num(op, _)) => *op == CmpOp::Ne,
+                (Some(FieldValue::F64(v)), FieldTest::Float(op, want)) => op.test_f64(v, *want),
+                (Some(FieldValue::F64(v)), FieldTest::Match(re)) => re.is_match(v.to_string().as_bytes()),
+                (
+                    None,
+                    FieldTest::Str(op, _)
+                    | FieldTest::StrNoCase(op, _)
+                    | FieldTest::Num(op, _)
+                    | FieldTest::Float(op, _),
+                ) => *op == CmpOp::Ne,
                 _ => false,
             },
             Expr::Cond(Cond::Signal(s)) => s.eval(ev),
@@ -344,9 +366,12 @@ impl Expr {
 
 impl FieldCond {
     fn bind(&mut self, schema: &[FieldDef]) -> Result<(), DslError> {
-        let Some(id) = schema.iter().position(|d| d.name == self.name) else {
+        // `json.msg` is the key `msg`: a source's field may be written with
+        // its prefix (a clashing key is only that way: `json.raw`).
+        let named = |n: &str| schema.iter().position(|d| d.name == n);
+        let Some(id) = named(&self.name).or_else(|| self.name.strip_prefix("json.").and_then(named)) else {
             let mut known: Vec<&str> = vec!["raw", "level"];
-            known.extend(schema.iter().map(|d| d.name));
+            known.extend(schema.iter().map(|d| d.name.as_ref()));
             return Err(DslError {
                 msg: format!("unknown field '{}' (this source has: {})", self.name, known.join(", ")),
                 pos: self.pos,
@@ -357,17 +382,46 @@ impl FieldCond {
         let test = std::mem::replace(&mut self.test, FieldTest::Num(CmpOp::Eq, 0));
         self.test = match (test, schema[id].kind) {
             (t @ (FieldTest::Match(_) | FieldTest::Str(..)), FieldKind::Str)
-            | (t @ (FieldTest::Num(..) | FieldTest::Match(_)), FieldKind::U64) => t,
+            | (t @ (FieldTest::Match(_) | FieldTest::StrNoCase(..)), FieldKind::Name)
+            | (t @ (FieldTest::Num(..) | FieldTest::Match(_)), FieldKind::U64)
+            | (t @ (FieldTest::Float(..) | FieldTest::Match(_)), FieldKind::F64) => t,
+            (FieldTest::Literal(op, v, pos), FieldKind::F64) => match parse_f64(&v) {
+                Some(n) => FieldTest::Float(op, n),
+                None => return fail(format!("'{name}' is a number but '{v}' isn't"), pos),
+            },
+            (
+                FieldTest::Str(..)
+                | FieldTest::StrNoCase(..)
+                | FieldTest::Num(..)
+                | FieldTest::Any
+                | FieldTest::Time(..),
+                FieldKind::F64,
+            ) => {
+                return fail(format!("'{name}' is a number: use ==, !=, >=, <=, >, <, ~ or !~"), self.op_pos);
+            }
             (FieldTest::Literal(op @ (CmpOp::Eq | CmpOp::Ne), v, _), FieldKind::Str) => {
                 FieldTest::Str(op, v.into_bytes())
+            }
+            (FieldTest::Literal(op @ (CmpOp::Eq | CmpOp::Ne), v, _), FieldKind::Name) => {
+                FieldTest::StrNoCase(op, v.to_ascii_lowercase().into_bytes())
             }
             (
                 FieldTest::Literal(..)
                 | FieldTest::Num(..)
                 | FieldTest::Float(..)
                 | FieldTest::Any
-                | FieldTest::Time(..),
+                | FieldTest::Time(..)
+                | FieldTest::StrNoCase(..),
                 FieldKind::Str,
+            )
+            | (
+                FieldTest::Literal(..)
+                | FieldTest::Num(..)
+                | FieldTest::Float(..)
+                | FieldTest::Any
+                | FieldTest::Time(..)
+                | FieldTest::Str(..),
+                FieldKind::Name,
             ) => {
                 return fail(format!("'{name}' is text: use ==, !=, ~ or !~"), self.op_pos);
             }
@@ -375,7 +429,14 @@ impl FieldCond {
                 Some(n) => FieldTest::Num(op, n),
                 None => return fail(format!("'{name}' is a number but '{v}' isn't"), pos),
             },
-            (FieldTest::Str(..) | FieldTest::Float(..) | FieldTest::Any | FieldTest::Time(..), FieldKind::U64) => {
+            (
+                FieldTest::Str(..)
+                | FieldTest::StrNoCase(..)
+                | FieldTest::Float(..)
+                | FieldTest::Any
+                | FieldTest::Time(..),
+                FieldKind::U64,
+            ) => {
                 return fail(format!("'{name}' is a number: use ==, !=, >=, <=, >, <, ~ or !~"), self.op_pos);
             }
         };
@@ -413,6 +474,8 @@ impl SignalCond {
             | (t @ FieldTest::Float(..), SignalKind::Num)
             | (t @ FieldTest::Time(..), SignalKind::Time)
             | (t @ FieldTest::Any, _) => t,
+            // Only fields of kind Name bind to it; the parser never makes one.
+            (FieldTest::StrNoCase(..), _) => return fail(format!("'@{name}': no such comparison"), self.op_pos),
             (FieldTest::Literal(op @ (CmpOp::Eq | CmpOp::Ne), v, _), SignalKind::Enum) => {
                 FieldTest::Str(op, v.into_bytes())
             }
@@ -511,6 +574,31 @@ fn parse_u64(s: &str) -> Option<u64> {
         Some(hex) => u64::from_str_radix(hex, 16).ok(),
         None => s.parse().ok(),
     }
+}
+
+/// A plain `raw` or `bookmark` (NFD's own) on a source with a field of that
+/// name too (a JSON key, `json.raw`) is ambiguous: an error that says how
+/// to write either. `level` isn't: a JSON level key is the row's level.
+fn ambiguous(src: &str, schema: &[FieldDef]) -> Result<(), DslError> {
+    let Ok(toks) = parser::tokens(src) else { return Ok(()) };
+    for (i, (tok, at)) in toks.iter().enumerate() {
+        let parser::Tok::Word(w) = tok else { continue };
+        let w = w.to_ascii_lowercase();
+        // A value (`apid == raw`) isn't a field.
+        let value = i > 0 && matches!(toks[i - 1].0, parser::Tok::Op(_));
+        let what = match w.as_str() {
+            "raw" => "the line's text",
+            "bookmark" => "the line's bookmark",
+            _ => continue,
+        };
+        if !value && schema.iter().any(|d| d.name == format!("json.{w}")) {
+            return Err(DslError {
+                msg: format!("'{w}' is ambiguous here: write nfd.{w} ({what}) or json.{w} (the record's key)"),
+                pos: at.start,
+            });
+        }
+    }
+    Ok(())
 }
 
 /// A compiled, optimized query.
@@ -632,6 +720,7 @@ impl Query {
     /// operators that don't fit the field's kind are errors. Binding a
     /// bound query again is fine.
     pub fn bind(mut self, schema: &[FieldDef]) -> Result<Query, DslError> {
+        ambiguous(&self.source, schema)?;
         self.expr.bind(schema)?;
         // Costs are known only now.
         self.expr = self.expr.optimize();
@@ -772,6 +861,17 @@ mod tests {
     }
 
     #[test]
+    fn numbers_with_a_fraction_bind() {
+        let schema = [FieldDef::new("temp", FieldKind::F64, false)];
+        for ok in ["temp > 20.5", "temp == 7", "temp != 0x10", "temp ~ /^2/"] {
+            let q = Query::compile_for(ok, &schema).unwrap();
+            assert_eq!(q.expr().field_names(), ["temp"], "{ok}");
+        }
+        let e = Query::compile_for("temp >= warm", &schema).unwrap_err();
+        assert_eq!((e.pos, e.msg.as_str()), (8, "'temp' is a number but 'warm' isn't"));
+    }
+
+    #[test]
     fn bookmark_parses_alone_or_compared() {
         let cond = |s: &str| match q(s).expr().clone() {
             Expr::Cond(Cond::Bookmark(b)) => b.test,
@@ -791,6 +891,19 @@ mod tests {
         // A field name for the binding: bookmark isn't one of the source's.
         assert!(Query::compile_for("bookmark AND apid == NAV", &[]).is_err());
         assert!(Query::compile_for("bookmark", &[]).is_ok());
+    }
+
+    #[test]
+    fn nfd_own_fields_may_be_written_nfd_dot() {
+        assert!(matches!(q("nfd.level >= ERROR").expr(), Expr::Cond(Cond::Level(CmpOp::Ge, Level::Error))));
+        assert!(matches!(q("NFD.Raw ~ /x/").expr(), Expr::Cond(Cond::RawMatch(_))));
+        assert!(matches!(q("nfd.bookmark").expr(), Expr::Cond(Cond::Bookmark(_))));
+        let e = Query::compile("level >= WARN OR nfd.apid == NAV").unwrap_err();
+        assert_eq!((e.pos, e.msg.as_str()), (17, "'nfd.apid' isn't one of NFD's own fields (raw, level, bookmark)"));
+        // A source field with its source's prefix.
+        let schema = [FieldDef::new("msg", FieldKind::Str, false)];
+        assert!(Query::compile_for("json.msg == hi", &schema).is_ok());
+        assert!(Query::compile_for("json.nope == hi", &schema).is_err());
     }
 
     #[test]
@@ -852,10 +965,7 @@ mod tests {
 
     #[test]
     fn costly_fields_run_last() {
-        let schema = [
-            FieldDef { name: "payload", kind: FieldKind::Str, costly: true },
-            FieldDef { name: "apid", kind: FieldKind::Str, costly: false },
-        ];
+        let schema = [FieldDef::new("payload", FieldKind::Str, true), FieldDef::new("apid", FieldKind::Str, false)];
         let q = Query::compile_for(r#"payload ~ "a.b" AND apid == NAV AND /x/"#, &schema).unwrap();
         let Expr::And(xs) = q.expr() else { panic!("{:?}", q.expr()) };
         assert!(matches!(&xs[0], Expr::Cond(Cond::Field(f)) if f.name == "apid"));
