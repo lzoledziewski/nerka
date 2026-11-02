@@ -98,6 +98,9 @@ pub enum FieldKind {
     /// Unsigned number (counters, timestamps, ids): all comparisons, and
     /// `~`, `!~` on its decimal text (a signal can capture it).
     U64,
+    /// A number with a fraction (a JSON number that isn't whole): all
+    /// comparisons with a number, and `~`, `!~` on its text.
+    F64,
     /// A name (`proto`: `DLT`, `SOMEIP`, `syslog`): text whose `==` and `!=`
     /// ignore case; `~`, `!~` as for text.
     Name,
@@ -130,11 +133,12 @@ impl FieldDef {
 /// Index into [`crate::LogSource::schema`].
 pub type FieldId = usize;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum FieldValue<'a> {
     /// Borrowed for header fields, owned for decoded ones.
     Str(Cow<'a, [u8]>),
     U64(u64),
+    F64(f64),
 }
 
 /// Lazily-normalized view of one line, passed to filter evaluation.

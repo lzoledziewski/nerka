@@ -31,7 +31,8 @@
 //! Source fields (DLT `ecu`, `apid`, …) are parsed generically and resolved
 //! by [`Query::bind`] against the source's schema, which also checks the
 //! operator and value against the field's kind: text fields take `==`,
-//! `!=`, `~`, `!~`; numeric fields take every comparison, and `~`, `!~` on
+//! `!=`, `~`, `!~`; numeric fields (whole numbers, or with a fraction: a
+//! JSON number, `temp > 20.5`) take every comparison, and `~`, `!~` on
 //! their decimal text (`tmsp ~ /(?<up>\d+)/`: a signal can capture a
 //! numeric field, e.g. one ECU's uptime); name fields (`proto`) are text
 //! whose `==` and `!=` ignore case. A line without a
@@ -240,7 +241,15 @@ impl Expr {
                 (Some(FieldValue::U64(v)), FieldTest::Num(op, want)) => op.test(v, *want),
                 (Some(FieldValue::Str(v)), FieldTest::Match(re)) => re.is_match(&v),
                 (Some(FieldValue::U64(v)), FieldTest::Match(re)) => re.is_match(v.to_string().as_bytes()),
-                (None, FieldTest::Str(op, _) | FieldTest::StrNoCase(op, _) | FieldTest::Num(op, _)) => *op == CmpOp::Ne,
+                (Some(FieldValue::F64(v)), FieldTest::Float(op, want)) => op.test_f64(v, *want),
+                (Some(FieldValue::F64(v)), FieldTest::Match(re)) => re.is_match(v.to_string().as_bytes()),
+                (
+                    None,
+                    FieldTest::Str(op, _)
+                    | FieldTest::StrNoCase(op, _)
+                    | FieldTest::Num(op, _)
+                    | FieldTest::Float(op, _),
+                ) => *op == CmpOp::Ne,
                 _ => false,
             },
             Expr::Cond(Cond::Signal(s)) => s.eval(ev),
@@ -364,7 +373,22 @@ impl FieldCond {
         self.test = match (test, schema[id].kind) {
             (t @ (FieldTest::Match(_) | FieldTest::Str(..)), FieldKind::Str)
             | (t @ (FieldTest::Match(_) | FieldTest::StrNoCase(..)), FieldKind::Name)
-            | (t @ (FieldTest::Num(..) | FieldTest::Match(_)), FieldKind::U64) => t,
+            | (t @ (FieldTest::Num(..) | FieldTest::Match(_)), FieldKind::U64)
+            | (t @ (FieldTest::Float(..) | FieldTest::Match(_)), FieldKind::F64) => t,
+            (FieldTest::Literal(op, v, pos), FieldKind::F64) => match parse_f64(&v) {
+                Some(n) => FieldTest::Float(op, n),
+                None => return fail(format!("'{name}' is a number but '{v}' isn't"), pos),
+            },
+            (
+                FieldTest::Str(..)
+                | FieldTest::StrNoCase(..)
+                | FieldTest::Num(..)
+                | FieldTest::Any
+                | FieldTest::Time(..),
+                FieldKind::F64,
+            ) => {
+                return fail(format!("'{name}' is a number: use ==, !=, >=, <=, >, <, ~ or !~"), self.op_pos);
+            }
             (FieldTest::Literal(op @ (CmpOp::Eq | CmpOp::Ne), v, _), FieldKind::Str) => {
                 FieldTest::Str(op, v.into_bytes())
             }
@@ -798,6 +822,17 @@ mod tests {
         assert!(e.msg.contains("unknown field 'service'"), "{e}");
         assert_eq!(e.pos, 0);
         assert!(Query::compile("apid ~ 5").unwrap_err().msg.contains("regex"));
+    }
+
+    #[test]
+    fn numbers_with_a_fraction_bind() {
+        let schema = [FieldDef::new("temp", FieldKind::F64, false)];
+        for ok in ["temp > 20.5", "temp == 7", "temp != 0x10", "temp ~ /^2/"] {
+            let q = Query::compile_for(ok, &schema).unwrap();
+            assert_eq!(q.expr().field_names(), ["temp"], "{ok}");
+        }
+        let e = Query::compile_for("temp >= warm", &schema).unwrap_err();
+        assert_eq!((e.pos, e.msg.as_str()), (8, "'temp' is a number but 'warm' isn't"));
     }
 
     #[test]

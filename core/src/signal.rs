@@ -1016,10 +1016,13 @@ fn capture(e: &Expr, group: &str, ev: &mut Event<'_>) -> Option<Vec<u8>> {
             (FieldTest::Match(re), Some(FieldValue::Str(v))) if has_group(re, group) => {
                 re.captures(&v).and_then(|c| c.name(group)).map(|m| m.as_bytes().to_vec())
             }
-            // A numeric field (DLT `tmsp`) is matched as its decimal text.
-            (FieldTest::Match(re), Some(FieldValue::U64(v))) if has_group(re, group) => {
-                let text = v.to_string();
-                re.captures(text.as_bytes()).and_then(|c| c.name(group)).map(|m| m.as_bytes().to_vec())
+            // A numeric field (DLT `tmsp`, a JSON number) is matched as its
+            // decimal text.
+            (FieldTest::Match(re), Some(FieldValue::U64(n))) if has_group(re, group) => {
+                re.captures(n.to_string().as_bytes()).and_then(|c| c.name(group)).map(|m| m.as_bytes().to_vec())
+            }
+            (FieldTest::Match(re), Some(FieldValue::F64(x))) if has_group(re, group) => {
+                re.captures(x.to_string().as_bytes()).and_then(|c| c.name(group)).map(|m| m.as_bytes().to_vec())
             }
             _ => None,
         },
