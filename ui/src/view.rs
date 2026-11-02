@@ -281,6 +281,8 @@ fn hit_bg(c: Color32, dark: bool) -> Color32 {
 #[derive(Default)]
 pub struct ViewOutput {
     pub clicked: Option<u64>,
+    /// The view has the keyboard focus (the tests check it keeps it).
+    #[cfg_attr(not(test), allow(dead_code))]
     pub has_focus: bool,
     /// Lines copied to the clipboard and whether the copy was cut short.
     pub copied: Option<(u64, bool)>,

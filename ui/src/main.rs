@@ -36,7 +36,6 @@ mod icon_art;
 mod instance;
 mod job;
 mod library;
-mod memory;
 mod plot;
 mod plots;
 mod prefs;
@@ -2315,8 +2314,10 @@ impl Tab {
                 },
             );
             self.view_output(&out, true, |row| hits.lines[row as usize]);
-            // Selecting a hit moves the main view to it.
-            let picked = out.clicked.or(if out.has_focus { self.hits_view.selected } else { None });
+            // Selecting a hit (a click, the keys) moves the main view to it;
+            // only then: a hit selected earlier doesn't pull the main view
+            // back (it still has the focus while a click there is pressed).
+            let picked = out.clicked.or(out.moved_to);
             if let Some(row) = picked {
                 let line = hits.lines[row as usize];
                 if self.current_line() != line {
@@ -3777,18 +3778,9 @@ impl App {
                     ui.separator();
                     let indexes: usize =
                         self.tabs.iter().filter_map(|t| t.file.as_ref()).map(|f| f.index_memory_bytes()).sum();
-                    let held = memory::private_bytes();
-                    let text = format!(
-                        "{} lines · {} · {}{}",
-                        f.line_count(),
-                        size_text(f.size_bytes()),
-                        f.format(),
-                        held.map_or(String::new(), |m| format!(" · RAM {}", size_text(m)))
-                    );
+                    let text = format!("{} lines · {} · {}", f.line_count(), size_text(f.size_bytes()), f.format());
                     let tip = format!(
-                        "Read as: {}\nIndex of this tab: {}; of all tabs: {}\n\
-                         RAM: memory nerka holds itself (indexes, results, caches, the graphics driver's), not the files: \
-                         they're mapped and read as needed",
+                        "Read as: {}\nIndex of this tab: {}; of all tabs: {}",
                         f.format(),
                         size_text(f.index_memory_bytes() as u64),
                         size_text(indexes as u64)
@@ -4580,6 +4572,86 @@ gear=D
             Preview::AutoText { why, .. } => why.clone(),
             _ => None,
         }
+    }
+
+    /// Bug (owner, 2026-11-02): after a click on a search hit, a click on a
+    /// line of the main view jumped back to the hit. The hits pane (drawn
+    /// first, still focused on the press) moved the main view to its hit
+    /// whenever they differed, not only when its selection moved.
+    #[test]
+    fn a_click_in_the_main_view_after_a_hit_stays() {
+        let dir = std::env::temp_dir().join(format!("nerka-gui-hitclick-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("app.log");
+        let text: String =
+            (0..300).map(|i| if i % 50 == 0 { format!("needle {i}\n") } else { format!("line {i}\n") }).collect();
+        std::fs::write(&log, text).unwrap();
+        let ctx = egui::Context::default();
+        let mut app = App::default();
+        app.open(&ctx, log);
+        settle(&mut app.tabs[0], &ctx);
+        app.tabs[0].search.pattern = "needle".into();
+        app.tabs[0].run_search_box(&ctx);
+        settle_app(&mut app, &ctx);
+        let mut t = 0.0;
+        let mut frame = |app: &mut App, events: Vec<egui::Event>| {
+            t += 1.0 / 60.0;
+            let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1200.0, 800.0));
+            let input = egui::RawInput { screen_rect: Some(screen), time: Some(t), events, ..Default::default() };
+            let mut out = ctx.run_ui(input, |ui| app.frame(ui));
+            out.textures_delta.clear();
+            out.shapes
+        };
+        let find = |shapes: &[egui::epaint::ClippedShape], label: &str, lowest: bool| {
+            let at = shapes.iter().filter_map(|s| match &s.shape {
+                egui::Shape::Text(t) if t.galley.text() == label => Some(t.pos + egui::vec2(20.0, 5.0)),
+                _ => None,
+            });
+            if lowest { at.max_by(|a, b| a.y.total_cmp(&b.y)) } else { at.min_by(|a, b| a.y.total_cmp(&b.y)) }
+        };
+        let button = |p: egui::Pos2, pressed| egui::Event::PointerButton {
+            pos: p,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        let mut shapes = Vec::new();
+        for _ in 0..3 {
+            shapes = frame(&mut app, vec![]);
+        }
+        // A click on the hit `needle 150` (the lowest: the hits pane).
+        let hit = find(&shapes, "needle 150", true).expect("the hit");
+        frame(&mut app, vec![egui::Event::PointerMoved(hit), button(hit, true)]);
+        frame(&mut app, vec![button(hit, false)]);
+        for _ in 0..2 {
+            shapes = frame(&mut app, vec![]);
+        }
+        assert_eq!(app.tabs[0].current_line(), 150);
+        // Then scroll the main view away and click a line there: press, a
+        // frame, release.
+        let main = find(&shapes, "line 145", false).expect("line 145 in the main view");
+        let wheel = egui::Event::MouseWheel {
+            unit: egui::MouseWheelUnit::Line,
+            delta: egui::vec2(0.0, -10.0),
+            phase: egui::TouchPhase::Move,
+            source: egui::MouseWheelSource::Wheel,
+            modifiers: egui::Modifiers::NONE,
+        };
+        frame(&mut app, vec![egui::Event::PointerMoved(main), wheel]);
+        for _ in 0..2 {
+            shapes = frame(&mut app, vec![]);
+        }
+        let target = app.tabs[0].main_view.top + 5;
+        assert!(target > 160, "scrolled: {target}");
+        let other = find(&shapes, &format!("line {target}"), false).expect("a line of the main view, scrolled");
+        frame(&mut app, vec![egui::Event::PointerMoved(other), button(other, true)]);
+        frame(&mut app, vec![]);
+        frame(&mut app, vec![button(other, false)]);
+        for _ in 0..3 {
+            frame(&mut app, vec![]);
+        }
+        assert_eq!(app.tabs[0].current_line(), target, "the cursor stays on the line clicked");
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// Bug: ticking the Search box's Regex / Ignore case wasn't saved, as
