@@ -44,21 +44,21 @@ const LEN: FieldId = 7;
 const PAYLOAD: FieldId = 8;
 
 const SCHEMA: &[FieldDef] = &[
-    FieldDef { name: "service", kind: FieldKind::U64, costly: false },
+    FieldDef::new("service", FieldKind::U64, false),
     // method or event id
-    FieldDef { name: "method", kind: FieldKind::U64, costly: false },
-    FieldDef { name: "client", kind: FieldKind::U64, costly: false },
-    FieldDef { name: "session", kind: FieldKind::U64, costly: false },
+    FieldDef::new("method", FieldKind::U64, false),
+    FieldDef::new("client", FieldKind::U64, false),
+    FieldDef::new("session", FieldKind::U64, false),
     // interface version
-    FieldDef { name: "iface", kind: FieldKind::U64, costly: false },
+    FieldDef::new("iface", FieldKind::U64, false),
     // REQUEST, NOTIFICATION, RESPONSE, ERROR, …
-    FieldDef { name: "type", kind: FieldKind::Str, costly: false },
+    FieldDef::new("type", FieldKind::Str, false),
     // return code: E_OK, E_NOT_OK, …
-    FieldDef { name: "rc", kind: FieldKind::Str, costly: false },
+    FieldDef::new("rc", FieldKind::Str, false),
     // payload length in bytes
-    FieldDef { name: "len", kind: FieldKind::U64, costly: false },
+    FieldDef::new("len", FieldKind::U64, false),
     // the payload as hex, i.e. the `payload` column
-    FieldDef { name: "payload", kind: FieldKind::Str, costly: true },
+    FieldDef::new("payload", FieldKind::Str, true),
 ];
 
 /// The SOME/IP protocol.

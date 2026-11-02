@@ -352,7 +352,7 @@ impl FieldCond {
     fn bind(&mut self, schema: &[FieldDef]) -> Result<(), DslError> {
         let Some(id) = schema.iter().position(|d| d.name == self.name) else {
             let mut known: Vec<&str> = vec!["raw", "level"];
-            known.extend(schema.iter().map(|d| d.name));
+            known.extend(schema.iter().map(|d| d.name.as_ref()));
             return Err(DslError {
                 msg: format!("unknown field '{}' (this source has: {})", self.name, known.join(", ")),
                 pos: self.pos,
@@ -881,10 +881,7 @@ mod tests {
 
     #[test]
     fn costly_fields_run_last() {
-        let schema = [
-            FieldDef { name: "payload", kind: FieldKind::Str, costly: true },
-            FieldDef { name: "apid", kind: FieldKind::Str, costly: false },
-        ];
+        let schema = [FieldDef::new("payload", FieldKind::Str, true), FieldDef::new("apid", FieldKind::Str, false)];
         let q = Query::compile_for(r#"payload ~ "a.b" AND apid == NAV AND /x/"#, &schema).unwrap();
         let Expr::And(xs) = q.expr() else { panic!("{:?}", q.expr()) };
         assert!(matches!(&xs[0], Expr::Cond(Cond::Field(f)) if f.name == "apid"));

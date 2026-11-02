@@ -183,7 +183,7 @@ pub const MIXED_COLUMNS: [ColumnDef; 4] = [
 
 const TIME: ColumnDef = ColumnDef { name: "time", width: 26 };
 /// The protocol's name; compared without case (`proto == syslog`, `SYSLOG`).
-const PROTO_FIELD: FieldDef = FieldDef { name: "proto", kind: FieldKind::Name, costly: false };
+const PROTO_FIELD: FieldDef = FieldDef::new("proto", FieldKind::Name, false);
 
 impl View {
     /// The view for the protocols `present` (indexes into `protos`).

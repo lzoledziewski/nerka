@@ -657,7 +657,7 @@ pub fn removable_chip(ui: &mut egui::Ui, text: &str, color: Color32) -> egui::Re
 /// Why a query can't run on this file: the fields it needs that the file
 /// doesn't have.
 fn incompatible_text(missing: &[String], schema: &[FieldDef]) -> String {
-    let has: Vec<&str> = ["raw", "level"].into_iter().chain(schema.iter().map(|d| d.name)).collect();
+    let has: Vec<&str> = ["raw", "level"].into_iter().chain(schema.iter().map(|d| d.name.as_ref())).collect();
     format!(
         "Can't run on this file: it has no field {} (it has: {})",
         missing.iter().map(|m| format!("'{m}'")).collect::<Vec<_>>().join(", "),

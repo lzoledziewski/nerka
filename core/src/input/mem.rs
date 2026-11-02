@@ -7,10 +7,8 @@ use crate::event::{FieldDef, FieldId, FieldKind, FieldValue, Level};
 use std::borrow::Cow;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-pub(crate) const SCHEMA: &[FieldDef] = &[
-    FieldDef { name: "apid", kind: FieldKind::Str, costly: false },
-    FieldDef { name: "mcnt", kind: FieldKind::U64, costly: false },
-];
+pub(crate) const SCHEMA: &[FieldDef] =
+    &[FieldDef::new("apid", FieldKind::Str, false), FieldDef::new("mcnt", FieldKind::U64, false)];
 
 pub(crate) struct Row {
     pub text: &'static str,

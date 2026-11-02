@@ -58,23 +58,23 @@ const MODE: FieldId = 8;
 const PAYLOAD: FieldId = 9;
 
 const SCHEMA: &[FieldDef] = &[
-    FieldDef { name: "ecu", kind: FieldKind::Str, costly: false },
-    FieldDef { name: "apid", kind: FieldKind::Str, costly: false },
-    FieldDef { name: "ctid", kind: FieldKind::Str, costly: false },
+    FieldDef::new("ecu", FieldKind::Str, false),
+    FieldDef::new("apid", FieldKind::Str, false),
+    FieldDef::new("ctid", FieldKind::Str, false),
     // log, app_trace, nw_trace, control
-    FieldDef { name: "type", kind: FieldKind::Str, costly: false },
+    FieldDef::new("type", FieldKind::Str, false),
     // message counter
-    FieldDef { name: "mcnt", kind: FieldKind::U64, costly: false },
+    FieldDef::new("mcnt", FieldKind::U64, false),
     // ECU uptime in 0.1 ms units
-    FieldDef { name: "tmsp", kind: FieldKind::U64, costly: false },
+    FieldDef::new("tmsp", FieldKind::U64, false),
     // session id
-    FieldDef { name: "seid", kind: FieldKind::U64, costly: false },
+    FieldDef::new("seid", FieldKind::U64, false),
     // message id of non-verbose messages (none on verbose ones: 0 is a valid id)
-    FieldDef { name: "mid", kind: FieldKind::U64, costly: false },
+    FieldDef::new("mid", FieldKind::U64, false),
     // verbose, non-verbose
-    FieldDef { name: "mode", kind: FieldKind::Str, costly: false },
+    FieldDef::new("mode", FieldKind::Str, false),
     // the decoded payload, i.e. the `payload` column
-    FieldDef { name: "payload", kind: FieldKind::Str, costly: true },
+    FieldDef::new("payload", FieldKind::Str, true),
 ];
 
 /// Length of the well-formed DLT message whose standard header is at

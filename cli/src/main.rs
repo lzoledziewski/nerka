@@ -376,7 +376,7 @@ fn run() -> Result<()> {
             writeln!(out, "size:        {} bytes", f.size_bytes())?;
             writeln!(out, "lines:       {}", f.line_count())?;
             if !f.schema().is_empty() {
-                let names: Vec<&str> = f.schema().iter().map(|d| d.name).collect();
+                let names: Vec<&str> = f.schema().iter().map(|d| d.name.as_ref()).collect();
                 writeln!(out, "fields:      {}", names.join(", "))?;
             }
             writeln!(out, "index mem:   {} KiB", f.index_memory_bytes() / 1024)?;

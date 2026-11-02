@@ -33,18 +33,18 @@ const PAYLOAD: FieldId = 6;
 
 const SCHEMA: &[FieldDef] = &[
     // kern, user, daemon, auth, local0, …
-    FieldDef { name: "facility", kind: FieldKind::Str, costly: false },
-    FieldDef { name: "host", kind: FieldKind::Str, costly: false },
+    FieldDef::new("facility", FieldKind::Str, false),
+    FieldDef::new("host", FieldKind::Str, false),
     // APP-NAME (RFC 5424) or the tag (RFC 3164)
-    FieldDef { name: "app", kind: FieldKind::Str, costly: false },
+    FieldDef::new("app", FieldKind::Str, false),
     // PROCID, or the tag's [pid]
-    FieldDef { name: "pid", kind: FieldKind::Str, costly: false },
+    FieldDef::new("pid", FieldKind::Str, false),
     // MSGID (RFC 5424)
-    FieldDef { name: "msgid", kind: FieldKind::Str, costly: false },
+    FieldDef::new("msgid", FieldKind::Str, false),
     // the message's own timestamp, as written
-    FieldDef { name: "stamp", kind: FieldKind::Str, costly: false },
+    FieldDef::new("stamp", FieldKind::Str, false),
     // the message text, i.e. the `payload` column
-    FieldDef { name: "payload", kind: FieldKind::Str, costly: false },
+    FieldDef::new("payload", FieldKind::Str, false),
 ];
 
 const FACILITIES: [&str; 24] = [

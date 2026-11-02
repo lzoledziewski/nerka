@@ -49,7 +49,7 @@ fn a_view_of_several_protocols_unites_their_fields() {
         vec![Arc::new(crate::input::dlt::Dlt::default()), Arc::new(SomeIp), Arc::new(syslog::Syslog)];
     let v = View::new(&protos, &[0, 1]);
     assert!(v.mixed);
-    let names: Vec<&str> = v.schema.iter().map(|d| d.name).collect();
+    let names: Vec<&str> = v.schema.iter().map(|d| d.name.as_ref()).collect();
     assert_eq!(&names[..3], ["proto", "ecu", "apid"]);
     for (i, name) in names.iter().enumerate() {
         assert_eq!(names.iter().position(|n| n == name), Some(i), "{name} once");

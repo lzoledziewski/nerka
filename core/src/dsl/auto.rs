@@ -245,7 +245,7 @@ mod tests {
         let (t, e) = read("apid == NAV").unwrap_err();
         assert_eq!(t, "apid == NAV");
         assert!(e.unwrap().contains("apid"));
-        let schema = [FieldDef { name: "apid", kind: FieldKind::Str, costly: false }];
+        let schema = [FieldDef::new("apid", FieldKind::Str, false)];
         assert_eq!(read_with("apid == NAV AND timeout", false, &schema).unwrap(), "apid == NAV AND \"timeout\"");
     }
 

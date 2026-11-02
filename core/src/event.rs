@@ -103,15 +103,28 @@ pub enum FieldKind {
     Name,
 }
 
-/// One field a source supplies for every line, e.g. DLT's `apid`.
+/// One field a source supplies for every line, e.g. DLT's `apid`, or a
+/// JSON record's key (a name found in the data: owned).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FieldDef {
     /// Lower-case name used in queries.
-    pub name: &'static str,
+    pub name: Cow<'static, str>,
     pub kind: FieldKind,
     /// Getting the value decodes the line (e.g. a DLT payload), so
     /// conditions on it are evaluated after the cheap ones.
     pub costly: bool,
+}
+
+impl FieldDef {
+    /// A field with a fixed name.
+    pub const fn new(name: &'static str, kind: FieldKind, costly: bool) -> FieldDef {
+        FieldDef { name: Cow::Borrowed(name), kind, costly }
+    }
+
+    /// A field whose name comes from the data (a JSON key).
+    pub fn owned(name: String, kind: FieldKind, costly: bool) -> FieldDef {
+        FieldDef { name: Cow::Owned(name), kind, costly }
+    }
 }
 
 /// Index into [`crate::LogSource::schema`].
