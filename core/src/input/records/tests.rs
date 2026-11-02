@@ -187,6 +187,35 @@ fn json_keys_are_fields() {
     assert_eq!(q("level == INFO"), [0]);
 }
 
+/// A key may hold a dot (zeek writes `id.orig_h`): it's one key, not a path.
+/// A nested path of the same name: the first one seen is the field.
+#[test]
+fn json_keys_with_dots() {
+    let f = json(concat!(
+        r#"{"id.orig_h": "10.0.0.1", "id.resp_p": 53, "a": {"b": 1}}"#,
+        "\n",
+        r#"{"id.orig_h": "10.0.0.2", "id.resp_p": 443, "a.b": 2}"#,
+        "\n",
+    ));
+    let q = |s: &str| run_on(&f, &Filter::Query(Query::compile(s).unwrap()));
+    assert_eq!(q("id.resp_p == 53"), [0]);
+    assert_eq!(q("id.orig_h == 10.0.0.2"), [1]);
+    assert_eq!(q("a.b == 1"), [0], "a.b is the nested path, seen first");
+}
+
+/// Every record's keys are fields, a key first written late among them
+/// (records are read in chunks; fields keep the order first seen).
+#[test]
+fn json_keys_of_late_records() {
+    let mut text: String = (0..5000).map(|i| format!("{{\"n\": {i}}}\n")).collect();
+    text.push_str("{\"n\": 5000, \"rare\": \"x\", \"late\": 1.5}\n");
+    let f = json(&text);
+    let names: Vec<&str> = f.schema().iter().map(|d| d.name.as_ref()).collect();
+    assert_eq!(names, ["n", "rare", "late"]);
+    let q = |s: &str| run_on(&f, &Filter::Query(Query::compile(s).unwrap()));
+    assert_eq!(q("rare == x AND late > 1"), [5000]);
+}
+
 /// A file opened without a choice is read as JSON if it looks like JSON;
 /// a choice of lines reads it as lines.
 #[test]

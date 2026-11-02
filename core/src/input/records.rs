@@ -122,8 +122,8 @@ pub struct RecordFile {
     data_id: usize,
 }
 
-/// The fields of JSON records: every key path with a value in the first
-/// [`SAMPLE`] records (lower case, nested keys joined by `.`: `ctx.user`),
+/// The fields of JSON records: every key path with a value in any record
+/// (lower case, nested keys joined by `.`: `ctx.user`),
 /// typed by what they hold (whole numbers `U64`, other numbers `F64`, the
 /// rest text; arrays and objects as their text). A `level`, `severity`,
 /// `lvl` or `loglevel` key gives the row's level (names, or numbers on the
@@ -136,43 +136,87 @@ pub struct JsonFields {
     level: Option<Vec<String>>,
 }
 
-/// Records read for the JSON fields.
-const SAMPLE: usize = 1000;
+/// Records a thread reads for the JSON fields at a time.
+const CHUNK: usize = 4096;
+
+/// Key paths of JSON records, in the order first seen: name, keys, kind.
+/// Two paths of one name (a key `id.x`, and `x` in `id`): the first one
+/// seen is the field.
+#[derive(Default)]
+struct Keys {
+    seen: Vec<(String, Vec<String>, FieldKind)>,
+    at: std::collections::HashMap<String, usize>,
+}
+
+impl Keys {
+    fn read(&mut self, rec: &[u8]) {
+        json::flatten(rec, &mut |path, ends, v| {
+            let kind = match v {
+                Json::Null => return,
+                Json::Num(n) if n.iter().all(u8::is_ascii_digit) => FieldKind::U64,
+                Json::Num(_) => FieldKind::F64,
+                _ => FieldKind::Str,
+            };
+            self.add(path, || json::keys_of(path, ends), kind);
+        });
+    }
+
+    fn add(&mut self, path: &str, keys: impl FnOnce() -> Vec<String>, kind: FieldKind) {
+        match self.at.get(path) {
+            Some(&i) => {
+                let k = &mut self.seen[i].2;
+                *k = match (*k, kind) {
+                    (a, b) if a == b => a,
+                    (FieldKind::U64 | FieldKind::F64, FieldKind::U64 | FieldKind::F64) => FieldKind::F64,
+                    _ => FieldKind::Str,
+                }
+            }
+            None => {
+                self.at.insert(path.to_owned(), self.seen.len());
+                self.seen.push((path.to_owned(), keys(), kind));
+            }
+        }
+    }
+
+    /// `later`'s keys after these (it read the records after these).
+    fn join(&mut self, later: Keys) {
+        for (path, keys, kind) in later.seen {
+            self.add(&path, || keys, kind);
+        }
+    }
+}
 
 /// Keys whose value is the level, in this order.
 const LEVEL_KEYS: [&str; 4] = ["level", "severity", "lvl", "loglevel"];
 
 impl JsonFields {
     fn of(buf: &[u8], starts: &[u64], ends: &[u64]) -> JsonFields {
-        let mut seen: Vec<(String, FieldKind)> = Vec::new();
-        for (&s, &e) in starts.iter().zip(ends).take(SAMPLE) {
-            json::flatten(&buf[s as usize..e as usize], &mut |path, v| {
-                let kind = match v {
-                    Json::Null => return,
-                    Json::Num(n) if n.iter().all(u8::is_ascii_digit) => FieldKind::U64,
-                    Json::Num(_) => FieldKind::F64,
-                    _ => FieldKind::Str,
-                };
-                match seen.iter_mut().find(|(p, _)| p == path) {
-                    Some((_, k)) => {
-                        *k = match (*k, kind) {
-                            (a, b) if a == b => a,
-                            (FieldKind::U64 | FieldKind::F64, FieldKind::U64 | FieldKind::F64) => FieldKind::F64,
-                            _ => FieldKind::Str,
-                        }
-                    }
-                    None => seen.push((path.to_owned(), kind)),
+        use rayon::prelude::*;
+        // Every record, in chunks read in parallel and joined in order: a
+        // key may first come late (one kind of event among thousands).
+        let records: Vec<(u64, u64)> = starts.iter().copied().zip(ends.iter().copied()).collect();
+        let seen = records
+            .par_chunks(CHUNK)
+            .map(|chunk| {
+                let mut keys = Keys::default();
+                for &(s, e) in chunk {
+                    keys.read(&buf[s as usize..e as usize]);
                 }
-            });
-        }
-        let level = LEVEL_KEYS.iter().find(|k| seen.iter().any(|(p, _)| p == *k)).map(|k| vec![k.to_string()]);
-        // Names a query can write (a WORD of NFD), and not NFD's own.
+                keys
+            })
+            .reduce_with(|mut a, b| {
+                a.join(b);
+                a
+            })
+            .unwrap_or_default()
+            .seen;
+        let level = LEVEL_KEYS.iter().find(|k| seen.iter().any(|(p, _, _)| p == *k)).map(|k| vec![k.to_string()]);
         // Names a query can write (a WORD of NFD); a key named like one of
         // NFD's own fields is `json.raw` (`raw` stays the line's text).
         let usable = |p: &str| p.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-'));
         let (mut schema, mut paths) = (Vec::new(), Vec::new());
-        for (p, kind) in seen.into_iter().filter(|(p, _)| usable(p)) {
-            paths.push(p.split('.').map(str::to_owned).collect());
+        for (p, keys, kind) in seen.into_iter().filter(|(p, _, _)| usable(p)) {
+            paths.push(keys);
             let name = if matches!(p.as_str(), "raw" | "level" | "bookmark") { format!("json.{p}") } else { p };
             schema.push(FieldDef::owned(name, kind, false));
         }

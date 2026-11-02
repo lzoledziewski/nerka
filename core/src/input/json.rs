@@ -213,25 +213,45 @@ pub fn get<'a>(rec: &'a [u8], path: &[String]) -> Option<Json<'a>> {
 }
 
 /// Every key path of `rec` with a value that isn't an object (arrays are
-/// values, as text), lower case and joined by `.`, depth first.
-pub fn flatten<'a>(rec: &'a [u8], out: &mut dyn FnMut(&str, &Json<'a>)) {
-    fn walk<'a>(rec: &'a [u8], at: usize, prefix: &mut String, out: &mut dyn FnMut(&str, &Json<'a>)) {
+/// values, as text), lower case and joined by `.`, depth first; with the
+/// end of each key in it (a key may hold a `.`: zeek's `id.orig_h`).
+pub fn flatten<'a>(rec: &'a [u8], out: &mut dyn FnMut(&str, &[usize], &Json<'a>)) {
+    type Out<'o, 'a> = &'o mut dyn FnMut(&str, &[usize], &Json<'a>);
+    fn walk<'a>(rec: &'a [u8], at: usize, prefix: &mut String, ends: &mut Vec<usize>, out: Out<'_, 'a>) {
         let _ = members(rec, at, &mut |k, v| {
             let len = prefix.len();
             if !prefix.is_empty() {
                 prefix.push('.');
             }
-            prefix.push_str(&unescape(k).to_lowercase());
-            if rec[v] == b'{' {
-                walk(rec, v, prefix, out);
-            } else if let Some((value, _)) = value(rec, v) {
-                out(prefix, &value);
+            if k.is_ascii() && !k.contains(&b'\\') {
+                prefix.extend(k.iter().map(|b| b.to_ascii_lowercase() as char));
+            } else {
+                prefix.push_str(&unescape(k).to_lowercase());
             }
+            ends.push(prefix.len());
+            if rec[v] == b'{' {
+                walk(rec, v, prefix, ends, out);
+            } else if let Some((value, _)) = value(rec, v) {
+                out(prefix, ends, &value);
+            }
+            ends.pop();
             prefix.truncate(len);
             true
         });
     }
-    walk(rec, skip_ws(rec, 0), &mut String::new(), out);
+    walk(rec, skip_ws(rec, 0), &mut String::new(), &mut Vec::new(), out);
+}
+
+/// The keys of a path [`flatten`] gives: `ends` are where each ends in it.
+pub fn keys_of(path: &str, ends: &[usize]) -> Vec<String> {
+    let mut from = 0;
+    ends.iter()
+        .map(|&end| {
+            let key = path[from..end].to_owned();
+            from = end + 1;
+            key
+        })
+        .collect()
 }
 
 /// Where the records of a JSON file are: (start, end) of each top-level
@@ -328,7 +348,7 @@ mod tests {
     fn flattened_keys() {
         let rec = br#"{"Level": "info", "ctx": {"user": {"id": 7}, "tags": [1]}, "n": 1}"#;
         let mut got = Vec::new();
-        flatten(rec, &mut |k, v| got.push((k.to_owned(), v.text().into_owned())));
+        flatten(rec, &mut |k, _, v| got.push((k.to_owned(), v.text().into_owned())));
         let want = [("level", "info"), ("ctx.user.id", "7"), ("ctx.tags", "[1]"), ("n", "1")];
         assert_eq!(got, want.map(|(k, v)| (k.to_owned(), v.as_bytes().to_vec())));
     }
