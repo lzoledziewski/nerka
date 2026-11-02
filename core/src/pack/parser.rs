@@ -320,29 +320,39 @@ fn finish(file: &str, mut q: PackQuery, mut body: Vec<(usize, &str)>) -> Result<
     };
 
     // Same-length placeholders keep DSL error positions valid. A bare
-    // parameter becomes a string, as in the real expansion.
+    // parameter is a string, as in the real expansion. If the body doesn't
+    // parse with `"xx"`, it is tried with `"I"` (a level too: `level >=
+    // $lvl`); the first try's error is the one reported.
     let text = &q.text;
-    let checked = render(
-        text,
-        false,
-        |name, ctx, at| {
-            if !is_name(name) {
-                return Err(err(file_pos(at), format!("invalid parameter name '{name}'")));
-            }
-            if !q.params.iter().any(|p| p == name) {
-                return Err(err(
-                    file_pos(at),
-                    format!("parameter '${name}' is not declared (list it in the header: query {}({name}))", q.id),
-                ));
-            }
-            let len = if text[at + 1..].starts_with('{') { name.len() + 3 } else { name.len() + 1 };
-            Ok(match ctx {
-                Ctx::Bare => format!("\"{}\"", "x".repeat(len - 2)),
-                Ctx::Regex | Ctx::Str => "x".repeat(len),
-            })
-        },
-        |at| err(file_pos(at), "missing '}' after '${'".into()),
-    )?;
-    crate::dsl::parse(&checked).map_err(|e| err(file_pos(e.pos), e.msg))?;
+    let with = |level: bool| {
+        render(
+            text,
+            false,
+            |name, ctx, at| {
+                if !is_name(name) {
+                    return Err(err(file_pos(at), format!("invalid parameter name '{name}'")));
+                }
+                if !q.params.iter().any(|p| p == name) {
+                    return Err(err(
+                        file_pos(at),
+                        format!("parameter '${name}' is not declared (list it in the header: query {}({name}))", q.id),
+                    ));
+                }
+                let len = if text[at + 1..].starts_with('{') { name.len() + 3 } else { name.len() + 1 };
+                Ok(match ctx {
+                    Ctx::Bare if level => "\"I\"".into(),
+                    Ctx::Bare => format!("\"{}\"", "x".repeat(len - 2)),
+                    Ctx::Regex | Ctx::Str => "x".repeat(len),
+                })
+            },
+            |at| err(file_pos(at), "missing '}' after '${'".into()),
+        )
+    };
+    let checked = with(false)?;
+    if let Err(e) = crate::dsl::parse(&checked) {
+        if with(true).ok().is_none_or(|t| crate::dsl::parse(&t).is_err()) {
+            return Err(err(file_pos(e.pos), e.msg));
+        }
+    }
     Ok(q)
 }

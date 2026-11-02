@@ -12,7 +12,7 @@ your logs carry. Everything runs locally, with no backend: a desktop viewer
 
 ![nerka on a synthetic DLT drive: warnings filtered from a query pack, speed, temperature and battery voltage plotted with a throttling threshold, a text search (regex, ignoring case) for throttling messages in the bottom pane, and the library and selection panes on the right](doc/img/nerka.png)
 
-> Status: **0.1.0-alpha.9**, a pre-release before 0.1.0. Windows is the main
+> Status: **0.1.0**, the first release. Windows is the main
 > platform; Linux builds come from CI; macOS isn't built yet. While nerka is
 > at 0.x, file formats, the filter language and the GUI can still change.
 
