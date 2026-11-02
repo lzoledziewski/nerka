@@ -127,8 +127,8 @@ pub struct RecordFile {
 /// typed by what they hold (whole numbers `U64`, other numbers `F64`, the
 /// rest text; arrays and objects as their text). A `level`, `severity`,
 /// `lvl` or `loglevel` key gives the row's level (names, or numbers on the
-/// 10–60 scale of bunyan / pino); `raw`, `level` and `bookmark` are NFD's own
-/// and aren't fields.
+/// 10–60 scale of bunyan / pino). A key named like one of NFD's own fields
+/// (`raw`, `level`, `bookmark`) is the field `json.raw` (…); see `dsl`.
 #[derive(Debug, Clone, Default)]
 pub struct JsonFields {
     schema: Vec<FieldDef>,
@@ -167,14 +167,14 @@ impl JsonFields {
         }
         let level = LEVEL_KEYS.iter().find(|k| seen.iter().any(|(p, _)| p == *k)).map(|k| vec![k.to_string()]);
         // Names a query can write (a WORD of NFD), and not NFD's own.
-        let usable = |p: &str| {
-            p.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-'))
-                && !matches!(p, "raw" | "level" | "bookmark")
-        };
+        // Names a query can write (a WORD of NFD); a key named like one of
+        // NFD's own fields is `json.raw` (`raw` stays the line's text).
+        let usable = |p: &str| p.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-'));
         let (mut schema, mut paths) = (Vec::new(), Vec::new());
         for (p, kind) in seen.into_iter().filter(|(p, _)| usable(p)) {
             paths.push(p.split('.').map(str::to_owned).collect());
-            schema.push(FieldDef::owned(p, kind, false));
+            let name = if matches!(p.as_str(), "raw" | "level" | "bookmark") { format!("json.{p}") } else { p };
+            schema.push(FieldDef::owned(name, kind, false));
         }
         JsonFields { schema, paths, level }
     }

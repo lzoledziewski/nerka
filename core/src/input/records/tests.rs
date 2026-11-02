@@ -155,6 +155,7 @@ fn json_keys_are_fields() {
         names,
         [
             ("ts", Str),
+            ("json.level", Str),
             ("msg", Str),
             ("ctx.user", Str),
             ("ctx.id", U64),
@@ -162,7 +163,7 @@ fn json_keys_are_fields() {
             ("status", Str),
             ("tags", Str)
         ],
-        "level is the row's level; a key holding a number and text is text"
+        "the level key is the row's level, json.level its text; a key holding a number and text is text"
     );
     let q = |s: &str| run_on(&f, &Filter::Query(Query::compile(s).unwrap()));
     assert_eq!(q("level >= WARN"), [1, 2]);
@@ -199,10 +200,38 @@ fn json_is_found_unless_lines_are_asked_for() {
     let auto = crate::OpenOptions::default();
     let lines = crate::OpenOptions { records: Some(RecordSplit::Lines), ..Default::default() };
     let open = |path: &Path, o: &crate::OpenOptions| crate::open_with(path, o, &p).unwrap();
-    assert_eq!((open(&j, &auto).line_count(), open(&j, &auto).schema().len()), (4, 7));
+    assert_eq!((open(&j, &auto).line_count(), open(&j, &auto).schema().len()), (4, 8));
     assert_eq!((open(&j, &lines).line_count(), open(&j, &lines).schema().len()), (5, 0));
     assert_eq!((open(&t, &auto).line_count(), open(&t, &auto).schema().len()), (2, 0), "[INFO] is text");
     assert_eq!(RecordSplit::parse_choice("auto").unwrap(), None);
     assert_eq!(RecordSplit::parse_choice("json").unwrap(), Some(RecordSplit::Json));
     std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Keys named like NFD's own fields are `json.raw` (…); a plain `raw` or
+/// `bookmark` is then ambiguous, and says how to write either.
+#[test]
+fn keys_named_like_nfd_fields_are_written_json_dot() {
+    let text = r#"{"raw": "r1", "level": "warn", "bookmark": "b1", "msg": "hello"}
+{"raw": "r2", "level": "error", "bookmark": "b2", "msg": "bye"}
+"#;
+    let f = json(text);
+    let names: Vec<&str> = f.schema().iter().map(|d| d.name.as_ref()).collect();
+    assert_eq!(names, ["json.raw", "json.level", "json.bookmark", "msg"]);
+    let q = |s: &str| run_on(&f, &Filter::Query(Query::compile(s).unwrap()));
+    assert_eq!(q("json.raw == r2"), [1]);
+    assert_eq!(q("json.level == warn"), [0], "the key's text");
+    assert_eq!(q("level >= ERROR"), [1], "level is the row's level: no clash");
+    assert_eq!(q("json.msg == hello"), [0], "any key with the prefix");
+    assert_eq!(q("nfd.raw ~ /bye/"), [1]);
+    assert_eq!(q("/r1/"), [0], "a bare regex is the line's text, not ambiguous");
+    assert_eq!(q("msg == raw"), Vec::<LineNo>::new(), "a value isn't a field");
+    let e = Query::compile("level >= WARN AND raw ~ /x/").unwrap().bind(f.schema()).unwrap_err();
+    assert_eq!(
+        (e.pos, e.msg.as_str()),
+        (18, "'raw' is ambiguous here: write nfd.raw (the line's text) or json.raw (the record's key)")
+    );
+    let e = Query::compile("NOT bookmark").unwrap().bind(f.schema()).unwrap_err();
+    assert_eq!(e.pos, 4);
+    assert!(e.msg.contains("nfd.bookmark (the line's bookmark) or json.bookmark"), "{}", e.msg);
 }

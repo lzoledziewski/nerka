@@ -53,6 +53,13 @@
 //! compared with the value's time of day). As with fields, a row without a value only satisfies `!=`
 //! and `!~`, and an unknown signal is an error.
 //!
+//! NFD's own fields (`raw`, `level`, `bookmark`) may be written `nfd.raw`,
+//! `nfd.level`, `nfd.bookmark`; a source's field may be written with the
+//! source's prefix (`json.msg`, a JSON record's key). A source field named
+//! like one of NFD's own (a JSON key `raw`) is only `json.raw`, and a plain
+//! `raw` or `bookmark` on that source is an error saying so (`level` isn't:
+//! a JSON level key is the row's level, and `json.level` its text).
+//!
 //! `bookmark` (case-insensitive, like every field name) is the line's
 //! bookmark, a regular field the tab supplies ([`Query::with_bookmarks`]):
 //! alone it holds on a bookmarked line (`level >= ERROR OR bookmark`);
@@ -359,7 +366,10 @@ impl Expr {
 
 impl FieldCond {
     fn bind(&mut self, schema: &[FieldDef]) -> Result<(), DslError> {
-        let Some(id) = schema.iter().position(|d| d.name == self.name) else {
+        // `json.msg` is the key `msg`: a source's field may be written with
+        // its prefix (a clashing key is only that way: `json.raw`).
+        let named = |n: &str| schema.iter().position(|d| d.name == n);
+        let Some(id) = named(&self.name).or_else(|| self.name.strip_prefix("json.").and_then(named)) else {
             let mut known: Vec<&str> = vec!["raw", "level"];
             known.extend(schema.iter().map(|d| d.name.as_ref()));
             return Err(DslError {
@@ -566,6 +576,31 @@ fn parse_u64(s: &str) -> Option<u64> {
     }
 }
 
+/// A plain `raw` or `bookmark` (NFD's own) on a source with a field of that
+/// name too (a JSON key, `json.raw`) is ambiguous: an error that says how
+/// to write either. `level` isn't: a JSON level key is the row's level.
+fn ambiguous(src: &str, schema: &[FieldDef]) -> Result<(), DslError> {
+    let Ok(toks) = parser::tokens(src) else { return Ok(()) };
+    for (i, (tok, at)) in toks.iter().enumerate() {
+        let parser::Tok::Word(w) = tok else { continue };
+        let w = w.to_ascii_lowercase();
+        // A value (`apid == raw`) isn't a field.
+        let value = i > 0 && matches!(toks[i - 1].0, parser::Tok::Op(_));
+        let what = match w.as_str() {
+            "raw" => "the line's text",
+            "bookmark" => "the line's bookmark",
+            _ => continue,
+        };
+        if !value && schema.iter().any(|d| d.name == format!("json.{w}")) {
+            return Err(DslError {
+                msg: format!("'{w}' is ambiguous here: write nfd.{w} ({what}) or json.{w} (the record's key)"),
+                pos: at.start,
+            });
+        }
+    }
+    Ok(())
+}
+
 /// A compiled, optimized query.
 #[derive(Debug, Clone)]
 pub struct Query {
@@ -685,6 +720,7 @@ impl Query {
     /// operators that don't fit the field's kind are errors. Binding a
     /// bound query again is fine.
     pub fn bind(mut self, schema: &[FieldDef]) -> Result<Query, DslError> {
+        ambiguous(&self.source, schema)?;
         self.expr.bind(schema)?;
         // Costs are known only now.
         self.expr = self.expr.optimize();
@@ -855,6 +891,19 @@ mod tests {
         // A field name for the binding: bookmark isn't one of the source's.
         assert!(Query::compile_for("bookmark AND apid == NAV", &[]).is_err());
         assert!(Query::compile_for("bookmark", &[]).is_ok());
+    }
+
+    #[test]
+    fn nfd_own_fields_may_be_written_nfd_dot() {
+        assert!(matches!(q("nfd.level >= ERROR").expr(), Expr::Cond(Cond::Level(CmpOp::Ge, Level::Error))));
+        assert!(matches!(q("NFD.Raw ~ /x/").expr(), Expr::Cond(Cond::RawMatch(_))));
+        assert!(matches!(q("nfd.bookmark").expr(), Expr::Cond(Cond::Bookmark(_))));
+        let e = Query::compile("level >= WARN OR nfd.apid == NAV").unwrap_err();
+        assert_eq!((e.pos, e.msg.as_str()), (17, "'nfd.apid' isn't one of NFD's own fields (raw, level, bookmark)"));
+        // A source field with its source's prefix.
+        let schema = [FieldDef::new("msg", FieldKind::Str, false)];
+        assert!(Query::compile_for("json.msg == hi", &schema).is_ok());
+        assert!(Query::compile_for("json.nope == hi", &schema).is_err());
     }
 
     #[test]

@@ -255,8 +255,19 @@ impl Parser<'_> {
             }
             Tok::Regex { pat, ci } => Ok(Expr::Cond(Cond::RawMatch(regex(&pat, ci, pos)?))),
             Tok::Str(s) => Ok(Expr::Cond(Cond::RawMatch(regex(&regex::escape(&s), false, pos)?))),
-            Tok::Word(field) if field.eq_ignore_ascii_case("bookmark") => self.bookmark_condition(pos),
-            Tok::Word(field) => self.condition(&field, pos),
+            Tok::Word(word) => {
+                // `nfd.raw`, `nfd.level`, `nfd.bookmark`: NFD's own fields,
+                // when a source's field of that name (a JSON key) clashes.
+                let lower = word.to_ascii_lowercase();
+                let field = match lower.strip_prefix("nfd.") {
+                    Some(own @ ("raw" | "level" | "bookmark")) => own,
+                    Some(other) => {
+                        return err(format!("'nfd.{other}' isn't one of NFD's own fields (raw, level, bookmark)"), pos);
+                    }
+                    None => &lower,
+                };
+                if field == "bookmark" { self.bookmark_condition(pos) } else { self.condition(field, pos) }
+            }
             Tok::Signal(name, view) => self.signal_condition(name, view, pos),
             t => err(format!("expected a condition but found {}", describe(&t)), pos),
         }
