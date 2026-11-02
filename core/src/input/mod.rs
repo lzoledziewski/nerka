@@ -144,6 +144,12 @@ pub trait LogSource: Send + Sync {
         0
     }
 
+    /// What the source is read as, for people: `text`, `JSON`,
+    /// `pcap: DLT + SOMEIP`.
+    fn format(&self) -> String {
+        "text".into()
+    }
+
     /// Columns of the rendered lines, if they are tab-separated cells. UIs
     /// show such sources as a table; plain text has none.
     fn columns(&self) -> &[ColumnDef] {

@@ -116,6 +116,16 @@ impl LogSource for Concat {
         self.parts.iter().map(|p| p.index_memory_bytes()).sum::<usize>() + self.starts.capacity() * 8
     }
 
+    fn format(&self) -> String {
+        let mut formats: Vec<String> = Vec::new();
+        for f in self.parts.iter().map(|p| p.format()) {
+            if !formats.contains(&f) {
+                formats.push(f);
+            }
+        }
+        formats.join(" + ")
+    }
+
     fn columns(&self) -> &[ColumnDef] {
         self.parts[0].columns()
     }

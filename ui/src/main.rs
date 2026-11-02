@@ -36,6 +36,7 @@ mod icon_art;
 mod instance;
 mod job;
 mod library;
+mod memory;
 mod plot;
 mod plots;
 mod prefs;
@@ -3774,7 +3775,25 @@ impl App {
                 );
                 if let Some(f) = self.tabs.get(self.active).and_then(|t| t.file.as_ref()) {
                     ui.separator();
-                    ui.label(format!("{} lines · {:.1} MiB", f.line_count(), f.size_bytes() as f64 / 1048576.0));
+                    let indexes: usize =
+                        self.tabs.iter().filter_map(|t| t.file.as_ref()).map(|f| f.index_memory_bytes()).sum();
+                    let held = memory::private_bytes();
+                    let text = format!(
+                        "{} lines · {} · {}{}",
+                        f.line_count(),
+                        size_text(f.size_bytes()),
+                        f.format(),
+                        held.map_or(String::new(), |m| format!(" · RAM {}", size_text(m)))
+                    );
+                    let tip = format!(
+                        "Read as: {}\nIndex of this tab: {}; of all tabs: {}\n\
+                         RAM: memory nerka holds itself (indexes, results, caches, the graphics driver's), not the files: \
+                         they're mapped and read as needed",
+                        f.format(),
+                        size_text(f.index_memory_bytes() as u64),
+                        size_text(indexes as u64)
+                    );
+                    ui.label(text).on_hover_text(tip);
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui.button("ℹ About").on_hover_text("F1").clicked() {

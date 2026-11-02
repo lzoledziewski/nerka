@@ -201,6 +201,7 @@ fn json_keys_with_dots() {
     assert_eq!(q("id.resp_p == 53"), [0]);
     assert_eq!(q("id.orig_h == 10.0.0.2"), [1]);
     assert_eq!(q("a.b == 1"), [0], "a.b is the nested path, seen first");
+    assert_eq!(f.format(), "JSON");
 }
 
 /// Every record's keys are fields, a key first written late among them

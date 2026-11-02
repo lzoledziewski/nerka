@@ -354,6 +354,17 @@ impl Records {
     }
 }
 
+/// The kind of capture file `data` is, by its first bytes.
+fn container(data: &[u8]) -> &'static str {
+    match data.get(..8).unwrap_or(data) {
+        [0x0a, 0x0d, 0x0d, 0x0a, ..] => "pcapng",
+        [0xd4, 0xc3, 0xb2, 0xa1, ..] | [0xa1, 0xb2, 0xc3, 0xd4, ..] => "pcap",
+        [0x4d, 0x3c, 0xb2, 0xa1, ..] | [0xa1, 0xb2, 0x3c, 0x4d, ..] => "pcap",
+        b"MDF     " | b"UnFinMF " => "MF4",
+        _ => "capture",
+    }
+}
+
 /// `YYYY-MM-DD HH:MM:SS.uuuuuu`, UTC or local time (`crate::time::set_local`).
 pub(crate) fn write_time(out: &mut Vec<u8>, secs: u32, usecs: i32) {
     use std::io::Write;
@@ -427,6 +438,21 @@ impl LogSource for Records {
 
     fn size_bytes(&self) -> u64 {
         self.data.bytes().len() as u64
+    }
+
+    fn format(&self) -> String {
+        let names =
+            |present: &[ProtoId]| present.iter().map(|&p| self.protos[p].name()).collect::<Vec<_>>().join(" + ");
+        match &self.index {
+            Index::Stored { .. } => format!("{} file", self.protos[0].name()),
+            Index::Framed { msgs, .. } => {
+                let mut seen = [false; MAX_PROTOCOLS];
+                msgs.iter().for_each(|m| seen[m.proto()] = true);
+                let present: Vec<ProtoId> = (0..self.protos.len()).filter(|&p| seen[p]).collect();
+                let inside = if present.is_empty() { "no messages".to_owned() } else { names(&present) };
+                format!("{}: {inside}", container(self.data.bytes()))
+            }
+        }
     }
 
     fn index_memory_bytes(&self) -> usize {

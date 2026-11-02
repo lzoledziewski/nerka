@@ -468,6 +468,14 @@ impl LogSource for RecordFile {
 
     fn index_memory_bytes(&self) -> usize {
         (self.starts.capacity() + self.ends.capacity()) * size_of::<u64>()
+            + self.json.as_ref().map_or(0, |j| j.paths.iter().flatten().map(|k| k.capacity()).sum())
+    }
+
+    fn format(&self) -> String {
+        match &self.split {
+            RecordSplit::Json => "JSON".into(),
+            split => format!("text records ({})", split.spec()),
+        }
     }
 
     /// The record, its line breaks included.
