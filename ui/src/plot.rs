@@ -296,6 +296,8 @@ const GUTTER: f32 = 120.0;
 const GUTTER_MIN: f32 = 60.0;
 /// A row of the strip above the lanes (tags, Δt).
 const MARK_ROW: f32 = 17.0;
+/// Rows the tags stack in, at most (more on one x share the last).
+const MAX_TAG_ROWS: usize = 4;
 /// Width of a character of the lane names (monospace 11), and room kept for
 /// the y labels beside them.
 const CHAR_W: f32 = 6.7;
@@ -502,14 +504,22 @@ pub fn plot_panel(ui: &mut egui::Ui, state: &mut PlotState, src: Source<'_>) -> 
     let rect = ui.available_rect_before_wrap();
     let response = ui.allocate_rect(rect, Sense::click_and_drag());
     let gutter = if state.gutter > 0.0 { state.gutter } else { GUTTER }.min((rect.width() / 2.0).max(GUTTER_MIN));
-    // The strip for the cursors' and bookmarks' tags (a row) and the Δt
-    // between them (a second row), above the lanes.
+    // The strip for the cursors' and bookmarks' tags (rows: tags at the same
+    // or nearly the same x stack) and the Δt between them (a row below),
+    // above the lanes. The rows are counted in the view before this frame's
+    // zoom or pan; a change shows on the next frame.
     let tagged = state.cursors.len() + marks.len();
-    let strip_h = match tagged {
-        0 => 0.0,
-        1 => MARK_ROW,
-        _ => 2.0 * MARK_ROW,
+    let tag_rows = if tagged == 0 {
+        0
+    } else {
+        let (left, right) = (rect.min.x + gutter, rect.max.x - 8.0);
+        let (x0, x1) = state.range.unwrap_or(data.full);
+        let tags = tags_in_view(&state.cursors, &marks, (x0, x1), |x| {
+            left + ((x - x0) / (x1 - x0) * (right - left) as f64) as f32
+        });
+        tag_rows_of(ui, &tags, MAX_TAG_ROWS).iter().max().map_or(1, |r| r + 1)
     };
+    let strip_h = MARK_ROW * (tag_rows + usize::from(tagged > 1)) as f32;
     let plot = Rect::from_min_max(
         pos2(rect.min.x + gutter, rect.min.y + strip_h),
         pos2(rect.max.x - 8.0, rect.max.y - AXIS_H),
@@ -905,31 +915,28 @@ pub fn plot_panel(ui: &mut egui::Ui, state: &mut PlotState, src: Source<'_>) -> 
         let px = to_px(m.x, x0, x1);
         painter.line_segment([pos2(px, strip.min.y), pos2(px, axis_y)], Stroke::new(1.5, red));
     }
-    // Tags, left to right; each is cut where the next one starts (hover:
+    // Tags, left to right, in rows: one that would hide the name of the one
+    // before it goes a row down (owner, 2026-11-02: two bookmarks on one x
+    // are two). Each is cut where the next one in its row starts (hover:
     // all of it).
-    enum Tag<'m> {
-        Cursor(usize),
-        Mark(&'m BookmarkCursor),
+    let tags = tags_in_view(&state.cursors, &marks, (x0, x1), |x| to_px(x, x0, x1));
+    let mut rows = tag_rows_of(ui, &tags, MAX_TAG_ROWS);
+    if tagged > 0 && rows.iter().max().map_or(1, |r| r + 1) != tag_rows {
+        // The strip has another height from the next frame on.
+        ui.ctx().request_repaint();
+        rows.iter_mut().for_each(|r| *r = (*r).min(tag_rows.max(1) - 1));
     }
-    let mut tags: Vec<(f32, Tag)> = state
-        .cursors
-        .iter()
-        .enumerate()
-        .filter(|(_, c)| (x0..=x1).contains(*c))
-        .map(|(i, &c)| (to_px(c, x0, x1), Tag::Cursor(i)))
-        .collect();
-    tags.extend(marks.iter().filter(|m| (x0..=x1).contains(&m.x)).map(|m| (to_px(m.x, x0, x1), Tag::Mark(m))));
-    tags.sort_by(|a, b| a.0.total_cmp(&b.0));
-    let tag_row = Rect::from_min_size(strip.min, vec2(strip.width(), MARK_ROW - 2.0));
     for (k, (px, tag)) in tags.iter().enumerate() {
-        let next = tags.get(k + 1).map_or(rect.max.x, |t| t.0);
+        let row = rows[k];
+        let next = (k + 1..tags.len()).find(|&j| rows[j] == row).map_or(rect.max.x, |j| tags[j].0);
         let (text, fill, ink) = match tag {
             Tag::Cursor(i) => (cursor_name(*i), amber, Color32::BLACK),
             Tag::Mark(m) => (format!("🔖{} {}", m.name, m.note).trim_end().to_owned(), red, Color32::WHITE),
         };
         let galley = painter.layout_no_wrap(text, font.clone(), ink);
         let w = (galley.size().x + 4.0).min((next - px - 1.0).max(14.0));
-        let r = Rect::from_min_size(pos2(px - 1.0, tag_row.min.y), vec2(w, tag_row.height()));
+        let top = strip.min.y + row as f32 * MARK_ROW;
+        let r = Rect::from_min_size(pos2(px - 1.0, top), vec2(w, MARK_ROW - 2.0));
         let clip = painter.with_clip_rect(r.intersect(rect));
         clip.rect_filled(r, 2.0, fill);
         clip.galley(pos2(r.min.x + 2.0, r.center().y - galley.size().y / 2.0), galley, ink);
@@ -946,7 +953,7 @@ pub fn plot_panel(ui: &mut egui::Ui, state: &mut PlotState, src: Source<'_>) -> 
         }
     }
     // Δt between neighbours, on the strip's second row, cut to its span.
-    let dt_y = strip.min.y + MARK_ROW + MARK_ROW / 2.0;
+    let dt_y = strip.min.y + tag_rows as f32 * MARK_ROW + MARK_ROW / 2.0;
     for pair in placed.windows(2) {
         let ((ni, a), (nj, b)) = ((&pair[0].0, pair[0].1), (&pair[1].0, pair[1].1));
         let (pa, pb) = (to_px(a, x0, x1).max(plot.min.x), to_px(b, x0, x1).min(plot.max.x));
@@ -1226,6 +1233,70 @@ impl BookmarkCursor {
     fn name(&self) -> String {
         format!("🔖{}", self.name)
     }
+}
+
+/// A tag in the strip above the lanes.
+enum Tag<'m> {
+    Cursor(usize),
+    Mark(&'m BookmarkCursor),
+}
+
+/// The time cursors' and bookmarks' tags in `x0..=x1`, left to right, with
+/// where each starts (`to_px`).
+fn tags_in_view<'m>(
+    cursors: &[f64],
+    marks: &'m [BookmarkCursor],
+    (x0, x1): (f64, f64),
+    to_px: impl Fn(f64) -> f32,
+) -> Vec<(f32, Tag<'m>)> {
+    let mut tags: Vec<(f32, Tag)> = cursors
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| (x0..=x1).contains(*c))
+        .map(|(i, &c)| (to_px(c), Tag::Cursor(i)))
+        .collect();
+    tags.extend(marks.iter().filter(|m| (x0..=x1).contains(&m.x)).map(|m| (to_px(m.x), Tag::Mark(m))));
+    tags.sort_by(|a, b| a.0.total_cmp(&b.0));
+    tags
+}
+
+/// The row of each tag (`stack_tags`): what must show of one is its name.
+fn tag_rows_of(ui: &egui::Ui, tags: &[(f32, Tag)], rows: usize) -> Vec<usize> {
+    let font = FontId::monospace(11.0);
+    let spans: Vec<(f32, f32)> = tags
+        .iter()
+        .map(|(px, tag)| {
+            let name = match tag {
+                Tag::Cursor(i) => cursor_name(*i),
+                Tag::Mark(m) => m.name(),
+            };
+            (*px, ui.painter().layout_no_wrap(name, font.clone(), Color32::WHITE).size().x + 4.0)
+        })
+        .collect();
+    stack_tags(&spans, rows)
+}
+
+/// Rows for tags at `px` (left to right) that need `w` to show: each goes in
+/// the first row free from its x on, so none hides the one before it; at
+/// most `rows` rows (at least one), and with none free, the row that frees
+/// first.
+fn stack_tags(spans: &[(f32, f32)], rows: usize) -> Vec<usize> {
+    let mut ends: Vec<f32> = Vec::new();
+    spans
+        .iter()
+        .map(|&(px, w)| {
+            let row = match ends.iter().position(|&end| px >= end) {
+                Some(r) => r,
+                None if ends.len() < rows.max(1) => {
+                    ends.push(px);
+                    ends.len() - 1
+                }
+                None => (0..ends.len()).min_by(|&a, &b| ends[a].total_cmp(&ends[b])).unwrap_or(0),
+            };
+            ends[row] = px + w + 1.0;
+            row
+        })
+        .collect()
 }
 
 /// A right-click menu with fields in it (a note, marker labels and values).
@@ -1772,6 +1843,89 @@ mod tests {
         assert!(st.range.is_none(), "the view didn't pan");
         let moved = st.cursors[0] - 49.5;
         assert!((moved - 50.0 / w as f64 * 99.0).abs() < 0.5, "{moved}");
+    }
+
+    /// Two bookmarks on one x: their tags stack, each shows its name, and a
+    /// click on each goes to its own line.
+    #[test]
+    fn bookmarks_on_one_x_are_two() {
+        // Two lines a second: lines 50 and 51 are both at 00:00:25.
+        let text: String = (0..100).map(|i| format!("00:{:02}:{:02} v={}\n", i / 120, i / 2 % 60, i % 7)).collect();
+        let file = nerka_core::TextFile::from_bytes("t", text.into_bytes());
+        let mut sig = Signals::default();
+        sig.set(nerka_core::SignalDef::parse_spec(r"t:time=/^(?<t>\S+)/").unwrap());
+        sig.set(nerka_core::SignalDef::parse_spec(r"v=/v=(?<v>\d+)/").unwrap());
+        for d in sig.iter() {
+            d.series(&file, &nerka_core::Progress::new()).unwrap();
+        }
+        let marks = [
+            Bookmark { line: 50, name: "B1".into(), note: "first".into() },
+            Bookmark { line: 51, name: "B2".into(), note: "second".into() },
+        ];
+        let mut st = PlotState::default();
+        st.toggle("v");
+        let ctx = egui::Context::default();
+        let mut t = 0.0;
+        let mut scope = egui::Id::NULL;
+        let mut step = |events: Vec<egui::Event>, st: &mut PlotState| {
+            t += 1.0 / 60.0;
+            let screen = Rect::from_min_size(pos2(0.0, 0.0), vec2(800.0, 300.0));
+            let input = egui::RawInput { screen_rect: Some(screen), time: Some(t), events, ..Default::default() };
+            let mut out = Output::default();
+            let mut full = ctx.run_ui(input, |ui| {
+                egui::CentralPanel::default().show(ui, |ui| {
+                    let mut series_of = |d: &SignalDef| d.cached_series(&file).map(Arc::new);
+                    let src = Source {
+                        signals: &sig,
+                        generation: 1,
+                        file: &file,
+                        cursor: 0,
+                        kept: 0,
+                        series_of: &mut series_of,
+                        in_window: false,
+                        bookmarks: &marks,
+                        saved: &[],
+                    };
+                    scope = ui.scope_id();
+                    out = plot_panel(ui, st, src);
+                });
+            });
+            full.textures_delta.clear();
+            (out, scope)
+        };
+        step(vec![], &mut st);
+        let (_, scope) = step(vec![], &mut st);
+        let tag = |line: LineNo| ctx.read_response(scope.with(("bookmark", line))).expect("a tag").rect;
+        let (b1, b2) = (tag(50), tag(51));
+        assert!((b1.min.x - b2.min.x).abs() < 1.0, "one x: {b1:?} {b2:?}");
+        assert!(b2.min.y >= b1.max.y, "B2 is a row below B1: {b1:?} {b2:?}");
+        let name_w =
+            ctx.fonts_mut(|f| f.layout_no_wrap("🔖B1".into(), FontId::monospace(11.0), Color32::WHITE).size().x);
+        assert!(b1.width() >= name_w && b2.width() >= name_w, "names show: {b1:?} {b2:?}");
+        for (line, r) in [(50, b1), (51, b2)] {
+            let at = r.center();
+            let button = |pressed| egui::Event::PointerButton {
+                pos: at,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            };
+            step(vec![egui::Event::PointerMoved(at)], &mut st);
+            step(vec![button(true)], &mut st);
+            let (out, _) = step(vec![button(false)], &mut st);
+            assert_eq!(out.goto, Some(line), "the click on its tag");
+        }
+    }
+
+    #[test]
+    fn tags_stack_where_they_would_hide_a_name() {
+        // Apart: one row; on one x or a few px apart: rows down; a row is
+        // used again where it is free.
+        assert_eq!(stack_tags(&[(0.0, 20.0), (40.0, 20.0)], 4), [0, 0]);
+        assert_eq!(stack_tags(&[(0.0, 20.0), (0.0, 20.0), (3.0, 20.0), (30.0, 20.0)], 4), [0, 1, 2, 0]);
+        // More than the rows: the one that frees first.
+        assert_eq!(stack_tags(&[(0.0, 20.0), (1.0, 20.0), (2.0, 20.0)], 2), [0, 1, 0]);
+        assert_eq!(stack_tags(&[(0.0, 20.0), (1.0, 20.0)], 0), [0, 0]);
     }
 
     /// The plot's ✖ closes it; with nothing plotted it says how to plot.
