@@ -37,6 +37,8 @@ const MAX_DISPLAY_BYTES: usize = 4096;
 /// An unfolded record shows this much of itself at most, in this many lines.
 const MAX_UNFOLD_BYTES: usize = 64 * 1024;
 const MAX_UNFOLD_LINES: usize = 500;
+/// A folded record shows this much of its other lines, joined, after its first.
+const FOLDED_PREVIEW_CHARS: usize = 400;
 /// Copying more lines than this is cut short (the clipboard is not a file).
 const MAX_COPY_LINES: u64 = 100_000;
 const SCROLLBAR_W: f32 = 14.0;
@@ -951,6 +953,18 @@ pub fn log_view(
                 if click.clicked() {
                     folds.push((line, !open));
                 }
+            }
+            // Folded: the rest of the record after the marker, its lines
+            // joined (a pretty JSON record's first line is only `{`).
+            if !open {
+                let rest: String =
+                    whole[end..].split('\n').map(str::trim).filter(|l| !l.is_empty()).collect::<Vec<_>>().join(" ");
+                let rest: String = rest.chars().take(FOLDED_PREVIEW_CHARS).collect();
+                let format = TextFormat { font_id: font.clone(), color: dim, ..Default::default() };
+                let galley = painter.layout_job(LayoutJob::single_section(format!("  {rest}"), format));
+                let at = pos2(x + width, snap(y + 1.0));
+                width += galley.size().x;
+                painter.with_clip_rect(text_clip).galley(at, galley, dim);
             }
         }
         if hl.notes == NoteMode::EndOfLine
