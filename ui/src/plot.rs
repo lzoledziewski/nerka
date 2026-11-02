@@ -662,7 +662,7 @@ pub fn plot_panel(ui: &mut egui::Ui, state: &mut PlotState, src: Source<'_>) -> 
     }
     let (menu_x, menu_row) = (state.menu_x, state.menu_row.clone());
     let mut bookmark = None;
-    response.context_menu(|ui| {
+    response.context_menu_with_fields(|ui| {
         bookmark = cursor_menu(ui, &mut state.cursors, menu_x, menu_row, &mut state.bookmark_note);
     });
     out.bookmark = bookmark;
@@ -770,7 +770,7 @@ pub fn plot_panel(ui: &mut egui::Ui, state: &mut PlotState, src: Source<'_>) -> 
             let markers = state.markers.entry(lane.name.clone()).or_default();
             name_r
                 .on_hover_text(format!("{name}\nDrag: move the lane. Right-click: y axis, markers, order"))
-                .context_menu(|ui| {
+                .context_menu_with_fields(|ui| {
                     y_axis_menu(ui, y, lane.y_range);
                     ui.separator();
                     markers_menu(ui, markers, lane.y_range);
@@ -1228,6 +1228,20 @@ impl BookmarkCursor {
     }
 }
 
+/// A right-click menu with fields in it (a note, marker labels and values).
+/// A plain context menu closes on any click, inside it too, so its fields
+/// couldn't be typed in; this one closes on a click outside, Esc or its own
+/// buttons.
+trait FieldMenu {
+    fn context_menu_with_fields(&self, add: impl FnOnce(&mut egui::Ui));
+}
+
+impl FieldMenu for egui::Response {
+    fn context_menu_with_fields(&self, add: impl FnOnce(&mut egui::Ui)) {
+        egui::Popup::context_menu(self).close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside).show(add);
+    }
+}
+
 /// The plot's right-click menu: time cursors (`x`: where it was opened),
 /// and a bookmark (with `note`) on `row`, the nearest event's line (in
 /// that lane). Returns the bookmark to set.
@@ -1470,6 +1484,66 @@ fn short_num(v: f64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A right-click menu with a text field: clicking into the field keeps
+    /// the menu open and typing reaches it (a plain context menu closes on
+    /// that click).
+    #[test]
+    fn menus_with_fields_take_typing() {
+        let typed = |with_fields: bool| {
+            let ctx = egui::Context::default();
+            let (mut text, mut field, mut t) = (String::new(), None::<Rect>, 0.0);
+            let mut frame = |events: Vec<egui::Event>, text: &mut String, field: &mut Option<Rect>| {
+                t += 1.0 / 60.0;
+                let screen = Rect::from_min_size(pos2(0.0, 0.0), vec2(600.0, 400.0));
+                let input = egui::RawInput { screen_rect: Some(screen), time: Some(t), events, ..Default::default() };
+                let mut out = ctx.run_ui(input, |ui| {
+                    egui::CentralPanel::default().show(ui, |ui| {
+                        let r = ui.allocate_rect(
+                            Rect::from_min_size(pos2(0.0, 0.0), vec2(600.0, 400.0)),
+                            egui::Sense::click(),
+                        );
+                        let menu = |ui: &mut egui::Ui| *field = Some(ui.text_edit_singleline(text).rect);
+                        if with_fields {
+                            r.context_menu_with_fields(menu);
+                        } else {
+                            r.context_menu(menu);
+                        }
+                    });
+                });
+                out.textures_delta.clear();
+            };
+            let button = |pos, button, pressed| egui::Event::PointerButton {
+                pos,
+                button,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            };
+            let at = pos2(100.0, 100.0);
+            let right = egui::PointerButton::Secondary;
+            frame(vec![], &mut text, &mut field);
+            frame(
+                vec![egui::Event::PointerMoved(at), button(at, right, true), button(at, right, false)],
+                &mut text,
+                &mut field,
+            );
+            frame(vec![], &mut text, &mut field);
+            let f = field.take()?;
+            let left = egui::PointerButton::Primary;
+            let c = f.center();
+            frame(
+                vec![egui::Event::PointerMoved(c), button(c, left, true), button(c, left, false)],
+                &mut text,
+                &mut field,
+            );
+            frame(vec![egui::Event::Text("note".into())], &mut text, &mut field);
+            frame(vec![], &mut text, &mut field);
+            Some((text, field.is_some()))
+        };
+        assert_eq!(typed(true), Some(("note".to_owned(), true)), "typed into, still open");
+        let plain = typed(false);
+        assert_ne!(plain, Some(("note".to_owned(), true)), "a plain context menu closes on the click: {plain:?}");
+    }
 
     /// One frame of a plot of `@v` (one event per second) at 800 x 300.
     fn frame(
