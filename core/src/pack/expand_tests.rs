@@ -339,3 +339,21 @@ fn a_pick_covered_by_a_picked_ancestor_is_left_out() {
     let e = expand(&sel(&["nav.slow"], &["nav.all"]), &lib, &p).unwrap();
     assert!(e.parts.iter().all(|p| p.covered.is_none()));
 }
+
+/// Bug (owner, 2026-11-02): a parameter standing for a level
+/// (`level >= $lvl`) made the whole pack fail to load: the syntax check put
+/// in a placeholder that isn't a level.
+#[test]
+fn a_parameter_may_be_a_level() {
+    let mut lib = Library::new();
+    lib.add(pack(
+        "pack lv\nquery min(lvl)\n    level >= $lvl\nquery app_min(app, l)\n    apid == $app AND level >= ${l}\n",
+    ))
+    .unwrap();
+    let e = expand(&sel(&["lv.min"], &[]), &lib, &params(&[("lvl", "WARN")])).unwrap();
+    assert_eq!(same_lines(&mem(), &e.nfd, "level >= WARN"), [1, 5, 6]);
+    let e = expand(&sel(&["lv.app_min"], &[]), &lib, &params(&[("app", "NAV"), ("l", "error")])).unwrap();
+    assert_eq!(same_lines(&mem(), &e.nfd, "apid == NAV AND level >= ERROR"), [5]);
+    // A value that isn't a level is an error when it runs, not at load.
+    assert!(expand(&sel(&["lv.min"], &[]), &lib, &params(&[("lvl", "loud")])).is_err());
+}

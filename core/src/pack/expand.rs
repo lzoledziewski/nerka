@@ -276,11 +276,12 @@ impl Library {
         let mut out: Vec<String> = Vec::new();
         for qid in ids {
             let Some((_, q)) = self.get(&qid) else { continue };
-            // Parameters as placeholder values: only the fields matter.
+            // Parameters as placeholder values: only the fields matter (`"I"`
+            // is a level too).
             let text = render(
                 &q.text,
                 false,
-                |_, ctx, _| Ok::<_, ()>(if ctx == Ctx::Bare { "\"x\"".into() } else { "x".into() }),
+                |_, ctx, _| Ok::<_, ()>(if ctx == Ctx::Bare { "\"I\"".into() } else { "x".into() }),
                 |_| (),
             );
             let Some(expr) = text.ok().and_then(|t| crate::dsl::parse(&t).ok()) else { continue };
