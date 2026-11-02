@@ -608,6 +608,9 @@ struct LineDetail {
     cells: Vec<String>,
     /// Column names of a table source; empty for plain text.
     names: Vec<&'static str>,
+    /// Every field the source supplies for the line: name, value (`None`:
+    /// the line has none), kind. Shown with the Fields checkbox.
+    fields: Vec<(String, Option<String>, &'static str)>,
     wrap: bool,
     /// The tab's signals on this line (filled by the tab every frame:
     /// values appear once their events are collected).
@@ -694,6 +697,62 @@ fn signals_section(ui: &mut egui::Ui, line: LineNo, signals: &[LineSignal]) -> O
     goto
 }
 
+/// Every field `file` supplies for `line`: name, value as text (`None`
+/// if the line has none), kind. Numbers show in hex too where that's how
+/// they're written (SOME/IP ids).
+fn field_values(file: &dyn LogSource, line: LineNo) -> Vec<(String, Option<String>, &'static str)> {
+    file.schema()
+        .iter()
+        .enumerate()
+        .map(|(id, def)| {
+            let value = file.field(line, id).map(|v| match v {
+                nerka_core::FieldValue::Str(b) => String::from_utf8_lossy(&b).into_owned(),
+                nerka_core::FieldValue::U64(n) if n > 9 => format!("{n} (0x{n:x})"),
+                nerka_core::FieldValue::U64(n) => n.to_string(),
+                nerka_core::FieldValue::F64(x) => x.to_string(),
+            });
+            let kind = match def.kind {
+                nerka_core::FieldKind::Str => "text",
+                nerka_core::FieldKind::Name => "name",
+                nerka_core::FieldKind::U64 => "number",
+                nerka_core::FieldKind::F64 => "number",
+            };
+            (def.name.to_string(), value, kind)
+        })
+        .collect()
+}
+
+/// The line window's Fields section: every field, its value and kind; a
+/// field the line has no value for is dimmed.
+fn fields_section(ui: &mut egui::Ui, fields: &[(String, Option<String>, &'static str)]) {
+    egui::CollapsingHeader::new(RichText::new(format!("Fields ({})", fields.len())).strong())
+        .id_salt("line-detail-fields")
+        .default_open(true)
+        .show(ui, |ui| {
+            egui::Grid::new("line-detail-fields-grid").num_columns(3).spacing([12.0, 2.0]).striped(true).show(
+                ui,
+                |ui| {
+                    for (name, value, kind) in fields {
+                        match value {
+                            Some(v) => {
+                                ui.label(RichText::new(name).monospace().strong());
+                                // Long values (a payload) are cut: the message below has all of it.
+                                let shown: String = v.chars().take(200).collect();
+                                ui.monospace(if v.chars().count() > 200 { format!("{shown}…") } else { shown });
+                            }
+                            None => {
+                                ui.label(RichText::new(name).monospace().weak());
+                                ui.weak("—");
+                            }
+                        }
+                        ui.weak(*kind);
+                        ui.end_row();
+                    }
+                },
+            );
+        });
+}
+
 /// Text shown in the line window at most; Copy still copies all of it.
 const DETAIL_MAX_BYTES: usize = 1 << 20;
 
@@ -701,7 +760,18 @@ impl LineDetail {
     fn of(file: &dyn LogSource, line: LineNo) -> Option<Self> {
         let cells = file.line_detail(line)?;
         let names = file.columns().iter().map(|c| c.name).collect();
-        Some(LineDetail { line, cells, names, wrap: true, signals: Vec::new(), goto: None, step: None, in_hits: false })
+        let fields = field_values(file, line);
+        Some(LineDetail {
+            line,
+            cells,
+            names,
+            fields,
+            wrap: true,
+            signals: Vec::new(),
+            goto: None,
+            step: None,
+            in_hits: false,
+        })
     }
 
     /// The same window on another line, keeping Wrap and the view it follows.
@@ -756,6 +826,15 @@ impl LineDetail {
                         copied = Some(msg.to_owned());
                     }
                     ui.checkbox(&mut self.wrap, "Wrap");
+                    if !self.fields.is_empty() {
+                        let id = egui::Id::unique("line-detail-all-fields");
+                        let mut all = ctx.data(|d| d.get_temp::<bool>(id)).unwrap_or(false);
+                        let tip = "Every field of the line (what queries can use), not only the columns";
+                        if ui.checkbox(&mut all, format!("Fields ({})", self.fields.len())).on_hover_text(tip).changed()
+                        {
+                            ctx.data_mut(|d| d.insert_temp(id, all));
+                        }
+                    }
                     let lines = msg.lines().count().max(1);
                     let s = if lines == 1 { "" } else { "s" };
                     ui.weak(format!("{} characters, {lines} line{s}", msg.chars().count()));
@@ -772,6 +851,9 @@ impl LineDetail {
                                 ui.end_row();
                             }
                         });
+                    }
+                    if ctx.data(|d| d.get_temp::<bool>(egui::Id::unique("line-detail-all-fields"))).unwrap_or(false) {
+                        fields_section(ui, &self.fields);
                     }
                     if !self.signals.is_empty() {
                         self.goto = signals_section(ui, self.line, &self.signals).or(self.goto);
@@ -3262,9 +3344,13 @@ impl App {
 
     fn pick_files(&mut self, ctx: &egui::Context) {
         if let Some(paths) = rfd::FileDialog::new()
-            .add_filter("Logs and traces", &["log", "txt", "out", "dlt", "pcap", "pcapng", "mf4"])
+            .add_filter(
+                "Logs and traces",
+                &["log", "txt", "out", "json", "jsonl", "ndjson", "dlt", "pcap", "pcapng", "cap", "mf4"],
+            )
+            .add_filter("JSON logs", &["json", "jsonl", "ndjson"])
             .add_filter("DLT traces", &["dlt"])
-            .add_filter("Network captures (DLT over UDP)", &["pcap", "pcapng"])
+            .add_filter("Network captures (DLT, SOME/IP, syslog)", &["pcap", "pcapng", "cap"])
             .add_filter("MF4 bus logs (DLT)", &["mf4"])
             .add_filter("All files", &["*"])
             .pick_files()
@@ -5160,6 +5246,36 @@ query nav
 
     /// A search chip's click removes its query: the others are searched
     /// again; removing the last one clears the search.
+    /// The line window's Fields: every field of the line, with its value
+    /// (DLT's ten and `proto`; a JSON record's keys, missing ones empty).
+    #[test]
+    fn the_line_window_lists_every_field() {
+        use nerka_core::input::dlt::writer::{Msg, Value};
+        let mut buf = Vec::new();
+        Msg::log(nerka_core::Level::Warn, "ECU1", "NAV", "CTX", vec![Value::Str("hi".into()).into()]).encode(&mut buf);
+        let dlt = nerka_core::DltFile::from_bytes("t.dlt", buf);
+        let d = LineDetail::of(&dlt, 0).unwrap();
+        let get = |d: &LineDetail, n: &str| d.fields.iter().find(|f| f.0 == n).and_then(|f| f.1.clone());
+        assert_eq!(d.fields.len(), 11);
+        assert_eq!(
+            (get(&d, "ecu"), get(&d, "apid"), get(&d, "proto")),
+            (Some("ECU1".into()), Some("NAV".into()), Some("DLT".into()))
+        );
+        assert_eq!(get(&d, "mid"), None, "a verbose message has no message id");
+
+        use nerka_core::input::records::{RecordFile, RecordSplit};
+        let text = b"{\"a\": 1, \"b\": {\"c\": \"x\"}}
+{\"a\": 20}
+"
+        .to_vec();
+        let json = RecordFile::from_bytes("t", text, RecordSplit::Json);
+        let d = LineDetail::of(&json, 1).unwrap();
+        assert_eq!(
+            d.fields.iter().map(|f| (f.0.as_str(), f.1.clone())).collect::<Vec<_>>(),
+            [("a", Some("20 (0x14)".into())), ("b.c", None)]
+        );
+    }
+
     #[test]
     fn removing_a_search_chip_drops_its_query() {
         use nerka_core::input::dlt::writer::Msg;
