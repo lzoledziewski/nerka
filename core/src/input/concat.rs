@@ -157,6 +157,11 @@ impl LogSource for Concat {
         self.parts[k].argument(l, index)
     }
 
+    fn uptime(&self, line: LineNo) -> Option<f64> {
+        let (k, l) = self.locate(line)?;
+        self.parts[k].uptime(l)
+    }
+
     fn parts(&self) -> Option<Vec<super::Part<'_>>> {
         Some(
             (0..self.parts.len())
@@ -229,6 +234,10 @@ impl LogSource for View<'_> {
 
     fn argument(&self, line: LineNo, index: usize) -> Option<crate::signal::SignalValue> {
         self.part().argument(line, index)
+    }
+
+    fn uptime(&self, line: LineNo) -> Option<f64> {
+        self.part().uptime(line)
     }
 
     fn contiguous(&self) -> Option<&[u8]> {

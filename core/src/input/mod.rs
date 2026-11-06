@@ -231,6 +231,13 @@ pub trait LogSource: Send + Sync {
         None
     }
 
+    /// How long the line's writer had been running when it wrote the line,
+    /// in seconds, if the format records it (DLT's `tmsp`): the built-in
+    /// `@uptime`, for lifecycles ([`crate::lifecycle`]).
+    fn uptime(&self, _line: LineNo) -> Option<f64> {
+        None
+    }
+
     /// Where `line` is, to find it again when row numbers change
     /// (bookmarks): see [`Anchor`]. `None` if the source can't say (a view
     /// of several files: ask its [`Self::parts`]).

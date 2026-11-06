@@ -1,5 +1,8 @@
 //! Generate a synthetic DLT file (storage headers, verbose and non-verbose
-//! messages, several ECUs) for testing and benchmarking.
+//! messages, several ECUs) for testing and benchmarking. ECUs reboot now
+//! and then (their `tmsp` uptime starts again), some after a
+//! "shutdown requested" message: lifecycles to find
+//! (`--lifecycle 'boot(ecu): reset @uptime; planned payload ~ /shutdown requested/'`).
 //!
 //!     cargo run --release -p nerka-core --example gen_dlt -- big.dlt 1024
 //!
@@ -32,14 +35,24 @@ fn main() -> std::io::Result<()> {
     let (mut written, mut count) = (0u64, 0u64);
     let mut rng: u64 = 0x9E37_79B9_7F4A_7C15;
     let mut t_100us: u64 = 0;
+    // When each ECU last booted (its uptime counts from there).
+    let mut booted = [0u64; 3];
     while written < target {
         rng ^= rng << 13;
         rng ^= rng >> 7;
         rng ^= rng << 17;
         t_100us += rng % 70;
         let (apid, ctid) = apps[((rng >> 8) % apps.len() as u64) as usize];
-        let ecu = ecus[((rng >> 4) % ecus.len() as u64) as usize];
-        let level = levels[(rng % levels.len() as u64) as usize];
+        let e = ((rng >> 4) % ecus.len() as u64) as usize;
+        let ecu = ecus[e];
+        let mut level = levels[(rng % levels.len() as u64) as usize];
+        // About one reboot per ECU in 600 000 messages, after this message;
+        // every other one planned (this message says so).
+        let reboot = (rng >> 20) % 200_000 == 7;
+        let planned = reboot && (rng >> 44) % 2 == 0;
+        if planned {
+            level = Level::Info;
+        }
         let (a, b) = ((rng >> 16) % 255, (rng >> 24) % 9999);
         let mut m = Msg::log(
             level,
@@ -47,14 +60,18 @@ fn main() -> std::io::Result<()> {
             apid,
             ctid,
             vec![
-                Value::Str(msgs[((rng >> 32) % msgs.len() as u64) as usize].into()).into(),
+                Value::Str(
+                    if planned { "shutdown requested" } else { msgs[((rng >> 32) % msgs.len() as u64) as usize] }
+                        .into(),
+                )
+                .into(),
                 Value::U(a, 4).into(),
                 Arg { value: Value::U(b, 4), name: Some(("n".into(), String::new())) },
             ],
         );
         m.secs = 1_760_745_600 + (t_100us / 10_000) as u32;
         m.usecs = (t_100us % 10_000) as i32 * 100;
-        m.timestamp = Some(t_100us as u32);
+        m.timestamp = Some((t_100us - booted[e]) as u32);
         m.mcnt = count as u8;
         if rng % 20 == 0 {
             m.payload = Payload::NonVerbose { id: (rng >> 40) as u32 % 1000, data: (0..(a % 32) as u8).collect() };
@@ -63,6 +80,9 @@ fn main() -> std::io::Result<()> {
         m.encode(&mut buf);
         out.write_all(&buf)?;
         written += buf.len() as u64;
+        if reboot {
+            booted[e] = t_100us;
+        }
         count += 1;
     }
     out.flush()?;

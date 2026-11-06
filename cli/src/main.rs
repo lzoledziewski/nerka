@@ -11,6 +11,7 @@
 //!     nerka search --in 'ecu == SOCB' -l ota app.log     (per pack query)
 //!     nerka --signal 'v=/v=(?<v>\d+)/' filter '@v > 100' app.log   (signals)
 //!     nerka --fibex ecu1.xml filter 'apid == NAV' trace.dlt         (non-verbose DLT)
+//!     nerka --lifecycle 'boot(ecu): reset @uptime' lifecycles trace.dlt   (boots per ECU)
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -54,6 +55,12 @@ struct Cli {
     /// NAME[(GROUP)][:num|enum]=QUERY, e.g. 'speed=/speed=(?<speed>\d+)/'.
     #[arg(long, global = true, value_name = "SPEC")]
     signal: Vec<String>,
+    /// Define a lifecycle (repeatable): NAME[(KEY)]: CLAUSES, e.g.
+    /// 'boot(ecu): reset @uptime; planned payload ~ /shutdown/'. It is a
+    /// signal too (`@boot`, its number); signals reset per lifecycle with
+    /// `:per(boot)`.
+    #[arg(long, global = true, value_name = "SPEC")]
+    lifecycle: Vec<String>,
     /// Show times (DLT's time column, signals) in this computer's local
     /// time and read times without a zone as local; default: UTC.
     #[arg(long = "local-time", global = true)]
@@ -121,6 +128,24 @@ enum Cmd {
     Marks { file: PathBuf },
     /// Print a 1-based inclusive range of lines.
     Lines { file: PathBuf, from: u64, to: u64 },
+    /// Print the lifecycles (`--lifecycle`) of a file: per key, when each
+    /// starts and how it ends, and where the definition and the uptime
+    /// disagree (findings, on stderr).
+    Lifecycles {
+        file: PathBuf,
+        /// Which lifecycle, if several are defined.
+        #[arg(short = 'n', long)]
+        name: Option<String>,
+        /// Print JSON (the lifecycles and an `issues` array).
+        #[arg(long)]
+        json: bool,
+        /// Fail (exit status 1) if there are findings.
+        #[arg(long)]
+        strict: bool,
+        /// Also count the lines of each lifecycle matching this NFD query.
+        #[arg(long, value_name = "QUERY")]
+        count: Option<String>,
+    },
 }
 
 #[derive(clap::Args)]
@@ -320,6 +345,137 @@ fn run_search_within(
     Ok(())
 }
 
+/// Print the lifecycles of `file`; returns the number of findings.
+fn lifecycles(
+    file: &PathBuf,
+    name: Option<&str>,
+    count: Option<&str>,
+    json: bool,
+    out: &mut impl Write,
+) -> Result<usize> {
+    use nerka_core::time::format_time;
+    let (f, _) = open(file)?;
+    let signals = SIGNALS.get_or_init(Default::default).for_source(&*f);
+    let defs: Vec<_> = signals.lifecycles().collect();
+    let def = match (name, defs.as_slice()) {
+        (_, []) => anyhow::bail!("no lifecycle defined: use --lifecycle 'NAME[(KEY)]: CLAUSES'"),
+        (None, [d]) => *d,
+        (None, _) => anyhow::bail!(
+            "several lifecycles are defined: pick one with -n ({})",
+            defs.iter().map(|d| d.name()).collect::<Vec<_>>().join(", ")
+        ),
+        (Some(n), _) => {
+            *defs.iter().find(|d| d.name().eq_ignore_ascii_case(n)).with_context(|| format!("no lifecycle '{n}'"))?
+        }
+    };
+    let t = Instant::now();
+    let l = def.lifecycles(&*f, &Progress::new())?;
+    let took = t.elapsed();
+    // Lines per lifecycle matching `count`.
+    let counts: Option<Vec<u64>> = match count {
+        Some(q) => {
+            let hits = search(&*f, &Filter::Query(compile(q, &*f)?), &Progress::new())?.lines;
+            let mut c = vec![0u64; l.lives.len()];
+            for row in hits {
+                if let Some((i, _)) = l.at(&*f, row) {
+                    c[i] += 1;
+                }
+            }
+            Some(c)
+        }
+        None => None,
+    };
+    let time = |t: Option<f64>| t.map(|t| format_time(t, 3)).unwrap_or_else(|| "-".into());
+    let secs = |d: Option<f64>| d.map(|d| format!("{d:.1}")).unwrap_or_else(|| "-".into());
+    if json {
+        let num = |v: Option<f64>| v.map(|v| format!("{v}")).unwrap_or_else(|| "null".into());
+        writeln!(out, "{{\"lifecycle\": {}, \"key\": {},", js(def.name()), def.key().map_or("null".into(), js))?;
+        writeln!(out, " \"lifecycles\": [")?;
+        for (i, x) in l.lives.iter().enumerate() {
+            let c = counts.as_ref().map(|c| format!(", \"count\": {}", c[i])).unwrap_or_default();
+            writeln!(
+                out,
+                "  {{\"key\": {}, \"number\": {}, \"first_line\": {}, \"last_line\": {}, \"lines\": {}, \
+                 \"started_by\": {}, \"outcome\": {}, \"marker_line\": {}, \"start\": {}, \"end\": {}, \
+                 \"duration\": {}, \"first_uptime\": {}, \"boot\": {}, \"spread\": {}{c}}}{}",
+                x.key.as_deref().map_or("null".into(), js),
+                x.number,
+                x.first + 1,
+                x.last + 1,
+                x.lines,
+                js(x.started_by.as_str()),
+                js(x.outcome.as_str()),
+                x.marker.map_or("null".into(), |m| (m + 1).to_string()),
+                num(x.first_time),
+                num(x.last_time),
+                num(x.duration()),
+                num(x.first_uptime),
+                num(x.boot),
+                num(x.spread),
+                if i + 1 < l.lives.len() { "," } else { "" }
+            )?;
+        }
+        writeln!(out, " ],\n \"issues\": [")?;
+        for (i, x) in l.findings.iter().enumerate() {
+            writeln!(
+                out,
+                "  {{\"kind\": {}, \"line\": {}, \"lifecycle\": {}, \"detail\": {}}}{}",
+                js(x.kind.as_str()),
+                x.row + 1,
+                js(&l.lives[x.life].label()),
+                js(&x.detail),
+                if i + 1 < l.findings.len() { "," } else { "" }
+            )?;
+        }
+        writeln!(out, " ],\n \"summary\": {}}}", js(&l.summary()))?;
+    } else {
+        let key = def.key().unwrap_or("key");
+        let c = if counts.is_some() { "\tcount" } else { "" };
+        writeln!(out, "{key}\t#\tline\tstart\tend\tduration_s\toutcome{c}\tfindings")?;
+        for (i, x) in l.lives.iter().enumerate() {
+            let c = counts.as_ref().map(|c| format!("\t{}", c[i])).unwrap_or_default();
+            let notes: Vec<&str> = l.findings_of(i).map(|f| f.kind.as_str()).collect();
+            writeln!(
+                out,
+                "{}\t{}\t{}\t{}\t{}\t{}\t{}{c}\t{}",
+                x.key.as_deref().unwrap_or("-"),
+                x.number,
+                x.first + 1,
+                time(x.first_time),
+                time(x.last_time),
+                secs(x.duration()),
+                x.outcome.as_str(),
+                notes.join(", ")
+            )?;
+        }
+        out.flush()?;
+        for x in &l.findings {
+            eprintln!("warning: {} line {}: {}: {}", l.lives[x.life].label(), x.row + 1, x.kind.as_str(), x.detail);
+        }
+        eprintln!("{} | {took:.2?}", l.summary());
+    }
+    Ok(l.findings.len())
+}
+
+/// A JSON string.
+fn js(s: &str) -> String {
+    let mut o = String::with_capacity(s.len() + 2);
+    o.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => o.push_str("\\\""),
+            '\\' => o.push_str("\\\\"),
+            '\n' => o.push_str("\\n"),
+            '\r' => o.push_str("\\r"),
+            '\t' => o.push_str("\\t"),
+            c if (c as u32) < 0x20 => o.push_str(&format!("\\u{:04x}", c as u32)),
+            c => o.push(c),
+        }
+    }
+    o.push('"');
+    o
+}
+
 /// The `--signal` definitions, set once in `main`.
 static SIGNALS: std::sync::OnceLock<Signals> = std::sync::OnceLock::new();
 
@@ -377,6 +533,16 @@ fn run() -> Result<()> {
     let mut signals = Signals::default();
     for spec in &cli.signal {
         signals.set(SignalDef::parse_spec(spec).with_context(|| format!("--signal {spec}"))?);
+    }
+    for spec in &cli.lifecycle {
+        let def = nerka_core::lifecycle::LifecycleDef::parse_spec(spec).map_err(|e| {
+            anyhow::anyhow!(
+                "--lifecycle: {}\n  {spec}\n  {}^",
+                e.msg,
+                " ".repeat(spec[..e.pos.min(spec.len())].chars().count())
+            )
+        })?;
+        signals.set(SignalDef::lifecycle(def));
     }
     SIGNALS.set(signals).expect("set once");
     let stdout = std::io::stdout().lock();
@@ -473,6 +639,13 @@ fn run() -> Result<()> {
                 } else {
                     writeln!(out, "{name} {}: {text}\n    # {note}", l + 1)?;
                 }
+            }
+        }
+        Cmd::Lifecycles { file, name, json, strict, count } => {
+            let found = lifecycles(&file, name.as_deref(), count.as_deref(), json, &mut out)?;
+            if strict && found > 0 {
+                out.flush()?;
+                anyhow::bail!("{found} finding{}", if found == 1 { "" } else { "s" });
             }
         }
         Cmd::Lines { file, from, to } => {

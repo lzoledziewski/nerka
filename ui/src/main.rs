@@ -4386,10 +4386,10 @@ query timeouts  labels: vision
         assert_eq!(tab.result().unwrap().lines, [1, 3]);
         // Picked, it is listed once, as the tab's signal.
         let own = tab.line_signals(1, &args);
-        // (with the file's built-in @time, an event on every DLT line).
+        // (with the file's built-in @time and @uptime, events on every DLT line).
         assert_eq!(
             own.iter().map(|s| (s.name.as_str(), s.origin)).collect::<Vec<_>>(),
-            [("time", "built in"), ("free_slots", "FIBEX")]
+            [("time", "built in"), ("uptime", "built in"), ("free_slots", "FIBEX")]
         );
 
         // Its − in the Signals panel unpicks it (owner, 2026-10-28: it only

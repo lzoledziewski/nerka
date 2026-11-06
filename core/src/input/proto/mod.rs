@@ -87,6 +87,12 @@ pub trait Protocol: Send + Sync {
     fn argument(&self, _msg: &[u8], _at: &Origin<'_>, _index: usize) -> Option<crate::signal::SignalValue> {
         None
     }
+
+    /// The writer's uptime in seconds, if the message records it
+    /// ([`LogSource::uptime`]).
+    fn uptime(&self, _msg: &[u8], _at: &Origin<'_>) -> Option<f64> {
+        None
+    }
 }
 
 /// Index of a protocol in a [`Records`] source.
@@ -495,6 +501,11 @@ impl LogSource for Records {
     fn argument(&self, line: LineNo, index: usize) -> Option<crate::signal::SignalValue> {
         let (p, msg, at) = self.msg(line)?;
         self.protos[p].argument(msg, &at, index)
+    }
+
+    fn uptime(&self, line: LineNo) -> Option<f64> {
+        let (p, msg, at) = self.msg(line)?;
+        self.protos[p].uptime(msg, &at)
     }
 
     /// A `.dlt` file: the storage header's offset, the hash from there;
