@@ -1,162 +1,93 @@
 # Lifecycles — design
 
-_Status: design written 2026-11-06 with the owner; **v1 built 2026-11-07** (core, CLI, GUI), see "Built" below for what differs from the design and what is not built yet. Current state and decisions: `status.md`._
-
-## Built (2026-11-07)
-
-- **Core** (`core/src/lifecycle.rs`): `LifecycleDef` from the spec line `NAME[(KEY)]: CLAUSES` (`start NFD`, `reset @SIGNAL [tolerance DUR]`, `gap DUR`, `planned NFD`, `crash NFD`, `late DUR`; errors with positions). One pass finds `Lifecycles` (per key, numbered, outcome, boot time and spread, first uptime, lines) and the findings **missed reset**, **false reset** and **late start**, each with its line. The query hits come from the engine; the source's key, time and uptime are read in parallel chunks and walked in order. Results are cached per source.
-- **`@uptime`**: `LogSource::uptime` (DLT: `tmsp` through `Protocol::uptime`), a built-in like `@time`. A tab signal named `uptime` (text logs) takes its place for `reset @uptime`.
-- **Signals**: a lifecycle is a signal (`SignalDef::lifecycle`, saved in the signals file as `lifecycle …`), `:per(NAME)` and `:default(VALUE)` as designed. `Signals` links lifecycles and bound signals by name; a filter that uses a signal bound to a lifecycle that isn't defined is an error.
-- **CLI**: `--lifecycle SPEC`, `nerka lifecycles FILE` (a table, `--json` with an `issues` array, `--count QUERY`, `--strict`, `-n NAME`); bound signals and `@boot` work in `filter` / `search`.
-- **GUI**: the Signals panel defines lifecycles (Signal / Lifecycle in the form) and binds signals (Per, Default); a default shows as `idle (default)`, italic. **The lifecycles table is a section of the Signals panel** (not a panel of its own): key, number, first line (click: go there), duration, outcome (red when bad), `▾ filter` (sets `@boot == N AND ecu == "K"`), and its findings (click: go to the line). The plot draws a dashed line where each lifecycle starts, labelled where there is room, red after a bad end, **across all lanes**; a bound signal of a keyed lifecycle gets a lane per key (`ota A`), its defaults dashed, unset spans empty. The log view draws a line above each lifecycle's first row with its label.
-- **Tolerance**: `reset` steps back of up to 5 s aren't resets (the default; `tolerance` sets another). `late` defaults to 10 s.
-- **Benchmark** (512 MiB DLT, 6.25 M messages, 3 ECUs, 40 lifecycles; `gen_dlt` simulates reboots): finding them 267 ms; `@boot == 3 AND apid == NAV` 290–307 ms (finding included, cached afterwards in the GUI); `apid == NAV AND level >= WARN` unchanged at 16–17 ms.
-
-**Not built yet:** lifecycles in packs (and a shipped `boot(ecu)` pack for DLT), library query ids in clauses (NFD only), a key from a signal (fields only), a derived `@uptime` from `@time`, the findings clock jump and noisy, findings as bookmarks, next / previous lifecycle navigation, boundaries spanning only their key's lanes, start / end / count columns in the GUI table, `reset auto`, `--probe`. Lines without a key belong to no lifecycle (as proposed below).
+_Status: designed 2026-11-06 with the owner, reworked 2026-11-07 after trying v1 (one lifecycle per entity, library queries, a form instead of clauses typed by hand). Built: core, CLI, GUI; see "Not built yet". Current state and decisions: `status.md`._
 
 ## Goal
 
-Logs from devices span several **lifecycles**: an ECU boots, runs, shuts down or crashes, and boots again. Most questions only make sense per lifecycle: "3 resets" means nothing over a whole trace, but "an OTA job in `downloading` when the boot ended unclean" is a finding. Several entities (ECUs, nodes, hosts) have their own lifecycles in one view, especially when files are merged by time.
+Logs from devices span several **lifecycles**: an ECU boots, runs, shuts down or crashes, and boots again. Most questions only make sense per lifecycle: "3 resets" means nothing over a whole trace, but "an OTA job in `downloading` when ECU1's boot ended unclean" is a finding.
 
-v1 adds:
+Lifecycles are the groundwork for **checks** (known-issue signatures that run on every trace), which come next. General state machines (transition rules, timeouts, events from other machines) are left out on purpose. The owner's usage is "state straight from a signal or a regex, reset on a new boot", which signals bound to a lifecycle cover.
 
-1. **Lifecycle definitions**: when a lifecycle of an entity starts and how it ends.
-2. **Signals bound to a lifecycle**: their state resets when a new lifecycle starts, optionally to a default value.
-3. **Validation** of the definition against the time and the uptime, with findings that point to lines.
-4. **Boundaries** in the plot and the log view, a lifecycle table, and the CLI.
+## Decisions (owner)
 
-It is the groundwork for **checks** (known-issue signatures that run on every trace), which come after it. General state machines (transition rules, timeouts, events from other machines) are left out on purpose. The owner's usage is "state straight from a signal or a regex, reset on a new boot", which signals bound to a lifecycle already cover.
-
-## Nothing format-specific (owner, 2026-11-06)
-
-The engine knows no DLT here. A lifecycle is built from generic pieces: queries, signals, times and fields. A source may provide a built-in **`@uptime`** the way it provides `@time` (DLT gives it from the header's `tmsp`). Ready-made definitions, such as `boot` per `ecu` for DLT, ship as **data** in a pack that can be edited or replaced, not as code.
+- **Nothing format-specific (2026-11-06).** A lifecycle is built from generic pieces: queries, signals, times. A source may record its lines' writer's **uptime** (`LogSource::uptime`, DLT's `tmsp`); nothing else knows DLT.
+- **One lifecycle per entity (2026-11-07).** v1 had a key field (`boot(ecu)`: lifecycles for every ECU at once, one set of rules). The owner wants to define one ECU (or application) at a time, each with its own reset criteria. A lifecycle has **its lines** (a query, e.g. `ecu == ECU1`); everything else is about them.
+- **No ambiguous `@uptime` (2026-11-07).** v1 had a built-in `@uptime` signal: in a view of several ECUs it mixes their clocks. Now `reset uptime` means the uptime **its lines** carry, so whose uptime it is follows from the lines. There is no `@uptime` signal.
+- **Binding a signal only resets it (2026-11-07, "A").** `per(ecu1)` resets the signal's state each time `ecu1` starts; the signal's own query decides its lines (no hidden filter; one ECU's state can reset on another's reboot, e.g. the gateway's). Picking a lifecycle in the form fills an empty query with the lifecycle's lines.
+- **Reuse library queries (2026-11-07).** Every query of a lifecycle can be a library query by name, `{pack.query param=value}`, so a fix in its pack reaches every lifecycle using it.
+- **Defaults are dashed (2026-11-06).** A default is assumed, not from the log: dashed in the plot, `idle (default)` in the panel. Boundaries show in the plot and the log view ("lifecycle boundaries are nice").
 
 ## Definition
 
+| Part | Spec | Meaning |
+|---|---|---|
+| Name | `ecu1:` | `@ecu1` (the lifecycle's number), `.ecu1`, `per(ecu1)` |
+| Its lines | `lines QUERY` | the entity's lines; default every line |
+| Starts when | `reset uptime [tolerance 5s]` | the uptime its lines carry goes back by more than the tolerance (default 5 s; lines of different writers interleave) |
+| | `reset @signal [tolerance …]` | a numeric signal of the tab goes back (a dmesg `[ 12.3]` capture in a text log) |
+| | `start QUERY` | one of its lines matches |
+| | `gap 30s` | its lines stop for longer; ends the previous one as `lost` |
+| Ended by | `planned QUERY`, `crash QUERY` | the outcome (the last marker in it wins) |
+| | `late 10s` | a first line above this uptime is a "late start" finding |
+
+`QUERY` is NFD or `{pack.query name=value}`. The spec line (CLI `--lifecycle`, the saved signals file as `lifecycle …`):
+
 ```
-lifecycle boot
-  key      ecu                  # optional: one lifecycle stream per value
-  reset    @uptime              # a num signal that goes back: a new lifecycle
-  start    sys.boot             # a query: a new lifecycle
-  gap      30s                  # no line of the key for longer: a new lifecycle
-  planned  sys.shutdown         # an outcome marker
-  crash    sys.watchdog         # an outcome marker
+ecu1: lines {sys.of ecu=ECU1}; reset uptime; planned {sys.shutdown}
+gw: lines ecu == GW; reset uptime tolerance 2s; planned payload ~ /shutdown requested/
+app: lines apid == NAV; start payload ~ /NAV started/; crash payload ~ /panic/
 ```
 
-- **Name:** the lifecycle's name, used by `@NAME`, `.NAME` and `:per(NAME)`.
-- **`key`** (optional): a field (`ecu`, `host`) or a signal (`@node`). Each value has its own lifecycles, and lines are only compared with lines of the same key. Without a key there is one stream.
-- **Start triggers**, any combination, at least one (or a derived one, see `@uptime`):
-  - `start QUERY`: a line matching it starts a lifecycle.
-  - `reset @SIGNAL [tolerance T]`: a numeric signal goes **back** by more than the tolerance. Lines from different writers interleave, so small steps back aren't resets. The default tolerance comes from validation (the measured spread), else 1 s.
-  - `gap T`: no line of the key for longer than T (needs times). It ends the previous lifecycle as `lost`.
-- **Outcome markers:** `planned QUERY`, `crash QUERY`. More names may be allowed later; v1 has these two.
-- Queries are library query ids (`pack.query`, with parameters as in selections), or NFD in quotes.
-
-The CLI takes the same lines joined with `;`: `--lifecycle 'boot(ecu): reset @uptime; planned sys.shutdown'`.
+**A lifecycle lasts** from its first line to the next one's first line. Every line in between is in it, whoever wrote it (`@ecu1 == 2 AND ecu == GW` is "GW's lines during ECU1's second boot"). Before the entity's first line there is none.
 
 ### Outcomes
 
-A lifecycle ends where the next one of its key starts, or where the log ends.
-
 | Outcome | When |
 |---|---|
-| `planned` | a `planned` marker matched in it (the last marker wins) |
+| `planned` | a `planned` marker matched in it |
 | `crash` | a `crash` marker matched in it |
-| `unclean` | no marker, and a new lifecycle started |
+| `unclean` | no marker, and a new one started |
 | `lost` | it was ended by a `gap` |
 | `open` | the log ends in it |
 
-### Numbering
+### Validation
 
-Lifecycles are numbered per key from 1, in row order. In a merged view that's the time order. The first lifecycle of a key may have started before the log did (see "late start").
-
-## `@uptime` and validation
-
-| Have | Then |
-|---|---|
-| `@time` only | Lifecycles from `start` / `gap`. **`@uptime` is derived** as `@time − the lifecycle's first time`. |
-| `@uptime` only | Lifecycles from `reset @uptime` (where it rolls back). |
-| both | Lifecycles as defined, **validated** against the boot time. |
-
-**Boot time.** Within one lifecycle `@time − @uptime` is the moment the entity booted, and it should stay constant. Delivery delays (buffering, transport) only ever make `@time` later, so the lifecycle's **minimum** of `@time − @uptime` is the boot time. How far the values sit above it (the **spread**) is the lifecycle's natural tolerance.
-
-**Findings**, each with the line that shows it:
+Within one lifecycle, `time − uptime` is the boot time and should stay constant. Delivery delays only make the time later, so the least value is the boot time, and how far the others sit above it is the **spread**. Findings, each with its line:
 
 | Finding | Meaning |
 |---|---|
-| missed reset | The boot time jumps (uptime rolled back, time went on), but no trigger started a lifecycle. |
-| false reset | A trigger started a lifecycle, but the boot time stayed the same: uptime kept counting. |
-| clock jump | The boot time shifts while uptime keeps rising: the recording clock was set (NTP, a logger), not a reboot. Reported, not a reset. |
-| late start | The lifecycle's first line came long after its boot (uptime 38 s): its early lines are missing. Information. |
-| noisy | The spread is large: delivery delays are big, so the tolerance is loose. |
+| missed reset | the uptime went back by more than the tolerance but nothing started a lifecycle |
+| false reset | a start line or a gap started one but the uptime kept counting |
+| late start | its first line has an uptime above `late`: its early lines are missing (or the log started during it) |
 
-**The definition wins:** lifecycles always follow what was written, and a mismatch is only reported, so results never change silently. `reset auto` lets the uptime decide instead (an open question, see below).
-
-**Where findings show:** a status column in the lifecycle table, a count in its header and in the tab's status ("5 lifecycles, 1 unclean, 1 finding"), bookmarks named after them (`lifecycle: missed reset`), and warnings on stderr in the CLI (`warning: A#2 line 48 211: late start, first line at uptime 38.0 s`). In `--json` they are an `issues` array, and `--strict` makes a finding fail the run (CI, agents).
+The definition wins: lifecycles follow what was written; a mismatch is only reported.
 
 ## Signals bound to a lifecycle
 
-Today a signal's state resets at each file boundary. Binding it to a lifecycle replaces "file" with "lifecycle". The spec gets two optional parts:
-
 ```
-spec  := NAME [ "(" GROUP ")" ] [ ":" KIND ] [ ":" SCOPE ] [ ":per(" LIFECYCLE ")" ] [ ":default(" VALUE ")" ] "=" QUERY
+spec := NAME [ "(" GROUP ")" ] ( ":" PART )* "=" QUERY
+PART := KIND | SCOPE | "per(" LIFECYCLE ")" | "default(" VALUE ")"
 
-ota(s):enum:per(boot):default(idle)=/OTA state=(?<s>\w+)/
-retries:per(boot):default(0)=/retry #(?<retries>\d+)/
+ota(s):enum:per(ecu1):default(idle)=ecu == ECU1 AND /OTA state=(?<s>\w+)/
 ```
 
-Parentheses, not `per=boot`: the spec is split at its first `=`, and the head already uses `(GROUP)`.
-
-- **`per(LIFECYCLE)`:** the state at a row is the last event at or before it **of the same key, in the same lifecycle**. Otherwise it's unset, or the default. With a keyed lifecycle the signal is per key too: ECU B's state never shows on ECU A's lines, and A's reboot doesn't reset B. It **replaces** the per-file reset, so a boot split over several files (log rotation) keeps its state across the file boundary.
-- **`default(VALUE)`:** the state from the lifecycle's first line (unbound: the file's first line) until the first event. It's checked against the kind: a number for `num`, any name for `enum`, not allowed for `time`. A default **isn't an event**: `.event` doesn't fire, and `.changed` fires at the first real event only if the value differs.
-- **Independent of `all` / `filtered`;** both can be combined.
-- **Cost:** a state lookup is already a binary search in the signal's cached events. Binding adds the key's lifecycle start for the row, computed once per tab, like the events.
-
-The lifecycle itself is a signal: **`@boot`** is the lifecycle's number for the row's key (`@boot == 3 AND level >= ERROR`), and **`.boot`** is the event at each start (searches, bookmarks, navigation).
-
-### How values look (owner, 2026-11-06)
-
-| Look | Meaning |
-|---|---|
-| solid | a value from the log: an event set it |
-| **dashed** | a default nerka assumed, not from the log, until the first event; `idle (default)` in the Signals panel |
-| gap | unset: no default, no event yet |
-
-"Dashed = nerka assumed it" is the rule for any value the definition supplies, including later kinds.
+- **`per(ecu1)`:** the state on a line is the last event since the line's lifecycle started, else the default, else unset. It replaces the per-file reset, so a boot over several files (log rotation) keeps its state.
+- **`default(VALUE)`:** checked against the kind (a number for `num`, text for `enum`, none for `time`). Not an event: `.event` doesn't see it, `.changed` fires at the first event only if it differs. Without `per`, a default applies from each file's start.
+- The lifecycle is a signal too: `@ecu1` is its number (`@ecu1 == 3 AND level >= ERROR`), `.ecu1` an event where one starts.
 
 ## Surfaces
 
-- **Plot:** a vertical line at each lifecycle start, labelled `A boot 2`, red when the lifecycle before it ended `unclean` or `crash`. With several keys a line spans only that key's lanes. Bound signals get a lane per key (`A · @ota`, `B · @ota`). Boundaries show whether or not any signal is bound (owner, 2026-11-06: "lifecycle boundaries are nice").
-- **Log view:** a thin separator above each lifecycle's first row, with the same label and colour. Next / previous lifecycle navigation works like bookmarks.
-- **Lifecycles table** (a panel like Signals): key, number, start, end, duration, outcome, findings, and optionally the count of a chosen query's matches. A click jumps; "Filter to this lifecycle" sets `@boot == N AND ecu == K`.
-- **Signal editor:** a lifecycle and a default per signal.
-- **CLI:** `nerka lifecycles FILES` (the table, `--json`, `--strict`); `--lifecycle SPEC` for a definition outside packs. Bound signals work in `filter` / `search` as any signal does.
+- **CLI:** `--lifecycle SPEC` (repeatable; `{pack.query}` from `--pack`), `nerka lifecycles FILE` (every lifecycle defined, or `-n NAME`; a table, findings on stderr; `--json` with an `issues` array; `--count QUERY` per lifecycle; `--strict` fails on findings). Bound signals and `@ecu1` work in `filter` / `search`.
+- **GUI, Signals panel:** the form makes a signal or a lifecycle. A lifecycle's form: Name; Its lines; Starts when (☐ its uptime goes back by more than …, ☐ one of its lines matches …, ☐ its lines stop for …); Ended as planned by; Ended as a crash by; Late start above; **Preview** (what it finds in the file: count, outcomes, findings, or why it can't). Every query field takes NFD or a library query: 📚 picks one (its parameters to fill), or drag one from the Library onto the field. A signal's form has Per (a lifecycle) and Default. Under the signals, each lifecycle's list: number, first line (click: go there), duration, outcome (red when bad), `▾ filter` (`@ecu1 == N AND (its lines)`), its findings (click: go to the line).
+- **Plot:** a dashed line where each lifecycle starts, labelled `ecu1 #2` where there is room, red after a bad end. A bound signal's lane has a point where each lifecycle starts: its default (dashed) or nothing (unset).
+- **Log view:** a line with the label above each lifecycle's first row.
 
-## Execution
+## Execution and cost
 
-One pass in row order, cancellable with `&Progress`:
+Its lines come from the engine (the fast path for `ecu == ECU1`); the start and marker queries too. Then one walk over its lines in order; their time and uptime are read in parallel chunks. Nothing per line is kept: a few numbers per lifecycle. Cached per source.
 
-1. Evaluate the start and marker queries through the engine (fast path), and the `reset` signal's events (already cached).
-2. Walk the matches per key, plus the gaps where times are known, to produce per key the sorted lifecycle starts with their outcomes and findings.
+512 MiB DLT (6.25 M messages, 3 ECUs; `gen_dlt` simulates reboots), release, Windows: `ecu1: lines ecu == ECU1; reset uptime; planned payload ~ /shutdown requested/` 158 ms (16 lifecycles), `gw` 153 ms (12); `apid == NAV AND level >= WARN` unchanged at 16–17 ms. (v1, one key over all ECUs: 267 ms.)
 
-The result is small (a few entries per lifecycle, nothing per line). A row's key is read from the row when needed (a field fetch, or a signal's state). `--stats` numbers will be reported against a filter over the same queries on the 1 GiB DLT benchmark.
+## Not built yet
 
-## v1 scope
-
-1. Definitions in packs and on the CLI: key, `start` / `reset` / `gap`, `planned` / `crash`, outcomes, numbering.
-2. The source's `@uptime` (DLT: `tmsp`) and a derived one from `@time`; validation and findings.
-3. `:per(…)` and `:default(…)` on signals, defaults drawn dashed.
-4. `@NAME` / `.NAME`.
-5. Boundaries in the plot and the log view, lifecycle navigation, the Lifecycles table, the signal editor.
-6. CLI `nerka lifecycles`, `--lifecycle`, `--json`, `--strict`.
-7. A shipped `boot(ecu)` definition for DLT as a pack.
-8. Engine tests (every trigger and outcome, keys, merged files, signals bound across a file boundary), parser tests with error positions, the grammar in `signal.rs` and the pack format docs.
-
-**Later:** checks (rules scoped to lifecycles: count, rate, sequence, absence, outcome), nested lifecycles (boot › ignition › OTA), transition rules and timeouts, events from other lifecycles.
-
-## Open questions
-
-- **`reset auto`**: should the uptime be allowed to override the definition, or should results only ever follow the definition?
-- **Lines without a key** (a DLT message without an ECU id, a text line where the key signal is unset): v1 proposal is that they belong to no lifecycle, `@boot` is unset there, and bound signals act unbound.
-- **Tolerance defaults** for `reset` and the threshold for "late start" need real traces. A `nerka lifecycles --probe` printing the detected resets and boot-time spread per key would let them be set from data.
-- **Pack syntax** of the `lifecycle` block next to queries, and whether a pack can ship a definition that a selection turns on.
+Lifecycles stored in packs (a pack shipping definitions; today they live with the saved signals and on the CLI), a derived uptime from the time for logs without one, the findings clock jump and noisy, findings as bookmarks, next / previous lifecycle navigation, start / end / count columns in the GUI list, "add one per ECU" (copy a definition for each value of a field), `--probe`. **Later:** checks; nested lifecycles; transition rules and timeouts.

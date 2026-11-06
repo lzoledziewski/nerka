@@ -387,47 +387,34 @@ fn build(
                 labels.len() - 1
             }) as f64,
         };
-        // Points: (x, y, row, assumed); per key for a signal bound to a
-        // lifecycle (its state resets where each starts).
+        // Points: (x, y, row, assumed); for a signal bound to a lifecycle
+        // also where each starts (its state resets there to the default).
         let mut groups: Vec<(Option<String>, Vec<Point>)> = Vec::new();
-        match series.lifecycles() {
-            None => groups
-                .push((None, series.iter().filter_map(|(row, v)| Some((x_of(row)?, y_of(v), row, false))).collect())),
-            Some(life) => {
-                let reset = def.default_value().map_or(f64::NAN, |d| y_of(d.as_ref()));
-                let keys = life.keys();
-                for key in &keys {
-                    let hash = key.map_or(0, |k| nerka_core::lifecycle::key_hash(k.as_bytes()));
-                    let mut starts: Vec<LineNo> =
-                        life.lives.iter().filter(|l| l.key.as_deref() == *key).map(|l| l.first).collect();
-                    starts.reverse();
-                    let mut pts = Vec::new();
-                    for (row, v) in series.iter() {
-                        if life.key_of(file, row) != Some(hash) {
-                            continue;
-                        }
-                        while starts.last().is_some_and(|&s| s <= row) {
-                            let s = starts.pop().expect("checked");
-                            if s < row
-                                && let Some(x) = x_of(s)
-                            {
-                                pts.push((x, reset, s, true));
-                            }
-                        }
-                        if let Some(x) = x_of(row) {
-                            pts.push((x, y_of(v), row, false));
-                        }
-                    }
-                    for s in starts.into_iter().rev() {
-                        if let Some(x) = x_of(s) {
-                            pts.push((x, reset, s, true));
-                        }
-                    }
-                    let shown = if keys.len() > 1 { key.map(str::to_owned) } else { None };
-                    groups.push((shown, pts));
+        let mut pts: Vec<Point> = Vec::new();
+        let mut starts: Vec<LineNo> = match series.lifecycles() {
+            Some(life) => life.lives.iter().rev().map(|l| l.first).collect(),
+            None => Vec::new(),
+        };
+        let reset = def.default_value().map_or(f64::NAN, |d| y_of(d.as_ref()));
+        for (row, v) in series.iter() {
+            while starts.last().is_some_and(|&s| s <= row) {
+                let s = starts.pop().expect("checked");
+                if s < row
+                    && let Some(x) = x_of(s)
+                {
+                    pts.push((x, reset, s, true));
                 }
             }
+            if let Some(x) = x_of(row) {
+                pts.push((x, y_of(v), row, false));
+            }
         }
+        for s in starts.into_iter().rev() {
+            if let Some(x) = x_of(s) {
+                pts.push((x, reset, s, true));
+            }
+        }
+        groups.push((None, pts));
         for (key, mut pts) in groups {
             // Clocks may step back (a logger's time jumps): keep x sorted.
             if pts.windows(2).any(|w| w[1].0 < w[0].0) {
@@ -1087,14 +1074,13 @@ pub fn plot_panel(ui: &mut egui::Ui, state: &mut PlotState, src: Source<'_>) -> 
             let Some(x) = clock.at(file, clock_series.as_ref(), life.first).filter(|x| (x0..=x1).contains(x)) else {
                 continue;
             };
-            let before = l.lives[..i].iter().rev().find(|p| p.key == life.key);
-            let bad = before.is_some_and(|p| p.outcome.is_bad());
+            let bad = i > 0 && l.lives[i - 1].outcome.is_bad();
             let c = if bad { red } else { weak };
             let px = to_px(x, x0, x1);
             let line = [pos2(px, plot.min.y), pos2(px, axis_y)];
             painter.extend(egui::Shape::dashed_line(&line, Stroke::new(1.0, c), 2.0, 2.0));
             if px > label_end + 4.0 {
-                let label = format!("{} {}", def.name(), life.label());
+                let label = format!("{} #{}", def.name(), life.number);
                 let r =
                     painter.text(pos2(px + 2.0, plot.min.y + 1.0), Align2::LEFT_TOP, label, FontId::monospace(9.0), c);
                 label_end = r.max.x;
@@ -1748,9 +1734,9 @@ mod tests {
     /// A signal bound to a lifecycle of two ECUs: a lane per ECU, a
     /// default point (assumed) where each lifecycle starts, its events.
     #[test]
-    fn a_bound_signal_has_a_lane_per_key_with_its_defaults() {
+    fn a_bound_signal_resets_where_its_lifecycle_starts() {
         use nerka_core::input::dlt::writer::{Msg, Value};
-        // (ecu, uptime in s, text): A reboots after line 2.
+        // (ecu, uptime in s, text): A reboots before line 4.
         let rows = [("A", 1.0, "s=up"), ("B", 1.0, "x"), ("A", 20.0, "s=down"), ("B", 21.0, "s=on"), ("A", 0.5, "y")];
         let mut bytes = Vec::new();
         for (i, (ecu, up, text)) in rows.iter().enumerate() {
@@ -1761,7 +1747,9 @@ mod tests {
         }
         let file = nerka_core::DltFile::from_bytes("t.dlt", bytes);
         let mut signals = Signals::default();
-        for spec in ["lifecycle boot(ecu): reset @uptime", r"s:enum:per(boot):default(idle)=/s=(?<s>\w+)/"] {
+        for spec in
+            ["lifecycle a: lines ecu == A; reset uptime", r"s:enum:per(a):default(idle)=ecu == A AND /s=(?<s>\w+)/"]
+        {
             signals.set(SignalDef::parse_spec(spec).unwrap());
         }
         let d = signals.get("s").unwrap().clone();
@@ -1769,23 +1757,12 @@ mod tests {
         let state = PlotState { plotted: vec!["s".into()], ..Default::default() };
         let mut series_of = |d: &SignalDef| d.cached_series(&file).map(Arc::new);
         let data = build(&state, &signals, &file, &Clock::of(&file, &signals), &mut series_of).unwrap();
-        let lanes: Vec<(String, Vec<(LineNo, bool)>)> = data
-            .lanes
-            .iter()
-            .map(|l| (l.name.clone(), l.rows.iter().copied().zip(l.assumed.iter().copied()).collect()))
-            .collect();
-        assert_eq!(
-            lanes,
-            [
-                // A: an event on its first line (no default point there), its
-                // reboot on line 4 starts with the default.
-                ("s A".to_owned(), vec![(0, false), (2, false), (4, true)]),
-                ("s B".to_owned(), vec![(1, true), (3, false)]),
-            ]
-        );
-        assert!(data.lanes.iter().all(|l| l.signal == "s"));
-        let b = &data.lanes[1];
-        assert_eq!(b.labels[b.ys[0] as usize], "idle");
+        let lane = &data.lanes[0];
+        let pts: Vec<(LineNo, bool)> = lane.rows.iter().copied().zip(lane.assumed.iter().copied()).collect();
+        // Its events (A's lines); where A's second lifecycle starts, the
+        // default (no point where an event is on the start line).
+        assert_eq!((lane.name.as_str(), pts), ("s", vec![(0, false), (2, false), (4, true)]));
+        assert_eq!(lane.labels[lane.ys[2] as usize], "idle");
     }
 
     /// A right-click menu with a text field: clicking into the field keeps

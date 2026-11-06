@@ -31,10 +31,11 @@
 //! the plot; a filter can't use such a signal, it would depend on itself).
 //!
 //! **Lifecycles** ([`crate::lifecycle`], `doc/lifecycles.md`): a lifecycle
-//! is a signal too (`@boot`: the lifecycle's number for the line's key, an
-//! event where one starts). A signal bound to one (`per(boot)`) resets at
-//! each start: its state on a line is the last event of the line's key in
-//! the line's lifecycle (not the file's), else unset, else its `default`.
+//! is a signal too (`@ecu1`: the number of the lifecycle a line is in, an
+//! event where one starts). A signal bound to one (`per(ecu1)`) only
+//! resets at each start (owner, 2026-11-07: its own query decides its
+//! lines): its state on a line is the last event since the line's
+//! lifecycle started (not the file's), else its `default`, else unset.
 //! A default isn't an event (`.event` and `.changed` don't see it); a UI
 //! shows it as assumed. Without `per`, a default applies from each file's
 //! start.
@@ -57,12 +58,11 @@
 use crate::dsl::{Cond, DslError, Expr, FieldTest, Query};
 use crate::engine::search::{Filter, Matcher, scan};
 use crate::event::{Event, FieldDef, FieldValue};
-use crate::lifecycle::{LifecycleDef, Lifecycles, key_hash};
+use crate::lifecycle::{LifecycleDef, Lifecycles};
 use crate::time::{TIME_OF_DAY_END, format_time, parse_time};
 use crate::{LineNo, LogSource, Progress};
 use rayon::prelude::*;
 use regex::bytes::Regex;
-use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 /// Where a signal's events come from.
@@ -136,9 +136,6 @@ impl SignalValue {
 pub struct Events {
     rows: Vec<LineNo>,
     values: Values,
-    /// For a signal bound to a lifecycle: the key hash of each event's
-    /// line, and per key the indices of its events (ascending).
-    by_key: HashMap<u64, Vec<u32>>,
 }
 
 #[derive(Debug)]
@@ -166,7 +163,7 @@ impl Events {
                 prev = *n;
             }
         }
-        Events { rows, values: Values::Num(nums), by_key: HashMap::new() }
+        Events { rows, values: Values::Num(nums) }
     }
 
     fn build(found: Vec<(LineNo, SignalValue)>, kind: SignalKind) -> Events {
@@ -195,34 +192,17 @@ impl Events {
                 Values::Enum { ids, table }
             }
         };
-        Events { rows, values, by_key: HashMap::new() }
+        Events { rows, values }
     }
 
-    /// The events with the key hash of each one's line.
-    fn with_keys(mut self, keys: &[u64]) -> Events {
-        self.by_key.clear();
-        for (i, &k) in keys.iter().enumerate() {
-            self.by_key.entry(k).or_default().push(i as u32);
-        }
-        self
-    }
-
-    /// The last event of key `k` on a row at or before `limit` (before it,
-    /// if not `inclusive`); `None` for `limit` means every row.
-    fn last_of_key(&self, k: u64, limit: Option<LineNo>, inclusive: bool) -> Option<usize> {
-        let idx = self.by_key.get(&k)?;
+    /// The last event on a row at or before `limit` (before it, if not
+    /// `inclusive`); `None` for `limit` means every row.
+    fn last_until(&self, limit: Option<LineNo>, inclusive: bool) -> Option<usize> {
         let n = match limit {
-            Some(l) => idx.partition_point(|&i| {
-                let r = self.rows[i as usize];
-                if inclusive { r <= l } else { r < l }
-            }),
-            None => idx.len(),
+            Some(l) => self.rows.partition_point(|&r| if inclusive { r <= l } else { r < l }),
+            None => self.rows.len(),
         };
-        n.checked_sub(1).map(|j| idx[j] as usize)
-    }
-
-    fn is_keyed(&self) -> bool {
-        !self.by_key.is_empty() || self.rows.is_empty()
+        n.checked_sub(1)
     }
 
     pub fn len(&self) -> usize {
@@ -250,15 +230,7 @@ impl Events {
                 Values::Enum { ids: idx.iter().map(|&i| ids[i]).collect(), table: table.clone() }
             }
         };
-        let mut key_of = vec![0u64; self.rows.len()];
-        for (&k, is) in &self.by_key {
-            for &i in is {
-                key_of[i as usize] = k;
-            }
-        }
-        let keys: Vec<u64> = idx.iter().map(|&i| key_of[i]).collect();
-        let ev = Events { rows, values, by_key: HashMap::new() };
-        if self.by_key.is_empty() { ev } else { ev.with_keys(&keys) }
+        Events { rows, values }
     }
 
     /// Row and value of the `i`-th event.
@@ -330,17 +302,15 @@ impl SignalSeries {
         let (p, local) = self.locate_part(source_key(src), line)?;
         let ev = &*self.parts[p].2;
         let default = self.default.as_ref().map(SignalValue::as_ref);
-        let bound = self.bound(src, line, p, local);
+        let bound = self.bound(p, local);
         Some(match (view, bound) {
             (SignalView::State, None) => view_at(ev, local, view).or(default),
-            (SignalView::State, Some((k, first))) => {
-                self.state_of_key(p, local, k, first, true).map(|x| x.1).or(default)
-            }
+            (SignalView::State, Some(first)) => self.state_since(p, local, first, true).map(|x| x.1).or(default),
             (SignalView::Event, _) => view_at(ev, local, view),
             (SignalView::Changed, None) => view_at(ev, local, view),
-            (SignalView::Changed, Some((k, first))) => {
+            (SignalView::Changed, Some(first)) => {
                 let v = view_at(ev, local, SignalView::Event);
-                let before = self.state_of_key(p, local, k, first, false).map(|x| x.1).or(default);
+                let before = self.state_since(p, local, first, false).map(|x| x.1).or(default);
                 v.filter(|v| before != Some(*v))
             }
         })
@@ -349,44 +319,31 @@ impl SignalSeries {
     /// The state at `row` of the whole source `src` (that the series was
     /// made for): the row of the event that set it (`None`: the default,
     /// assumed) and its value.
-    pub fn state_at(&self, src: &dyn LogSource, row: LineNo) -> Option<(Option<LineNo>, ValueRef<'_>)> {
+    pub fn state_at(&self, row: LineNo) -> Option<(Option<LineNo>, ValueRef<'_>)> {
         let default = || self.default.as_ref().map(|d| (None, d.as_ref()));
         let Some((p, local)) = self.locate_part(self.key, row) else { return default() };
-        match self.bound(src, row, p, local) {
-            Some((k, first)) => self.state_of_key(p, local, k, first, true).map(|(r, v)| (Some(r), v)).or_else(default),
+        match self.bound(p, local) {
+            Some(first) => self.state_since(p, local, first, true).map(|(r, v)| (Some(r), v)).or_else(default),
             None => self.state(row).map(|(r, v)| (Some(r), v)).or_else(default),
         }
     }
 
-    /// The key and the first row of the lifecycle of `line` of `src` (part
-    /// `p`, row `local` there), if the signal is bound and the line has a
-    /// key.
-    fn bound(&self, src: &dyn LogSource, line: LineNo, p: usize, local: LineNo) -> Option<(u64, LineNo)> {
-        let life = self.life.as_ref()?;
-        if !self.parts[p].2.is_keyed() {
-            return None;
-        }
-        let k = life.key_of(src, line)?;
-        let (_, l) = life.life_at(k, self.parts[p].0 + local)?;
-        Some((k, l.first))
+    /// The first row of the lifecycle of row `local` of part `p`, if the
+    /// signal is bound and a lifecycle has started there.
+    fn bound(&self, p: usize, local: LineNo) -> Option<LineNo> {
+        let (_, l) = self.life.as_ref()?.at(self.parts[p].0 + local)?;
+        Some(l.first)
     }
 
-    /// The last event of key `k` at or before (`inclusive`) or before
-    /// `local` of part `p`, within its lifecycle (from `first`): its row in
-    /// the source and value. Looks back through earlier files.
-    fn state_of_key(
-        &self,
-        p: usize,
-        local: LineNo,
-        k: u64,
-        first: LineNo,
-        inclusive: bool,
-    ) -> Option<(LineNo, ValueRef<'_>)> {
+    /// The last event at or before (`inclusive`) or before `local` of part
+    /// `p`, within its lifecycle (from `first`): its row in the source and
+    /// value. Looks back through earlier files.
+    fn state_since(&self, p: usize, local: LineNo, first: LineNo, inclusive: bool) -> Option<(LineNo, ValueRef<'_>)> {
         let mut q = p;
         let mut limit = Some(local);
         loop {
             let (start, _, ev) = &self.parts[q];
-            if let Some(i) = ev.last_of_key(k, limit, inclusive) {
+            if let Some(i) = ev.last_until(limit, inclusive) {
                 let (r, v) = ev.get(i);
                 return (start + r >= first).then_some((start + r, v));
             }
@@ -537,8 +494,6 @@ enum Builtin {
     No,
     /// The built-in `@time`: the source's own time of each line.
     Time,
-    /// The built-in `@uptime`: the source's own uptime of each line.
-    Uptime,
     /// A lifecycle: its number for the line's key.
     Life(Arc<LifecycleDef>),
 }
@@ -702,18 +657,6 @@ impl SignalDef {
         }
     }
 
-    /// The built-in `@uptime` of a source that knows its writers' uptime
-    /// (DLT's `tmsp`, in seconds): every line with one is an event.
-    pub fn source_uptime() -> SignalDef {
-        SignalDef {
-            name: "uptime".into(),
-            kind: SignalKind::Num,
-            group: "uptime".into(),
-            builtin: Builtin::Uptime,
-            ..SignalDef::source_time()
-        }
-    }
-
     /// A lifecycle as a signal (`@boot`): the lifecycle's number for the
     /// line's key; an event where one starts.
     pub fn lifecycle(def: LifecycleDef) -> SignalDef {
@@ -732,7 +675,7 @@ impl SignalDef {
 
     /// Whether this is a built-in the source gives (`@time`, `@uptime`).
     pub fn is_from_source(&self) -> bool {
-        matches!(self.builtin, Builtin::Time | Builtin::Uptime)
+        matches!(self.builtin, Builtin::Time)
     }
 
     /// Whether its values don't come from its query (a built-in or a
@@ -745,7 +688,6 @@ impl SignalDef {
     pub fn source_value(&self, source: &dyn LogSource, line: LineNo) -> Option<f64> {
         match self.builtin {
             Builtin::Time => source.time(line),
-            Builtin::Uptime => source.uptime(line),
             _ => None,
         }
     }
@@ -851,7 +793,6 @@ impl SignalDef {
     pub fn spec(&self) -> String {
         match &self.builtin {
             Builtin::Time => return "time:time (the file's own time)".into(),
-            Builtin::Uptime => return "uptime (the file's own uptime, in seconds)".into(),
             Builtin::Life(l) => return format!("lifecycle {}", l.spec()),
             Builtin::No => {}
         }
@@ -890,7 +831,6 @@ impl SignalDef {
     pub fn value(&self, ev: &mut Event<'_>) -> Option<SignalValue> {
         match self.builtin {
             Builtin::Time => return ev.source()?.time(ev.line()).map(SignalValue::Num),
-            Builtin::Uptime => return ev.source()?.uptime(ev.line()).map(SignalValue::Num),
             // Known from the whole source only.
             Builtin::Life(_) => return None,
             Builtin::No => {}
@@ -943,7 +883,7 @@ impl SignalDef {
         let default = self.default.clone();
         match &self.builtin {
             // Every line is an event: the source answers directly.
-            Builtin::Time | Builtin::Uptime => {
+            Builtin::Time => {
                 return Ok(SignalSeries { key: source_key(source), parts, life: None, default: None });
             }
             // Events where lifecycles start, per file.
@@ -954,9 +894,7 @@ impl SignalDef {
                         lifes.lives.iter().filter(|l| l.first >= first && l.first < first + n).collect();
                     let rows = lives.iter().map(|l| l.first - first).collect();
                     let nums = lives.iter().map(|l| f64::from(l.number)).collect();
-                    let keys: Vec<u64> =
-                        lives.iter().map(|l| l.key.as_ref().map_or(0, |k| key_hash(k.as_bytes()))).collect();
-                    let ev = Events::numbers(rows, nums, SignalKind::Num).with_keys(&keys);
+                    let ev = Events::numbers(rows, nums, SignalKind::Num);
                     parts.push((first, key, Arc::new(ev)));
                 }
                 return Ok(SignalSeries { key: source_key(source), parts, life, default: None });
@@ -1049,7 +987,7 @@ impl SignalDef {
         // per line) must not go through a list of enums first. `filter_map`,
         // not rayon's `flatten`: that makes a parallel iterator per item
         // (several times slower here).
-        let mut ev = match self.kind {
+        let ev = match self.kind {
             SignalKind::Enum => Events::build(values.filter_map(|v| v).collect(), self.kind),
             _ => {
                 let (rows, nums): (Vec<LineNo>, Vec<f64>) = values
@@ -1059,30 +997,6 @@ impl SignalDef {
                 Events::numbers(rows, nums, self.kind)
             }
         };
-        // Bound to a lifecycle: each event's key (a lifecycle without a key:
-        // one for all).
-        if let Some(life) = &self.life {
-            let keys: Vec<u64> = match life.key() {
-                None => vec![0; ev.rows.len()],
-                Some(k) => match source.schema().iter().position(|d| d.name == k) {
-                    Some(id) => ev
-                        .rows
-                        .par_iter()
-                        .map(|&r| {
-                            source.field(r, id).map_or(u64::MAX, |v| match v {
-                                FieldValue::Str(s) => key_hash(&s),
-                                FieldValue::U64(n) => key_hash(n.to_string().as_bytes()),
-                                FieldValue::F64(n) => key_hash(n.to_string().as_bytes()),
-                            })
-                        })
-                        .collect(),
-                    None => Vec::new(),
-                },
-            };
-            if !keys.is_empty() {
-                ev = ev.with_keys(&keys);
-            }
-        }
         let ev = Arc::new(ev);
         let mut cache = self.cache.lock().unwrap_or_else(|e| e.into_inner());
         if !cache.iter().any(|(k, _)| *k == key) {
@@ -1142,10 +1056,6 @@ impl Signals {
             };
             if !same {
                 let mut new = (**d).clone();
-                // Events carry the lifecycle's key: another key, other events.
-                if new.life.as_ref().map(|l| l.key()) != want.as_ref().map(|l| l.key()) {
-                    new.cache = Cache::default();
-                }
                 new.life = want;
                 *d = Arc::new(new);
             }
@@ -1157,9 +1067,6 @@ impl Signals {
     pub fn for_source(&self, source: &dyn LogSource) -> Signals {
         let mut s = self.clone();
         let some = source.line_count() > 0;
-        if some && source.uptime(0).is_some() && s.get("uptime").is_none() {
-            s.0.insert(0, Arc::new(SignalDef::source_uptime()));
-        }
         if some && source.time(0).is_some() && s.get("time").is_none() {
             s.0.insert(0, Arc::new(SignalDef::source_time()));
         }
@@ -1170,6 +1077,27 @@ impl Signals {
     pub fn remove(&mut self, name: &str) {
         self.0.retain(|d| !d.name.eq_ignore_ascii_case(name));
         self.link();
+    }
+
+    /// Expand the library queries the lifecycles use with `lib`; the
+    /// errors (a query not loaded), one per lifecycle.
+    pub fn resolve_lifecycles(&mut self, lib: &crate::pack::Library) -> Vec<String> {
+        let mut errors = Vec::new();
+        for d in &mut self.0 {
+            let Builtin::Life(l) = &d.builtin else { continue };
+            match l.resolved(lib) {
+                Ok(r) => {
+                    let r = Arc::new(r);
+                    let mut new = (**d).clone();
+                    new.builtin = Builtin::Life(r.clone());
+                    new.life = Some(r);
+                    *d = Arc::new(new);
+                }
+                Err(e) => errors.push(format!("lifecycle '{}': {e}", l.name())),
+            }
+        }
+        self.link();
+        errors
     }
 
     /// The lifecycles defined.

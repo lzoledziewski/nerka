@@ -1307,8 +1307,14 @@ impl Tab {
     /// chosen here).
     fn refresh_signals(&mut self, ctx: &egui::Context, lib: &Library, saved: &Signals, saved_gen: u64) {
         let Some(file) = self.file.clone() else { return };
+        // The library queries lifecycles use: an edit there finds them again.
+        let lifecycle_queries: Vec<Option<&str>> = saved
+            .lifecycles()
+            .flat_map(|l| l.unresolved())
+            .map(|id| lib.get(id).map(|(_, q)| q.text.as_str()))
+            .collect();
         let fingerprint = format!(
-            "{:?}{:?}",
+            "{:?}{:?}{lifecycle_queries:?}",
             self.picks
                 .nodes
                 .iter()
@@ -1356,6 +1362,10 @@ impl Tab {
                     s.set(d.with_scope(scope));
                 }
             }
+        }
+        // Library queries in lifecycles, expanded; what isn't loaded says so.
+        if let Some(e) = s.resolve_lifecycles(lib).into_iter().next() {
+            self.status = e;
         }
         self.signals = s;
         self.signals_changed(ctx);
@@ -2468,8 +2478,8 @@ impl Tab {
         for def in self.signals.lifecycles() {
             let Some(l) = def.cached(file) else { continue };
             for (i, life) in l.lives.iter().enumerate() {
-                let bad = l.lives[..i].iter().rev().find(|p| p.key == life.key).is_some_and(|p| p.outcome.is_bad());
-                out.push(view::Boundary { line: life.first, label: format!("{} {}", def.name(), life.label()), bad });
+                let bad = i > 0 && l.lives[i - 1].outcome.is_bad();
+                out.push(view::Boundary { line: life.first, label: format!("{} #{}", def.name(), life.number), bad });
             }
         }
         out.sort_by_key(|b| b.line);
@@ -4042,6 +4052,7 @@ impl App {
                         kept: tab.session.result(),
                         fibex: fibex.as_deref(),
                         arg_picks: &mut tab.arg_picks,
+                        library: &self.library,
                     };
                     signals::signals_panel(ui, &mut tab.signals_ui, input)
                 })
@@ -4409,10 +4420,10 @@ query timeouts  labels: vision
         assert_eq!(tab.result().unwrap().lines, [1, 3]);
         // Picked, it is listed once, as the tab's signal.
         let own = tab.line_signals(1, &args);
-        // (with the file's built-in @time and @uptime, events on every DLT line).
+        // (with the file's built-in @time, an event on every DLT line).
         assert_eq!(
             own.iter().map(|s| (s.name.as_str(), s.origin)).collect::<Vec<_>>(),
-            [("time", "built in"), ("uptime", "built in"), ("free_slots", "FIBEX")]
+            [("time", "built in"), ("free_slots", "FIBEX")]
         );
 
         // Its − in the Signals panel unpicks it (owner, 2026-10-28: it only
@@ -4456,6 +4467,7 @@ query timeouts  labels: vision
                         kept: None,
                         fibex: Some(&*fibex),
                         arg_picks: &mut tab.arg_picks,
+                        library: &Library::new(),
                     };
                     changed = signals::signals_panel(ui, &mut tab.signals_ui, input).args_changed;
                 });

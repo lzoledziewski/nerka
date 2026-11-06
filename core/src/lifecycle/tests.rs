@@ -1,5 +1,5 @@
 use super::*;
-use crate::event::{FieldDef, FieldId, FieldKind};
+use crate::event::{FieldDef, FieldId, FieldKind, FieldValue};
 use crate::signal::SignalDef;
 use std::borrow::Cow;
 
@@ -42,9 +42,13 @@ fn run(spec: &str, src: &Src) -> Arc<Lifecycles> {
     def(spec).linked(&Signals::default()).lifecycles(src, &Progress::new()).unwrap()
 }
 
-/// (label, first, outcome) of each lifecycle.
-fn lives(l: &Lifecycles) -> Vec<(String, LineNo, &'static str)> {
-    l.lives.iter().map(|x| (x.label(), x.first, x.outcome.as_str())).collect()
+fn run_err(spec: &str, src: &Src) -> String {
+    def(spec).linked(&Signals::default()).lifecycles(src, &Progress::new()).unwrap_err().to_string()
+}
+
+/// (number, first, outcome) of each lifecycle.
+fn lives(l: &Lifecycles) -> Vec<(u32, LineNo, &'static str)> {
+    l.lives.iter().map(|x| (x.number, x.first, x.outcome.as_str())).collect()
 }
 
 fn findings(l: &Lifecycles) -> Vec<(&'static str, LineNo)> {
@@ -67,35 +71,42 @@ fn two_ecus() -> Src {
 }
 
 #[test]
-fn a_reset_of_the_uptime_starts_a_lifecycle_per_key() {
-    let l = run("boot(ecu): reset @uptime; planned raw ~ /shutdown/", &two_ecus());
-    assert_eq!(
-        lives(&l),
-        [
-            ("A#1".into(), 0, "unclean"),
-            ("B#1".into(), 1, "planned"),
-            ("A#2".into(), 4, "open"),
-            ("B#2".into(), 6, "open"),
-        ]
-    );
-    assert_eq!(l.lives[2].started_by, Start::Reset);
-    assert_eq!(l.lives[1].marker, Some(3));
-    assert!(l.findings.is_empty(), "{:?}", l.findings);
-    // Lines are of their key's lifecycle; a line without a key of none.
+fn each_entity_has_its_lifecycles_from_its_own_lines() {
     let src = two_ecus();
-    assert_eq!(l.at(&src, 3).map(|(_, x)| x.label()), Some("B#1".into()));
-    assert_eq!(l.at(&src, 7).map(|(_, x)| x.label()), Some("A#2".into()));
-    assert_eq!(l.at(&src, 5), None);
-    // Boot time: the least time − uptime.
-    assert_eq!(l.lives[0].boot, Some(99.0));
-    assert_eq!(l.lives[2].lines, 2);
-    assert_eq!(l.summary(), "4 lifecycles (2 keys), 1 unclean");
+    let a = run("a: lines ecu == A; reset uptime; planned raw ~ /shutdown/", &src);
+    assert_eq!(lives(&a), [(1, 0, "unclean"), (2, 4, "open")]);
+    assert_eq!(a.lives[1].started_by, Start::Reset);
+    assert_eq!(a.lives[0].boot, Some(99.0));
+    assert_eq!(a.lives[1].lines, 2);
+    assert!(a.findings.is_empty(), "{:?}", a.findings);
+    // B's own rules: the same uptime, its own marker.
+    let b = run("b: lines ecu == B; reset uptime; planned raw ~ /shutdown/", &src);
+    assert_eq!(lives(&b), [(1, 1, "planned"), (2, 6, "open")]);
+    assert_eq!(b.lives[0].marker, Some(3));
+    // A lifecycle lasts until the next one starts: every line in between
+    // is in it, whoever wrote it; before its first line, none.
+    assert_eq!(a.at(5).map(|(_, l)| l.number), Some(2));
+    assert_eq!(b.at(4).map(|(_, l)| l.number), Some(1));
+    assert_eq!(b.at(0), None);
+    assert_eq!(a.summary(), "2 lifecycles, 1 unclean");
+}
+
+#[test]
+fn the_uptime_of_all_lines_mixes_writers() {
+    // Without `lines`, A's and B's uptimes interleave: B's small one after
+    // A's large one looks like a reset. Its lines say whose uptime it is.
+    let src = Src(vec![
+        (Some("A"), None, Some(100.0), "a"),
+        (Some("B"), None, Some(30.0), "b"),
+        (Some("A"), None, Some(101.0), "a"),
+        (Some("B"), None, Some(31.0), "b"),
+    ]);
+    assert_eq!(run("all: reset uptime", &src).lives.len(), 3);
+    assert_eq!(run("a: lines ecu == A; reset uptime", &src).lives.len(), 1);
 }
 
 #[test]
 fn a_query_starts_lifecycles_and_the_uptime_validates_them() {
-    // `start` on "boot" lines only of ECU A's text: B's boot line 6 also
-    // matches; line 2 says "boot" falsely.
     let src = Src(vec![
         (Some("A"), Some(100.0), Some(1.0), "boot"),
         (Some("A"), Some(105.0), Some(6.0), "x"),
@@ -103,11 +114,18 @@ fn a_query_starts_lifecycles_and_the_uptime_validates_them() {
         (Some("A"), Some(130.0), Some(0.5), "y"),
         (Some("A"), Some(140.0), Some(10.5), "z"),
     ]);
-    let l = run("boot(ecu): start raw ~ /^boot/", &src);
-    assert_eq!(lives(&l), [("A#1".into(), 0, "unclean"), ("A#2".into(), 2, "open")]);
+    let l = run("a: start raw ~ /^boot/", &src);
+    assert_eq!(lives(&l), [(1, 0, "unclean"), (2, 2, "open")]);
     // Line 2 started one while the uptime kept counting; line 3's uptime
     // went back without a start.
     assert_eq!(findings(&l), [("false reset", 2), ("missed reset", 3)]);
+}
+
+#[test]
+fn start_and_markers_count_on_its_lines_only() {
+    // B's "boot" doesn't start one of A's.
+    let l = run("a: lines ecu == A; start raw ~ /boot/", &two_ecus());
+    assert_eq!(lives(&l), [(1, 0, "unclean"), (2, 4, "open")]);
 }
 
 #[test]
@@ -118,8 +136,8 @@ fn small_steps_back_are_within_the_tolerance() {
         (Some("A"), None, Some(12.0), "c"),
         (Some("A"), None, Some(1.0), "d"),
     ]);
-    assert_eq!(run("b(ecu): reset @uptime", &src).lives.len(), 2);
-    assert_eq!(run("b(ecu): reset @uptime tolerance 1s", &src).lives.len(), 3);
+    assert_eq!(run("b: reset uptime", &src).lives.len(), 2);
+    assert_eq!(run("b: reset uptime tolerance 1s", &src).lives.len(), 3);
 }
 
 #[test]
@@ -132,18 +150,17 @@ fn a_gap_ends_a_lifecycle_as_lost() {
         (None, Some(200.0), None, "d"),
     ]);
     let l = run("run: gap 30s; crash raw ~ /crash/", &src);
-    assert_eq!(lives(&l), [("#1".into(), 0, "lost"), ("#2".into(), 2, "crash"), ("#3".into(), 4, "open")]);
+    assert_eq!(lives(&l), [(1, 0, "lost"), (2, 2, "crash"), (3, 4, "open")]);
     assert_eq!(l.lives[0].duration(), Some(10.0));
 }
 
 #[test]
 fn a_late_first_line_is_noted() {
     let src = Src(vec![(Some("A"), Some(100.0), Some(38.0), "a"), (Some("A"), Some(101.0), Some(0.1), "b")]);
-    let l = run("boot(ecu): reset @uptime", &src);
+    let l = run("a: reset uptime", &src);
     assert_eq!(findings(&l), [("late start", 0)]);
     assert!(l.findings[0].detail.contains("or the log started during it"));
-    let l = run("boot(ecu): reset @uptime; late 60s", &src);
-    assert!(l.findings.is_empty());
+    assert!(run("a: reset uptime; late 60s", &src).findings.is_empty());
 }
 
 #[test]
@@ -156,23 +173,44 @@ fn a_defined_signal_can_be_the_reset() {
         (None, None, None, "[    0.5] c"),
     ]);
     let mut signals = Signals::default();
-    signals.set(SignalDef::parse_spec(r"uptime=/^\[\s*(?<uptime>[\d.]+)\]/").unwrap());
-    let l = def("boot: reset @uptime").linked(&signals).lifecycles(&src, &Progress::new()).unwrap();
-    assert_eq!(lives(&l), [("#1".into(), 0, "unclean"), ("#2".into(), 3, "open")]);
-    // Without the signal and without a source uptime: an error that says so.
-    let e = def("boot: reset @uptime").linked(&Signals::default()).lifecycles(&src, &Progress::new()).unwrap_err();
-    assert!(e.to_string().contains("no @uptime here"), "{e}");
+    signals.set(SignalDef::parse_spec(r"up=/^\[\s*(?<up>[\d.]+)\]/").unwrap());
+    let l = def("boot: reset @up").linked(&signals).lifecycles(&src, &Progress::new()).unwrap();
+    assert_eq!(lives(&l), [(1, 0, "unclean"), (2, 3, "open")]);
+    // Without the signal: an error that says so.
+    assert_eq!(run_err("boot: reset @up", &src), "lifecycle 'boot': no signal @up (define it, or reset on uptime)");
+    // Lines without an uptime: resetting on it is an error too.
+    let e = run_err("boot: reset uptime", &src);
+    assert!(e.contains("its lines carry no uptime"), "{e}");
 }
 
 #[test]
-fn an_unknown_key_is_an_error() {
-    let e = def("boot(node): reset @uptime").lifecycles(&two_ecus(), &Progress::new()).unwrap_err();
-    assert_eq!(e.to_string(), "lifecycle 'boot': unknown key field 'node' (this source has: ecu)");
+fn library_queries_are_kept_by_name_and_expanded() {
+    let dir = std::env::temp_dir().join(format!("nerka-lifecycle-lib-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let pack = dir.join("sys.nerka-pack");
+    std::fs::write(&pack, "pack sys\n\nquery shutdown\n  raw ~ /shutdown/\n\nquery of(ecu)\n  ecu == \"$ecu\"\n")
+        .unwrap();
+    let mut lib = Library::new();
+    lib.load(&pack).unwrap();
+    let d = def("b: lines {sys.of ecu=B}; reset uptime; planned {sys.shutdown}");
+    // Kept by name: the spec says so, and it isn't usable before resolved.
+    assert_eq!(d.spec(), "b: lines {sys.of ecu=B}; reset uptime; planned {sys.shutdown}");
+    assert_eq!(d.unresolved(), ["sys.of", "sys.shutdown"]);
+    let e = d.lifecycles(&two_ecus(), &Progress::new()).unwrap_err().to_string();
+    assert!(e.contains("library query sys.of isn't loaded"), "{e}");
+    let r = d.resolved(&lib).unwrap();
+    assert!(r.unresolved().is_empty());
+    assert_eq!(r.planned().and_then(Rule::query).map(|q| q.source()), Some("(raw ~ /shutdown/)"));
+    let l = r.lifecycles(&two_ecus(), &Progress::new()).unwrap();
+    assert_eq!(lives(&l), [(1, 1, "planned"), (2, 6, "open")]);
+    let e = def("b: reset uptime; planned {sys.nope}").resolved(&lib).unwrap_err();
+    assert!(e.contains("sys.nope"), "{e}");
+    std::fs::remove_dir_all(&dir).ok();
 }
 
 #[test]
 fn results_are_cached_per_source() {
-    let d = def("boot(ecu): reset @uptime");
+    let d = def("a: reset uptime");
     let src = two_ecus();
     assert!(d.cached(&src).is_none());
     let a = d.lifecycles(&src, &Progress::new()).unwrap();
@@ -183,10 +221,10 @@ fn results_are_cached_per_source() {
 #[test]
 fn specs_round_trip() {
     for s in [
-        "boot(ecu): reset @uptime; planned raw ~ /shutdown/",
+        "a: lines ecu == A; reset uptime; planned raw ~ /shutdown/",
         "run: start apid == SYS; gap 30s; crash raw ~ /crash/; late 1m",
         "b: reset @up tolerance 500ms",
-        "b(ecu): start raw ~ /boot/; reset @uptime tolerance 2s; planned raw ~ /bye/; late 20s",
+        "b: lines {sys.of ecu=B}; start {sys.boot}; reset uptime tolerance 2s; planned raw ~ /bye/; late 20s",
     ] {
         assert_eq!(def(s).spec(), s.replace("1m", "60s"));
     }
@@ -199,18 +237,19 @@ fn spec_errors_say_where() {
         assert_eq!(e.pos, pos, "{s}: {}", e.msg);
         assert!(e.msg.contains(msg), "{s}: {}", e.msg);
     };
-    bad("boot reset @uptime", 0, "expected NAME[(KEY)]:");
+    bad("boot reset uptime", 0, "expected NAME:");
     bad("1boot: gap 1s", 0, "isn't a name");
-    bad("boot(ecu: gap 1s", 8, "expected ')'");
-    bad("boot(): gap 1s", 5, "the key is empty");
     bad("boot: gap 1s; restart x", 14, "unknown clause 'restart'");
     bad("boot: gap soon", 10, "needs a duration");
-    bad("boot: reset uptime", 12, "needs a signal");
-    bad("boot: reset @uptime tolerance x", 30, "expected a duration");
-    bad("boot: reset @uptime later", 12, "expected 'reset @SIGNAL'");
+    bad("boot: reset tmsp", 12, "needs uptime or a signal");
+    bad("boot: reset uptime tolerance x", 29, "expected a duration");
+    bad("boot: reset uptime later", 12, "expected 'reset uptime'");
     bad("boot: start", 11, "'start' needs a query");
     bad("boot: start level >= LOUD", 21, "unknown level");
     bad("boot: planned raw ~ /x/", 23, "needs a start, reset or gap");
+    bad("boot: gap 1s; planned {sys.x", 28, "expected '}'");
+    bad("boot: gap 1s; planned {shutdown}", 23, "expected a library query");
+    bad("boot: gap 1s; planned {sys.x cam}", 29, "expected NAME=VALUE");
 }
 
 #[test]
@@ -229,10 +268,10 @@ mod signals {
     use super::*;
     use crate::engine::search::tests::run_on;
     use crate::input::concat::Concat;
-    use crate::signal::{SignalError, SignalView};
+    use crate::signal::SignalError;
     use crate::{Filter, TextFile};
 
-    /// A's OTA job runs over A's reboot; B's isn't touched by it.
+    /// A's OTA job runs over A's reboot.
     fn ota() -> Src {
         Src(vec![
             (Some("A"), Some(100.0), Some(1.0), "boot"),
@@ -258,17 +297,18 @@ mod signals {
         Filter::Query(Query::compile(nfd).unwrap().with_signals(sig).unwrap_or_else(|e| panic!("{nfd}: {e}")))
     }
 
-    const BOOT: &str = "lifecycle boot(ecu): reset @uptime";
-    const OTA: &str = r"ota(s):enum:per(boot):default(idle)=/OTA state=(?<s>\w+)/";
+    const ECU_A: &str = "lifecycle a: lines ecu == A; reset uptime";
+    /// A's OTA state: its query picks A's lines, it resets with A.
+    const OTA: &str = r"ota(s):enum:per(a):default(idle)=ecu == A AND /OTA state=(?<s>\w+)/";
 
     #[test]
-    fn a_bound_signal_resets_per_key_at_each_lifecycle() {
+    fn a_bound_signal_resets_when_its_lifecycle_starts() {
         let src = ota();
-        let sig = signals(&[BOOT, OTA]);
+        let sig = signals(&[ECU_A, OTA]);
         let d = sig.get("ota").unwrap();
         let series = d.series(&src, &Progress::new()).unwrap();
         let state: Vec<String> = (0..8)
-            .map(|r| match series.state_at(&src, r) {
+            .map(|r| match series.state_at(r) {
                 Some((Some(_), v)) => d.format(v),
                 Some((None, v)) => format!("{} (default)", d.format(v)),
                 None => "-".into(),
@@ -280,24 +320,32 @@ mod signals {
                 "idle (default)",
                 "idle (default)",
                 "downloading",
-                "installing",
-                // A rebooted: its job's state is gone, B's stays.
+                "downloading",
+                // A rebooted: the default again, on every line from there
+                // (the lifecycle is a time span, B's lines are in it too).
                 "idle (default)",
                 "idle (default)",
-                "installing",
+                "idle (default)",
                 "done",
             ]
         );
         // The same through filters, fast and naive paths agreeing.
-        assert_eq!(run_on(&src, &filter("@ota == idle", &sig)), [0, 1, 4, 5]);
-        assert_eq!(run_on(&src, &filter("@ota == installing", &sig)), [3, 6]);
+        assert_eq!(run_on(&src, &filter("@ota == idle", &sig)), [0, 1, 4, 5, 6]);
         // A default isn't an event; the first event changes it only if it differs.
-        assert_eq!(run_on(&src, &filter("@ota.event", &sig)), [2, 3, 7]);
-        assert_eq!(run_on(&src, &filter("@ota.changed", &sig)), [2, 3, 7]);
-        // The lifecycle itself: its number for the line's key, events where they start.
-        assert_eq!(run_on(&src, &filter("@boot == 2", &sig)), [4, 5, 7]);
-        assert_eq!(run_on(&src, &filter("@boot.event", &sig)), [0, 1, 4]);
-        assert_eq!(run_on(&src, &filter("@boot == 1 AND ecu == B", &sig)), [1, 3, 6]);
+        assert_eq!(run_on(&src, &filter("@ota.event", &sig)), [2, 7]);
+        assert_eq!(run_on(&src, &filter("@ota.changed", &sig)), [2, 7]);
+        // The lifecycle itself: its number, events where they start.
+        assert_eq!(run_on(&src, &filter("@a == 2", &sig)), [4, 5, 6, 7]);
+        assert_eq!(run_on(&src, &filter("@a.event", &sig)), [0, 4]);
+        assert_eq!(run_on(&src, &filter("@a == 1 AND ecu == B", &sig)), [1, 3]);
+    }
+
+    #[test]
+    fn a_signal_resets_with_another_entitys_lifecycle() {
+        // B's state reset when A (say, the gateway) reboots: allowed.
+        let src = ota();
+        let sig = signals(&[ECU_A, r"b:enum:per(a)=ecu == B AND /OTA state=(?<b>\w+)/"]);
+        assert_eq!(run_on(&src, &filter("@b == installing", &sig)), [3]);
     }
 
     #[test]
@@ -307,7 +355,7 @@ mod signals {
             (Some("A"), None, Some(12.0), "s=busy"),
             (Some("A"), None, Some(0.1), "s=busy"),
         ]);
-        let sig = signals(&[BOOT, r"s:enum:per(boot):default(idle)=/s=(?<s>\w+)/"]);
+        let sig = signals(&[ECU_A, r"s:enum:per(a):default(idle)=/s=(?<s>\w+)/"]);
         // Line 0 sets what the default said; line 2 is the first after a reboot.
         assert_eq!(run_on(&src, &filter("@s.changed", &sig)), [1, 2]);
     }
@@ -340,17 +388,12 @@ mod signals {
 
     #[test]
     fn specs_with_lifecycles_round_trip() {
-        let sig = signals(&[BOOT, OTA, r"n:num:default(-1.5)=/n=(?<n>\S+)/"]);
-        let text = sig.to_text();
-        let (back, errors) = Signals::parse_text(&text);
+        let sig = signals(&[ECU_A, OTA, r"n:num:default(-1.5)=/n=(?<n>\S+)/"]);
+        let (back, errors) = Signals::parse_text(&sig.to_text());
         assert!(errors.is_empty(), "{errors:?}");
         assert_eq!(
             back.iter().map(|d| d.spec()).collect::<Vec<_>>(),
-            [
-                "lifecycle boot(ecu): reset @uptime",
-                r"ota(s):enum:per(boot):default(idle)=/OTA state=(?<s>\w+)/",
-                r"n:num:default(-1.5)=/n=(?<n>\S+)/",
-            ]
+            [ECU_A, OTA, r"n:num:default(-1.5)=/n=(?<n>\S+)/"]
         );
         assert_eq!(back.lifecycles().count(), 1);
         assert!(back.get("ota").unwrap().is_linked());
@@ -362,31 +405,24 @@ mod signals {
         assert_eq!(e(r"n:default(x)=/n=(?<n>\d)/"), "default 'x' isn't a number");
         assert_eq!(e(r"t:time:default(1)=/t=(?<t>\S+)/"), "a time signal takes no default");
         assert_eq!(e(r"n:per(1x)=/n=(?<n>\d)/"), "per(1x): not a lifecycle's name");
-        assert!(
-            e("lifecycle boot: gap soon").starts_with("lifecycle: 'gap' needs a duration"),
-            "{}",
-            e("lifecycle boot: gap soon")
-        );
+        let gap = e("lifecycle boot: gap soon");
+        assert!(gap.starts_with("lifecycle: 'gap' needs a duration"), "{gap}");
         assert!(
             matches!(SignalDef::parse_spec("x:sometimes=/(?<x>.)/"), Err(SignalError::Spec(m)) if m.contains("per(LIFECYCLE)"))
         );
         // Bound to a lifecycle that isn't defined: an error where it's used.
-        let sig = signals(&[OTA]);
+        let mut sig = signals(&[OTA]);
         let err = Query::compile("@ota == idle").unwrap().with_signals(&sig).unwrap_err();
-        assert_eq!(err.msg, "'@ota' resets per lifecycle 'boot', which isn't defined");
+        assert_eq!(err.msg, "'@ota' resets per lifecycle 'a', which isn't defined");
         // Defining it later links it.
-        let mut sig = sig;
-        sig.set(SignalDef::parse_spec(BOOT).unwrap());
+        sig.set(SignalDef::parse_spec(ECU_A).unwrap());
         assert!(Query::compile("@ota == idle").unwrap().with_signals(&sig).is_ok());
     }
 
     #[test]
-    fn the_source_uptime_is_a_built_in() {
-        let src = ota();
-        let sig = Signals::default().for_source(&src);
-        assert_eq!(sig.iter().map(|d| d.name()).collect::<Vec<_>>(), ["time", "uptime"]);
-        assert_eq!(run_on(&src, &filter("@uptime > 30", &sig)), [6]);
-        assert!(!sig.to_text().contains("uptime"));
-        let _ = SignalView::State;
+    fn there_is_no_built_in_uptime_signal() {
+        // Whose uptime would it be? Lifecycles read it from their own lines.
+        let sig = Signals::default().for_source(&ota());
+        assert_eq!(sig.iter().map(|d| d.name()).collect::<Vec<_>>(), ["time"]);
     }
 }
