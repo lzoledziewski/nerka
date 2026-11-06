@@ -1030,6 +1030,7 @@ impl Tab {
         options.fibex = fibex;
         // As the first file was read last time: lines or records.
         let split = records::remembered(&paths[0]);
+        let merge = prefs.merge_by_time;
         options.records = split.clone();
         Self {
             path: paths[0].clone(),
@@ -1037,8 +1038,15 @@ impl Tab {
             part_files: Vec::new(),
             mixed: None,
             file: None,
-            // Files that know their times (DLT, captures) in the order they start.
-            loading: Some(Job::spawn(ctx, move |prog| nerka_core::open_many_by_time(&ps, &options, prog))),
+            // Files that know their times (DLT, captures) in the order they
+            // start, their lines interleaved by time if that was last chosen.
+            loading: Some(Job::spawn(ctx, move |prog| {
+                if merge {
+                    nerka_core::open_merged_by_time(&ps, &options, prog)
+                } else {
+                    nerka_core::open_many_by_time(&ps, &options, prog)
+                }
+            })),
             main_view: ViewState::with_free_keys(),
             hits_view: ViewState::default(),
             columns: Columns::default(),
@@ -1086,7 +1094,7 @@ impl Tab {
             records: split,
             records_edit: None,
             files_undo: None,
-            merge: false,
+            merge,
             status: String::new(),
         }
     }
@@ -3153,6 +3161,7 @@ impl App {
             local_time: self.prefs.local_time,
             mf4_local_time: self.prefs.mf4_local_time,
             bookmark_notes: self.prefs.bookmark_notes,
+            merge_by_time: self.prefs.merge_by_time,
             ..prefs
         };
         if prefs == self.prefs {
@@ -3477,7 +3486,7 @@ impl App {
                             let mut on = t.merge;
                             let tip = "Lines of all files in the order of their times (DLT, captures), each file's \
                                        own order kept; off: one file after another";
-                            if ui.checkbox(&mut on, "Merge lines by time").on_hover_text(tip).changed() {
+                            if ui.checkbox(&mut on, "Merge by time").on_hover_text(tip).changed() {
                                 merge = Some(i);
                                 ui.close();
                             }
@@ -3523,6 +3532,13 @@ impl App {
             let t = &mut self.tabs[i];
             t.merge = !t.merge;
             t.reopen(&ui.ctx().clone(), &self.prefs, self.fibex.clone());
+            // New tabs of several files follow the last choice.
+            self.prefs.merge_by_time = t.merge;
+            if let Some(path) = prefs_path()
+                && let Err(e) = self.prefs.save(&path)
+            {
+                self.status = format!("Could not save preferences: {e}");
+            }
         }
         if let Some(i) = unfold {
             let t = &mut self.tabs[i];
@@ -4936,6 +4952,12 @@ gear=D
         tab.reopen(&ctx, &SearchPrefs::default(), None);
         settle(&mut tab, &ctx);
         assert!(tab.bookmarks.contains(4), "b starts at line 3");
+        // The last choice is the default: a new tab with it on opens merged.
+        let prefs = SearchPrefs { merge_by_time: true, ..SearchPrefs::default() };
+        let mut two = Tab::open_many(&ctx, vec![b.clone(), a.clone()], &prefs, None);
+        settle(&mut two, &ctx);
+        assert!(two.merge && two.file.as_ref().unwrap().reordered().is_some());
+        assert!(two.bookmarks.contains(3), "b1's bookmark on its merged row");
         std::fs::remove_dir_all(&dir).ok();
     }
 
