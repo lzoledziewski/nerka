@@ -274,21 +274,53 @@ pub fn open_many_by_time(
     options: &super::OpenOptions,
     progress: &crate::Progress,
 ) -> Result<(Box<dyn LogSource>, Vec<std::path::PathBuf>)> {
+    let (mut sources, paths, _) = open_sorted(paths, options, progress)?;
+    let source = if sources.len() == 1 { sources.pop().expect("one") } else { Box::new(Concat::new(sources)?) };
+    Ok((source, paths))
+}
+
+/// Like [`open_many_by_time`], with the files' lines interleaved by time
+/// ([`super::merged::Merged`]) when there are several and each knows its
+/// lines' times; otherwise as `open_many_by_time` opens them.
+pub fn open_merged_by_time(
+    paths: &[std::path::PathBuf],
+    options: &super::OpenOptions,
+    progress: &crate::Progress,
+) -> Result<(Box<dyn LogSource>, Vec<std::path::PathBuf>)> {
+    let (mut sources, paths, timed) = open_sorted(paths, options, progress)?;
+    let source: Box<dyn LogSource> = match sources.len() {
+        1 => sources.pop().expect("one"),
+        _ if timed => Box::new(super::merged::Merged::new(Concat::new(sources)?, progress)?),
+        _ => Box::new(Concat::new(sources)?),
+    };
+    Ok((source, paths))
+}
+
+/// Opened files, their paths in that order, and whether every file
+/// knows its times.
+type Sorted = (Vec<Box<dyn LogSource>>, Vec<std::path::PathBuf>, bool);
+
+/// Open `paths`, in the order they start when every file knows its
+/// times (then `true`), else as given.
+fn open_sorted(
+    paths: &[std::path::PathBuf],
+    options: &super::OpenOptions,
+    progress: &crate::Progress,
+) -> Result<Sorted> {
     let mut parts = Vec::with_capacity(paths.len());
     for p in paths {
         parts.push((p.clone(), super::open_with(p, options, progress)?));
     }
     let starts: Option<Vec<f64>> = parts.iter().map(|(_, s)| start_time(s.as_ref())).collect();
+    let timed = starts.is_some();
     if let Some(starts) = starts {
         let mut order: Vec<usize> = (0..parts.len()).collect();
         order.sort_by(|&a, &b| starts[a].total_cmp(&starts[b])); // stable: ties keep their order
         let mut slots: Vec<Option<_>> = parts.into_iter().map(Some).collect();
         parts = order.iter().map(|&i| slots[i].take().expect("a permutation")).collect();
     }
-    let paths: Vec<std::path::PathBuf> = parts.iter().map(|(p, _)| p.clone()).collect();
-    let mut sources: Vec<Box<dyn LogSource>> = parts.into_iter().map(|(_, s)| s).collect();
-    let source = if sources.len() == 1 { sources.pop().expect("one") } else { Box::new(Concat::new(sources)?) };
-    Ok((source, paths))
+    let paths = parts.iter().map(|(p, _)| p.clone()).collect();
+    Ok((parts.into_iter().map(|(_, s)| s).collect(), paths, timed))
 }
 
 /// The first time a source holds (looking at its first lines only), if it

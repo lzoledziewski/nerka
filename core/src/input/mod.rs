@@ -8,6 +8,7 @@ pub mod capture;
 pub mod concat;
 pub mod dlt;
 pub mod json;
+pub mod merged;
 pub mod proto;
 pub mod records;
 
@@ -201,6 +202,14 @@ pub trait LogSource: Send + Sync {
         None
     }
 
+    /// For a source whose rows are another source's lines in another order
+    /// ([`merged::Merged`]: files interleaved by time): that source and the
+    /// map both ways. The engine scans that source (its fast path) and maps
+    /// the lines, unless a query depends on row numbers.
+    fn reordered(&self) -> Option<Reorder<'_>> {
+        None
+    }
+
     /// `(first line, line count)` of each file the source shows: one for a
     /// plain file, one per part for [`concat::Concat`] (bookmarks are kept
     /// per file).
@@ -250,6 +259,16 @@ pub trait LogSource: Send + Sync {
     fn data_id(&self) -> usize {
         self as *const Self as *const () as usize
     }
+}
+
+/// Rows that are another source's lines in another order
+/// ([`LogSource::reordered`]).
+pub struct Reorder<'a> {
+    pub inner: &'a dyn LogSource,
+    /// Row -> line of `inner`.
+    pub line_of: &'a [LineNo],
+    /// Line of `inner` -> row.
+    pub row_of: &'a [LineNo],
 }
 
 /// Where a line is in its file, to find it again when row numbers change

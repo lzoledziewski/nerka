@@ -197,6 +197,13 @@ impl Bookmarks {
             .collect()
     }
 
+    /// The same bookmarks on other line numbers (`map` must not merge two
+    /// lines): between a view's rows and its files' lines when the rows are
+    /// those lines in another order (files merged by time).
+    pub fn remapped(&self, map: impl Fn(LineNo) -> LineNo) -> Bookmarks {
+        Bookmarks { marks: self.marks.iter().map(|(&l, m)| (map(l), m.clone())).collect() }
+    }
+
     /// Add or remove a bookmark; returns whether the line is now marked. A
     /// new one gets the first free name (`B1`, `B2`…).
     pub fn toggle(&mut self, line: LineNo) -> bool {

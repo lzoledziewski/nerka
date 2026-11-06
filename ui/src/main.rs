@@ -603,6 +603,9 @@ struct Tab {
     records_edit: Option<records::Edit>,
     /// The files are being read in a new order or set.
     files_undo: Option<FilesUndo>,
+    /// Several files with times: their lines interleaved by time, not one
+    /// file after another.
+    merge: bool,
     status: String,
 }
 
@@ -1083,6 +1086,7 @@ impl Tab {
             records: split,
             records_edit: None,
             files_undo: None,
+            merge: false,
             status: String::new(),
         }
     }
@@ -1243,7 +1247,7 @@ impl Tab {
         options.records = self.records.clone();
         self.file = None;
         self.reopen_at = Some(line);
-        self.loading = Some(Job::spawn(ctx, move |prog| nerka_core::open_many(&ps, &options, prog).map(|f| (f, ps))));
+        self.loading = Some(self.open_job(ctx, ps, options));
     }
 
     /// Show `paths` in this tab instead (the Files window: reordered, added,
@@ -1278,7 +1282,15 @@ impl Tab {
         let mut options = prefs.open_options();
         options.fibex = fibex;
         options.records = self.records.clone();
-        self.loading = Some(Job::spawn(ctx, move |prog| nerka_core::open_many(&ps, &options, prog).map(|f| (f, ps))));
+        self.loading = Some(self.open_job(ctx, ps, options));
+    }
+
+    /// Read `paths` again: in this order, or merged by time.
+    fn open_job(&self, ctx: &egui::Context, ps: Vec<PathBuf>, options: nerka_core::OpenOptions) -> Job<Opened> {
+        if self.merge {
+            return Job::spawn(ctx, move |prog| nerka_core::open_merged_by_time(&ps, &options, prog));
+        }
+        Job::spawn(ctx, move |prog| nerka_core::open_many(&ps, &options, prog).map(|f| (f, ps)))
     }
 
     /// Build the tab's signals again if what they come from changed: the
@@ -1448,6 +1460,13 @@ impl Tab {
                             }
                             self.status = match self.paths.len() {
                                 1 => format!("Indexed {} lines in {took:.2?}", f.line_count()),
+                                n if f.reordered().is_some() => {
+                                    format!("Merged {} lines of {n} files by time in {took:.2?}", f.line_count())
+                                }
+                                n if self.merge => format!(
+                                    "Indexed {} lines of {n} files; not merged: not every file knows its lines' times",
+                                    f.line_count()
+                                ),
                                 n => format!("Indexed {} lines of {n} files in {took:.2?}", f.line_count()),
                             };
                             self.part_files = f.part_files();
@@ -1919,6 +1938,10 @@ impl Tab {
     /// Each file keeps its own sidecar, anchored on its own lines; a view
     /// of several maps lines.
     fn load_bookmarks(&self, file: &dyn LogSource) -> std::io::Result<Bookmarks> {
+        // Merged by time: the files' bookmarks, on the rows their lines are.
+        if let Some(r) = file.reordered() {
+            return Ok(self.load_bookmarks(r.inner)?.remapped(|l| r.row_of[l as usize]));
+        }
         let Some(parts) = file.parts() else { return Bookmarks::load_for(&self.path, file) };
         let files: Vec<(&Path, LineNo, &dyn LogSource)> =
             self.paths.iter().zip(&parts).map(|(p, part)| (p.as_path(), part.first, part.source.as_ref())).collect();
@@ -1927,8 +1950,13 @@ impl Tab {
 
     fn save_bookmarks(&mut self) {
         let Some(file) = self.file.clone() else { return };
+        // Merged by time: each file's bookmarks on its own lines.
+        let (marks, file) = match file.reordered() {
+            Some(r) => (self.bookmarks.remapped(|row| r.line_of[row as usize]), r.inner),
+            None => (self.bookmarks.clone(), &*file),
+        };
         let res = match file.parts() {
-            None => self.bookmarks.save_for(&self.path, &*file),
+            None => marks.save_for(&self.path, file),
             Some(parts) => {
                 let files: Vec<(&Path, LineNo, LineNo, &dyn LogSource)> = self
                     .paths
@@ -1936,7 +1964,7 @@ impl Tab {
                     .zip(&parts)
                     .map(|(p, part)| (p.as_path(), part.first, part.source.line_count(), part.source.as_ref()))
                     .collect();
-                self.bookmarks.save_for_parts(&files)
+                marks.save_for_parts(&files)
             }
         };
         if let Err(e) = res {
@@ -3413,7 +3441,7 @@ impl App {
 
     fn tab_bar(&mut self, ui: &mut egui::Ui) {
         let (mut select, mut close, mut close_others, mut moved, mut split) = (None, None, None, None, None);
-        let (mut files, mut records_edit, mut unfold) = (None, None, None);
+        let (mut files, mut records_edit, mut unfold, mut merge) = (None, None, None, None);
         egui::ScrollArea::horizontal().show(ui, |ui| {
             ui.horizontal(|ui| {
                 for (i, t) in self.tabs.iter().enumerate() {
@@ -3444,6 +3472,15 @@ impl App {
                         }
                         if t.paths.len() > 1 && ui.button("Open the files as separate tabs").clicked() {
                             split = Some(i);
+                        }
+                        if t.paths.len() > 1 {
+                            let mut on = t.merge;
+                            let tip = "Lines of all files in the order of their times (DLT, captures), each file's \
+                                       own order kept; off: one file after another";
+                            if ui.checkbox(&mut on, "Merge lines by time").on_hover_text(tip).changed() {
+                                merge = Some(i);
+                                ui.close();
+                            }
                         }
                         if ui.button("Files…").on_hover_text("Reorder, add or remove the files of this tab").clicked()
                         {
@@ -3480,6 +3517,12 @@ impl App {
             self.active = i;
             let t = &mut self.tabs[i];
             t.files_edit = Some(t.paths.clone());
+        }
+        if let Some(i) = merge {
+            self.active = i;
+            let t = &mut self.tabs[i];
+            t.merge = !t.merge;
+            t.reopen(&ui.ctx().clone(), &self.prefs, self.fibex.clone());
         }
         if let Some(i) = unfold {
             let t = &mut self.tabs[i];
@@ -4842,6 +4885,57 @@ gear=D
         t.set_files(&ctx, vec![late.clone(), early.clone()], &SearchPrefs::default(), None);
         settle(t, &ctx);
         assert_eq!(t.paths, [late, early]);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn dlt_files_merged_by_time_keep_bookmarks_per_file() {
+        use nerka_core::input::dlt::writer::{Msg, Value};
+        let dir = std::env::temp_dir().join(format!("nerka-gui-merge-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let dlt = |path: &PathBuf, msgs: &[(u32, &str)]| {
+            let mut buf = Vec::new();
+            for (secs, text) in msgs {
+                let mut m =
+                    Msg::log(nerka_core::Level::Warn, "ECU1", "NAV", "CTX", vec![Value::Str((*text).into()).into()]);
+                m.secs = *secs;
+                m.encode(&mut buf);
+            }
+            std::fs::write(path, buf).unwrap();
+        };
+        let (a, b) = (dir.join("a.dlt"), dir.join("b.dlt"));
+        dlt(&a, &[(10, "a0"), (30, "a1 boom"), (50, "a2")]);
+        dlt(&b, &[(20, "b0"), (40, "b1 boom")]);
+        let ctx = egui::Context::default();
+        let mut tab = Tab::open_many(&ctx, vec![a.clone(), b.clone()], &SearchPrefs::default(), None);
+        settle(&mut tab, &ctx);
+        assert_eq!(tab.part_files, [(0, 3), (3, 2)], "one after another first");
+        tab.merge = true;
+        tab.reopen(&ctx, &SearchPrefs::default(), None);
+        settle(&mut tab, &ctx);
+        let file = tab.file.clone().unwrap();
+        let last = |r: LineNo| file.line_text(r).unwrap().rsplit('\t').next().unwrap().to_owned();
+        assert_eq!((0..5).map(last).collect::<Vec<_>>(), ["a0", "b0", "a1 boom", "b1 boom", "a2"]);
+        assert!(tab.status.starts_with("Merged 5 lines of 2 files"), "{}", tab.status);
+        // Filters run over the merged rows.
+        tab.mode = Mode::Text;
+        tab.pattern = "boom".into();
+        tab.start_search(&ctx);
+        settle(&mut tab, &ctx);
+        assert_eq!(tab.result().unwrap().lines, [2, 3]);
+        // A bookmark on b1 (row 3) is line 1 of b's own sidecar.
+        tab.toggle_bookmark_at(3);
+        let sidecar = std::fs::read_to_string(Bookmarks::sidecar_path(&b)).unwrap();
+        assert!(sidecar.starts_with("2\t\tB1\t@"), "1-based: {sidecar:?}");
+        assert!(!Bookmarks::sidecar_path(&a).exists());
+        // Read again (merged), it is on row 3; one after another, on b's line 1.
+        tab.reopen(&ctx, &SearchPrefs::default(), None);
+        settle(&mut tab, &ctx);
+        assert!(tab.bookmarks.contains(3));
+        tab.merge = false;
+        tab.reopen(&ctx, &SearchPrefs::default(), None);
+        settle(&mut tab, &ctx);
+        assert!(tab.bookmarks.contains(4), "b starts at line 3");
         std::fs::remove_dir_all(&dir).ok();
     }
 

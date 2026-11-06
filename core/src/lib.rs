@@ -37,7 +37,7 @@ pub use engine::search::{Filter, Highlighter, Matcher, MatcherOptions, SearchRes
 pub use engine::within::{SearchHits, SearchSet, search_within};
 pub use event::{Event, FieldDef, FieldId, FieldKind, FieldValue, Level};
 pub use history::SearchHistory;
-pub use input::concat::{open_many, open_many_by_time};
+pub use input::concat::{open_many, open_many_by_time, open_merged_by_time};
 pub use input::dlt::DltFile;
 pub use input::dlt::fibex::{ArgType, Argument, Fibex, FibexError};
 pub use input::text::TextFile;
