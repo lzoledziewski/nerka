@@ -303,12 +303,19 @@ struct PlotData {
 }
 
 struct Lane {
+    /// What it shows: the signal's name, with the key for a signal bound to
+    /// a lifecycle of several keys (`ota A`).
     name: String,
+    /// The signal it is of (several lanes for one bound per key).
+    signal: String,
     kind: SignalKind,
     /// Events by x (ties keep row order): x, y (value or enum id), row.
+    /// For a signal bound to a lifecycle, also a point where each lifecycle
+    /// starts: its default (`assumed`), or NaN (unset).
     xs: Vec<f64>,
     ys: Vec<f64>,
     rows: Vec<LineNo>,
+    assumed: Vec<bool>,
     /// Enum ids' texts.
     labels: Vec<String>,
     y_range: (f64, f64),
@@ -351,6 +358,9 @@ const LANE_MAX: f32 = 110.0;
 const LANE_MIN: f32 = 52.0;
 const SCROLLBAR_W: f32 = 6.0;
 
+/// A lane's point: x, y, row, assumed (a default, not an event).
+type Point = (f64, f64, LineNo, bool);
+
 /// Build the lanes, or say why they can't be built yet.
 fn build(
     state: &PlotState,
@@ -370,34 +380,78 @@ fn build(
         let series = series_of(def).ok_or("Collecting events…")?;
         let mut ids: HashMap<Vec<u8>, usize> = HashMap::new();
         let mut labels = Vec::new();
-        let mut pts: Vec<(f64, f64, LineNo)> = series
-            .iter()
-            .filter_map(|(row, v)| {
-                let x = x_of(row)?;
-                let y = match v {
-                    ValueRef::Num(n) => n,
-                    ValueRef::Enum(t) => *ids.entry(t.to_vec()).or_insert_with(|| {
-                        labels.push(String::from_utf8_lossy(t).into_owned());
-                        labels.len() - 1
-                    }) as f64,
-                };
-                Some((x, y, row))
-            })
-            .collect();
-        // Clocks may step back (a logger's time jumps): keep x sorted.
-        if pts.windows(2).any(|w| w[1].0 < w[0].0) {
-            pts.sort_by(|a, b| a.0.total_cmp(&b.0));
+        let mut y_of = |v: ValueRef<'_>| match v {
+            ValueRef::Num(n) => n,
+            ValueRef::Enum(t) => *ids.entry(t.to_vec()).or_insert_with(|| {
+                labels.push(String::from_utf8_lossy(t).into_owned());
+                labels.len() - 1
+            }) as f64,
+        };
+        // Points: (x, y, row, assumed); per key for a signal bound to a
+        // lifecycle (its state resets where each starts).
+        let mut groups: Vec<(Option<String>, Vec<Point>)> = Vec::new();
+        match series.lifecycles() {
+            None => groups
+                .push((None, series.iter().filter_map(|(row, v)| Some((x_of(row)?, y_of(v), row, false))).collect())),
+            Some(life) => {
+                let reset = def.default_value().map_or(f64::NAN, |d| y_of(d.as_ref()));
+                let keys = life.keys();
+                for key in &keys {
+                    let hash = key.map_or(0, |k| nerka_core::lifecycle::key_hash(k.as_bytes()));
+                    let mut starts: Vec<LineNo> =
+                        life.lives.iter().filter(|l| l.key.as_deref() == *key).map(|l| l.first).collect();
+                    starts.reverse();
+                    let mut pts = Vec::new();
+                    for (row, v) in series.iter() {
+                        if life.key_of(file, row) != Some(hash) {
+                            continue;
+                        }
+                        while starts.last().is_some_and(|&s| s <= row) {
+                            let s = starts.pop().expect("checked");
+                            if s < row
+                                && let Some(x) = x_of(s)
+                            {
+                                pts.push((x, reset, s, true));
+                            }
+                        }
+                        if let Some(x) = x_of(row) {
+                            pts.push((x, y_of(v), row, false));
+                        }
+                    }
+                    for s in starts.into_iter().rev() {
+                        if let Some(x) = x_of(s) {
+                            pts.push((x, reset, s, true));
+                        }
+                    }
+                    let shown = if keys.len() > 1 { key.map(str::to_owned) } else { None };
+                    groups.push((shown, pts));
+                }
+            }
         }
-        let (lo, hi) = pts.iter().fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), p| (lo.min(p.1), hi.max(p.1)));
-        lanes.push(Lane {
-            name: name.clone(),
-            kind: def.kind(),
-            xs: pts.iter().map(|p| p.0).collect(),
-            ys: pts.iter().map(|p| p.1).collect(),
-            rows: pts.iter().map(|p| p.2).collect(),
-            labels,
-            y_range: if lo <= hi { (lo, hi) } else { (0.0, 1.0) },
-        });
+        for (key, mut pts) in groups {
+            // Clocks may step back (a logger's time jumps): keep x sorted.
+            if pts.windows(2).any(|w| w[1].0 < w[0].0) {
+                pts.sort_by(|a, b| a.0.total_cmp(&b.0));
+            }
+            let (lo, hi) = pts
+                .iter()
+                .filter(|p| p.1.is_finite())
+                .fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), p| (lo.min(p.1), hi.max(p.1)));
+            lanes.push(Lane {
+                name: match key {
+                    Some(k) => format!("{name} {k}"),
+                    None => name.clone(),
+                },
+                signal: name.clone(),
+                kind: def.kind(),
+                xs: pts.iter().map(|p| p.0).collect(),
+                ys: pts.iter().map(|p| p.1).collect(),
+                rows: pts.iter().map(|p| p.2).collect(),
+                assumed: pts.iter().map(|p| p.3).collect(),
+                labels: labels.clone(),
+                y_range: if lo <= hi { (lo, hi) } else { (0.0, 1.0) },
+            });
+        }
     }
     let full = lanes
         .iter()
@@ -437,7 +491,7 @@ pub fn plot_panel(ui: &mut egui::Ui, state: &mut PlotState, src: Source<'_>) -> 
     let mut out = Output::default();
     if let Some((from, to)) = state.reorder.take() {
         let names: Vec<String> =
-            state.data.as_ref().map(|(_, d)| d.lanes.iter().map(|l| l.name.clone()).collect()).unwrap_or_default();
+            state.data.as_ref().map(|(_, d)| d.lanes.iter().map(|l| l.signal.clone()).collect()).unwrap_or_default();
         move_lane(&mut state.plotted, &names, from, to);
         state.data = None;
     }
@@ -1023,6 +1077,31 @@ pub fn plot_panel(ui: &mut egui::Ui, state: &mut PlotState, src: Source<'_>) -> 
         clip.galley(at, galley, amber);
     }
 
+    // ----- lifecycles: a line where each starts (red after one that ended
+    // badly), labelled at the top of the lanes (owner, 2026-11-06) -----
+    // Labels only where they don't run into the one before.
+    let mut label_end = f32::NEG_INFINITY;
+    for def in signals.lifecycles() {
+        let Some(l) = def.cached(file) else { continue };
+        for (i, life) in l.lives.iter().enumerate() {
+            let Some(x) = clock.at(file, clock_series.as_ref(), life.first).filter(|x| (x0..=x1).contains(x)) else {
+                continue;
+            };
+            let before = l.lives[..i].iter().rev().find(|p| p.key == life.key);
+            let bad = before.is_some_and(|p| p.outcome.is_bad());
+            let c = if bad { red } else { weak };
+            let px = to_px(x, x0, x1);
+            let line = [pos2(px, plot.min.y), pos2(px, axis_y)];
+            painter.extend(egui::Shape::dashed_line(&line, Stroke::new(1.0, c), 2.0, 2.0));
+            if px > label_end + 4.0 {
+                let label = format!("{} {}", def.name(), life.label());
+                let r =
+                    painter.text(pos2(px + 2.0, plot.min.y + 1.0), Align2::LEFT_TOP, label, FontId::monospace(9.0), c);
+                label_end = r.max.x;
+            }
+        }
+    }
+
     // ----- cursor -----
     if let Some(cx) = clock.at(file, clock_series.as_ref(), cursor).filter(|x| (x0..=x1).contains(x)) {
         let px = to_px(cx, x0, x1);
@@ -1038,12 +1117,23 @@ pub fn plot_panel(ui: &mut egui::Ui, state: &mut PlotState, src: Source<'_>) -> 
         let at = lane.xs.partition_point(|&v| v <= x).checked_sub(1);
         let mut tip = format!("{}  ", if data.is_time { format_time(x, 6) } else { format!("line {}", x as u64 + 1) });
         match at {
+            Some(i) if !lane.ys[i].is_finite() => {
+                tip.push_str(&format!("@{}: unset (a lifecycle started on line {})", lane.name, lane.rows[i] + 1));
+            }
             Some(i) => {
                 let v = match lane.kind {
                     SignalKind::Enum => lane.labels.get(lane.ys[i] as usize).cloned().unwrap_or_default(),
                     _ => lane.ys[i].to_string(),
                 };
-                tip.push_str(&format!("@{} = {v}  (event on line {})", lane.name, lane.rows[i] + 1));
+                if lane.assumed[i] {
+                    tip.push_str(&format!(
+                        "@{} = {v}  (default: a lifecycle started on line {})",
+                        lane.name,
+                        lane.rows[i] + 1
+                    ));
+                } else {
+                    tip.push_str(&format!("@{} = {v}  (event on line {})", lane.name, lane.rows[i] + 1));
+                }
             }
             None => tip.push_str(&format!("@{}: no event yet", lane.name)),
         }
@@ -1459,6 +1549,10 @@ fn draw_steps(
 ) {
     let (from, to) = (events.start, events.end);
     let stroke = Stroke::new(1.5, color);
+    // A lane with defaults or unset spans: drawn piece by piece.
+    if lane.assumed.iter().any(|&a| a) {
+        return draw_pieces(painter, lane, area, from, to, to_px, to_py, stroke);
+    }
     let mut line: Vec<Pos2> = Vec::new();
     // Per column: the range of values seen, drawn as one vertical stroke.
     let (mut col, mut lo, mut hi) = (f32::NAN, f32::NAN, f32::NAN);
@@ -1491,6 +1585,41 @@ fn draw_steps(
     painter.add(egui::Shape::line(line, stroke));
 }
 
+/// A number's state with defaults (dashed: assumed) and unset spans
+/// (nothing): a step per point, no thinning per pixel column.
+#[allow(clippy::too_many_arguments)]
+fn draw_pieces(
+    painter: &egui::Painter,
+    lane: &Lane,
+    area: Rect,
+    from: usize,
+    to: usize,
+    to_px: impl Fn(f64) -> f32,
+    to_py: impl Fn(f64) -> f32,
+    stroke: Stroke,
+) {
+    let end = to.min(lane.xs.len());
+    for i in from..end {
+        let y = lane.ys[i];
+        if !y.is_finite() {
+            continue;
+        }
+        let a = to_px(lane.xs[i]).max(area.min.x);
+        let b = if i + 1 < lane.xs.len() { to_px(lane.xs[i + 1]) } else { area.max.x }.min(area.max.x);
+        let py = to_py(y);
+        let seg = [pos2(a, py), pos2(b.max(a), py)];
+        if lane.assumed[i] {
+            painter.extend(egui::Shape::dashed_line(&seg, stroke, 4.0, 3.0));
+        } else {
+            painter.line_segment(seg, stroke);
+        }
+        // The step to the next value.
+        if i + 1 < end && lane.ys[i + 1].is_finite() && b < area.max.x {
+            painter.line_segment([pos2(b, py), pos2(b, to_py(lane.ys[i + 1]))], stroke);
+        }
+    }
+}
+
 /// An enum's state: bands coloured by value, labelled where wide enough.
 fn draw_bands(
     painter: &egui::Painter,
@@ -1507,11 +1636,17 @@ fn draw_bands(
     // which shows the first of them.
     let mut painted = f32::NEG_INFINITY;
     while i < end {
+        // Unset (a lifecycle started, no default): no band.
+        if !lane.ys[i].is_finite() {
+            i += 1;
+            continue;
+        }
         let id = lane.ys[i] as usize;
-        // The run of events with this value.
+        let assumed = lane.assumed.get(i).copied().unwrap_or(false);
+        // The run of events with this value (a default is a run of its own).
         let start = to_px(lane.xs[i]).max(area.min.x);
         let mut j = i + 1;
-        while j < end && lane.ys[j] as usize == id {
+        while j < end && !assumed && lane.ys[j] == lane.ys[i] && !lane.assumed[j] {
             j += 1;
         }
         let stop = if j < lane.xs.len() { to_px(lane.xs[j]) } else { area.max.x }.min(area.max.x);
@@ -1521,7 +1656,16 @@ fn draw_bands(
             painted = stop;
             let band = Rect::from_min_max(pos2(start, area.min.y), pos2(stop, area.max.y));
             let c = crate::library::palette(id + 3);
-            painter.rect_filled(band, 0.0, c.gamma_multiply(0.45));
+            if assumed {
+                // A default: assumed, not from the log (owner, 2026-11-06).
+                painter.rect_filled(band, 0.0, c.gamma_multiply(0.15));
+                let s = Stroke::new(1.0, c);
+                let (t, b) = (area.min.y + 0.5, area.max.y - 0.5);
+                painter.extend(egui::Shape::dashed_line(&[pos2(start, t), pos2(stop, t)], s, 4.0, 3.0));
+                painter.extend(egui::Shape::dashed_line(&[pos2(start, b), pos2(stop, b)], s, 4.0, 3.0));
+            } else {
+                painter.rect_filled(band, 0.0, c.gamma_multiply(0.45));
+            }
             let label = &lane.labels[id];
             if band.width() > 8.0 * label.chars().count() as f32 + 6.0 {
                 painter.text(
@@ -1549,6 +1693,9 @@ fn draw_ticks(
 ) {
     let mut last = f32::NAN;
     for i in from..to.min(lane.xs.len()) {
+        if lane.assumed[i] {
+            continue;
+        }
         let px = to_px(lane.xs[i]).floor();
         if px != last {
             painter.line_segment([pos2(px, area.max.y - 6.0), pos2(px, area.max.y + 2.0)], Stroke::new(1.0, color));
@@ -1597,6 +1744,49 @@ fn short_num(v: f64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A signal bound to a lifecycle of two ECUs: a lane per ECU, a
+    /// default point (assumed) where each lifecycle starts, its events.
+    #[test]
+    fn a_bound_signal_has_a_lane_per_key_with_its_defaults() {
+        use nerka_core::input::dlt::writer::{Msg, Value};
+        // (ecu, uptime in s, text): A reboots after line 2.
+        let rows = [("A", 1.0, "s=up"), ("B", 1.0, "x"), ("A", 20.0, "s=down"), ("B", 21.0, "s=on"), ("A", 0.5, "y")];
+        let mut bytes = Vec::new();
+        for (i, (ecu, up, text)) in rows.iter().enumerate() {
+            let mut m = Msg::log(nerka_core::Level::Info, ecu, "APP", "CTX", vec![Value::Str((*text).into()).into()]);
+            m.secs = 1_760_000_000 + i as u32;
+            m.timestamp = Some((up * 10_000.0) as u32);
+            m.encode(&mut bytes);
+        }
+        let file = nerka_core::DltFile::from_bytes("t.dlt", bytes);
+        let mut signals = Signals::default();
+        for spec in ["lifecycle boot(ecu): reset @uptime", r"s:enum:per(boot):default(idle)=/s=(?<s>\w+)/"] {
+            signals.set(SignalDef::parse_spec(spec).unwrap());
+        }
+        let d = signals.get("s").unwrap().clone();
+        d.series(&file, &nerka_core::Progress::new()).unwrap();
+        let state = PlotState { plotted: vec!["s".into()], ..Default::default() };
+        let mut series_of = |d: &SignalDef| d.cached_series(&file).map(Arc::new);
+        let data = build(&state, &signals, &file, &Clock::of(&file, &signals), &mut series_of).unwrap();
+        let lanes: Vec<(String, Vec<(LineNo, bool)>)> = data
+            .lanes
+            .iter()
+            .map(|l| (l.name.clone(), l.rows.iter().copied().zip(l.assumed.iter().copied()).collect()))
+            .collect();
+        assert_eq!(
+            lanes,
+            [
+                // A: an event on its first line (no default point there), its
+                // reboot on line 4 starts with the default.
+                ("s A".to_owned(), vec![(0, false), (2, false), (4, true)]),
+                ("s B".to_owned(), vec![(1, true), (3, false)]),
+            ]
+        );
+        assert!(data.lanes.iter().all(|l| l.signal == "s"));
+        let b = &data.lanes[1];
+        assert_eq!(b.labels[b.ys[0] as usize], "idle");
+    }
 
     /// A right-click menu with a text field: clicking into the field keeps
     /// the menu open and typing reaches it (a plain context menu closes on

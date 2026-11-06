@@ -255,6 +255,18 @@ pub struct Highlight<'a> {
     pub lines: Option<&'a SearchMarks<'a>>,
     /// Where the bookmarks' notes show.
     pub notes: NoteMode,
+    /// Where lifecycles start (file lines, ascending): a line above the row,
+    /// labelled, red after one that ended badly (`doc/lifecycles.md`).
+    pub lifecycles: Option<&'a [Boundary]>,
+}
+
+/// A lifecycle's start, as the view marks it.
+pub struct Boundary {
+    pub line: LineNo,
+    /// `boot ECU1#2`.
+    pub label: String,
+    /// The lifecycle before it (of its key) ended badly.
+    pub bad: bool,
 }
 
 /// Search hits to mark, coloured per search query.
@@ -941,6 +953,23 @@ pub fn log_view(
         if hl.bookmarks.is_some_and(|b| b.contains(line)) {
             painter.rect_filled(Rect::from_min_size(row_rect.min, vec2(char_w * 0.6, row_h)), 0.0, BOOKMARK_COLOR);
         }
+        // A lifecycle starts here: a line above the row, its label at the
+        // right (on the row's first slot).
+        if numbered != Some(row)
+            && let Some(b) =
+                hl.lifecycles.and_then(|bs| bs.binary_search_by_key(&line, |b| b.line).ok().map(|i| &bs[i]))
+        {
+            let c = if b.bad { Color32::from_rgb(220, 60, 60) } else { dim };
+            painter.line_segment(
+                [pos2(text_rect.min.x, row_rect.min.y), pos2(text_rect.max.x, row_rect.min.y)],
+                Stroke::new(1.0, c),
+            );
+            // On the panel's colour, so the line's text under it doesn't mix in.
+            let galley = painter.layout_no_wrap(b.label.clone(), FontId::monospace(10.0), c);
+            let at = pos2(text_rect.max.x - char_w - galley.size().x, row_rect.min.y + 1.0);
+            painter.rect_filled(Rect::from_min_size(at, galley.size()).expand(1.0), 2.0, vis.panel_fill);
+            painter.galley(at, galley, c);
+        }
         // Its number on its first slot shown (a record scrolled into).
         if numbered != Some(row) {
             numbered = Some(row);
@@ -1481,7 +1510,14 @@ mod tests {
         let rows: Vec<u64> = (0..file.line_count()).step_by(2).collect();
         let screen = Rect::from_min_size(pos2(0.0, 0.0), vec2(1000.0, 800.0));
         let input = egui::RawInput { screen_rect: Some(screen), time: Some(t), events, ..Default::default() };
-        let hl = Highlight { highlighter: None, bookmarks: None, search: None, lines: None, notes: NoteMode::Off };
+        let hl = Highlight {
+            highlighter: None,
+            bookmarks: None,
+            search: None,
+            lines: None,
+            notes: NoteMode::Off,
+            lifecycles: None,
+        };
         let mut rect = Rect::NOTHING;
         let mut out = ctx.run_ui(input, |ui| {
             egui::Panel::bottom("filter").resizable(true).default_size(260.0).min_size(120.0).show(ui, |ui| {
@@ -1549,7 +1585,14 @@ mod tests {
         let ctx = egui::Context::default();
         let (mut state, mut columns) =
             (ViewState::default(), Columns { names: vec!["a", "b", "rest"], widths: vec![4, 3, 0] });
-        let hl = Highlight { highlighter: None, bookmarks: None, search: None, lines: None, notes: NoteMode::Off };
+        let hl = Highlight {
+            highlighter: None,
+            bookmarks: None,
+            search: None,
+            lines: None,
+            notes: NoteMode::Off,
+            lifecycles: None,
+        };
         let mut t = 0.0;
         let mut step = |events: Vec<egui::Event>, state: &mut ViewState, columns: &mut Columns| {
             t += 1.0 / 60.0;
@@ -1597,7 +1640,14 @@ mod tests {
         let file = nerka_core::TextFile::from_bytes("t", long.into_bytes());
         let short = nerka_core::TextFile::from_bytes("s", b"short\nlines\n".to_vec());
         let ctx = egui::Context::default();
-        let hl = Highlight { highlighter: None, bookmarks: None, search: None, lines: None, notes: NoteMode::Off };
+        let hl = Highlight {
+            highlighter: None,
+            bookmarks: None,
+            search: None,
+            lines: None,
+            notes: NoteMode::Off,
+            lifecycles: None,
+        };
         let mut t = 0.0;
         let mut step = |events: Vec<egui::Event>, state: &mut ViewState, file: &nerka_core::TextFile| {
             t += 1.0 / 60.0;
@@ -1673,7 +1723,14 @@ mod tests {
             t += 1.0 / 60.0;
             let screen = Rect::from_min_size(pos2(0.0, 0.0), vec2(600.0, 300.0));
             let input = egui::RawInput { screen_rect: Some(screen), time: Some(t), events, ..Default::default() };
-            let hl = Highlight { highlighter: None, bookmarks: None, search: None, lines: None, notes: NoteMode::Off };
+            let hl = Highlight {
+                highlighter: None,
+                bookmarks: None,
+                search: None,
+                lines: None,
+                notes: NoteMode::Off,
+                lifecycles: None,
+            };
             let mut out = ctx.run_ui(input, |ui| {
                 egui::CentralPanel::default().frame(egui::Frame::NONE).show(ui, |ui| {
                     log_view(ui, "v", state, file.line_count(), &|r| r, &file, &mut Columns::default(), &hl);
@@ -1775,7 +1832,14 @@ mod tests {
             t += 1.0 / 60.0;
             let screen = Rect::from_min_size(pos2(0.0, 0.0), vec2(600.0, 300.0));
             let input = egui::RawInput { screen_rect: Some(screen), time: Some(t), events, ..Default::default() };
-            let hl = Highlight { highlighter: None, bookmarks: None, search: None, lines: None, notes: NoteMode::Off };
+            let hl = Highlight {
+                highlighter: None,
+                bookmarks: None,
+                search: None,
+                lines: None,
+                notes: NoteMode::Off,
+                lifecycles: None,
+            };
             let mut out = ctx.run_ui(input, |ui| {
                 egui::CentralPanel::default().frame(egui::Frame::NONE).show(ui, |ui| {
                     log_view(ui, "v", state, rows, &|r| r, &file, &mut Columns::default(), &hl);
@@ -1830,7 +1894,14 @@ mod tests {
             t += 1.0 / 60.0;
             let screen = Rect::from_min_size(pos2(0.0, 0.0), vec2(600.0, 300.0));
             let input = egui::RawInput { screen_rect: Some(screen), time: Some(t), events, ..Default::default() };
-            let hl = Highlight { highlighter: None, bookmarks: None, search: None, lines: None, notes: NoteMode::Off };
+            let hl = Highlight {
+                highlighter: None,
+                bookmarks: None,
+                search: None,
+                lines: None,
+                notes: NoteMode::Off,
+                lifecycles: None,
+            };
             let mut out = ctx.run_ui(input, |ui| {
                 egui::CentralPanel::default().frame(egui::Frame::NONE).show(ui, |ui| {
                     log_view(ui, "v", state, rows, &|r| r, &file, &mut Columns::default(), &hl);
@@ -1929,7 +2000,14 @@ mod tests {
             t += 1.0 / 60.0;
             let screen = Rect::from_min_size(pos2(0.0, 0.0), vec2(600.0, 300.0));
             let input = egui::RawInput { screen_rect: Some(screen), time: Some(t), events, ..Default::default() };
-            let hl = Highlight { highlighter: None, bookmarks: Some(&marks), search: None, lines: None, notes };
+            let hl = Highlight {
+                highlighter: None,
+                bookmarks: Some(&marks),
+                search: None,
+                lines: None,
+                notes,
+                lifecycles: None,
+            };
             let mut out = ctx.run_ui(input, |ui| {
                 egui::CentralPanel::default().frame(egui::Frame::NONE).show(ui, |ui| {
                     log_view(ui, "v", state, file.line_count(), &|r| r, &file, &mut Columns::default(), &hl);
@@ -1997,7 +2075,14 @@ mod tests {
                 t += 1.0 / 60.0;
                 let screen = Rect::from_min_size(pos2(0.0, 0.0), vec2(600.0, 300.0));
                 let input = egui::RawInput { screen_rect: Some(screen), time: Some(t), events, ..Default::default() };
-                let hl = Highlight { highlighter: None, bookmarks: Some(&marks), search: None, lines: None, notes };
+                let hl = Highlight {
+                    highlighter: None,
+                    bookmarks: Some(&marks),
+                    search: None,
+                    lines: None,
+                    notes,
+                    lifecycles: None,
+                };
                 let mut out = ctx.run_ui(input, |ui| {
                     egui::CentralPanel::default().frame(egui::Frame::NONE).show(ui, |ui| {
                         log_view(ui, "v", &mut state, file.line_count(), &|r| r, &file, &mut Columns::default(), &hl);
@@ -2026,7 +2111,14 @@ mod tests {
         let text: String = (0..100).map(|i| format!("line {i}\n")).collect();
         let file = nerka_core::TextFile::from_bytes("t", text.into_bytes());
         let ctx = egui::Context::default();
-        let hl = Highlight { highlighter: None, bookmarks: None, search: None, lines: None, notes: NoteMode::Off };
+        let hl = Highlight {
+            highlighter: None,
+            bookmarks: None,
+            search: None,
+            lines: None,
+            notes: NoteMode::Off,
+            lifecycles: None,
+        };
         let mut t = 0.0;
         let mut step = |events: Vec<egui::Event>, state: &mut ViewState| {
             t += 1.0 / 60.0;
@@ -2099,7 +2191,14 @@ mod tests {
     #[test]
     fn a_long_last_row_does_not_make_the_scrollbar_flicker() {
         let ctx = egui::Context::default();
-        let hl = Highlight { highlighter: None, bookmarks: None, search: None, lines: None, notes: NoteMode::Off };
+        let hl = Highlight {
+            highlighter: None,
+            bookmarks: None,
+            search: None,
+            lines: None,
+            notes: NoteMode::Off,
+            lifecycles: None,
+        };
         let mut t = 0.0;
         // Wherever the long line is, one of these rows is the cut-off last one.
         for long in 0..30 {
@@ -2131,7 +2230,14 @@ mod tests {
         // Every second line, as a filtered view shows them.
         let rows: Vec<u64> = (0..20).step_by(2).collect();
         let ctx = egui::Context::default();
-        let hl = Highlight { highlighter: None, bookmarks: None, search: None, lines: None, notes: NoteMode::Off };
+        let hl = Highlight {
+            highlighter: None,
+            bookmarks: None,
+            search: None,
+            lines: None,
+            notes: NoteMode::Off,
+            lifecycles: None,
+        };
         let mut t = 0.0;
         let mut step = |events: Vec<egui::Event>, state: &mut ViewState| {
             t += 1.0 / 60.0;

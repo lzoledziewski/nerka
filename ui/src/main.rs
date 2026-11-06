@@ -2313,6 +2313,7 @@ impl Tab {
                     // The filter queries' line colours, as in the main view.
                     lines: lines.as_ref(),
                     notes: self.notes,
+                    lifecycles: None,
                 },
             );
             self.view_output(&out, true, |row| hits.lines[row as usize]);
@@ -2439,6 +2440,7 @@ impl Tab {
             None => row,
         };
         let rows = self.main_rows();
+        let boundaries = self.lifecycle_boundaries(file);
         let out = log_view(
             ui,
             "main",
@@ -2454,9 +2456,25 @@ impl Tab {
                 search: marks.as_ref(),
                 lines: lines.as_ref(),
                 notes: self.notes,
+                lifecycles: Some(&boundaries),
             },
         );
         self.view_output(&out, false, line_of_row);
+    }
+
+    /// Where the tab's lifecycles start (found already), for the view.
+    fn lifecycle_boundaries(&self, file: &dyn LogSource) -> Vec<view::Boundary> {
+        let mut out = Vec::new();
+        for def in self.signals.lifecycles() {
+            let Some(l) = def.cached(file) else { continue };
+            for (i, life) in l.lives.iter().enumerate() {
+                let bad = l.lives[..i].iter().rev().find(|p| p.key == life.key).is_some_and(|p| p.outcome.is_bad());
+                out.push(view::Boundary { line: life.first, label: format!("{} {}", def.name(), life.label()), bad });
+            }
+        }
+        out.sort_by_key(|b| b.line);
+        out.dedup_by_key(|b| b.line);
+        out
     }
 }
 
@@ -4057,6 +4075,11 @@ impl App {
             }
             if let Some(line) = out.goto {
                 tab.goto_line(line);
+            }
+            if let Some(nfd) = out.filter
+                && tab.set_filter("query", &nfd)
+            {
+                tab.start_search(ui.ctx());
             }
         }
         let search_history = &self.search_history;

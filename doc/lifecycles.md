@@ -1,6 +1,18 @@
 # Lifecycles — design
 
-_Status: design for review, written 2026-11-06 with the owner. Nothing is built yet. Current state and decisions: `status.md`._
+_Status: design written 2026-11-06 with the owner; **v1 built 2026-11-07** (core, CLI, GUI), see "Built" below for what differs from the design and what is not built yet. Current state and decisions: `status.md`._
+
+## Built (2026-11-07)
+
+- **Core** (`core/src/lifecycle.rs`): `LifecycleDef` from the spec line `NAME[(KEY)]: CLAUSES` (`start NFD`, `reset @SIGNAL [tolerance DUR]`, `gap DUR`, `planned NFD`, `crash NFD`, `late DUR`; errors with positions). One pass finds `Lifecycles` (per key, numbered, outcome, boot time and spread, first uptime, lines) and the findings **missed reset**, **false reset** and **late start**, each with its line. The query hits come from the engine; the source's key, time and uptime are read in parallel chunks and walked in order. Results are cached per source.
+- **`@uptime`**: `LogSource::uptime` (DLT: `tmsp` through `Protocol::uptime`), a built-in like `@time`. A tab signal named `uptime` (text logs) takes its place for `reset @uptime`.
+- **Signals**: a lifecycle is a signal (`SignalDef::lifecycle`, saved in the signals file as `lifecycle …`), `:per(NAME)` and `:default(VALUE)` as designed. `Signals` links lifecycles and bound signals by name; a filter that uses a signal bound to a lifecycle that isn't defined is an error.
+- **CLI**: `--lifecycle SPEC`, `nerka lifecycles FILE` (a table, `--json` with an `issues` array, `--count QUERY`, `--strict`, `-n NAME`); bound signals and `@boot` work in `filter` / `search`.
+- **GUI**: the Signals panel defines lifecycles (Signal / Lifecycle in the form) and binds signals (Per, Default); a default shows as `idle (default)`, italic. **The lifecycles table is a section of the Signals panel** (not a panel of its own): key, number, first line (click: go there), duration, outcome (red when bad), `▾ filter` (sets `@boot == N AND ecu == "K"`), and its findings (click: go to the line). The plot draws a dashed line where each lifecycle starts, labelled where there is room, red after a bad end, **across all lanes**; a bound signal of a keyed lifecycle gets a lane per key (`ota A`), its defaults dashed, unset spans empty. The log view draws a line above each lifecycle's first row with its label.
+- **Tolerance**: `reset` steps back of up to 5 s aren't resets (the default; `tolerance` sets another). `late` defaults to 10 s.
+- **Benchmark** (512 MiB DLT, 6.25 M messages, 3 ECUs, 40 lifecycles; `gen_dlt` simulates reboots): finding them 267 ms; `@boot == 3 AND apid == NAV` 290–307 ms (finding included, cached afterwards in the GUI); `apid == NAV AND level >= WARN` unchanged at 16–17 ms.
+
+**Not built yet:** lifecycles in packs (and a shipped `boot(ecu)` pack for DLT), library query ids in clauses (NFD only), a key from a signal (fields only), a derived `@uptime` from `@time`, the findings clock jump and noisy, findings as bookmarks, next / previous lifecycle navigation, boundaries spanning only their key's lanes, start / end / count columns in the GUI table, `reset auto`, `--probe`. Lines without a key belong to no lifecycle (as proposed below).
 
 ## Goal
 

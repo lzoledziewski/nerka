@@ -21,6 +21,8 @@ cargo run -p nerka-cli -- --signal 'v=/v=(?<v>\d+)/' filter '@v > 100' app.log  
 cargo run -p nerka-cli -- --fibex ecu1.xml filter 'apid == NAV' trace.dlt        # DLT non-verbose via FIBEX
 cargo run -p nerka-cli -- --someip-port 30501 filter 'proto == SOMEIP AND type == ERROR' trace.pcap   # protocols by UDP port
 cargo run -p nerka-cli -- --records 'start=/\d{4}-\d\d-\d\d/' filter 'level >= ERROR' app.log   # multi-line records
+cargo run -p nerka-cli -- --lifecycle 'boot(ecu): reset @uptime; planned payload ~ /shutdown/' lifecycles trace.dlt   # boots per ECU
+cargo run -p nerka-cli -- --lifecycle 'boot(ecu): reset @uptime' --signal 'ota(s):enum:per(boot):default(idle)=/OTA (?<s>\w+)/' filter '@ota == idle' trace.dlt
 cargo run -p nerka-cli -- --pack packs/ expand -l ota -p cam=CAM1 --parts   # pack picks -> NFD
 cargo run -p nerka-cli -- --pack packs/ search --in 'level >= WARN' -l ota app.log
 cargo run --release -p nerka-core --example gen_log -- big.log 1024   # 1 GiB test log

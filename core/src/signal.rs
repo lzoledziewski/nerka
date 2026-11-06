@@ -742,7 +742,7 @@ impl SignalDef {
     }
 
     /// The value the source itself gives `line`, for `@time` and `@uptime`.
-    pub(crate) fn source_value(&self, source: &dyn LogSource, line: LineNo) -> Option<f64> {
+    pub fn source_value(&self, source: &dyn LogSource, line: LineNo) -> Option<f64> {
         match self.builtin {
             Builtin::Time => source.time(line),
             Builtin::Uptime => source.uptime(line),
