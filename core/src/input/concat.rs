@@ -265,5 +265,37 @@ pub fn open_many(
     Ok(Box::new(Concat::new(parts)?))
 }
 
+/// Like [`open_many`], but files that know their lines' times (DLT,
+/// captures) are put in the order they start: by the first time each
+/// holds. If any file has no time (a text log), the given order stays.
+/// Returns the paths in the order used.
+pub fn open_many_by_time(
+    paths: &[std::path::PathBuf],
+    options: &super::OpenOptions,
+    progress: &crate::Progress,
+) -> Result<(Box<dyn LogSource>, Vec<std::path::PathBuf>)> {
+    let mut parts = Vec::with_capacity(paths.len());
+    for p in paths {
+        parts.push((p.clone(), super::open_with(p, options, progress)?));
+    }
+    let starts: Option<Vec<f64>> = parts.iter().map(|(_, s)| start_time(s.as_ref())).collect();
+    if let Some(starts) = starts {
+        let mut order: Vec<usize> = (0..parts.len()).collect();
+        order.sort_by(|&a, &b| starts[a].total_cmp(&starts[b])); // stable: ties keep their order
+        let mut slots: Vec<Option<_>> = parts.into_iter().map(Some).collect();
+        parts = order.iter().map(|&i| slots[i].take().expect("a permutation")).collect();
+    }
+    let paths: Vec<std::path::PathBuf> = parts.iter().map(|(p, _)| p.clone()).collect();
+    let mut sources: Vec<Box<dyn LogSource>> = parts.into_iter().map(|(_, s)| s).collect();
+    let source = if sources.len() == 1 { sources.pop().expect("one") } else { Box::new(Concat::new(sources)?) };
+    Ok((source, paths))
+}
+
+/// The first time a source holds (looking at its first lines only), if it
+/// knows its lines' times.
+pub fn start_time(s: &dyn LogSource) -> Option<f64> {
+    (0..s.line_count().min(1000)).find_map(|l| s.time(l))
+}
+
 #[cfg(test)]
 mod tests;

@@ -500,6 +500,9 @@ impl PreviewCache {
 
 /// One open file (or several of one kind, one after another) with its own
 /// filter, view positions and bookmarks.
+/// A tab's files, read: the source and the paths in the order read.
+type Opened = (Box<dyn LogSource>, Vec<PathBuf>);
+
 struct Tab {
     /// The first file.
     path: PathBuf,
@@ -511,7 +514,8 @@ struct Tab {
     /// opens them as separate tabs.
     mixed: Option<String>,
     file: Option<Arc<dyn LogSource>>,
-    loading: Option<Job<Box<dyn LogSource>>>,
+    /// The files being read, and their paths in the order read.
+    loading: Option<Job<Opened>>,
     /// The lines the filter keeps (all lines without a filter).
     main_view: ViewState,
     /// The search hits.
@@ -1042,7 +1046,8 @@ impl Tab {
             part_files: Vec::new(),
             mixed: None,
             file: None,
-            loading: Some(Job::spawn(ctx, move |prog| nerka_core::open_many(&ps, &options, prog))),
+            // Files that know their times (DLT, captures) in the order they start.
+            loading: Some(Job::spawn(ctx, move |prog| nerka_core::open_many_by_time(&ps, &options, prog))),
             main_view: ViewState::with_free_keys(),
             hits_view: ViewState::default(),
             columns: Columns::default(),
@@ -1217,7 +1222,7 @@ impl Tab {
         self.file = None;
         self.result = None;
         self.reopen_at = Some(line);
-        self.loading = Some(Job::spawn(ctx, move |prog| nerka_core::open_many(&ps, &options, prog)));
+        self.loading = Some(Job::spawn(ctx, move |prog| nerka_core::open_many(&ps, &options, prog).map(|f| (f, ps))));
     }
 
     /// Show `paths` in this tab instead (the Files window: reordered, added,
@@ -1252,7 +1257,7 @@ impl Tab {
         let mut options = prefs.open_options();
         options.fibex = fibex;
         options.records = self.records.clone();
-        self.loading = Some(Job::spawn(ctx, move |prog| nerka_core::open_many(&ps, &options, prog)));
+        self.loading = Some(Job::spawn(ctx, move |prog| nerka_core::open_many(&ps, &options, prog).map(|f| (f, ps))));
     }
 
     /// Build the tab's signals again if what they come from changed: the
@@ -1430,7 +1435,11 @@ impl Tab {
                 Poll::Done(r, took) => {
                     self.loading = None;
                     match r {
-                        Ok(f) => {
+                        Ok((f, order)) => {
+                            if order != self.paths {
+                                self.path = order[0].clone();
+                                self.paths = order;
+                            }
                             if let Some(FilesUndo { at, .. }) = self.files_undo.take() {
                                 // Other files: what referred to the old lines goes.
                                 self.cancel_jobs();
@@ -2598,6 +2607,7 @@ fn expansion_lines<'a>(a: &'a Applied, lit: &dyn Fn(u64) -> bool) -> Vec<ChipLin
             let joiner = match p.role {
                 Role::Include if includes == 0 => "",
                 Role::Include => "OR",
+                Role::Require => "AND",
                 Role::Exclude => "AND NOT",
                 // Not in the box: signals and colours only.
                 Role::Signal => "signals:",
@@ -2911,6 +2921,13 @@ impl App {
         }
         self.library = lib;
         self.library_errors = errors;
+        // Another window may have counted uses since.
+        if let Some(path) = nerka_core::pack::default_usage_path() {
+            match pack::Usage::load(&path) {
+                Ok(u) => self.library_view.usage = u,
+                Err(e) => self.library_errors.push(format!("{}: {e}", path.display())),
+            }
+        }
     }
 
     fn preset_action(&mut self, ctx: &egui::Context, action: presets::Action) {
@@ -2959,24 +2976,39 @@ impl App {
             library::Action::Reload => self.load_library(),
             library::Action::Apply => {
                 let lib = std::mem::take(&mut self.library);
-                let recorded = self.tab().and_then(|t| t.apply_selection(ctx, &lib));
+                let recorded =
+                    self.tab().and_then(|t| t.apply_selection(ctx, &lib).map(|nfd| (nfd, t.picks.used_queries())));
                 self.library = lib;
-                if let Some(nfd) = recorded {
+                if let Some((nfd, used)) = recorded {
                     self.record_search("query", &nfd);
+                    self.record_usage(&used);
                 }
             }
             library::Action::Search { target, add } => {
                 let lib = std::mem::take(&mut self.library);
                 let searched = self.tab().and_then(|t| {
                     t.search_for(ctx, &lib, &target, add);
-                    t.search.active.is_some().then(|| (t.search.tag(), t.search.pattern.clone()))
+                    let used = t.picks.target_query(&target);
+                    t.search.active.is_some().then(|| (t.search.tag(), t.search.pattern.clone(), used))
                 });
                 self.library = lib;
-                if let Some((tag, pattern)) = searched {
+                if let Some((tag, pattern, used)) = searched {
                     self.record_search_box(tag, &pattern);
+                    self.record_usage(&used.into_iter().collect::<Vec<_>>());
                 }
             }
             library::Action::Edited { renamed, removed } => {
+                let usage = &mut self.library_view.usage;
+                let before = usage.clone();
+                if let Some((old, new)) = &renamed {
+                    usage.renamed(old, new);
+                }
+                if let Some(id) = &removed {
+                    usage.removed(id);
+                }
+                if *usage != before {
+                    self.save_usage();
+                }
                 for t in &mut self.tabs {
                     if let Some((old, new)) = &renamed {
                         t.picks.renamed(old, new);
@@ -2992,6 +3024,23 @@ impl App {
             }
         }
     }
+    /// Count a use of these library queries (the Most used list) and save.
+    fn record_usage(&mut self, ids: &[String]) {
+        if ids.is_empty() {
+            return;
+        }
+        self.library_view.usage.record(ids.iter().map(String::as_str));
+        self.save_usage();
+    }
+
+    fn save_usage(&mut self) {
+        if let Some(path) = nerka_core::pack::default_usage_path()
+            && let Err(e) = self.library_view.usage.save(&path)
+        {
+            self.status = format!("{}: {e}", path.display());
+        }
+    }
+
     fn load_saved_signals(&mut self) {
         let Some(path) = signals_path() else { return };
         let Ok(text) = std::fs::read_to_string(&path) else { return };
@@ -4817,6 +4866,35 @@ gear=D
         assert_eq!(p.plotted, [arg.name.as_str(), "w"]);
         assert_eq!(p.name.as_deref(), Some("drive"));
         drop(p);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn dlt_files_opened_together_are_put_in_the_order_they_start() {
+        use nerka_core::input::dlt::writer::{Msg, Value};
+        let dir = std::env::temp_dir().join(format!("nerka-gui-bytime-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let dlt = |path: &PathBuf, secs: u32| {
+            let mut buf = Vec::new();
+            let mut m = Msg::log(nerka_core::Level::Warn, "ECU1", "NAV", "CTX", vec![Value::Str("x".into()).into()]);
+            m.secs = secs;
+            m.encode(&mut buf);
+            std::fs::write(path, buf).unwrap();
+        };
+        let (late, early) = (dir.join("a_late.dlt"), dir.join("b_early.dlt"));
+        dlt(&late, 2_000);
+        dlt(&early, 1_000);
+        let ctx = egui::Context::default();
+        let mut app = App::default();
+        app.open_files(&ctx, vec![late.clone(), early.clone()]);
+        settle_app(&mut app, &ctx);
+        let t = &mut app.tabs[0];
+        assert_eq!(t.paths, [early.clone(), late.clone()]);
+        assert_eq!(t.title(), "b_early.dlt + 1");
+        // Reordered by hand in the Files window: that order is kept.
+        t.set_files(&ctx, vec![late.clone(), early.clone()], &SearchPrefs::default(), None);
+        settle(t, &ctx);
+        assert_eq!(t.paths, [late, early]);
         std::fs::remove_dir_all(&dir).ok();
     }
 

@@ -14,7 +14,8 @@
 //! never leaves stale picks behind.
 //!
 //! Order matters: included filter queries are OR'ed in this order, and
-//! where line colours overlap the later node wins.
+//! where line colours overlap the later node wins. Required (`&`) nodes
+//! are ANDed to the included ones: `(a OR b) AND r`.
 //!
 //! The panes only edit the selection. Expanding it into NFD is core's job
 //! (`nerka_core::pack::expand`): local (new or edited) nodes are put into a
@@ -35,6 +36,8 @@ use std::collections::BTreeMap;
 pub enum Use {
     /// Lines it matches are kept (OR'ed with the other includes).
     Include,
+    /// Kept lines must match it too (AND).
+    Require,
     /// Lines it matches are dropped (AND NOT).
     Exclude,
     /// Not in the filter: its named groups are signals, and it can colour
@@ -46,6 +49,7 @@ impl Use {
     fn symbol(self) -> &'static str {
         match self {
             Use::Include => "+",
+            Use::Require => "&",
             Use::Exclude => "−",
             Use::Signal => "~",
         }
@@ -54,6 +58,7 @@ impl Use {
     fn describe(self) -> &'static str {
         match self {
             Use::Include => "+  include in the filter",
+            Use::Require => "&  require (AND): kept lines must match it too",
             Use::Exclude => "−  exclude from the filter",
             Use::Signal => "~  signals only (doesn't filter; can colour lines)",
         }
@@ -64,6 +69,7 @@ impl From<pack::Role> for Use {
     fn from(r: pack::Role) -> Use {
         match r {
             pack::Role::Include => Use::Include,
+            pack::Role::Require => Use::Require,
             pack::Role::Exclude => Use::Exclude,
             pack::Role::Signal => Use::Signal,
         }
@@ -74,6 +80,7 @@ impl From<Use> for pack::Role {
     fn from(u: Use) -> pack::Role {
         match u {
             Use::Include => pack::Role::Include,
+            Use::Require => pack::Role::Require,
             Use::Exclude => pack::Role::Exclude,
             Use::Signal => pack::Role::Signal,
         }
@@ -116,6 +123,8 @@ pub struct Node {
     pub error: Option<String>,
     /// Kinds its pack pins for its named groups (`signals:`).
     pub signals: Vec<(String, SignalKind)>,
+    /// What it is for (the pack's `##` lines).
+    pub note: String,
 }
 
 impl Node {
@@ -136,6 +145,7 @@ impl Node {
             open: true,
             error: None,
             signals: Vec::new(),
+            note: String::new(),
         }
     }
 
@@ -150,6 +160,7 @@ impl Node {
             labels: q.labels.join(", "),
             color: q.color.clone().unwrap_or_default(),
             signals: q.signals.clone(),
+            note: q.note.clone(),
             edited: false,
             open: false,
             ..Node::blank(key, role)
@@ -180,7 +191,9 @@ impl Node {
             color: Some(self.color.trim().to_owned()).filter(|c| !c.is_empty()),
             signals: self.signals.clone(),
             text: self.text.clone(),
+            note: self.note.trim().to_owned(),
             line: 0,
+            start_line: 0,
             end_line: 0,
         }
     }
@@ -294,6 +307,21 @@ impl Picks {
         true
     }
 
+    /// Add every query with `label` (or one below it) at `at`, in library
+    /// order; ones already selected as includes are skipped. Returns how
+    /// many were added.
+    pub fn add_label(&mut self, lib: &Library, label: &str, at: usize) -> usize {
+        let mut at = at.min(self.nodes.len());
+        let mut added = 0;
+        for id in lib.with_label(label) {
+            if self.add(lib, &id, Use::Include, Some(at)) {
+                at += 1;
+                added += 1;
+            }
+        }
+        added
+    }
+
     /// A new, empty node at the end, with its editor open.
     pub fn add_new(&mut self, role: Use) -> u64 {
         let key = self.next_key();
@@ -369,6 +397,7 @@ impl Picks {
                     n.parent = if n.detached { None } else { p.parent_of(q) };
                     n.labels = q.labels.join(", ");
                     n.color = q.color.clone().unwrap_or_default();
+                    n.note = q.note.clone();
                 }
                 Some(_) => {}
                 None => {
@@ -408,6 +437,7 @@ impl Picks {
             let id = n.expand_id();
             match n.role {
                 Use::Include => sel.include.push(Pick::Query(id.clone())),
+                Use::Require => sel.require.push(Pick::Query(id.clone())),
                 Use::Exclude => sel.exclude.push(Pick::Query(id.clone())),
                 Use::Signal => sel.signal.push(Pick::Query(id.clone())),
             }
@@ -496,6 +526,7 @@ impl Picks {
                         labels: q.labels.join(", "),
                         color: q.color.clone().unwrap_or_default(),
                         signals: q.signals.clone(),
+                        note: q.note.clone(),
                         open: false,
                         ..Node::blank(key, role)
                     }
@@ -567,12 +598,37 @@ pub struct LibEdit {
 pub struct LibraryView {
     pub by_pack: bool,
     pub editing: Option<LibEdit>,
+    /// The search box: words that name, labels, note or text must hold.
+    pub search: String,
+    /// How often each query was used (the Most used list).
+    pub usage: pack::Usage,
+}
+
+/// How many queries the Most used list shows.
+const MOST_USED: usize = 10;
+
+impl Picks {
+    /// The library queries the filter nodes stand for (edited copies
+    /// count for the query they came from): what Apply counts as used.
+    pub fn used_queries(&self) -> Vec<String> {
+        self.nodes.iter().filter_map(|n| n.source.clone()).collect()
+    }
+
+    /// The library query a search target stands for.
+    pub fn target_query(&self, target: &Target) -> Option<String> {
+        match target {
+            Target::Library(id) => Some(id.clone()),
+            Target::Node(key) => self.nodes.iter().find(|n| n.key == *key).and_then(|n| n.source.clone()),
+        }
+    }
 }
 
 /// Dragged between the panes.
 #[derive(Debug, Clone)]
 enum Drag {
     Library(String),
+    /// Every query with this label (or one below it).
+    Label(String),
     Node(u64),
 }
 
@@ -741,10 +797,52 @@ pub fn library_panel(
         ui.separator();
     }
 
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 4.0;
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            let clear = ui.add_enabled(!view.search.is_empty(), egui::Button::new("✖").small());
+            if clear.on_hover_text("Clear the search").clicked() {
+                view.search.clear();
+            }
+            ui.add(
+                egui::TextEdit::singleline(&mut view.search)
+                    .hint_text("🔎 find queries: name, label, note, text")
+                    .desired_width(ui.available_width()),
+            )
+            .on_hover_text("Queries that hold every word typed (ignoring case)");
+        });
+    });
     ui.weak("+ adds to the selection (or drag it) · 🔍 searches · ⋮ edit, refine");
     let lib_ro: &Library = lib;
     let mut edit_request: Option<EditRequest> = None;
+    let found = (!view.search.trim().is_empty()).then(|| lib_ro.search(&view.search));
+    let most_used = view.usage.most_used(lib_ro, MOST_USED);
     egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+        if let Some(ids) = &found {
+            if ids.is_empty() {
+                ui.weak("No query holds all of these words.");
+            } else {
+                ui.weak(format!("{} found", ids.len()));
+                group_ui(ui, lib_ro, ids, picks, &mut action, &mut edit_request, schema);
+            }
+            return;
+        }
+        // With the labels only: grouped by pack, the packs are the point.
+        if !view.by_pack && !most_used.is_empty() {
+            egui::CollapsingHeader::new(RichText::new("Most used").strong())
+                .id_salt("most used")
+                .default_open(true)
+                .show(ui, |ui| {
+                    for (id, _) in &most_used {
+                        ui.horizontal(|ui| {
+                            ui.add_space(ui.spacing().icon_width + ui.spacing().item_spacing.x);
+                            query_row(ui, lib_ro, id, None, picks, &mut action, &mut edit_request, schema);
+                        });
+                    }
+                })
+                .header_response
+                .on_hover_text("The queries you applied or searched for most often");
+        }
         if view.by_pack {
             for p in lib_ro.packs() {
                 let ids: Vec<String> = p.queries.iter().map(|q| format!("{}.{}", p.name, q.id)).collect();
@@ -766,10 +864,13 @@ pub fn library_panel(
         } else {
             for label in lib_ro.labels() {
                 let ids = lib_ro.with_label(label);
-                egui::CollapsingHeader::new(RichText::new(label).strong())
-                    .id_salt(("label", label))
-                    .default_open(true)
-                    .show(ui, |ui| group_ui(ui, lib_ro, &ids, picks, &mut action, &mut edit_request, schema));
+                egui::collapsing_header::CollapsingState::load_with_default_open(
+                    ui.ctx(),
+                    ui.make_persistent_id(("label", label)),
+                    true,
+                )
+                .show_header(ui, |ui| label_header(ui, label, ids.len()))
+                .body(|ui| group_ui(ui, lib_ro, &ids, picks, &mut action, &mut edit_request, schema));
             }
             let unlabelled: Vec<String> = lib_ro
                 .packs()
@@ -795,6 +896,25 @@ pub fn library_panel(
         view.editing = Some(LibEdit { pack, old, node, confirm_delete: false });
     }
     action
+}
+
+/// A label's name in the library: drag it into the selection to add all
+/// of its queries there.
+fn label_header(ui: &mut egui::Ui, label: &str, n: usize) {
+    let r = ui.add(egui::Label::new(RichText::new(label).strong()).sense(egui::Sense::drag()));
+    r.dnd_set_drag_payload(Drag::Label(label.to_owned()));
+    if r.dragged()
+        && let Some(p) = ui.ctx().pointer_interact_pos()
+    {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+        egui::Area::new(ui.make_persistent_id(("label-drag-preview", label)))
+            .order(egui::Order::Tooltip)
+            .fixed_pos(p + egui::vec2(12.0, 4.0))
+            .show(ui.ctx(), |ui| {
+                egui::Frame::popup(ui.style()).show(ui, |ui| ui.label(format!("{label}: {n} queries")));
+            });
+    }
+    r.on_hover_text("Drag into the selection to add all of its queries");
 }
 
 /// Open the library editor: on query `old` of `pack`, or on a new query
@@ -935,7 +1055,8 @@ fn query_row(
     if !q.params.is_empty() {
         name += &format!("({})", q.params.join(", "));
     }
-    let mut tip = format!("{id}\n\n{}", q.text);
+    let mut tip =
+        if q.note.is_empty() { format!("{id}\n\n{}", q.text) } else { format!("{id}\n{}\n\n{}", q.note, q.text) };
     if let Some(parent) = pack.parent_of(q) {
         tip += &format!("\n\nrefines {parent}");
     }
@@ -985,6 +1106,12 @@ fn query_row(
                 ui.close();
             }
             ui.separator();
+            let r = ui.add_enabled(usable, egui::Button::new("Require (AND)"));
+            let tip = "Add to the selection as & : the lines the filter keeps must match it too";
+            if r.on_hover_text(tip).on_disabled_hover_text(&why).clicked() {
+                picks.add(lib, id, Use::Require, None);
+                ui.close();
+            }
             let r = ui.add_enabled(usable, egui::Button::new("Exclude from the filter"));
             if r.on_hover_text("Add to the selection as − (AND NOT)").on_disabled_hover_text(&why).clicked() {
                 picks.add(lib, id, Use::Exclude, None);
@@ -1124,6 +1251,19 @@ fn fields_ui(ui: &mut egui::Ui, n: &mut Node, parents: &[String], need_name: boo
             n.edited = true;
         }
         ui.end_row();
+        ui.label("Note").on_hover_text("What it is for: shown on hover, searched, saved as ## lines in the pack");
+        if ui
+            .add(
+                egui::TextEdit::multiline(&mut n.note)
+                    .hint_text("what it finds, when to use it")
+                    .desired_rows(1)
+                    .desired_width(f32::INFINITY),
+            )
+            .changed()
+        {
+            n.edited = true;
+        }
+        ui.end_row();
     });
     let r = ui.add(
         egui::TextEdit::multiline(&mut n.text)
@@ -1159,7 +1299,7 @@ pub fn selection_panel(ui: &mut egui::Ui, lib: &mut Library, picks: &mut Picks) 
             }
         });
     });
-    ui.weak("Filter queries, in order: ⠿ drags · − removes · ✎ edits · 🔍 searches");
+    ui.weak("Filter queries, in order: + OR · & AND · − AND NOT · ⠿ drags · ✎ edits · 🔍 searches");
     ui.separator();
 
     // Bottom part first, so the list gets the space that is left.
@@ -1237,6 +1377,9 @@ pub fn selection_panel(ui: &mut egui::Ui, lib: &mut Library, picks: &mut Picks) 
             Drag::Library(id) => {
                 picks.add(lib, id, Use::Include, Some(insert_at));
             }
+            Drag::Label(label) => {
+                picks.add_label(lib, label, insert_at);
+            }
             Drag::Node(key) => picks.move_node(*key, insert_at),
         }
     }
@@ -1277,7 +1420,7 @@ fn node_row(ui: &mut egui::Ui, n: &mut Node, remove: &mut Option<u64>, action: &
         .response
         .on_hover_text("Drag to reorder");
         egui::ComboBox::from_id_salt(("role", n.key)).width(28.0).selected_text(n.role.symbol()).show_ui(ui, |ui| {
-            for u in [Use::Include, Use::Exclude, Use::Signal] {
+            for u in [Use::Include, Use::Require, Use::Exclude, Use::Signal] {
                 ui.selectable_value(&mut n.role, u, u.describe());
             }
         });
@@ -1840,7 +1983,8 @@ mod tests {
     #[test]
     fn the_dots_menu_of_a_library_query_edits_or_refines_it() {
         let ctx = egui::Context::default();
-        let (mut lib, mut picks, mut view) = (lib(), Picks::default(), LibraryView { by_pack: true, editing: None });
+        let (mut lib, mut picks, mut view) =
+            (lib(), Picks::default(), LibraryView { by_pack: true, ..Default::default() });
         let mut frame = |events: Vec<egui::Event>, view: &mut LibraryView| {
             let input = egui::RawInput {
                 screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(500.0, 600.0))),
@@ -1887,7 +2031,7 @@ mod tests {
     fn queries_a_file_cant_run_are_greyed_out() {
         let mut lib = Library::new();
         lib.add(parse_pack("d.nerka-pack", "pack d\nquery nav\n  apid == NAV\nquery any\n  /x/\n").unwrap()).unwrap();
-        let (mut picks, mut view) = (Picks::default(), LibraryView { by_pack: true, editing: None });
+        let (mut picks, mut view) = (Picks::default(), LibraryView { by_pack: true, ..Default::default() });
         let ctx = egui::Context::default();
         // On a text file (no fields): + of `nav` is disabled, of `any` not.
         let mut frame = |events: Vec<egui::Event>, picks: &mut Picks| {
@@ -1951,7 +2095,7 @@ query swup  parent: soc
   /SWUP/
 ";
         lib.add(parse_pack("soc.nerka-pack", text).unwrap()).unwrap();
-        let (mut picks, mut view) = (Picks::default(), LibraryView { by_pack: true, editing: None });
+        let (mut picks, mut view) = (Picks::default(), LibraryView { by_pack: true, ..Default::default() });
         let ctx = egui::Context::default();
         let mut frame = |events: Vec<egui::Event>, picks: &mut Picks| {
             let input = egui::RawInput {
@@ -2129,6 +2273,61 @@ query swup  parent: soc
         p.node_mut(new).unwrap().text = "level >= LOUD".into();
         let e = p.expand(&lib).unwrap_err();
         assert!(e.contains("unknown level"), "{e}");
+    }
+
+    #[test]
+    fn required_nodes_are_anded_and_count_as_used() {
+        let lib = lib();
+        let mut p = Picks::default();
+        p.add(&lib, "v.slow", Use::Include, None);
+        p.add(&lib, "v.drops", Use::Include, None);
+        // The same query may be included and required: two roles, two nodes.
+        assert!(p.add(&lib, "v.slow", Use::Require, None));
+        let new = p.add_new(Use::Require);
+        p.node_mut(new).unwrap().text = "level >= WARN".into();
+        p.params.insert("ecu".into(), ("E1".into(), false));
+        let a = p.expand(&lib).unwrap();
+        assert_eq!(a.exp.nfd, r#"((/slow/) OR (ecu == "E1") AND (/drop/)) AND (/slow/) AND (level >= WARN)"#);
+        assert_eq!(a.names, ["slow", "drops", "slow", "level >= WARN"]);
+        // The library queries applied: the new node has none.
+        assert_eq!(p.used_queries(), ["v.slow", "v.drops", "v.slow"]);
+        assert_eq!(p.target_query(&Target::Node(new)), None);
+        assert_eq!(p.target_query(&Target::Library("v.drops".into())).as_deref(), Some("v.drops"));
+        // A preset keeps the role.
+        let preset = p.to_preset("x");
+        let mut q = Picks::default();
+        q.use_preset(&lib, &preset);
+        let roles: Vec<Use> = q.nodes.iter().map(|n| n.role).collect();
+        assert_eq!(roles, [Use::Include, Use::Include, Use::Require, Use::Require]);
+    }
+
+    #[test]
+    fn a_dropped_label_adds_its_queries_in_place() {
+        let mut lib = Library::new();
+        let text =
+            "pack v\nquery a  labels: sys/x\n  /a/\nquery b  labels: other\n  /b/\nquery c  labels: sys\n  /c/\n";
+        lib.add(parse_pack("v.nerka-pack", text).unwrap()).unwrap();
+        let mut p = Picks::default();
+        p.add(&lib, "v.b", Use::Include, None);
+        p.add(&lib, "v.c", Use::Include, None);
+        // Dropped before b: a and c (sys and below), c only once.
+        assert_eq!(p.add_label(&lib, "sys", 0), 1);
+        let names: Vec<&str> = p.nodes.iter().map(|n| n.name.as_str()).collect();
+        assert_eq!(names, ["a", "b", "c"]);
+        assert_eq!(p.add_label(&lib, "nope", 9), 0);
+    }
+
+    #[test]
+    fn notes_come_from_the_pack_and_are_saved_with_the_query() {
+        let mut lib = Library::new();
+        let text = "pack v\n## Slow paths.\nquery slow\n  /slow/\n";
+        lib.add(parse_pack("v.nerka-pack", text).unwrap()).unwrap();
+        let mut p = Picks::default();
+        p.add(&lib, "v.slow", Use::Include, None);
+        assert_eq!(p.nodes[0].note, "Slow paths.");
+        p.nodes[0].note = "Slow paths.\nTry with level >= WARN.".into();
+        let q = p.nodes[0].as_query("slow");
+        assert_eq!(format_query(&q), "## Slow paths.\n## Try with level >= WARN.\nquery slow\n    /slow/");
     }
 
     #[test]

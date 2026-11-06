@@ -146,6 +146,12 @@ struct PickArgs {
     /// Include every query with this label (or one below it).
     #[arg(short = 'l', long = "label")]
     labels: Vec<String>,
+    /// Require a query (AND): kept lines must match it too.
+    #[arg(short = 'r', long = "require", value_name = "ID")]
+    require: Vec<String>,
+    /// Require every query with this label (each one ANDed).
+    #[arg(short = 'R', long = "require-label", value_name = "LABEL")]
+    require_labels: Vec<String>,
     /// Exclude a query (AND NOT).
     #[arg(short = 'x', long = "exclude", value_name = "ID")]
     exclude: Vec<String>,
@@ -162,7 +168,12 @@ struct PickArgs {
 
 impl PickArgs {
     fn is_empty(&self) -> bool {
-        self.queries.is_empty() && self.labels.is_empty() && self.exclude.is_empty() && self.exclude_labels.is_empty()
+        self.queries.is_empty()
+            && self.labels.is_empty()
+            && self.require.is_empty()
+            && self.require_labels.is_empty()
+            && self.exclude.is_empty()
+            && self.exclude_labels.is_empty()
     }
 
     /// Queries come before labels, each in command-line order.
@@ -172,6 +183,7 @@ impl PickArgs {
         };
         let sel = Selection {
             include: picks(&self.queries, &self.labels),
+            require: picks(&self.require, &self.require_labels),
             exclude: picks(&self.exclude, &self.exclude_labels),
             signal: Vec::new(),
         };
@@ -414,13 +426,18 @@ fn run() -> Result<()> {
         }
         Cmd::Expand { picks, parts } => {
             if picks.is_empty() {
-                anyhow::bail!("nothing picked: use -q ID, -l LABEL, -x ID or -X LABEL");
+                anyhow::bail!("nothing picked: use -q ID, -l LABEL, -r ID, -R LABEL, -x ID or -X LABEL");
             }
             let e = picks.expand(&library(&cli.pack)?)?;
             writeln!(out, "{}", e.nfd)?;
             if parts {
                 for p in &e.parts {
-                    let role = if p.role == Role::Include { "include" } else { "exclude" };
+                    let role = match p.role {
+                        Role::Include => "include",
+                        Role::Require => "require",
+                        Role::Exclude => "exclude",
+                        Role::Signal => "signal",
+                    };
                     let note = p.covered.as_ref().map(|by| format!(" (in {by}, not repeated)")).unwrap_or_default();
                     writeln!(out, "{role} {}{note}: {}", p.query, e.part_nfd(p))?;
                 }

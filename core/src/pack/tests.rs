@@ -239,3 +239,16 @@ fn library_loads_files_and_dirs() {
     assert_eq!(lenient.get("ota.swup").unwrap().1.text, "apid == SWUP2");
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+#[test]
+fn search_matches_every_word_in_name_labels_note_or_text() {
+    let mut lib = Library::new();
+    let text = "pack vision\n## Frames the camera dropped.\nquery frame_drops  labels: perf\n    /frame drop/\nquery boot\n    /starting/\n";
+    lib.add(parse_pack("t", text).unwrap()).unwrap();
+    assert_eq!(lib.search("CAMERA"), ["vision.frame_drops"]);
+    assert_eq!(lib.search("perf drop"), ["vision.frame_drops"]);
+    assert_eq!(lib.search("vision.boot"), ["vision.boot"]);
+    assert_eq!(lib.search("start"), ["vision.boot"]);
+    assert_eq!(lib.search("").len(), 2);
+    assert!(lib.search("perf boot").is_empty());
+}

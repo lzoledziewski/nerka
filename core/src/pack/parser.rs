@@ -10,12 +10,22 @@ pub fn parse_pack(file: &str, text: &str) -> Result<Pack, PackError> {
     let mut queries: Vec<PackQuery> = Vec::new();
     // The query whose body is being read, with its body lines.
     let mut cur: Option<(PackQuery, Vec<(usize, &str)>)> = None;
+    // `##` lines read since the last other line: the next query's note.
+    let mut note: Vec<(usize, &str)> = Vec::new();
 
     for (ln, line) in text.lines().enumerate() {
         if line.trim().is_empty() {
-            if let Some((_, body)) = &mut cur {
-                body.push((ln, ""));
+            match &mut cur {
+                Some((_, body)) => body.push((ln, "")),
+                None => note.clear(),
             }
+            continue;
+        }
+        if let Some(n) = line.strip_prefix("##") {
+            if let Some((q, body)) = cur.take() {
+                queries.push(finish(file, q, body)?);
+            }
+            note.push((ln, n.strip_prefix(' ').unwrap_or(n).trim_end()));
             continue;
         }
         if line.starts_with([' ', '\t']) {
@@ -32,6 +42,7 @@ pub fn parse_pack(file: &str, text: &str) -> Result<Pack, PackError> {
             queries.push(finish(file, q, body)?);
         }
         let content = strip_comment(line);
+        let note_lines = std::mem::take(&mut note);
         let Some(word) = content.split_whitespace().next() else { continue };
         match (word, &name) {
             ("pack", None) => {
@@ -73,7 +84,12 @@ pub fn parse_pack(file: &str, text: &str) -> Result<Pack, PackError> {
             }
             ("pack", Some(_)) => return Err(err(ln, 0, "a file holds one pack: second 'pack' line".into())),
             ("query", Some(_)) => {
-                let q = header(line, &content[..content.trim_end().len()], ln).map_err(|(col, m)| err(ln, col, m))?;
+                let mut q =
+                    header(line, &content[..content.trim_end().len()], ln).map_err(|(col, m)| err(ln, col, m))?;
+                if let Some(&(first, _)) = note_lines.first() {
+                    q.start_line = first;
+                    q.note = note_lines.iter().map(|(_, l)| *l).collect::<Vec<_>>().join("\n");
+                }
                 if let Some(other) = queries.iter().find(|o| o.id == q.id) {
                     let col = col_of(line, line.find(&q.id).unwrap_or(0));
                     return Err(err(
@@ -177,7 +193,9 @@ fn header(line: &str, content: &str, ln: usize) -> Result<PackQuery, (usize, Str
         color: None,
         signals: Vec::new(),
         text: String::new(),
+        note: String::new(),
         line: ln,
+        start_line: ln,
         end_line: ln,
     };
     let attrs = attributes(content, pos).map_err(|(b, m)| (col_of(line, b), m))?;

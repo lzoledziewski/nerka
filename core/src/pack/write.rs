@@ -10,10 +10,21 @@ fn quoted(name: &str) -> String {
 }
 use std::path::{Path, PathBuf};
 
-/// A query as pack text: the header line and the body indented by four
-/// spaces, without a trailing newline.
+/// A query as pack text: its note (`##` lines), the header line and the
+/// body indented by four spaces, without a trailing newline.
 pub fn format_query(q: &PackQuery) -> String {
-    let mut out = format!("query {}", quoted(&q.id));
+    let mut out = String::new();
+    if !q.note.trim().is_empty() {
+        for line in q.note.trim_end().lines() {
+            let line = line.trim_end();
+            out += if line.is_empty() { "##\n" } else { "## " };
+            if !line.is_empty() {
+                out += line;
+                out.push('\n');
+            }
+        }
+    }
+    out += &format!("query {}", quoted(&q.id));
     if !q.params.is_empty() {
         out += &format!("({})", q.params.join(", "));
     }
@@ -85,7 +96,7 @@ fn put(file: &str, text: &str, at: &str, q: Option<&PackQuery>) -> Result<String
     let mut lines: Vec<String> = text.lines().map(str::to_owned).collect();
     match pack.query(at) {
         Some(old) => {
-            let mut start = old.line;
+            let mut start = old.start_line;
             if q.is_none() && start > 0 && lines[start - 1].trim().is_empty() {
                 start -= 1;
             }
@@ -166,9 +177,33 @@ query b
             color: None,
             signals: Vec::new(),
             text: text.into(),
+            note: String::new(),
             line: 0,
+            start_line: 0,
             end_line: 0,
         }
+    }
+
+    #[test]
+    fn notes_are_read_written_and_replaced_with_their_query() {
+        let file =
+            "pack p\n\n## Frame drops.\n##\n## Use with cam.\nquery a\n    /drop/\n## a comment\n\nquery b\n    /x/\n";
+        let p = parse_pack("t", file).unwrap();
+        let a = p.query("a").unwrap();
+        assert_eq!(a.note, "Frame drops.\n\nUse with cam.");
+        assert_eq!((a.start_line, a.line, a.end_line), (2, 5, 6));
+        // A blank line between makes `##` a comment.
+        assert_eq!(p.query("b").unwrap().note, "");
+        assert_eq!(p.query("b").unwrap().start_line, 9);
+        assert_eq!(format_query(a), "## Frame drops.\n##\n## Use with cam.\nquery a\n    /drop/");
+
+        // Replacing the query replaces its note too.
+        let mut new = q("a", "/drop/");
+        new.note = "Only drops.".into();
+        let out = upsert_query("t", file, &new).unwrap();
+        assert_eq!(out, "pack p\n\n## Only drops.\nquery a\n    /drop/\n## a comment\n\nquery b\n    /x/\n");
+        // Removing it removes its note and the blank line before it.
+        assert_eq!(remove_query("t", file, "a").unwrap(), "pack p\n## a comment\n\nquery b\n    /x/\n");
     }
 
     #[test]
