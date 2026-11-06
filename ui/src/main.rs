@@ -339,18 +339,20 @@ impl Mode {
     }
 }
 
-/// The mode list of a box.
-fn mode_combo(ui: &mut egui::Ui, id: &str, mode: &mut Mode) {
+/// The mode list of a box; true: a mode was picked in it.
+fn mode_combo(ui: &mut egui::Ui, id: &str, mode: &mut Mode) -> bool {
+    let mut picked = false;
     egui::ComboBox::from_id_salt(id)
         .width(58.0)
         .selected_text(mode.label())
         .show_ui(ui, |ui| {
             for m in [Mode::Auto, Mode::Text, Mode::Query] {
-                ui.selectable_value(mode, m, m.label()).on_hover_text(m.describe());
+                picked |= ui.selectable_value(mode, m, m.label()).on_hover_text(m.describe()).clicked();
             }
         })
         .response
         .on_hover_text(mode.describe());
+    picked
 }
 
 /// How a box will be read, for the line under it.
@@ -517,6 +519,10 @@ struct Tab {
     columns: Columns,
 
     mode: Mode,
+    /// The mode last picked in the Filter box's list: the one remembered
+    /// for new tabs. A mode set for the box (a selection, 🔍, the history,
+    /// "Search as text instead") isn't the user's choice of a default.
+    picked_mode: Mode,
     pattern: String,
     options: MatcherOptions,
     result: Option<Arc<SearchResult>>,
@@ -904,6 +910,9 @@ impl LineDetail {
 #[derive(Default)]
 struct SearchBox {
     mode: Mode,
+    /// The mode last picked in the box's list: the one remembered for new
+    /// tabs (`Tab::picked_mode`).
+    picked: Mode,
     pattern: String,
     regex: bool,
     ignore_case: bool,
@@ -1038,6 +1047,7 @@ impl Tab {
             hits_view: ViewState::default(),
             columns: Columns::default(),
             mode: prefs.mode,
+            picked_mode: prefs.mode,
             pattern: String::new(),
             options: prefs.options.clone(),
             result: None,
@@ -1050,6 +1060,7 @@ impl Tab {
             colors_job: None,
             search: SearchBox {
                 mode: prefs.search_mode,
+                picked: prefs.search_mode,
                 regex: prefs.search_regex,
                 ignore_case: prefs.search_ignore_case,
                 ..SearchBox::default()
@@ -1126,9 +1137,9 @@ impl Tab {
 
     fn search_prefs(&self) -> SearchPrefs {
         SearchPrefs {
-            mode: self.mode,
+            mode: self.picked_mode,
             options: self.options.clone(),
-            search_mode: self.search.mode,
+            search_mode: self.search.picked,
             search_regex: self.search.regex,
             search_ignore_case: self.search.ignore_case,
             ..SearchPrefs::default()
@@ -2207,7 +2218,9 @@ impl Tab {
                 .on_hover_text("Decides which lines the main view shows; Enter applies it");
             // Mode and checkboxes only change how the box is read; only
             // Enter or the Filter button runs it.
-            mode_combo(ui, "filter-mode", &mut self.mode);
+            if mode_combo(ui, "filter-mode", &mut self.mode) {
+                self.picked_mode = self.mode;
+            }
             let hint = match self.mode {
                 Mode::Auto => "filter: text, or level >= ERROR AND timeout — Enter to apply",
                 Mode::Text if self.options.fixed_string => "filter: lines to keep (text) — Enter to apply",
@@ -2361,7 +2374,9 @@ impl Tab {
                 .response
                 .on_hover_text("Recent searches (or ↑ / ↓ in the box)");
             });
-            mode_combo(ui, "search-mode", &mut self.search.mode);
+            if mode_combo(ui, "search-mode", &mut self.search.mode) {
+                self.search.picked = self.search.mode;
+            }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 go |= ui.button("Find").clicked();
                 clear = ui.add_enabled(self.search.active.is_some(), egui::Button::new("Clear")).clicked();
@@ -2696,6 +2711,8 @@ struct App {
     /// The plot is in a window of its own, and what that window shares.
     plot_window: bool,
     plot_win: Arc<std::sync::Mutex<plot::Detached>>,
+    /// What the plot's window was last asked to repaint for.
+    plot_win_key: Option<plot::WindowKey>,
 }
 
 /// What the Settings window changed.
@@ -4002,12 +4019,15 @@ impl App {
             (p.shown, self.plots.listed(&p))
         };
         let mut plot_out = plot::Output::default();
+        if !(plotted && self.plot_window) {
+            self.plot_win_key = None;
+        }
         if plotted && self.plot_window {
             // The plot's own window: what it draws now, and what it asked.
             let line = tab.current_line();
             let (goto, toggle, closed) = {
                 let mut d = self.plot_win.lock().unwrap_or_else(|e| e.into_inner());
-                d.input = Some(plot::WindowInput {
+                let input = plot::WindowInput {
                     plot: tab.plot.clone(),
                     signals: tab.signals.clone(),
                     generation: tab.signals_gen,
@@ -4016,7 +4036,13 @@ impl App {
                     kept: tab.result.clone(),
                     bookmarks: plot::Bookmark::all(&tab.bookmarks),
                     saved: saved_plots,
-                });
+                };
+                let key = input.key();
+                if self.plot_win_key.as_ref() != Some(&key) {
+                    self.plot_win_key = Some(key);
+                    ctx.request_repaint_of(egui::ViewportId::from_hash_of("nerka-plot"));
+                }
+                d.input = Some(input);
                 let mut out = std::mem::take(&mut d.out);
                 if let Some((l, note)) = out.bookmark.take() {
                     tab.set_bookmark(l, note);
@@ -4031,10 +4057,9 @@ impl App {
                 .with_inner_size([1100.0, 460.0]);
             let id = egui::ViewportId::from_hash_of("nerka-plot");
             ctx.show_viewport_deferred(id, builder, move |ui, _| plot::window_ui(ui, &shared));
-            // The cursor or the data may have changed.
-            ctx.request_repaint_of(id);
             if toggle || closed {
                 self.plot_window = false;
+                self.plot_win_key = None;
             }
             if let Some(line) = goto {
                 tab.goto_line(line);
@@ -4938,6 +4963,29 @@ gear=D
         assert_eq!(got, prefs);
         // Through the prefs file, as the next start reads it.
         assert_eq!(SearchPrefs::parse(&prefs.serialize()), prefs);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A mode set for a box (the selection's NFD, a history entry) isn't
+    /// remembered for new tabs; only one picked in the box's list is.
+    #[test]
+    fn only_a_picked_mode_goes_into_the_prefs() {
+        let dir = std::env::temp_dir().join(format!("nerka-gui-pickedmode-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("app.log");
+        std::fs::write(&log, LOG).unwrap();
+        let mut lib = Library::new();
+        lib.add(pack::parse_pack("vision.nerka-pack", PACK).unwrap()).unwrap();
+        let prefs = SearchPrefs { mode: Mode::Auto, search_mode: Mode::Text, ..SearchPrefs::default() };
+        let ctx = egui::Context::default();
+        let mut tab = Tab::open(&ctx, log, &prefs);
+        settle(&mut tab, &ctx);
+        tab.picks.add(&lib, "vision.drops", Use::Include, None);
+        tab.apply_filter_picks(&ctx, &lib).unwrap();
+        tab.search.set("query", "level >= ERROR");
+        assert_eq!((tab.mode, tab.search.mode), (Mode::Query, Mode::Query));
+        let got = tab.search_prefs();
+        assert_eq!((got.mode, got.search_mode), (Mode::Auto, Mode::Text));
         std::fs::remove_dir_all(&dir).ok();
     }
 
