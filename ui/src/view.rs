@@ -392,7 +392,26 @@ pub fn log_view(
         whole.into_iter().filter(|&r| last_whole(r)).count()
     };
     state.page = (fits(state.top, state.skipped(), &is_open(state)) as u64).max(1);
-    let max_top = rows.saturating_sub(state.page);
+    // How far down the view scrolls: (top row, its slots skipped) with the
+    // last row's last slot at the bottom. Not `rows - page`: a long last
+    // record then fit "whole" only with rows past the end below it, and the
+    // view jumped back each time it scrolled into it.
+    let end = {
+        let open = is_open(state);
+        let mut left = (((rows_rect.bottom() - snap(rows_rect.top())) / row_h).floor() as usize).max(1);
+        let mut end = (0, 0);
+        for row in (0..rows).rev() {
+            let (note, n) = row_slots(row, &open);
+            let count = usize::from(note.is_some()) + n;
+            if count >= left {
+                end = (row, count - left);
+                break;
+            }
+            left -= count;
+        }
+        end
+    };
+    let max_top = end.0;
     let line_str = |row: u64| source.line_text(line_of_row(row)).unwrap_or_default();
 
     // ----- input -----
@@ -469,12 +488,12 @@ pub fn log_view(
         for _ in 0..(whole.abs() as u64).min(10 * rows_rect.height() as u64) {
             let skip = state.skipped();
             if whole > 0.0 {
-                if skip + 1 < count(state.top) {
-                    state.skip = (state.top, skip + 1);
-                } else if state.top < max_top {
-                    state.top += 1;
-                } else {
+                if (state.top, skip) >= end {
                     break;
+                } else if skip + 1 < count(state.top) {
+                    state.skip = (state.top, skip + 1);
+                } else {
+                    state.top += 1;
                 }
             } else if skip > 0 {
                 state.skip = (state.top, skip - 1);
@@ -807,8 +826,13 @@ pub fn log_view(
     {
         let f = ((p.y - bar_rect.top() - thumb_h / 2.0) / track).clamp(0.0, 1.0) as f64;
         state.top = (f * max_top as f64).round() as u64;
+        if f >= 1.0 {
+            state.skip = end;
+        }
     }
-    state.top = state.top.min(max_top);
+    if (state.top, state.skipped()) > end {
+        (state.top, state.skip) = (end.0, end);
+    }
     let hbar = ui.interact(hbar_rect, id.with("hbar"), Sense::click_and_drag());
     let hmax = max_x(state.content_w);
     let hthumb_w = if hmax > 0.0 {
@@ -1714,6 +1738,61 @@ mod tests {
         assert_eq!((s.top, s.skipped()), (1, 1), "on into record 1");
         step(vec![at.clone(), point(-2.0)], &mut s);
         assert_eq!((s.top, s.skipped()), (0, 3), "back up into record 0's last line");
+    }
+
+    /// A last record longer than the view, unfolded: the wheel scrolls down
+    /// through it to its last line and stops there, never jumping back.
+    #[test]
+    fn long_last_record_scrolls_to_its_end() {
+        use nerka_core::input::records::{RecordFile, RecordSplit};
+        let mut text = String::new();
+        for i in 0..5 {
+            text.push_str(&format!("2025-10-17 rec {i}\n  first {i}\n"));
+        }
+        text.push_str("2025-10-17 last\n");
+        for i in 0..60 {
+            text.push_str(&format!("  line {i}\n"));
+        }
+        let file = RecordFile::from_bytes("t", text.into_bytes(), RecordSplit::parse(r"start=/\d{4}-/").unwrap());
+        let rows = file.line_count();
+        assert_eq!(rows, 6);
+        let ctx = egui::Context::default();
+        let mut t = 0.0;
+        let mut step = |events: Vec<egui::Event>, state: &mut ViewState| {
+            t += 1.0 / 60.0;
+            let screen = Rect::from_min_size(pos2(0.0, 0.0), vec2(600.0, 300.0));
+            let input = egui::RawInput { screen_rect: Some(screen), time: Some(t), events, ..Default::default() };
+            let hl = Highlight { highlighter: None, bookmarks: None, search: None, lines: None, notes: NoteMode::Off };
+            let mut out = ctx.run_ui(input, |ui| {
+                egui::CentralPanel::default().frame(egui::Frame::NONE).show(ui, |ui| {
+                    log_view(ui, "v", state, rows, &|r| r, &file, &mut Columns::default(), &hl);
+                });
+            });
+            out.textures_delta.clear();
+        };
+        let mut s = ViewState { unfold_all: true, ..Default::default() };
+        step(vec![], &mut s);
+        let row_h = (ctx.fonts_mut(|f| f.row_height(&FontId::monospace(13.0))) + 2.0).round();
+        let at = egui::Event::PointerMoved(pos2(200.0, 50.0));
+        let wheel = egui::Event::MouseWheel {
+            unit: egui::MouseWheelUnit::Point,
+            delta: vec2(0.0, -3.0 * row_h),
+            phase: egui::TouchPhase::Move,
+            source: egui::MouseWheelSource::Wheel,
+            modifiers: egui::Modifiers::NONE,
+        };
+        let mut seen = vec![(s.top, s.skipped())];
+        for _ in 0..40 {
+            step(vec![at.clone(), wheel.clone()], &mut s);
+            seen.push((s.top, s.skipped()));
+        }
+        assert!(seen.windows(2).all(|w| w[0] <= w[1]), "never back up: {seen:?}");
+        let (top, skipped) = *seen.last().unwrap();
+        assert_eq!(top, rows - 1, "{seen:?}");
+        // The record's 61 lines end at the bottom: what's left of the view
+        // above them is under a row.
+        let shown = 61 - skipped;
+        assert!(shown as f32 * row_h <= 300.0 && (shown + 1) as f32 * row_h > 300.0 - row_h, "{seen:?}");
     }
 
     /// A folded record's preview: its other lines joined, starting near the

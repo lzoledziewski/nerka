@@ -63,6 +63,48 @@ pub struct WindowInput {
     pub saved: Vec<SavedPlot>,
 }
 
+/// What the plot's own window shows of its input, to compare between the
+/// main window's frames: the window repaints only when it changed. Every
+/// frame of a window costs all its pixels, and on a CPU renderer (Mesa's
+/// llvmpipe) hovering the main window repainted the plot too, doubling the
+/// cost (owner's measurements, 2026-11-06). The window repaints itself for
+/// its own input.
+#[derive(PartialEq)]
+pub struct WindowKey {
+    plot: usize,
+    layout: PlotLayout,
+    name: Option<String>,
+    cursors: Vec<f64>,
+    range: Option<(f64, f64)>,
+    built: bool,
+    generation: u64,
+    file: (usize, LineNo),
+    cursor: LineNo,
+    kept: usize,
+    bookmarks: Vec<Bookmark>,
+    saved: Vec<SavedPlot>,
+}
+
+impl WindowInput {
+    pub fn key(&self) -> WindowKey {
+        let p = lock(&self.plot);
+        WindowKey {
+            plot: Arc::as_ptr(&self.plot) as usize,
+            layout: p.layout(""),
+            name: p.name.clone(),
+            cursors: p.cursors.clone(),
+            range: p.range,
+            built: p.data.is_some(),
+            generation: self.generation,
+            file: (Arc::as_ptr(&self.file) as *const () as usize, self.file.line_count()),
+            cursor: self.cursor,
+            kept: self.kept.as_ref().map_or(0, |r| Arc::as_ptr(r) as usize),
+            bookmarks: self.bookmarks.clone(),
+            saved: self.saved.clone(),
+        }
+    }
+}
+
 /// A kept plot, as the plot's list shows it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SavedPlot {
