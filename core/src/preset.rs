@@ -11,6 +11,7 @@
 //! preset "cam triage"
 //! node include lit          query vision.cam
 //! node exclude              query "camera team.noise"
+//! node require              query vision.day_shift
 //! node include detached     query vision.drops
 //! node signal lit           query vision.speed
 //! node include lit          local n1  from vision.timeouts  name "slow ones"
@@ -26,7 +27,7 @@
 //!
 //! ```text
 //! file   := "preset" NAME line* [ "pack" "_preset" query* ]   -- queries as in packs
-//! line   := "node" ("include" | "exclude" | "signal") flag* source
+//! line   := "node" ("include" | "require" | "exclude" | "signal") flag* source
 //!         | "param" NAME ["raw"] "=" VALUE                    -- VALUE: rest of the line
 //!         | ("filter" | "search") ("selection" | TAG TEXT)    -- TAG: auto, text, regex, query
 //! flag   := "lit" | "detached"
@@ -161,6 +162,7 @@ impl Preset {
         for n in &self.nodes {
             out += match n.role {
                 Role::Include => "node include",
+                Role::Require => "node require",
                 Role::Exclude => "node exclude",
                 Role::Signal => "node signal",
             };
@@ -425,12 +427,13 @@ type NodeErr = (Option<usize>, String);
 
 fn node(w: &[(String, usize)]) -> Result<PresetNode, NodeErr> {
     let mut it = w.iter().skip(1).peekable();
-    let what = it.next().ok_or((None, "expected include, exclude or signal".to_owned()))?;
+    let what = it.next().ok_or((None, "expected include, require, exclude or signal".to_owned()))?;
     let role = match what.0.as_str() {
         "include" => Role::Include,
+        "require" => Role::Require,
         "exclude" => Role::Exclude,
         "signal" => Role::Signal,
-        r => return Err((Some(what.1), format!("expected include, exclude or signal but found '{r}'"))),
+        r => return Err((Some(what.1), format!("expected include, require, exclude or signal but found '{r}'"))),
     };
     let (mut lit, mut detached) = (false, false);
     while let Some((f, _)) = it.peek() {
@@ -487,7 +490,9 @@ mod tests {
             color: Some("red".into()),
             signals: Vec::new(),
             text: text.into(),
+            note: String::new(),
             line: 0,
+            start_line: 0,
             end_line: 0,
         }
     }
@@ -526,7 +531,7 @@ mod tests {
                 },
                 PresetNode {
                     source: NodeSource::Local { id: "n2".into(), from: None, name: String::new() },
-                    role: Role::Include,
+                    role: Role::Require,
                     lit: false,
                     detached: false,
                 },
@@ -582,7 +587,7 @@ mod tests {
         let back = parse_preset("t", &text).unwrap_or_else(|e| panic!("{e}\n{text}"));
         let strip = |mut p: Preset| {
             for q in &mut p.locals {
-                (q.line, q.end_line) = (0, 0);
+                (q.line, q.start_line, q.end_line) = (0, 0, 0);
             }
             p
         };
@@ -617,7 +622,7 @@ mod tests {
         bad("preset \"a.b\"\n", 1, 8, "invalid preset name");
         bad("preset \"a\n", 1, 8, "missing closing");
         bad("preset p\npreset q\n", 2, 1, "second 'preset'");
-        bad("preset p\nnode maybe query a.b\n", 2, 6, "include, exclude or signal");
+        bad("preset p\nnode maybe query a.b\n", 2, 6, "include, require, exclude or signal");
         bad("preset p\nnode include query ab\n", 2, 14, "isn't a qualified id");
         bad("preset p\nnode include lit thing a.b\n", 2, 18, "'query' or 'local'");
         bad("preset p\nnode include query a.b extra\n", 2, 24, "unexpected 'extra'");

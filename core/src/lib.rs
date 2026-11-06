@@ -26,6 +26,7 @@ pub mod input;
 pub mod pack;
 pub mod plot;
 pub mod preset;
+pub mod session;
 pub mod signal;
 pub mod time;
 
@@ -36,12 +37,13 @@ pub use engine::search::{Filter, Highlighter, Matcher, MatcherOptions, SearchRes
 pub use engine::within::{SearchHits, SearchSet, search_within};
 pub use event::{Event, FieldDef, FieldId, FieldKind, FieldValue, Level};
 pub use history::SearchHistory;
-pub use input::concat::open_many;
+pub use input::concat::{open_many, open_many_by_time, open_merged_by_time};
 pub use input::dlt::DltFile;
 pub use input::dlt::fibex::{ArgType, Argument, Fibex, FibexError};
 pub use input::text::TextFile;
 pub use input::{Anchor, ColumnDef, LogSource, OpenOptions, open, open_with};
 pub use pack::{Library, Pack, PackError, PackQuery};
+pub use session::{QueryContext, Session};
 pub use signal::{
     Clock, QueryPart, SignalDef, SignalKind, SignalScope, SignalSeries, SignalValue, SignalView, Signals, ValueRef,
     query_signals,

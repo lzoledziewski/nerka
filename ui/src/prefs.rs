@@ -1,6 +1,7 @@
 //! Options remembered between runs: the last search mode and checkboxes
 //! the user picked become the default for new tabs; the UDP ports that
-//! carry DLT in captures; the unpack cache's size limit; local time or UTC.
+//! carry DLT in captures; the unpack cache's size limit; local time or UTC;
+//! whether tabs of several files are merged by time.
 //!
 //! Stored as `key=value` lines in `<config>/nerka/prefs`. Unknown keys and
 //! bad values are ignored, so an old or hand-edited file never fails.
@@ -34,6 +35,9 @@ pub struct SearchPrefs {
     pub mf4_local_time: bool,
     /// Where bookmark notes show in the views.
     pub bookmark_notes: NoteMode,
+    /// Tabs of several files that know their times interleave their lines
+    /// by time (the last choice in a tab's menu).
+    pub merge_by_time: bool,
 }
 
 impl Default for SearchPrefs {
@@ -53,6 +57,7 @@ impl Default for SearchPrefs {
             local_time: true,
             mf4_local_time: true,
             bookmark_notes: NoteMode::default(),
+            merge_by_time: false,
         }
     }
 }
@@ -105,6 +110,7 @@ impl SearchPrefs {
                 "search_ignore_case" => p.search_ignore_case = flag,
                 "local_time" => p.local_time = flag,
                 "mf4_local_time" => p.mf4_local_time = flag,
+                "merge_by_time" => p.merge_by_time = flag,
                 _ => {}
             }
         }
@@ -118,7 +124,7 @@ impl SearchPrefs {
             Mode::Query => "query",
         };
         format!(
-            "mode={}\nregex={}\nignore_case={}\ninvert={}\nsearch_mode={}\nsearch_regex={}\nsearch_ignore_case={}\ndlt_ports={}\nsomeip_ports={}\nsyslog_ports={}\nunpack_limit_gib={}\nlocal_time={}\nmf4_local_time={}\nbookmark_notes={}\n",
+            "mode={}\nregex={}\nignore_case={}\ninvert={}\nsearch_mode={}\nsearch_regex={}\nsearch_ignore_case={}\ndlt_ports={}\nsomeip_ports={}\nsyslog_ports={}\nunpack_limit_gib={}\nlocal_time={}\nmf4_local_time={}\nbookmark_notes={}\nmerge_by_time={}\n",
             name(self.mode),
             !self.options.fixed_string,
             self.options.case_insensitive,
@@ -132,7 +138,8 @@ impl SearchPrefs {
             self.unpack_limit_gib,
             self.local_time,
             self.mf4_local_time,
-            self.bookmark_notes.key()
+            self.bookmark_notes.key(),
+            self.merge_by_time
         )
     }
 
@@ -210,6 +217,7 @@ mod tests {
             local_time: false,
             mf4_local_time: false,
             bookmark_notes: NoteMode::Column,
+            merge_by_time: true,
         };
         assert_eq!(SearchPrefs::parse(&p.serialize()), p);
         assert_eq!(SearchPrefs::parse(&SearchPrefs::default().serialize()), SearchPrefs::default());

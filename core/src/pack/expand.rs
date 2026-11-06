@@ -1,8 +1,9 @@
 //! Expansion: a selection from the [`Library`] becomes plain NFD.
 //!
 //! Each picked query stands for its parent chain ANDed with its own text:
-//! `(root) AND (…) AND (query)`. Included queries are OR'ed, excluded ones
-//! are added as `AND NOT`. The result is one line of NFD that compiles on
+//! `(root) AND (…) AND (query)`. Included queries are OR'ed, required ones
+//! are ANDed to that (`(a OR b) AND r`), excluded ones are added as
+//! `AND NOT`. The result is one line of NFD that compiles on
 //! its own, plus provenance: the byte range each query occupies.
 //!
 //! A pick whose ancestor is picked in the same role adds nothing
@@ -31,6 +32,8 @@ pub enum Pick {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Selection {
     pub include: Vec<Pick>,
+    /// Every kept line must match these too (AND).
+    pub require: Vec<Pick>,
     pub exclude: Vec<Pick>,
     /// Queries that don't filter: they give signals (their named groups)
     /// and can colour lines.
@@ -50,6 +53,7 @@ impl Selection {
         };
         Ok(Selection {
             include: freeze(&self.include)?,
+            require: freeze(&self.require)?,
             exclude: freeze(&self.exclude)?,
             signal: freeze(&self.signal)?,
         })
@@ -81,6 +85,8 @@ pub type Params = BTreeMap<String, ParamValue>;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Role {
     Include,
+    /// ANDed with the includes: lines must match it too.
+    Require,
     Exclude,
     /// Not in the filter: signals and line colours only.
     Signal,
@@ -109,8 +115,8 @@ pub struct Part {
 pub struct Expansion {
     /// Plain NFD, one line.
     pub nfd: String,
-    /// Included parts first, in pick order, then excluded ones, then the
-    /// signal ones (in `aside`).
+    /// Included parts first, in pick order, then required ones, then
+    /// excluded ones, then the signal ones (in `aside`).
     pub parts: Vec<Part>,
     /// The texts of covered parts, which `nfd` leaves out.
     pub aside: String,
@@ -129,11 +135,30 @@ impl Expansion {
 
     /// The parts as search queries: hits are reported per included part,
     /// in the order of [`parts_with`](Self::parts_with)`(Role::Include)`.
+    /// Required parts are ANDed to each included one (alone, they are the
+    /// only one).
     pub fn search_set(&self) -> Result<SearchSet, DslError> {
-        let compile = |role| {
-            self.parts_with(role).map(|p| Query::compile(self.part_nfd(p)).map(Filter::Query)).collect::<Result<_, _>>()
+        let required: Vec<&str> = self.parts_with(Role::Require).map(|p| self.part_nfd(p)).collect();
+        let with_required = |nfd: &str| {
+            let mut s = format!("({nfd})");
+            for r in &required {
+                s += &format!(" AND ({r})");
+            }
+            s
         };
-        Ok(SearchSet { include: compile(Role::Include)?, exclude: compile(Role::Exclude)? })
+        let mut include: Vec<Filter> = self
+            .parts_with(Role::Include)
+            .map(|p| Query::compile(&with_required(self.part_nfd(p))).map(Filter::Query))
+            .collect::<Result<_, _>>()?;
+        if include.is_empty() && !required.is_empty() {
+            let all = required.iter().map(|r| format!("({r})")).collect::<Vec<_>>().join(" AND ");
+            include.push(Filter::Query(Query::compile(&all)?));
+        }
+        let exclude = self
+            .parts_with(Role::Exclude)
+            .map(|p| Query::compile(self.part_nfd(p)).map(Filter::Query))
+            .collect::<Result<_, _>>()?;
+        Ok(SearchSet { include, exclude })
     }
 }
 
@@ -181,9 +206,10 @@ fn resolve(lib: &Library, picks: &[Pick]) -> Result<Vec<String>, ExpandError> {
 /// Expand a selection into plain NFD. Labels resolve against `lib` now.
 pub fn expand(sel: &Selection, lib: &Library, params: &Params) -> Result<Expansion, ExpandError> {
     let include = resolve(lib, &sel.include)?;
+    let require = resolve(lib, &sel.require)?;
     let exclude = resolve(lib, &sel.exclude)?;
     let signal = resolve(lib, &sel.signal)?;
-    if include.is_empty() && exclude.is_empty() && signal.is_empty() {
+    if include.is_empty() && require.is_empty() && exclude.is_empty() && signal.is_empty() {
         return Err(ExpandError::Empty);
     }
     let include_cov = covers(lib, &include)?;
@@ -191,7 +217,7 @@ pub fn expand(sel: &Selection, lib: &Library, params: &Params) -> Result<Expansi
     let (mut nfd, mut aside) = (String::new(), String::new());
     let mut parts = Vec::new();
     let shown = include_cov.iter().filter(|c| c.is_none()).count();
-    let group = shown > 1 && exclude_cov.iter().any(|c| c.is_none());
+    let group = shown > 1 && (!require.is_empty() || exclude_cov.iter().any(|c| c.is_none()));
     if group {
         nfd.push('(');
     }
@@ -212,6 +238,15 @@ pub fn expand(sel: &Selection, lib: &Library, params: &Params) -> Result<Expansi
         nfd.push(')');
     }
     let mut first = shown == 0;
+    // Required parts: AND binds tighter than OR, and the includes are
+    // grouped when there are several, so a chain needs no parentheses.
+    for id in &require {
+        if !first {
+            nfd.push_str(" AND ");
+        }
+        first = false;
+        parts.push(part(lib, id, Role::Require, params, &mut nfd)?);
+    }
     for (id, covered) in exclude.iter().zip(exclude_cov) {
         if covered.is_some() {
             parts.push(Part { covered, ..part(lib, id, Role::Exclude, params, &mut aside)? });

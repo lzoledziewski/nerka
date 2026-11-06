@@ -19,6 +19,8 @@
 //! query frame_drops(cam)  parent: cam_scope  labels: system/vision, perf  color: violet
 //!     payload ~ /$cam frame drop/
 //!
+//! ## Frames the camera dropped. Note lines ('##') right above a query
+//! ## are its note: what it is for, for people and tools reading packs.
 //! query "xyz logs"  parent: "vision.cam scope"
 //!     apid == XYZ
 //! ```
@@ -26,7 +28,7 @@
 //! ```text
 //! file    := comment* "pack" PNAME query*
 //! PNAME   := NAME | '"' text '"'                   -- quoted like a QNAME
-//! query   := "query" QNAME [ "(" PARAM ("," PARAM)* ")" ] attr*  NEWLINE  body
+//! query   := note* "query" QNAME [ "(" PARAM ("," PARAM)* ")" ] attr*  NEWLINE  body
 //! QNAME   := NAME | '"' text '"'                   -- quoted: spaces allowed,
 //!                                                     no . " # : at all
 //! attr    := "parent:" (NAME | NAME "." NAME       -- same pack, or pack.query
@@ -37,6 +39,10 @@
 //!          | "signals:" GROUP ":" KIND ("," GROUP ":" KIND)*  -- KIND: num, enum, time
 //! body    := indented lines (the NFD text, kept verbatim), up to the next
 //!            line that starts in column 1
+//! note    := "##" [" "] text NEWLINE                -- in column 1, directly
+//!                                                     above the header (a blank
+//!                                                     or other line in between
+//!                                                     makes it a comment)
 //! NAME    := [A-Za-z_][A-Za-z0-9_]*                -- also PARAM
 //! ```
 //!
@@ -51,6 +57,7 @@
 
 mod expand;
 mod parser;
+mod usage;
 mod write;
 
 use std::fmt;
@@ -58,6 +65,7 @@ use std::path::{Path, PathBuf};
 
 pub use expand::{ExpandError, Expansion, ParamValue, Params, Part, Pick, Role, Selection, expand};
 pub use parser::parse_pack;
+pub use usage::{Usage, default_usage_path};
 pub use write::{create_pack_file, format_query, params_in, remove_query, rename_query, upsert_query};
 
 /// File extension of pack files when a directory is loaded.
@@ -84,9 +92,13 @@ pub struct PackQuery {
     pub signals: Vec<(String, crate::signal::SignalKind)>,
     /// NFD text with `$param` placeholders, dedented, lines joined by `\n`.
     pub text: String,
+    /// What the query is for (its `##` lines, joined by `\n`); empty for none.
+    pub note: String,
     /// 0-based line of the `query` header in the file.
     pub line: usize,
-    /// 0-based line of the last body line (the block is `line..=end_line`).
+    /// 0-based line where its block starts: its first note line, else `line`.
+    pub start_line: usize,
+    /// 0-based line of the last body line (the block is `start_line..=end_line`).
     pub end_line: usize,
 }
 
@@ -248,6 +260,22 @@ impl Library {
             .iter()
             .flat_map(|p| p.queries.iter().map(move |q| (p, q)))
             .filter(|(_, q)| q.labels.iter().any(|l| under(l)))
+            .map(|(p, q)| format!("{}.{}", p.name, q.id))
+            .collect()
+    }
+
+    /// Qualified ids of the queries whose name, labels, note or text
+    /// contain every word of `text` (ignoring case), in library order.
+    pub fn search(&self, text: &str) -> Vec<String> {
+        let words: Vec<String> = text.split_whitespace().map(str::to_lowercase).collect();
+        self.packs
+            .iter()
+            .flat_map(|p| p.queries.iter().map(move |q| (p, q)))
+            .filter(|(p, q)| {
+                let hay = format!("{}.{}\n{}\n{}\n{}", p.name, q.id, q.labels.join(","), q.note, q.text);
+                let hay = hay.to_lowercase();
+                words.iter().all(|w| hay.contains(w.as_str()))
+            })
             .map(|(p, q)| format!("{}.{}", p.name, q.id))
             .collect()
     }

@@ -877,7 +877,10 @@ pub fn log_view(
 
     // Note and unfolded slots can push a row that just moved into view below it.
     if let Some(sel) = state.selected.filter(|_| state.selected != selected_before) {
-        if sel <= state.top {
+        // Keys go to a row's start; a click or a drag picked a line in
+        // view, so an unfolded record scrolled into stays where it is.
+        let by_pointer = clicked.is_some() || state.dragging;
+        if sel < state.top || (sel == state.top && !by_pointer) {
             state.skip = (0, 0);
         }
         for _ in 0..state.page {
@@ -1103,7 +1106,17 @@ pub fn log_view(
 
     // scrollbar paint
     painter.rect_filled(bar_rect, 0.0, vis.faint_bg_color);
-    let thumb_y = bar_rect.top() + if max_top == 0 { 0.0 } else { track * (state.top as f64 / max_top as f64) as f32 };
+    // Where the view is, in rows: inside an unfolded record scrolled into,
+    // the share of its slots scrolled past, so the thumb moves through it.
+    let at_row = |(row, skip): (u64, usize)| -> f64 {
+        if skip == 0 {
+            return row as f64;
+        }
+        let (note, n) = row_slots(row, &is_open(state));
+        row as f64 + skip as f64 / (usize::from(note.is_some()) + n) as f64
+    };
+    let (pos, last) = (at_row((state.top, state.skipped())), at_row(end));
+    let thumb_y = bar_rect.top() + if last <= 0.0 { 0.0 } else { track * (pos / last).min(1.0) as f32 };
     let thumb = Rect::from_min_size(pos2(bar_rect.left() + 2.0, thumb_y), vec2(SCROLLBAR_W - 4.0, thumb_h));
     painter.vline(bar_rect.left(), bar_rect.y_range(), vis.widgets.noninteractive.bg_stroke);
     // Derived from the text colour so the thumb stands out in both themes.
@@ -1793,6 +1806,90 @@ mod tests {
         // above them is under a row.
         let shown = 61 - skipped;
         assert!(shown as f32 * row_h <= 300.0 && (shown + 1) as f32 * row_h > 300.0 - row_h, "{seen:?}");
+    }
+
+    /// One record unfolded among folded ones: the wheel goes into it and
+    /// through it; a click on one of its lines (or on another row) leaves
+    /// the view where it is; the scrollbar moves while inside it.
+    #[test]
+    fn scrolling_through_one_unfolded_record() {
+        use nerka_core::input::records::{RecordFile, RecordSplit};
+        let mut text = String::new();
+        for i in 0..30 {
+            text.push_str(&format!("2025-10-17 rec {i}\n"));
+            let n = if i == 3 { 50 } else { 2 };
+            for k in 0..n {
+                text.push_str(&format!("  line {k} of {i}\n"));
+            }
+        }
+        let file = RecordFile::from_bytes("t", text.into_bytes(), RecordSplit::parse(r"start=/\d{4}-/").unwrap());
+        let rows = file.line_count();
+        let ctx = egui::Context::default();
+        let mut t = 0.0;
+        let mut step = |events: Vec<egui::Event>, state: &mut ViewState| {
+            t += 1.0 / 60.0;
+            let screen = Rect::from_min_size(pos2(0.0, 0.0), vec2(600.0, 300.0));
+            let input = egui::RawInput { screen_rect: Some(screen), time: Some(t), events, ..Default::default() };
+            let hl = Highlight { highlighter: None, bookmarks: None, search: None, lines: None, notes: NoteMode::Off };
+            let mut out = ctx.run_ui(input, |ui| {
+                egui::CentralPanel::default().frame(egui::Frame::NONE).show(ui, |ui| {
+                    log_view(ui, "v", state, rows, &|r| r, &file, &mut Columns::default(), &hl);
+                });
+            });
+            out.textures_delta.clear();
+        };
+        let mut s = ViewState::default();
+        s.unfolded.insert(3);
+        step(vec![], &mut s);
+        step(vec![], &mut s);
+        let row_h = (ctx.fonts_mut(|f| f.row_height(&FontId::monospace(13.0))) + 2.0).round();
+        let at = egui::Event::PointerMoved(pos2(200.0, 50.0));
+        let wheel = |n: f32| egui::Event::MouseWheel {
+            unit: egui::MouseWheelUnit::Point,
+            delta: vec2(0.0, -n * row_h),
+            phase: egui::TouchPhase::Move,
+            source: egui::MouseWheelSource::Wheel,
+            modifiers: egui::Modifiers::NONE,
+        };
+        // Three rows down, then 20 of record 3's 51 lines.
+        step(vec![at.clone(), wheel(23.0)], &mut s);
+        assert_eq!((s.top, s.skipped()), (3, 20));
+        // A click on a line of it: the view stays.
+        let click = |y: f32| {
+            let pos = pos2(200.0, y);
+            let b = |pressed| egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            };
+            vec![egui::Event::PointerMoved(pos), b(true), b(false)]
+        };
+        step(click(row_h * 2.5), &mut s);
+        step(vec![], &mut s);
+        assert_eq!(s.selected, Some(3));
+        assert_eq!((s.top, s.skipped()), (3, 20), "clicking inside it doesn't jump to its start");
+        // On through it and past it, one notch at a time, never backwards.
+        let mut seen = vec![(s.top, s.skipped())];
+        for _ in 0..20 {
+            step(vec![at.clone(), wheel(3.0)], &mut s);
+            seen.push((s.top, s.skipped()));
+        }
+        assert!(seen.windows(2).all(|w| w[0] <= w[1]), "{seen:?}");
+        // Three lines a notch while inside it, then three rows a notch.
+        assert_eq!(&seen[..3], [(3, 20), (3, 23), (3, 26)]);
+        assert!(seen.contains(&(3, 50)) && seen.contains(&(6, 0)), "{seen:?}");
+        assert!(s.top > 3, "past it: {seen:?}");
+        // A click on a row below it: the view stays too.
+        let before = (s.top, s.skipped());
+        step(click(row_h * 4.5), &mut s);
+        step(vec![], &mut s);
+        assert_eq!((s.top, s.skipped()), before);
+        // And back up into it from below: its last lines first.
+        while s.top > 3 {
+            step(vec![at.clone(), wheel(-1.0)], &mut s);
+        }
+        assert_eq!((s.top, s.skipped()), (3, 50));
     }
 
     /// A folded record's preview: its other lines joined, starting near the

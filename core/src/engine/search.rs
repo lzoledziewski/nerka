@@ -141,6 +141,14 @@ impl Filter {
         matches!(self, Filter::Query(q) if q.uses_bookmarks())
     }
 
+    /// Whether the result depends on row numbers beyond the line itself:
+    /// signals (states held from earlier rows) or bookmarks. Such a filter
+    /// can't run on the lines of a [reordered](LogSource::reordered)
+    /// source's inner one.
+    pub fn uses_rows(&self) -> bool {
+        matches!(self, Filter::Query(q) if q.uses_bookmarks() || !q.signal_names().is_empty())
+    }
+
     /// Progress units [`Self::prepare`] has to do.
     pub(crate) fn prepare_work(&self, source: &dyn LogSource) -> u64 {
         match self {
@@ -218,6 +226,9 @@ pub fn search(source: &dyn LogSource, filter: &Filter, progress: &Progress) -> R
 /// Can `filter` (bound) take the buffer-scan fast path on `source` (on
 /// every part, for a source made of several)?
 pub(crate) fn has_fast_path(source: &dyn LogSource, filter: &Filter) -> bool {
+    if let Some(r) = source.reordered().filter(|_| !filter.uses_rows()) {
+        return has_fast_path(r.inner, filter);
+    }
     if let Some(parts) = source.parts() {
         return parts.iter().all(|p| has_fast_path(p.source.as_ref(), filter));
     }
@@ -226,6 +237,9 @@ pub(crate) fn has_fast_path(source: &dyn LogSource, filter: &Filter) -> bool {
 
 /// Progress units [`scan`] reports: bytes on the fast path, else lines.
 pub(crate) fn work(source: &dyn LogSource, filter: &Filter) -> u64 {
+    if let Some(r) = source.reordered().filter(|_| !filter.uses_rows()) {
+        return work(r.inner, filter);
+    }
     if let Some(parts) = source.parts() {
         return parts.iter().map(|p| work(p.source.as_ref(), filter)).sum();
     }
@@ -238,6 +252,13 @@ pub(crate) fn work(source: &dyn LogSource, filter: &Filter) -> u64 {
 /// All lines matching a bound filter. Adds to `progress` but leaves its
 /// total to the caller.
 pub(crate) fn scan(source: &dyn LogSource, filter: &Filter, progress: &Progress) -> Result<Vec<LineNo>> {
+    // Lines of another source in another order: scan that one, map back.
+    if let Some(r) = source.reordered().filter(|_| !filter.uses_rows()) {
+        let mut rows: Vec<LineNo> =
+            scan(r.inner, filter, progress)?.into_iter().map(|l| r.row_of[l as usize]).collect();
+        rows.sort_unstable();
+        return Ok(rows);
+    }
     // Several sources in one: each part on its own path, lines shifted.
     if let Some(parts) = source.parts() {
         let mut out = Vec::new();

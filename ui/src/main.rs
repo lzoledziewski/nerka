@@ -52,6 +52,7 @@ use library::{Applied, LibraryView, Picks, Target, Term, Use};
 use nerka_core::dsl::{AutoRead, Plain, read_auto_in, read_auto_with};
 use nerka_core::pack::{self, Library, Role};
 use nerka_core::preset::{BoxText, Preset};
+use nerka_core::session::{Finished, Output, Session, Stage};
 use nerka_core::{
     Bookmarks, FieldDef, Filter, Highlighter, LineNo, LogSource, Matcher, MatcherOptions, Query, SearchHistory,
     SearchHits, SearchResult, SearchSet, SignalKind, SignalScope, Signals, text_to_nfd,
@@ -500,6 +501,9 @@ impl PreviewCache {
 
 /// One open file (or several of one kind, one after another) with its own
 /// filter, view positions and bookmarks.
+/// A tab's files, read: the source and the paths in the order read.
+type Opened = (Box<dyn LogSource>, Vec<PathBuf>);
+
 struct Tab {
     /// The first file.
     path: PathBuf,
@@ -511,7 +515,8 @@ struct Tab {
     /// opens them as separate tabs.
     mixed: Option<String>,
     file: Option<Arc<dyn LogSource>>,
-    loading: Option<Job<Box<dyn LogSource>>>,
+    /// The files being read, and their paths in the order read.
+    loading: Option<Job<Opened>>,
     /// The lines the filter keeps (all lines without a filter).
     main_view: ViewState,
     /// The search hits.
@@ -525,8 +530,11 @@ struct Tab {
     picked_mode: Mode,
     pattern: String,
     options: MatcherOptions,
-    result: Option<Arc<SearchResult>>,
-    searching: Option<(Arc<Filter>, Job<SearchResult>)>,
+    /// The filter, the search and the line colours over the file, and
+    /// what they depend on (core: what runs again when what changes).
+    session: Session,
+    /// The session's tasks running: one per stage, with its ticket.
+    stage_jobs: Vec<(Stage, u64, Job<Output>)>,
 
     /// The library expansion the Filter box holds, while its text is
     /// unchanged: shown grouped, with chips.
@@ -538,9 +546,11 @@ struct Tab {
     /// The selection as last expanded, for line colours: they follow the
     /// selection, not the Filter box text, so editing the box keeps them.
     colors_exp: Option<Arc<Applied>>,
-    /// Whole-line colours of the filter queries switched on in `picks`.
-    line_colors: Option<(Arc<ActiveSearch>, Arc<SearchHits>)>,
-    colors_job: Option<(Arc<ActiveSearch>, Job<SearchHits>)>,
+    /// Whole-line colours of the filter queries switched on in `picks`:
+    /// the names and colours of what the session colours by (set), and of
+    /// its colours shown (shown).
+    colors_set: Option<Arc<ActiveSearch>>,
+    colors_shown: Option<Arc<ActiveSearch>>,
     search: SearchBox,
     /// ↑ / ↓ in the Filter box.
     filter_recall: recall::Recall,
@@ -554,8 +564,6 @@ struct Tab {
     marks_changed: bool,
     /// Where bookmark notes show in the views (the app's setting).
     notes: NoteMode,
-    /// The filter behind `result` (rerun when it uses the bookmarks).
-    applied: Option<Arc<Filter>>,
     /// Bookmarks whose line is unfolded in the panel.
     marks_open: std::collections::HashSet<LineNo>,
     /// A bookmark's name being typed in the panel; set when the field
@@ -595,6 +603,9 @@ struct Tab {
     records_edit: Option<records::Edit>,
     /// The files are being read in a new order or set.
     files_undo: Option<FilesUndo>,
+    /// Several files with times: their lines interleaved by time, not one
+    /// file after another.
+    merge: bool,
     status: String,
 }
 
@@ -919,10 +930,11 @@ struct SearchBox {
     /// The queries the box holds (from 🔍 Search / Add to search), while
     /// its text is unchanged: each is searched and coloured on its own.
     terms: Vec<Term>,
-    /// The search that ran last. It runs again when the filter result changes.
+    /// The search the session runs (names, colours, highlighters). It
+    /// runs again when the filter result changes.
     active: Option<Arc<ActiveSearch>>,
-    hits: Option<(Arc<ActiveSearch>, Arc<SearchHits>)>,
-    job: Option<(Arc<ActiveSearch>, Job<SearchHits>)>,
+    /// The same for the hits the session holds.
+    shown: Option<Arc<ActiveSearch>>,
     /// ↑ / ↓ in the box.
     recall: recall::Recall,
     preview: PreviewCache,
@@ -934,23 +946,6 @@ struct ActiveSearch {
     names: Vec<String>,
     colors: Vec<Color32>,
     highlighters: Vec<Highlighter>,
-}
-
-impl ActiveSearch {
-    fn uses_bookmarks(&self) -> bool {
-        self.set.include.iter().chain(&self.set.exclude).any(Filter::uses_bookmarks)
-    }
-
-    /// The same search with `marks` for its `bookmark` conditions.
-    fn with_bookmarks(&self, marks: &Arc<Bookmarks>) -> ActiveSearch {
-        let bind = |fs: &[Filter]| fs.iter().map(|f| f.clone().with_bookmarks(marks)).collect();
-        ActiveSearch {
-            set: SearchSet { include: bind(&self.set.include), exclude: bind(&self.set.exclude) },
-            names: self.names.clone(),
-            colors: self.colors.clone(),
-            highlighters: self.highlighters.clone(),
-        }
-    }
 }
 
 impl SearchBox {
@@ -1035,6 +1030,7 @@ impl Tab {
         options.fibex = fibex;
         // As the first file was read last time: lines or records.
         let split = records::remembered(&paths[0]);
+        let merge = prefs.merge_by_time;
         options.records = split.clone();
         Self {
             path: paths[0].clone(),
@@ -1042,7 +1038,15 @@ impl Tab {
             part_files: Vec::new(),
             mixed: None,
             file: None,
-            loading: Some(Job::spawn(ctx, move |prog| nerka_core::open_many(&ps, &options, prog))),
+            // Files that know their times (DLT, captures) in the order they
+            // start, their lines interleaved by time if that was last chosen.
+            loading: Some(Job::spawn(ctx, move |prog| {
+                if merge {
+                    nerka_core::open_merged_by_time(&ps, &options, prog)
+                } else {
+                    nerka_core::open_many_by_time(&ps, &options, prog)
+                }
+            })),
             main_view: ViewState::with_free_keys(),
             hits_view: ViewState::default(),
             columns: Columns::default(),
@@ -1050,14 +1054,14 @@ impl Tab {
             picked_mode: prefs.mode,
             pattern: String::new(),
             options: prefs.options.clone(),
-            result: None,
-            searching: None,
+            session: Session::new(),
+            stage_jobs: Vec::new(),
             filter_exp: None,
             picks: Picks::default(),
             preset: None,
             colors_exp: None,
-            line_colors: None,
-            colors_job: None,
+            colors_set: None,
+            colors_shown: None,
             search: SearchBox {
                 mode: prefs.search_mode,
                 picked: prefs.search_mode,
@@ -1071,7 +1075,6 @@ impl Tab {
             bookmarks: Bookmarks::default(),
             marks_changed: false,
             notes: NoteMode::default(),
-            applied: None,
             marks_open: Default::default(),
             mark_rename: None,
             detail: None,
@@ -1091,6 +1094,7 @@ impl Tab {
             records: split,
             records_edit: None,
             files_undo: None,
+            merge,
             status: String::new(),
         }
     }
@@ -1110,28 +1114,52 @@ impl Tab {
     }
 
     fn is_busy(&self) -> bool {
-        self.loading.is_some()
-            || self.searching.is_some()
-            || self.search.job.is_some()
-            || self.colors_job.is_some()
-            || self.signals_job.is_some()
+        self.loading.is_some() || !self.stage_jobs.is_empty() || self.signals_job.is_some()
     }
 
     fn cancel_jobs(&mut self) {
         if let Some(j) = self.loading.take() {
             j.cancel();
         }
-        if let Some((_, j)) = self.searching.take() {
+        for (_, _, j) in self.stage_jobs.drain(..) {
             j.cancel();
         }
-        if let Some((_, j)) = self.search.job.take() {
-            j.cancel();
-        }
-        if let Some((_, j)) = self.colors_job.take() {
-            j.cancel();
-        }
+        // What was running runs again once there is something to run on.
+        self.session.requeue_running();
         if let Some(j) = self.signals_job.take() {
             j.cancel();
+        }
+    }
+
+    /// The lines the filter keeps, once in (`None`: no filter yet).
+    fn result(&self) -> Option<&Arc<SearchResult>> {
+        self.session.result()
+    }
+
+    /// The search hits, with the names and colours of their queries.
+    fn search_hits(&self) -> Option<(Arc<ActiveSearch>, Arc<SearchHits>)> {
+        Some((self.search.shown.clone()?, self.session.hits()?.clone()))
+    }
+
+    /// The line colours, with the names and colours of their queries.
+    fn line_colors(&self) -> Option<(Arc<ActiveSearch>, Arc<SearchHits>)> {
+        Some((self.colors_shown.clone()?, self.session.colors()?.clone()))
+    }
+
+    /// The job running for a stage of the session.
+    fn stage_job(&self, stage: Stage) -> Option<&Job<Output>> {
+        self.stage_jobs.iter().find(|(s, _, _)| *s == stage).map(|(_, _, j)| j)
+    }
+
+    /// Start what the session says is due, each stage in a thread of its
+    /// own (a stage's older job is cancelled: its result would be ignored).
+    fn kick(&mut self, ctx: &egui::Context) {
+        for t in self.session.tasks() {
+            let (stage, ticket) = (t.stage, t.ticket);
+            if let Some(i) = self.stage_jobs.iter().position(|(s, _, _)| *s == stage) {
+                self.stage_jobs.remove(i).2.cancel();
+            }
+            self.stage_jobs.push((stage, ticket, Job::spawn(ctx, move |prog| t.run(prog))));
         }
     }
 
@@ -1175,11 +1203,22 @@ impl Tab {
     fn signals_changed(&mut self, ctx: &egui::Context) {
         self.signals_gen += 1;
         self.collect_signals(ctx);
-        if self.pattern.contains('@') {
-            self.start_search(ctx);
-        } else if self.search.pattern.contains('@') {
-            self.rerun_search(ctx);
+        // What uses them is compiled again with them and runs again.
+        for (stage, e) in self.session.set_signals(self.signals.clone()) {
+            self.status = format!("{}: {e}", if stage == Stage::Filter { "Filter" } else { "Search" });
+            if stage == Stage::Search {
+                self.search.active = None;
+            }
         }
+        // Boxes whose text couldn't compile before (a signal not built yet,
+        // as at startup) are tried again.
+        if self.pattern.contains('@') && self.session.filter().is_none() && self.file.is_some() {
+            self.start_search(ctx);
+        }
+        if self.search.pattern.contains('@') && self.search.active.is_none() && self.file.is_some() {
+            self.run_search_box(ctx);
+        }
+        self.kick(ctx);
     }
 
     /// Plotted lanes whose signal the tab doesn't have but the FIBEX files
@@ -1215,9 +1254,8 @@ impl Tab {
         options.fibex = fibex;
         options.records = self.records.clone();
         self.file = None;
-        self.result = None;
         self.reopen_at = Some(line);
-        self.loading = Some(Job::spawn(ctx, move |prog| nerka_core::open_many(&ps, &options, prog)));
+        self.loading = Some(self.open_job(ctx, ps, options));
     }
 
     /// Show `paths` in this tab instead (the Files window: reordered, added,
@@ -1252,7 +1290,15 @@ impl Tab {
         let mut options = prefs.open_options();
         options.fibex = fibex;
         options.records = self.records.clone();
-        self.loading = Some(Job::spawn(ctx, move |prog| nerka_core::open_many(&ps, &options, prog)));
+        self.loading = Some(self.open_job(ctx, ps, options));
+    }
+
+    /// Read `paths` again: in this order, or merged by time.
+    fn open_job(&self, ctx: &egui::Context, ps: Vec<PathBuf>, options: nerka_core::OpenOptions) -> Job<Opened> {
+        if self.merge {
+            return Job::spawn(ctx, move |prog| nerka_core::open_merged_by_time(&ps, &options, prog));
+        }
+        Job::spawn(ctx, move |prog| nerka_core::open_many(&ps, &options, prog).map(|f| (f, ps)))
     }
 
     /// Build the tab's signals again if what they come from changed: the
@@ -1343,26 +1389,26 @@ impl Tab {
     /// Start searching with the current filter; returns whether a search
     /// was started (so the caller can record it in the history).
     fn start_search(&mut self, ctx: &egui::Context) -> bool {
-        let Some(file) = self.file.clone() else { return false };
-        if let Some((_, j)) = self.searching.take() {
-            j.cancel();
+        if self.file.is_none() {
+            return false;
         }
         if self.filter_exp.as_ref().is_some_and(|a| a.exp.nfd != self.pattern) {
             self.filter_exp = None;
         }
         if self.pattern.trim().is_empty() {
             let cur = self.current_line();
-            self.result = None;
-            self.applied = None;
+            self.session.set_filter(None);
             self.goto_line(cur);
             self.status.clear();
+            // The colours follow the selection (it may have changed too).
             self.recolor(ctx);
-            self.rerun_search(ctx);
             return false;
         }
         match self.build_filter() {
             Ok(f) => {
-                self.run_filter(ctx, file, f.with_bookmarks(&self.marks()));
+                self.session.set_filter(Some(f));
+                // Run over the new result once it is in.
+                self.recolor(ctx);
                 true
             }
             Err(e) => {
@@ -1372,44 +1418,12 @@ impl Tab {
         }
     }
 
-    fn run_filter(&mut self, ctx: &egui::Context, file: Arc<dyn LogSource>, f: Filter) {
-        let f = Arc::new(f);
-        let ff = f.clone();
-        let job = Job::spawn(ctx, move |prog| nerka_core::search(&*file, &ff, prog));
-        self.searching = Some((f, job));
-    }
-
-    /// The tab's bookmarks as queries take them.
-    fn marks(&self) -> Arc<Bookmarks> {
-        Arc::new(self.bookmarks.clone())
-    }
-
     /// The bookmarks changed: a filter, search or line colour that uses
-    /// `bookmark` runs again with them (the filter's own, not the box's
-    /// text, which may have been edited since).
+    /// `bookmark` runs again with them (the filter that ran, not the box's
+    /// text, which may have been edited since; the session decides).
     fn bookmarks_changed(&mut self, ctx: &egui::Context) {
-        let marks = self.marks();
-        let filter = match &self.searching {
-            Some((f, _)) => Some(f.clone()),
-            None => self.applied.clone(),
-        };
-        let refilter = filter.filter(|f| f.uses_bookmarks());
-        if let Some(a) = self.search.active.clone().filter(|a| a.uses_bookmarks()) {
-            self.search.active = Some(Arc::new(a.with_bookmarks(&marks)));
-            if refilter.is_none() {
-                self.rerun_search(ctx);
-            }
-        }
-        if let (Some(f), Some(file)) = (refilter, self.file.clone()) {
-            if let Some((_, j)) = self.searching.take() {
-                j.cancel();
-            }
-            // The search and the colours follow the new result.
-            self.run_filter(ctx, file, (*f).clone().with_bookmarks(&marks));
-        } else if self.colors_exp.as_ref().is_some_and(|a| Query::compile(&a.exp.nfd).is_ok_and(|q| q.uses_bookmarks()))
-        {
-            self.recolor(ctx);
-        }
+        self.session.set_bookmarks(self.bookmarks.clone());
+        self.kick(ctx);
     }
 
     /// Advance background jobs. Returns `false` if the file failed to open
@@ -1430,15 +1444,15 @@ impl Tab {
                 Poll::Done(r, took) => {
                     self.loading = None;
                     match r {
-                        Ok(f) => {
+                        Ok((f, order)) => {
+                            if order != self.paths {
+                                self.path = order[0].clone();
+                                self.paths = order;
+                            }
                             if let Some(FilesUndo { at, .. }) = self.files_undo.take() {
                                 // Other files: what referred to the old lines goes.
                                 self.cancel_jobs();
                                 self.path = self.paths[0].clone();
-                                self.result = None;
-                                self.applied = None;
-                                self.line_colors = None;
-                                self.search.hits = None;
                                 self.detail = None;
                                 self.main_view = ViewState::with_free_keys();
                                 self.hits_view = ViewState::default();
@@ -1454,6 +1468,13 @@ impl Tab {
                             }
                             self.status = match self.paths.len() {
                                 1 => format!("Indexed {} lines in {took:.2?}", f.line_count()),
+                                n if f.reordered().is_some() => {
+                                    format!("Merged {} lines of {n} files by time in {took:.2?}", f.line_count())
+                                }
+                                n if self.merge => format!(
+                                    "Indexed {} lines of {n} files; not merged: not every file knows its lines' times",
+                                    f.line_count()
+                                ),
                                 n => format!("Indexed {} lines of {n} files in {took:.2?}", f.line_count()),
                             };
                             self.part_files = f.part_files();
@@ -1462,7 +1483,11 @@ impl Tab {
                                 Bookmarks::default()
                             });
                             self.columns = Columns::from_defs(f.columns());
-                            self.file = Some(Arc::from(f));
+                            let f: Arc<dyn LogSource> = Arc::from(f);
+                            self.file = Some(f.clone());
+                            // Every query runs again on the file read.
+                            self.session.set_bookmarks(self.bookmarks.clone());
+                            self.session.set_source(f);
                             // Built with the next frame (`@time` if the
                             // file knows its lines' times).
                             self.signals_key = None;
@@ -1479,8 +1504,8 @@ impl Tab {
                                 self.start_search(ctx);
                             } else {
                                 self.recolor(ctx);
-                                self.rerun_search(ctx);
                             }
+                            self.kick(ctx);
                         }
                         // The Files window's list can't be read: the files
                         // shown stay.
@@ -1503,68 +1528,42 @@ impl Tab {
                 }
             }
         }
-        if let Some((f, job)) = &self.searching {
-            let f = f.clone();
-            match job.poll() {
-                Poll::Running => ctx.request_repaint_after(Duration::from_millis(50)),
-                Poll::Done(r, took) => {
-                    match r {
-                        Ok(res) => {
-                            self.applied = Some(f);
-                            self.status = format!("Filter keeps {} lines ({took:.2?})", res.lines.len());
-                            let cur = self.current_line();
-                            self.result = Some(Arc::new(res));
-                            self.goto_line(cur);
-                            self.searching = None;
-                            // Colours and the search follow the filter result.
-                            self.recolor(ctx);
-                            self.rerun_search(ctx);
-                        }
-                        Err(nerka_core::Error::Cancelled) => self.searching = None,
-                        Err(e) => {
-                            self.status = format!("Filter failed: {e}");
-                            self.searching = None;
-                        }
-                    }
+        let mut i = 0;
+        while i < self.stage_jobs.len() {
+            let Poll::Done(r, took) = self.stage_jobs[i].2.poll() else {
+                ctx.request_repaint_after(Duration::from_millis(50));
+                i += 1;
+                continue;
+            };
+            let (_, ticket, _) = self.stage_jobs.remove(i);
+            // Where the view is, before the filter's lines change.
+            let cur = self.current_line();
+            match self.session.finish(ticket, r) {
+                Ok(Finished::Done(Stage::Filter)) => {
+                    let n = self.result().map_or(0, |r| r.lines.len());
+                    self.status = format!("Filter keeps {n} lines ({took:.2?})");
+                    self.goto_line(cur);
                 }
-            }
-        }
-        if let Some((a, job)) = &self.colors_job {
-            match job.poll() {
-                Poll::Running => ctx.request_repaint_after(Duration::from_millis(50)),
-                Poll::Done(r, _) => {
-                    match r {
-                        Ok(hits) => self.line_colors = Some((a.clone(), Arc::new(hits))),
-                        Err(nerka_core::Error::Cancelled) => {}
-                        Err(e) => self.status = format!("Colouring failed: {e}"),
-                    }
-                    self.colors_job = None;
-                }
-            }
-        }
-        if let Some((a, job)) = &self.search.job {
-            match job.poll() {
-                Poll::Running => ctx.request_repaint_after(Duration::from_millis(50)),
-                Poll::Done(r, took) => {
-                    match r {
-                        Ok(hits) => {
-                            let mut msg = format!("{} search hits in {took:.2?}", hits.len());
-                            if a.names.len() > 1 {
-                                let counts = hits.counts(a.names.len());
-                                let per: Vec<String> =
-                                    a.names.iter().zip(counts).map(|(n, c)| format!("{} {c}", short(n))).collect();
-                                msg += &format!(" ({})", per.join(" · "));
-                            }
-                            self.status = msg;
-                            self.search.hits = Some((a.clone(), Arc::new(hits)));
-                            self.hits_view = ViewState::default();
+                Ok(Finished::Done(Stage::Search)) => {
+                    self.search.shown = self.search.active.clone();
+                    if let Some((a, hits)) = self.search_hits() {
+                        let mut msg = format!("{} search hits in {took:.2?}", hits.len());
+                        if a.names.len() > 1 {
+                            let counts = hits.counts(a.names.len());
+                            let per: Vec<String> =
+                                a.names.iter().zip(counts).map(|(n, c)| format!("{} {c}", short(n))).collect();
+                            msg += &format!(" ({})", per.join(" · "));
                         }
-                        Err(nerka_core::Error::Cancelled) => {}
-                        Err(e) => self.status = format!("Search failed: {e}"),
+                        self.status = msg;
                     }
-                    self.search.job = None;
+                    self.hits_view = ViewState::default();
                 }
+                Ok(Finished::Done(Stage::Colors)) => self.colors_shown = self.colors_set.clone(),
+                Ok(Finished::Ignored) => {}
+                Err(e) => self.status = format!("Failed: {e}"),
             }
+            // A filter result lets the search and the colours run over it.
+            self.kick(ctx);
         }
         true
     }
@@ -1678,8 +1677,9 @@ impl Tab {
         }
         match self.build_search() {
             Ok(a) => {
-                self.search.active = Some(Arc::new(a.with_bookmarks(&self.marks())));
-                self.rerun_search(ctx);
+                self.session.set_search(Some(a.set.clone()));
+                self.search.active = Some(Arc::new(a));
+                self.kick(ctx);
             }
             Err(e) => self.status = e,
         }
@@ -1693,11 +1693,12 @@ impl Tab {
     }
 
     fn clear_search(&mut self) {
-        if let Some((_, j)) = self.search.job.take() {
-            j.cancel();
+        if let Some(i) = self.stage_jobs.iter().position(|(s, _, _)| *s == Stage::Search) {
+            self.stage_jobs.remove(i).2.cancel();
         }
+        self.session.set_search(None);
         self.search.active = None;
-        self.search.hits = None;
+        self.search.shown = None;
         self.search.terms.clear();
         self.search.pattern.clear();
     }
@@ -1707,38 +1708,35 @@ impl Tab {
     /// a filter: issue #8, a selection of only signal queries). Runs after
     /// the filter result is in, and when a colour is switched on or off.
     fn recolor(&mut self, ctx: &egui::Context) {
-        if let Some((_, j)) = self.colors_job.take() {
-            j.cancel();
-        }
-        self.line_colors = None;
-        let (Some(a), Some(file)) = (self.colors_exp.clone(), self.file.clone()) else {
-            return;
-        };
-        let res = self.result.clone();
-        if self.searching.is_some() {
-            return;
-        }
-        let marks = self.marks();
-        let (mut include, mut names, mut colors) = (Vec::new(), Vec::new(), Vec::new());
-        for (i, p) in a.exp.parts.iter().enumerate() {
-            if p.role == Role::Exclude || !self.picks.is_lit(a.keys[i]) {
-                continue;
+        let set = self.colors_exp.clone().and_then(|a| {
+            let (mut include, mut names, mut colors) = (Vec::new(), Vec::new(), Vec::new());
+            for (i, p) in a.exp.parts.iter().enumerate() {
+                if p.role == Role::Exclude || !self.picks.is_lit(a.keys[i]) {
+                    continue;
+                }
+                let Ok(q) = Query::compile(a.exp.part_nfd(p)).and_then(|q| q.with_signals(&self.signals)) else {
+                    continue;
+                };
+                include.push(Filter::Query(q));
+                names.push(a.names[i].clone());
+                colors.push(a.colors[i]);
             }
-            let Ok(q) = Query::compile(a.exp.part_nfd(p)).and_then(|q| q.with_signals(&self.signals)) else { continue };
-            include.push(Filter::Query(q.with_bookmarks(&marks)));
-            names.push(a.names[i].clone());
-            colors.push(a.colors[i]);
-        }
-        if include.is_empty() {
-            return;
-        }
-        let a =
-            Arc::new(ActiveSearch { set: SearchSet { include, exclude: vec![] }, names, colors, highlighters: vec![] });
-        let aa = a.clone();
-        let job = Job::spawn(ctx, move |prog| {
-            nerka_core::search_within(&*file, res.as_ref().map(|r| r.lines.as_slice()), &aa.set, prog)
+            (!include.is_empty()).then(|| ActiveSearch {
+                set: SearchSet { include, exclude: vec![] },
+                names,
+                colors,
+                highlighters: vec![],
+            })
         });
-        self.colors_job = Some((a, job));
+        if let Some(i) = self.stage_jobs.iter().position(|(s, _, _)| *s == Stage::Colors) {
+            self.stage_jobs.remove(i).2.cancel();
+        }
+        self.session.set_colors(set.as_ref().map(|a| a.set.clone()));
+        if set.is_none() {
+            self.colors_shown = None;
+        }
+        self.colors_set = set.map(Arc::new);
+        self.kick(ctx);
     }
 
     /// This tab as a preset: the selection, parameters, and the boxes'
@@ -1800,35 +1798,17 @@ impl Tab {
         self.recolor(ctx);
     }
 
-    /// Start (again) the active search over the current filter result.
-    /// Waits while the file loads or the filter runs; they call it again.
-    fn rerun_search(&mut self, ctx: &egui::Context) {
-        let (Some(a), Some(file)) = (self.search.active.clone(), self.file.clone()) else { return };
-        if let Some((_, j)) = self.search.job.take() {
-            j.cancel();
-        }
-        if self.searching.is_some() {
-            return;
-        }
-        let within = self.result.clone();
-        let aa = a.clone();
-        let job = Job::spawn(ctx, move |prog| {
-            nerka_core::search_within(&*file, within.as_ref().map(|r| r.lines.as_slice()), &aa.set, prog)
-        });
-        self.search.job = Some((a, job));
-    }
-
     fn total_lines(&self) -> LineNo {
         self.file.as_ref().map_or(0, |f| f.line_count())
     }
 
     /// Rows of the main view: the lines the filter keeps, or all lines.
     fn main_rows(&self) -> u64 {
-        self.result.as_ref().map_or(self.total_lines(), |r| r.lines.len() as u64)
+        self.result().map_or(self.total_lines(), |r| r.lines.len() as u64)
     }
 
     fn line_of_row(&self, row: u64) -> LineNo {
-        match &self.result {
+        match self.result() {
             Some(r) => r.lines.get(row as usize).copied().unwrap_or(0),
             None => row,
         }
@@ -1837,7 +1817,7 @@ impl Tab {
     /// The main-view row of `line`, or of the next kept line after it (the
     /// last one if there is none).
     fn row_of_line(&self, line: LineNo) -> u64 {
-        match &self.result {
+        match self.result() {
             Some(r) => (r.position_at_or_after(line) as u64).min((r.lines.len() as u64).saturating_sub(1)),
             None => line.min(self.total_lines().saturating_sub(1)),
         }
@@ -1855,7 +1835,7 @@ impl Tab {
 
     /// Jump to the next/previous search hit after the main view's cursor.
     fn jump_match(&mut self, forward: bool) {
-        let Some((_, hits)) = self.search.hits.clone() else { return };
+        let Some((_, hits)) = self.search_hits() else { return };
         if hits.is_empty() {
             return;
         }
@@ -1895,7 +1875,7 @@ impl Tab {
     /// those not used as signals.
     fn line_signals(&mut self, line: LineNo, args: &[nerka_core::Argument]) -> Vec<LineSignal> {
         let Some(file) = self.file.clone() else { return Vec::new() };
-        let kept = self.result.clone();
+        let kept = self.result().cloned();
         let mut out: Vec<LineSignal> = Vec::new();
         for d in self.signals.iter() {
             let origin = if d.is_from_source() {
@@ -1966,6 +1946,10 @@ impl Tab {
     /// Each file keeps its own sidecar, anchored on its own lines; a view
     /// of several maps lines.
     fn load_bookmarks(&self, file: &dyn LogSource) -> std::io::Result<Bookmarks> {
+        // Merged by time: the files' bookmarks, on the rows their lines are.
+        if let Some(r) = file.reordered() {
+            return Ok(self.load_bookmarks(r.inner)?.remapped(|l| r.row_of[l as usize]));
+        }
         let Some(parts) = file.parts() else { return Bookmarks::load_for(&self.path, file) };
         let files: Vec<(&Path, LineNo, &dyn LogSource)> =
             self.paths.iter().zip(&parts).map(|(p, part)| (p.as_path(), part.first, part.source.as_ref())).collect();
@@ -1974,8 +1958,13 @@ impl Tab {
 
     fn save_bookmarks(&mut self) {
         let Some(file) = self.file.clone() else { return };
+        // Merged by time: each file's bookmarks on its own lines.
+        let (marks, file) = match file.reordered() {
+            Some(r) => (self.bookmarks.remapped(|row| r.line_of[row as usize]), r.inner),
+            None => (self.bookmarks.clone(), &*file),
+        };
         let res = match file.parts() {
-            None => self.bookmarks.save_for(&self.path, &*file),
+            None => marks.save_for(&self.path, file),
             Some(parts) => {
                 let files: Vec<(&Path, LineNo, LineNo, &dyn LogSource)> = self
                     .paths
@@ -1983,7 +1972,7 @@ impl Tab {
                     .zip(&parts)
                     .map(|(p, part)| (p.as_path(), part.first, part.source.line_count(), part.source.as_ref()))
                     .collect();
-                self.bookmarks.save_for_parts(&files)
+                marks.save_for_parts(&files)
             }
         };
         if let Err(e) = res {
@@ -2025,7 +2014,7 @@ impl Tab {
     /// follows (the search hits, else the main view), which moves there too.
     fn step_detail(&mut self, down: bool) {
         let Some(d) = &self.detail else { return };
-        let hits = self.search.hits.clone().filter(|(_, h)| d.in_hits && !h.is_empty());
+        let hits = self.search_hits().filter(|(_, h)| d.in_hits && !h.is_empty());
         let line = if let Some((_, hits)) = hits {
             let n = hits.len() as u64;
             let i = hits.position_at_or_after(d.line) as u64;
@@ -2231,7 +2220,7 @@ impl Tab {
             // so the row never grows wider than the panel.
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 go |= ui.button("Filter").on_hover_text("Show only the matching lines in the main view").clicked();
-                let on = self.result.is_some() || self.searching.is_some();
+                let on = self.result().is_some() || self.session.is_busy(Stage::Filter);
                 clear = ui
                     .add_enabled(on, egui::Button::new("Clear"))
                     .on_hover_text("Show every line again (↑ in the box brings the filter back)")
@@ -2301,14 +2290,14 @@ impl Tab {
     ) -> Option<(&'static str, String)> {
         let searched = self.search_row(ui, history);
         ui.add_space(2.0);
-        let marks = self.search.hits.as_ref().map(|(a, h)| SearchMarks {
+        let (search_hits, line_colors) = (self.search_hits(), self.line_colors());
+        let marks = search_hits.as_ref().map(|(a, h)| SearchMarks {
             hits: h,
             colors: &a.colors,
             highlighters: &a.highlighters,
         });
-        let lines =
-            self.line_colors.as_ref().map(|(a, h)| SearchMarks { hits: h, colors: &a.colors, highlighters: &[] });
-        if let Some((_, hits)) = self.search.hits.clone() {
+        let lines = line_colors.as_ref().map(|(a, h)| SearchMarks { hits: h, colors: &a.colors, highlighters: &[] });
+        if let Some((_, hits)) = search_hits.clone() {
             let out = log_view(
                 ui,
                 "hits",
@@ -2338,7 +2327,7 @@ impl Tab {
                 }
             }
         } else {
-            ui.weak(if self.result.is_some() {
+            ui.weak(if self.result().is_some() {
                 "No search. Type in the Search box to find lines among the filtered ones."
             } else {
                 "No search. Type in the Search box to find lines."
@@ -2437,14 +2426,14 @@ impl Tab {
     }
 
     fn main_panel(&mut self, ui: &mut egui::Ui, file: &dyn LogSource) {
-        let marks = self.search.hits.as_ref().map(|(a, h)| SearchMarks {
+        let (search_hits, line_colors) = (self.search_hits(), self.line_colors());
+        let marks = search_hits.as_ref().map(|(a, h)| SearchMarks {
             hits: h,
             colors: &a.colors,
             highlighters: &a.highlighters,
         });
-        let lines =
-            self.line_colors.as_ref().map(|(a, h)| SearchMarks { hits: h, colors: &a.colors, highlighters: &[] });
-        let result = self.result.clone();
+        let lines = line_colors.as_ref().map(|(a, h)| SearchMarks { hits: h, colors: &a.colors, highlighters: &[] });
+        let result = self.result().cloned();
         let line_of_row = |row: u64| match &result {
             Some(r) => r.lines[row as usize],
             None => row,
@@ -2598,6 +2587,7 @@ fn expansion_lines<'a>(a: &'a Applied, lit: &dyn Fn(u64) -> bool) -> Vec<ChipLin
             let joiner = match p.role {
                 Role::Include if includes == 0 => "",
                 Role::Include => "OR",
+                Role::Require => "AND",
                 Role::Exclude => "AND NOT",
                 // Not in the box: signals and colours only.
                 Role::Signal => "signals:",
@@ -2911,6 +2901,13 @@ impl App {
         }
         self.library = lib;
         self.library_errors = errors;
+        // Another window may have counted uses since.
+        if let Some(path) = nerka_core::pack::default_usage_path() {
+            match pack::Usage::load(&path) {
+                Ok(u) => self.library_view.usage = u,
+                Err(e) => self.library_errors.push(format!("{}: {e}", path.display())),
+            }
+        }
     }
 
     fn preset_action(&mut self, ctx: &egui::Context, action: presets::Action) {
@@ -2959,24 +2956,39 @@ impl App {
             library::Action::Reload => self.load_library(),
             library::Action::Apply => {
                 let lib = std::mem::take(&mut self.library);
-                let recorded = self.tab().and_then(|t| t.apply_selection(ctx, &lib));
+                let recorded =
+                    self.tab().and_then(|t| t.apply_selection(ctx, &lib).map(|nfd| (nfd, t.picks.used_queries())));
                 self.library = lib;
-                if let Some(nfd) = recorded {
+                if let Some((nfd, used)) = recorded {
                     self.record_search("query", &nfd);
+                    self.record_usage(&used);
                 }
             }
             library::Action::Search { target, add } => {
                 let lib = std::mem::take(&mut self.library);
                 let searched = self.tab().and_then(|t| {
                     t.search_for(ctx, &lib, &target, add);
-                    t.search.active.is_some().then(|| (t.search.tag(), t.search.pattern.clone()))
+                    let used = t.picks.target_query(&target);
+                    t.search.active.is_some().then(|| (t.search.tag(), t.search.pattern.clone(), used))
                 });
                 self.library = lib;
-                if let Some((tag, pattern)) = searched {
+                if let Some((tag, pattern, used)) = searched {
                     self.record_search_box(tag, &pattern);
+                    self.record_usage(&used.into_iter().collect::<Vec<_>>());
                 }
             }
             library::Action::Edited { renamed, removed } => {
+                let usage = &mut self.library_view.usage;
+                let before = usage.clone();
+                if let Some((old, new)) = &renamed {
+                    usage.renamed(old, new);
+                }
+                if let Some(id) = &removed {
+                    usage.removed(id);
+                }
+                if *usage != before {
+                    self.save_usage();
+                }
                 for t in &mut self.tabs {
                     if let Some((old, new)) = &renamed {
                         t.picks.renamed(old, new);
@@ -2992,6 +3004,23 @@ impl App {
             }
         }
     }
+    /// Count a use of these library queries (the Most used list) and save.
+    fn record_usage(&mut self, ids: &[String]) {
+        if ids.is_empty() {
+            return;
+        }
+        self.library_view.usage.record(ids.iter().map(String::as_str));
+        self.save_usage();
+    }
+
+    fn save_usage(&mut self) {
+        if let Some(path) = nerka_core::pack::default_usage_path()
+            && let Err(e) = self.library_view.usage.save(&path)
+        {
+            self.status = format!("{}: {e}", path.display());
+        }
+    }
+
     fn load_saved_signals(&mut self) {
         let Some(path) = signals_path() else { return };
         let Ok(text) = std::fs::read_to_string(&path) else { return };
@@ -3132,6 +3161,7 @@ impl App {
             local_time: self.prefs.local_time,
             mf4_local_time: self.prefs.mf4_local_time,
             bookmark_notes: self.prefs.bookmark_notes,
+            merge_by_time: self.prefs.merge_by_time,
             ..prefs
         };
         if prefs == self.prefs {
@@ -3420,7 +3450,7 @@ impl App {
 
     fn tab_bar(&mut self, ui: &mut egui::Ui) {
         let (mut select, mut close, mut close_others, mut moved, mut split) = (None, None, None, None, None);
-        let (mut files, mut records_edit, mut unfold) = (None, None, None);
+        let (mut files, mut records_edit, mut unfold, mut merge) = (None, None, None, None);
         egui::ScrollArea::horizontal().show(ui, |ui| {
             ui.horizontal(|ui| {
                 for (i, t) in self.tabs.iter().enumerate() {
@@ -3451,6 +3481,15 @@ impl App {
                         }
                         if t.paths.len() > 1 && ui.button("Open the files as separate tabs").clicked() {
                             split = Some(i);
+                        }
+                        if t.paths.len() > 1 {
+                            let mut on = t.merge;
+                            let tip = "Lines of all files in the order of their times (DLT, captures), each file's \
+                                       own order kept; off: one file after another";
+                            if ui.checkbox(&mut on, "Merge by time").on_hover_text(tip).changed() {
+                                merge = Some(i);
+                                ui.close();
+                            }
                         }
                         if ui.button("Files…").on_hover_text("Reorder, add or remove the files of this tab").clicked()
                         {
@@ -3487,6 +3526,19 @@ impl App {
             self.active = i;
             let t = &mut self.tabs[i];
             t.files_edit = Some(t.paths.clone());
+        }
+        if let Some(i) = merge {
+            self.active = i;
+            let t = &mut self.tabs[i];
+            t.merge = !t.merge;
+            t.reopen(&ui.ctx().clone(), &self.prefs, self.fibex.clone());
+            // New tabs of several files follow the last choice.
+            self.prefs.merge_by_time = t.merge;
+            if let Some(path) = prefs_path()
+                && let Err(e) = self.prefs.save(&path)
+            {
+                self.status = format!("Could not save preferences: {e}");
+            }
         }
         if let Some(i) = unfold {
             let t = &mut self.tabs[i];
@@ -3837,12 +3889,12 @@ impl App {
                     if let Some(j) = &t.loading {
                         ui.add(egui::ProgressBar::new(j.progress.fraction()).desired_width(200.0).show_percentage());
                         ui.label(format!("Indexing {}", t.path.display()));
-                    } else if let Some((_, j)) = &t.searching {
+                    } else if let Some(j) = t.stage_job(Stage::Filter) {
                         ui.add(egui::ProgressBar::new(j.progress.fraction()).desired_width(200.0).show_percentage());
                         if ui.button("Cancel").clicked() {
                             j.cancel();
                         }
-                    } else if let Some((_, j)) = &t.search.job {
+                    } else if let Some(j) = t.stage_job(Stage::Search) {
                         ui.add(egui::ProgressBar::new(j.progress.fraction()).desired_width(200.0).show_percentage());
                         ui.label("Searching");
                         if ui.button("Cancel").clicked() {
@@ -3969,7 +4021,7 @@ impl App {
                         line,
                         plot: &mut plot::lock(&tab.plot),
                         views: &mut tab.views,
-                        kept: tab.result.as_ref(),
+                        kept: tab.session.result(),
                         fibex: fibex.as_deref(),
                         arg_picks: &mut tab.arg_picks,
                     };
@@ -4033,7 +4085,7 @@ impl App {
                     generation: tab.signals_gen,
                     file: file.clone(),
                     cursor: line,
-                    kept: tab.result.clone(),
+                    kept: tab.result().cloned(),
                     bookmarks: plot::Bookmark::all(&tab.bookmarks),
                     saved: saved_plots,
                 };
@@ -4067,7 +4119,7 @@ impl App {
         } else if plotted {
             let line = tab.current_line();
             let in_window = false;
-            let kept = tab.result.clone();
+            let kept = tab.result().cloned();
             let (views, generation) = (&mut tab.views, tab.signals_gen);
             let mut series_of = |d: &nerka_core::SignalDef| views.series(d, &*file, kept.as_ref(), generation);
             let marks = plot::Bookmark::all(&tab.bookmarks);
@@ -4220,9 +4272,12 @@ query timeouts  labels: vision
         panic!("jobs still running");
     }
 
-    fn hits(tab: &Tab) -> Vec<(LineNo, Vec<&str>)> {
-        let (a, h) = tab.search.hits.as_ref().expect("search hits");
-        (0..h.len()).map(|i| (h.lines[i], h.matched(i).map(|q| short(&a.names[q])).collect())).collect()
+    /// Each hit's line and the (short) names of the queries it matched;
+    /// the names are leaked to compare with literals (tests only).
+    fn hits(tab: &Tab) -> Vec<(LineNo, Vec<&'static str>)> {
+        let (a, h) = tab.search_hits().expect("search hits");
+        let name = |q: usize| -> &'static str { Box::leak(short(&a.names[q]).to_owned().into_boxed_str()) };
+        (0..h.len()).map(|i| (h.lines[i], h.matched(i).map(name).collect())).collect()
     }
 
     #[test]
@@ -4268,7 +4323,7 @@ query timeouts  labels: vision
         settle(&mut tab, &ctx);
         assert!(text(&tab, 2).ends_with("	E1	NAV			speed 42"), "{}", text(&tab, 2));
         // The filter ran again on the decoded text; the current line stayed.
-        assert_eq!(tab.result.as_ref().unwrap().lines, [2, 3, 4]);
+        assert_eq!(tab.result().unwrap().lines, [2, 3, 4]);
         assert_eq!(tab.current_line(), 3);
         std::fs::remove_dir_all(&dir).unwrap();
     }
@@ -4328,7 +4383,7 @@ query timeouts  labels: vision
         tab.pattern = "@free_slots < 100".into();
         tab.start_search(&ctx);
         settle(&mut tab, &ctx);
-        assert_eq!(tab.result.as_ref().unwrap().lines, [1, 3]);
+        assert_eq!(tab.result().unwrap().lines, [1, 3]);
         // Picked, it is listed once, as the tab's signal.
         let own = tab.line_signals(1, &args);
         // (with the file's built-in @time, an event on every DLT line).
@@ -4448,7 +4503,7 @@ gear=D
         tab.pattern = "ERROR".into();
         tab.start_search(&ctx);
         settle(&mut tab, &ctx);
-        assert_eq!(tab.result.as_ref().unwrap().lines, [0, 2, 4]);
+        assert_eq!(tab.result().unwrap().lines, [0, 2, 4]);
         let file = tab.file.clone().unwrap();
         tab.detail = LineDetail::of(&*file, 0);
 
@@ -4821,6 +4876,92 @@ gear=D
     }
 
     #[test]
+    fn dlt_files_opened_together_are_put_in_the_order_they_start() {
+        use nerka_core::input::dlt::writer::{Msg, Value};
+        let dir = std::env::temp_dir().join(format!("nerka-gui-bytime-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let dlt = |path: &PathBuf, secs: u32| {
+            let mut buf = Vec::new();
+            let mut m = Msg::log(nerka_core::Level::Warn, "ECU1", "NAV", "CTX", vec![Value::Str("x".into()).into()]);
+            m.secs = secs;
+            m.encode(&mut buf);
+            std::fs::write(path, buf).unwrap();
+        };
+        let (late, early) = (dir.join("a_late.dlt"), dir.join("b_early.dlt"));
+        dlt(&late, 2_000);
+        dlt(&early, 1_000);
+        let ctx = egui::Context::default();
+        let mut app = App::default();
+        app.open_files(&ctx, vec![late.clone(), early.clone()]);
+        settle_app(&mut app, &ctx);
+        let t = &mut app.tabs[0];
+        assert_eq!(t.paths, [early.clone(), late.clone()]);
+        assert_eq!(t.title(), "b_early.dlt + 1");
+        // Reordered by hand in the Files window: that order is kept.
+        t.set_files(&ctx, vec![late.clone(), early.clone()], &SearchPrefs::default(), None);
+        settle(t, &ctx);
+        assert_eq!(t.paths, [late, early]);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn dlt_files_merged_by_time_keep_bookmarks_per_file() {
+        use nerka_core::input::dlt::writer::{Msg, Value};
+        let dir = std::env::temp_dir().join(format!("nerka-gui-merge-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let dlt = |path: &PathBuf, msgs: &[(u32, &str)]| {
+            let mut buf = Vec::new();
+            for (secs, text) in msgs {
+                let mut m =
+                    Msg::log(nerka_core::Level::Warn, "ECU1", "NAV", "CTX", vec![Value::Str((*text).into()).into()]);
+                m.secs = *secs;
+                m.encode(&mut buf);
+            }
+            std::fs::write(path, buf).unwrap();
+        };
+        let (a, b) = (dir.join("a.dlt"), dir.join("b.dlt"));
+        dlt(&a, &[(10, "a0"), (30, "a1 boom"), (50, "a2")]);
+        dlt(&b, &[(20, "b0"), (40, "b1 boom")]);
+        let ctx = egui::Context::default();
+        let mut tab = Tab::open_many(&ctx, vec![a.clone(), b.clone()], &SearchPrefs::default(), None);
+        settle(&mut tab, &ctx);
+        assert_eq!(tab.part_files, [(0, 3), (3, 2)], "one after another first");
+        tab.merge = true;
+        tab.reopen(&ctx, &SearchPrefs::default(), None);
+        settle(&mut tab, &ctx);
+        let file = tab.file.clone().unwrap();
+        let last = |r: LineNo| file.line_text(r).unwrap().rsplit('\t').next().unwrap().to_owned();
+        assert_eq!((0..5).map(last).collect::<Vec<_>>(), ["a0", "b0", "a1 boom", "b1 boom", "a2"]);
+        assert!(tab.status.starts_with("Merged 5 lines of 2 files"), "{}", tab.status);
+        // Filters run over the merged rows.
+        tab.mode = Mode::Text;
+        tab.pattern = "boom".into();
+        tab.start_search(&ctx);
+        settle(&mut tab, &ctx);
+        assert_eq!(tab.result().unwrap().lines, [2, 3]);
+        // A bookmark on b1 (row 3) is line 1 of b's own sidecar.
+        tab.toggle_bookmark_at(3);
+        let sidecar = std::fs::read_to_string(Bookmarks::sidecar_path(&b)).unwrap();
+        assert!(sidecar.starts_with("2\t\tB1\t@"), "1-based: {sidecar:?}");
+        assert!(!Bookmarks::sidecar_path(&a).exists());
+        // Read again (merged), it is on row 3; one after another, on b's line 1.
+        tab.reopen(&ctx, &SearchPrefs::default(), None);
+        settle(&mut tab, &ctx);
+        assert!(tab.bookmarks.contains(3));
+        tab.merge = false;
+        tab.reopen(&ctx, &SearchPrefs::default(), None);
+        settle(&mut tab, &ctx);
+        assert!(tab.bookmarks.contains(4), "b starts at line 3");
+        // The last choice is the default: a new tab with it on opens merged.
+        let prefs = SearchPrefs { merge_by_time: true, ..SearchPrefs::default() };
+        let mut two = Tab::open_many(&ctx, vec![b.clone(), a.clone()], &prefs, None);
+        settle(&mut two, &ctx);
+        assert!(two.merge && two.file.as_ref().unwrap().reordered().is_some());
+        assert!(two.bookmarks.contains(3), "b1's bookmark on its merged row");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn files_opened_together_are_one_view_with_bookmarks_per_file() {
         let dir = std::env::temp_dir().join(format!("nerka-gui-concat-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -4854,7 +4995,7 @@ gear=D
         t.pattern = "level >= ERROR AND NOT file == a.log".into();
         t.start_search(&ctx);
         settle(t, &ctx);
-        assert_eq!(t.result.as_ref().unwrap().lines, [2, 4]);
+        assert_eq!(t.result().unwrap().lines, [2, 4]);
         // A bookmark in b goes to b's own sidecar, as b numbers its lines.
         t.toggle_bookmark_at(3);
         let sidecar = std::fs::read_to_string(Bookmarks::sidecar_path(&b)).unwrap();
@@ -4891,7 +5032,7 @@ gear=D
         t.pattern = "ERROR".into();
         t.start_search(&ctx);
         settle(&mut t, &ctx);
-        assert_eq!(t.result.as_ref().unwrap().lines, [1, 2, 4]);
+        assert_eq!(t.result().unwrap().lines, [1, 2, 4]);
         t.goto_line(4); // b three
 
         t.set_files(&ctx, vec![b.clone(), a.clone()], &prefs, None);
@@ -4899,7 +5040,7 @@ gear=D
         assert_eq!(t.part_files, [(0, 3), (3, 2)]);
         assert_eq!(t.title(), "b.log + 1");
         assert_eq!(t.current_line(), 2, "still b three");
-        assert_eq!(t.result.as_ref().unwrap().lines, [0, 2, 4], "the filter ran again");
+        assert_eq!(t.result().unwrap().lines, [0, 2, 4], "the filter ran again");
 
         t.set_files(&ctx, vec![b.clone()], &prefs, None);
         settle(&mut t, &ctx);
@@ -5194,9 +5335,9 @@ gear=D
         settle(&mut two, &ctx);
         assert_eq!(two.preset.as_deref(), Some("cam triage"));
         assert_eq!(two.pattern, one.pattern);
-        assert_eq!(two.result.as_ref().unwrap().lines, [1, 6]);
-        assert_eq!(two.search.hits.as_ref().unwrap().1.lines, [1, 6]);
-        assert_eq!(two.line_colors.as_ref().expect("the colour came along").1.lines, [1, 6]);
+        assert_eq!(two.result().unwrap().lines, [1, 6]);
+        assert_eq!(two.search_hits().unwrap().1.lines, [1, 6]);
+        assert_eq!(two.line_colors().expect("the colour came along").1.lines, [1, 6]);
 
         // A typed filter comes back as typed text, in its mode.
         one.mode = Mode::Auto;
@@ -5207,7 +5348,7 @@ gear=D
         assert_eq!(p.filter, Some(BoxText::Typed { tag: "auto".into(), text: "disk full".into() }));
         two.use_preset(&ctx, &lib, &p);
         settle(&mut two, &ctx);
-        assert_eq!((two.mode, two.result.as_ref().unwrap().lines.as_slice()), (Mode::Auto, &[4][..]));
+        assert_eq!((two.mode, two.result().unwrap().lines.as_slice()), (Mode::Auto, &[4][..]));
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -5229,7 +5370,7 @@ gear=D
         tab.search.pattern = "cam1".into();
         tab.run_search_box(&ctx);
         settle(&mut tab, &ctx);
-        assert!(tab.line_colors.is_some());
+        assert!(tab.line_colors().is_some());
 
         let violet = library::parse_color("violet").unwrap();
         let tints: Vec<Color32> =
@@ -5272,32 +5413,32 @@ gear=D
         tab.picks.add(&lib, "vision.timeouts", Use::Include, None);
         tab.apply_filter_picks(&ctx, &lib).expect("runs");
         settle(&mut tab, &ctx);
-        assert_eq!(tab.result.as_ref().unwrap().lines, [1, 2, 3, 4, 5]);
+        assert_eq!(tab.result().unwrap().lines, [1, 2, 3, 4, 5]);
         tab.picks.light_source("vision.timeouts");
         tab.recolor_from(&ctx, &lib);
         settle(&mut tab, &ctx);
-        assert_eq!(tab.line_colors.clone().expect("line colours").1.lines, [3, 5]);
+        assert_eq!(tab.line_colors().expect("line colours").1.lines, [3, 5]);
 
         // Editing the Filter box by hand keeps them, among the lines the
         // new filter keeps.
         tab.pattern = "(level >= ERROR)".into();
         tab.start_search(&ctx);
         settle(&mut tab, &ctx);
-        assert_eq!(tab.result.as_ref().unwrap().lines, [1, 2, 4, 5]);
-        assert_eq!(tab.line_colors.clone().expect("after a manual edit").1.lines, [5]);
+        assert_eq!(tab.result().unwrap().lines, [1, 2, 4, 5]);
+        assert_eq!(tab.line_colors().expect("after a manual edit").1.lines, [5]);
 
         // A node switched on after Apply colours too; one removed doesn't.
         tab.picks.light_source("vision.errors");
         tab.recolor_from(&ctx, &lib);
         settle(&mut tab, &ctx);
-        assert_eq!(tab.line_colors.clone().unwrap().1.lines, [1, 2, 4, 5]);
+        assert_eq!(tab.line_colors().unwrap().1.lines, [1, 2, 4, 5]);
         let keys: Vec<u64> = tab.picks.nodes.iter().map(|n| n.key).collect();
         for k in keys {
             tab.picks.remove(k);
         }
         tab.recolor_from(&ctx, &lib);
         settle(&mut tab, &ctx);
-        assert!(tab.line_colors.is_none());
+        assert!(tab.line_colors().is_none());
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -5318,15 +5459,15 @@ gear=D
         tab.picks.light_source("vision.timeouts");
         tab.apply_filter_picks(&ctx, &lib);
         settle(&mut tab, &ctx);
-        assert!(tab.result.is_none(), "no filter");
-        assert_eq!(tab.line_colors.clone().expect("line colours").1.lines, [3, 5]);
+        assert!(tab.result().is_none(), "no filter");
+        assert_eq!(tab.line_colors().expect("line colours").1.lines, [3, 5]);
 
         // A tab that opens with the selection (a preset) colours once loaded.
         let p = tab.to_preset("p");
         let mut two = Tab::open(&ctx, log, &SearchPrefs::default());
         two.use_preset(&ctx, &lib, &p);
         settle(&mut two, &ctx);
-        assert_eq!(two.line_colors.clone().expect("after loading").1.lines, [3, 5]);
+        assert_eq!(two.line_colors().expect("after loading").1.lines, [3, 5]);
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -5379,23 +5520,23 @@ query nav
         tab.search.set("query", "bookmark ~ /look/");
         tab.run_search_box(&ctx);
         settle(&mut tab, &ctx);
-        assert_eq!(tab.result.as_ref().unwrap().lines, [3]);
+        assert_eq!(tab.result().unwrap().lines, [3]);
 
         tab.toggle_bookmark_at(1);
         settle(&mut tab, &ctx);
-        assert_eq!(tab.result.as_ref().unwrap().lines, [1, 3]);
+        assert_eq!(tab.result().unwrap().lines, [1, 3]);
         assert!(hits(&tab).is_empty());
 
         tab.set_bookmark(5, "look here".into());
         settle(&mut tab, &ctx);
-        assert_eq!(tab.result.as_ref().unwrap().lines, [1, 3, 5]);
+        assert_eq!(tab.result().unwrap().lines, [1, 3, 5]);
         assert_eq!(hits(&tab).iter().map(|(l, _)| *l).collect::<Vec<_>>(), [5]);
 
         // The box's text changed since: the filter that ran is kept.
         tab.pattern = "disk".into();
         tab.toggle_bookmark_at(1);
         settle(&mut tab, &ctx);
-        assert_eq!(tab.result.as_ref().unwrap().lines, [3, 5]);
+        assert_eq!(tab.result().unwrap().lines, [3, 5]);
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -5487,7 +5628,7 @@ query nav
         assert_eq!(nfd, "(level >= ERROR) AND (raw ~ /cam1 /) AND NOT (/timeout/)");
         assert_eq!(tab.mode, Mode::Query);
         settle(&mut tab, &ctx);
-        assert_eq!(tab.result.as_ref().unwrap().lines, [1]);
+        assert_eq!(tab.result().unwrap().lines, [1]);
 
         // Search inside the filter result only; then widen the filter and
         // the search follows it.
@@ -5495,7 +5636,7 @@ query nav
         tab.search_for(&ctx, &lib, &Target::Library("vision.timeouts".into()), true);
         settle(&mut tab, &ctx);
         assert_eq!(hits(&tab), [(1, vec!["drops"])]);
-        let colors = &tab.search.hits.as_ref().unwrap().0.colors;
+        let colors = &tab.search_hits().unwrap().0.colors;
         assert_eq!(colors[0], library::parse_color("violet").unwrap());
         assert_ne!(colors[1], colors[0]);
 
@@ -5503,16 +5644,16 @@ query nav
         tab.picks.remove(excluded);
         tab.apply_selection(&ctx, &lib).unwrap();
         settle(&mut tab, &ctx);
-        assert_eq!(tab.result.as_ref().unwrap().lines, [1, 5]);
+        assert_eq!(tab.result().unwrap().lines, [1, 5]);
         assert_eq!(hits(&tab), [(1, vec!["drops"]), (5, vec!["timeouts"])]);
 
         // Line colours are off by default; switched on, the later pick wins
         // where a line matches several.
-        assert!(tab.line_colors.is_none());
+        assert!(tab.line_colors().is_none());
         tab.picks.light_source("vision.cam");
         tab.recolor(&ctx);
         settle(&mut tab, &ctx);
-        let (a, h) = tab.line_colors.clone().expect("line colours");
+        let (a, h) = tab.line_colors().expect("line colours");
         assert_eq!(h.lines, [1, 5]);
         assert_eq!(a.names, ["cam"]);
 
@@ -5534,7 +5675,7 @@ query nav
         assert!(tab.search.current_terms().is_none());
         tab.run_search_box(&ctx);
         settle(&mut tab, &ctx);
-        assert_eq!(tab.search.hits.as_ref().unwrap().1.lines, [1, 5]);
+        assert_eq!(tab.search_hits().unwrap().1.lines, [1, 5]);
 
         // Without a filter the main view and the search cover the whole
         // file; the cursor stays on its line. Clear removes the filter.
@@ -5543,9 +5684,9 @@ query nav
         settle(&mut tab, &ctx);
         assert_eq!(tab.main_rows(), 6);
         assert_eq!(tab.current_line(), 5);
-        assert_eq!(tab.search.hits.as_ref().unwrap().1.lines, [0, 1, 2, 3, 4, 5]);
+        assert_eq!(tab.search_hits().unwrap().1.lines, [0, 1, 2, 3, 4, 5]);
         tab.clear_search();
-        assert!(tab.search.hits.is_none());
+        assert!(tab.search_hits().is_none());
 
         // Typed text, as a user would: literal by default, then a regex.
         tab.search.mode = Mode::Text;
@@ -5553,15 +5694,15 @@ query nav
         tab.search.ignore_case = true;
         tab.run_search_box(&ctx);
         settle(&mut tab, &ctx);
-        assert_eq!(tab.search.hits.as_ref().unwrap().1.lines, [0, 1, 2]);
+        assert_eq!(tab.search_hits().unwrap().1.lines, [0, 1, 2]);
         tab.search.pattern = "cam[2]".into();
         tab.run_search_box(&ctx);
         settle(&mut tab, &ctx);
-        assert!(tab.search.hits.as_ref().unwrap().1.is_empty(), "literal by default");
+        assert!(tab.search_hits().unwrap().1.is_empty(), "literal by default");
         tab.search.regex = true;
         tab.run_search_box(&ctx);
         settle(&mut tab, &ctx);
-        assert_eq!(tab.search.hits.as_ref().unwrap().1.lines, [2]);
+        assert_eq!(tab.search_hits().unwrap().1.lines, [2]);
 
         // Add to search: the typed regex becomes a query, OR'ed with the
         // library query, each with its own hits and colour.
@@ -5618,7 +5759,7 @@ query clock  signals: t:time
         tab.pattern = "@gear == D AND level >= WARN".into();
         tab.start_search(&ctx);
         settle(&mut tab, &ctx);
-        assert_eq!(tab.result.as_ref().unwrap().lines, [3]);
+        assert_eq!(tab.result().unwrap().lines, [3]);
 
         // A chosen kind wins over the values; a saved signal over the query's.
         tab.query_kind.insert("v".into(), SignalKind::Enum);
@@ -5659,7 +5800,7 @@ query clock  signals: t:time
         tab.signals_changed(&ctx);
         settle(&mut tab, &ctx);
         // The state holds on "boot" too.
-        assert_eq!(tab.result.as_ref().unwrap().lines, [1, 2, 3]);
+        assert_eq!(tab.result().unwrap().lines, [1, 2, 3]);
         // The panel's events were collected in the background.
         let file = tab.file.clone().unwrap();
         let series = tab.signals.get("v").unwrap().cached_series(&*file).expect("collected");
@@ -5667,7 +5808,7 @@ query clock  signals: t:time
         tab.pattern = "@v.event".into();
         tab.start_search(&ctx);
         settle(&mut tab, &ctx);
-        assert_eq!(tab.result.as_ref().unwrap().lines, [0, 1, 3]);
+        assert_eq!(tab.result().unwrap().lines, [0, 1, 3]);
         tab.pattern = "@v > 50".into();
         tab.start_search(&ctx);
         settle(&mut tab, &ctx);
@@ -5686,7 +5827,7 @@ query clock  signals: t:time
         tab.signals.remove("v");
         tab.signals_changed(&ctx);
         settle(&mut tab, &ctx);
-        assert!(tab.result.as_ref().unwrap().lines.is_empty());
+        assert!(tab.result().unwrap().lines.is_empty());
         tab.mode = Mode::Query;
         assert!(!tab.start_search(&ctx));
         assert!(tab.status.contains("unknown signal '@v' (no signals are defined)"), "{}", tab.status);

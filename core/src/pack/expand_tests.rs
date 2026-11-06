@@ -54,8 +54,54 @@ fn sel(include: &[&str], exclude: &[&str]) -> Selection {
     Selection {
         include: include.iter().map(pick).collect(),
         exclude: exclude.iter().map(pick).collect(),
+        require: vec![],
         signal: vec![],
     }
+}
+
+#[test]
+fn required_picks_are_anded_to_the_includes() {
+    let mut lib = lib();
+    lib.add(pack("pack cnt\nquery high\n    mcnt >= 3\nquery lvl\n    level >= WARN\n")).unwrap();
+    let p = params(&[("app", "NAV")]);
+    // Several includes are grouped, then each required part is ANDed.
+    let mut s = sel(&["nav.slow", "nav.errs"], &["nav.big"]);
+    s.require = vec![Pick::Query("cnt.high".into())];
+    let e = expand(&s, &lib, &p).unwrap();
+    assert_eq!(
+        e.nfd,
+        r#"((apid == "NAV") AND (/slow/) OR (apid == "NAV") AND (level >= ERROR OR /error/)) AND (mcnt >= 3) AND NOT ((apid == "NAV") AND (/slow/) AND (mcnt >= 0x10))"#
+    );
+    let roles: Vec<Role> = e.parts.iter().map(|p| p.role).collect();
+    assert_eq!(roles, [Role::Include, Role::Include, Role::Require, Role::Exclude]);
+    let hand = "apid == NAV AND (/slow/ OR level >= ERROR OR /error/) AND mcnt >= 3 AND NOT (/slow/ AND mcnt >= 16)";
+    assert_eq!(same_lines(&mem(), &e.nfd, hand), [2]);
+
+    // A required chain needs no parentheses; required parts alone are ANDed.
+    s = sel(&["nav.slow"], &[]);
+    s.require = vec![Pick::Query("nav.big".into()), Pick::Query("cnt.lvl".into())];
+    let e = expand(&s, &lib, &p).unwrap();
+    assert_eq!(
+        e.nfd,
+        r#"(apid == "NAV") AND (/slow/) AND (apid == "NAV") AND (/slow/) AND (mcnt >= 0x10) AND (level >= WARN)"#
+    );
+    assert_eq!(same_lines(&mem(), &e.nfd, "apid == NAV AND /slow/ AND mcnt >= 16 AND level >= WARN"), [5]);
+    let only = Selection {
+        require: vec![Pick::Query("cnt.high".into()), Pick::Query("cnt.lvl".into())],
+        ..Default::default()
+    };
+    let e = expand(&only, &lib, &p).unwrap();
+    assert_eq!(e.nfd, "(mcnt >= 3) AND (level >= WARN)");
+    assert_eq!(same_lines(&mem(), &e.nfd, "mcnt >= 3 AND level >= WARN"), [5, 6]);
+
+    // As a search: each include with the required parts; alone, one query.
+    let mut s = sel(&["nav.slow", "nav.errs"], &[]);
+    s.require = vec![Pick::Query("cnt.high".into())];
+    let set = expand(&s, &lib, &p).unwrap().search_set().unwrap();
+    assert_eq!(set.include.len(), 2);
+    assert_eq!(run_on(&mem(), &set.include[0]), [5]);
+    assert_eq!(run_on(&mem(), &set.include[1]), [2, 5]);
+    assert_eq!(expand(&only, &lib, &p).unwrap().search_set().unwrap().include.len(), 1);
 }
 
 #[test]

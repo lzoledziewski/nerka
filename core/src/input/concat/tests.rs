@@ -135,3 +135,36 @@ fn open_many_reads_files_in_order() {
     assert!(open_many(&[a, d], &o, &p).is_err());
     std::fs::remove_dir_all(&dir).ok();
 }
+
+#[test]
+fn files_with_times_open_in_the_order_they_start() {
+    let dir = std::env::temp_dir().join(format!("nerka-bytime-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let dlt = |secs: u32, apid: &str| {
+        let mut buf = Vec::new();
+        let mut m = Msg::log(crate::Level::Warn, "ECU1", apid, "CTX", vec![Value::Str(apid.into()).into()]);
+        m.secs = secs;
+        m.encode(&mut buf);
+        buf
+    };
+    let (early, late, same) = (dir.join("z_early.dlt"), dir.join("a_late.dlt"), dir.join("m_same.dlt"));
+    std::fs::write(&early, dlt(100, "EAR")).unwrap();
+    std::fs::write(&late, dlt(300, "LAT")).unwrap();
+    std::fs::write(&same, dlt(100, "SAM")).unwrap();
+    let (p, o) = (crate::Progress::new(), crate::OpenOptions::default());
+    // Sorted by start; ties keep the order given.
+    let (s, order) = open_many_by_time(&[late.clone(), early.clone(), same.clone()], &o, &p).unwrap();
+    assert_eq!(order, [early.clone(), same.clone(), late.clone()]);
+    let apids: Vec<String> = (0..3).map(|l| s.line_text(l).unwrap().into_owned()).collect();
+    assert!(apids[0].contains("EAR") && apids[1].contains("SAM") && apids[2].contains("LAT"), "{apids:?}");
+    assert_eq!(start_time(s.as_ref()), Some(100.0));
+
+    // Text files have no times: the given order stays.
+    let (a, b) = (dir.join("a.log"), dir.join("b.log"));
+    std::fs::write(&a, "one\n").unwrap();
+    std::fs::write(&b, "two\n").unwrap();
+    let (s, order) = open_many_by_time(&[b.clone(), a.clone()], &o, &p).unwrap();
+    assert_eq!(order, [b, a]);
+    assert_eq!(s.line_text(0).unwrap(), "two");
+    std::fs::remove_dir_all(&dir).ok();
+}
