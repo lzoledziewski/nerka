@@ -214,6 +214,8 @@ pub struct Output {
     pub saved_changed: bool,
     /// The signal the form added or updated (by name).
     pub adopted: Option<String>,
+    /// Show this check in the Checks pane (a check's signal was clicked).
+    pub open_check: Option<String>,
     /// A kind chosen for a query signal.
     pub kind: Option<(String, SignalKind)>,
     /// A scope chosen for a signal.
@@ -337,8 +339,7 @@ pub fn signals_panel(ui: &mut egui::Ui, st: &mut SignalsUi, input: Input<'_>) ->
             let mut remove_arg: Option<String> = None;
             let mut edit = None;
             egui::Grid::new("signals").num_columns(6).striped(true).show(ui, |ui| {
-                // A check's signal shows with its check (the Checks pane).
-                for d in signals.iter().filter(|d| !d.is_check()) {
+                for d in signals.iter() {
                     // Plotting a time against time says nothing.
                     if d.kind() == SignalKind::Time {
                         ui.label("");
@@ -355,6 +356,8 @@ pub fn signals_panel(ui: &mut egui::Ui, st: &mut SignalsUi, input: Input<'_>) ->
                             "lifecycle: {}\nThe number of the lifecycle each line is in; an event where one starts",
                             l.spec()
                         )
+                    } else if let Some(c) = d.check_name() {
+                        check_hover(c, d)
                     } else {
                         let mut h = format!("group: {}\n{}", d.group(), d.query().source());
                         if let Some(p) = d.per() {
@@ -454,7 +457,13 @@ pub fn signals_panel(ui: &mut egui::Ui, st: &mut SignalsUi, input: Input<'_>) ->
                             ui.label("");
                         }
                     }
-                    if d.queries().is_empty() {
+                    if let Some(c) = d.check_name() {
+                        // Read-only: the check is edited in the Checks pane.
+                        let tip = format!("{}\nClick: the check in the Checks pane", check_hover(c, d));
+                        if ui.link(RichText::new("check").weak()).on_hover_text(tip).clicked() {
+                            out.open_check = Some(c.to_owned());
+                        }
+                    } else if d.queries().is_empty() {
                         ui.horizontal(|ui| {
                             let mut on = true;
                             if ui
@@ -1269,6 +1278,22 @@ fn kind_cell(ui: &mut egui::Ui, d: &SignalDef, out: &mut Output) {
     if kind != d.kind() {
         out.kind = Some((d.name().to_owned(), kind));
     }
+}
+
+/// What a check's signal is (owner, 2026-11-07: listed with the others,
+/// to try).
+fn check_hover(check: &str, d: &SignalDef) -> String {
+    let per = d.per().map(|p| format!(", from 0 again in each lifecycle of {p}")).unwrap_or_default();
+    let value = if d.default_value().is_some() {
+        format!("its value counts them{per}")
+    } else {
+        "its value is what the fact measures there".to_owned()
+    };
+    format!(
+        "From check '{check}': an event where it finds something; {value}.\nUse it in queries and other checks \
+         (@{0}.event, @{0} > 0). Edit or switch it off in the Checks pane.",
+        d.name()
+    )
 }
 
 /// The scope: all lines, or only the lines the filter keeps.

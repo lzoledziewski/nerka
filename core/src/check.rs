@@ -327,7 +327,7 @@ impl CheckResult {
         let kind =
             if events.iter().all(|e| matches!(e.1, SignalValue::Num(_))) { SignalKind::Num } else { SignalKind::Enum };
         let default = (!measured).then_some(SignalValue::Num(0.0));
-        SignalDef::from_check(&signal_name(&self.name), kind, source, events, self.per.as_deref(), default)
+        SignalDef::from_check(&signal_name(&self.name), &self.name, kind, source, events, self.per.as_deref(), default)
     }
 }
 

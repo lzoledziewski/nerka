@@ -4275,6 +4275,11 @@ impl App {
             {
                 tab.start_search(ui.ctx());
             }
+            // A check's signal clicked: the check in the Checks pane.
+            if let Some(name) = out.open_check {
+                self.show_checks = true;
+                tab.checks_ui.selected = Some((name, 0));
+            }
             // A lifecycle's checks: the pane, on its first issue (else result).
             if let Some((life, n)) = out.checks {
                 self.show_checks = true;

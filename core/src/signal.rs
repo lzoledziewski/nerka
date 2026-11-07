@@ -692,9 +692,11 @@ impl SignalDef {
 
     /// A check as a signal (owner, 2026-11-07: checks cascade, "implicit,
     /// a signal with values"): `events` of `source` (rows ascending), bound
-    /// to the check's lifecycle `per`, `default` where none set it.
+    /// to the check's lifecycle `per`, `default` where none set it; the
+    /// check's name is `check`.
     pub(crate) fn from_check(
         name: &str,
+        check: &str,
         kind: SignalKind,
         source: &dyn LogSource,
         events: Vec<(LineNo, SignalValue)>,
@@ -704,7 +706,7 @@ impl SignalDef {
         SignalDef {
             name: name.to_ascii_lowercase(),
             kind,
-            group: name.to_owned(),
+            group: check.to_owned(),
             per: per.map(str::to_owned),
             default,
             builtin: Builtin::Check(Arc::new(CheckEvents { key: source_key(source), events })),
@@ -715,6 +717,11 @@ impl SignalDef {
     /// Whether a check gives it (not saved; the check's result).
     pub fn is_check(&self) -> bool {
         matches!(self.builtin, Builtin::Check(_))
+    }
+
+    /// The check that gives it, by name.
+    pub fn check_name(&self) -> Option<&str> {
+        self.is_check().then_some(self.group.as_str())
     }
 
     /// Whether this is a built-in the source gives (`@time`, `@uptime`).
