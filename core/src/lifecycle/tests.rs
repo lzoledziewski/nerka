@@ -455,3 +455,509 @@ mod signals {
         assert_eq!(sig.iter().map(|d| d.name()).collect::<Vec<_>>(), ["time"]);
     }
 }
+
+/// Random logs against a plain reference: the lifecycles found (chunked,
+/// parallel, through the engine's scans) are the ones a line-by-line walk
+/// finds, and a bound signal's state is the last event since its
+/// lifecycle started.
+mod stress {
+    use super::*;
+    use crate::engine::search::tests::run_on;
+    use crate::{Event, Filter};
+
+    type RandRow = (Option<&'static str>, Option<f64>, Option<f64>, String);
+
+    /// Rows: (ecu, time, uptime, text), the text owned.
+    struct Rand(Vec<RandRow>);
+
+    impl LogSource for Rand {
+        fn name(&self) -> &str {
+            "rand"
+        }
+        fn line_count(&self) -> LineNo {
+            self.0.len() as LineNo
+        }
+        fn line_bytes(&self, line: LineNo) -> Option<Cow<'_, [u8]>> {
+            self.0.get(line as usize).map(|r| Cow::Borrowed(r.3.as_bytes()))
+        }
+        fn schema(&self) -> &[FieldDef] {
+            SCHEMA
+        }
+        fn field(&self, line: LineNo, id: FieldId) -> Option<FieldValue<'_>> {
+            (id == 0).then(|| self.0.get(line as usize)?.0.map(|e| FieldValue::Str(e.as_bytes().into())))?
+        }
+        fn time(&self, line: LineNo) -> Option<f64> {
+            self.0.get(line as usize)?.1
+        }
+        fn uptime(&self, line: LineNo) -> Option<f64> {
+            self.0.get(line as usize)?.2
+        }
+    }
+
+    struct Rng(u64);
+
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+        fn below(&mut self, n: u64) -> u64 {
+            self.next() % n
+        }
+    }
+
+    /// Two ECUs rebooting now and then (some after "shutdown", some with
+    /// "panic"), jitter in the uptimes, gaps in time, lines without an ECU,
+    /// a time or an uptime, "boot" lines, and `s=` values.
+    fn log(seed: u64, n: usize) -> Rand {
+        let mut r = Rng(seed);
+        let (mut t, mut boot) = (1000.0, [990.0, 980.0]);
+        let mut rows = Vec::with_capacity(n);
+        for _ in 0..n {
+            t += r.below(100) as f64 / 1000.0;
+            if r.below(20_000) == 0 {
+                t += 120.0;
+            }
+            let e = r.below(2) as usize;
+            let ecu = if r.below(50) == 0 { None } else { Some(["A", "B"][e]) };
+            let mut text = match r.below(40) {
+                0 => "boot".to_owned(),
+                1 => format!("s={}", ["idle", "busy", "done"][r.below(3) as usize]),
+                2..=4 => format!("s={}", ["idle", "busy"][r.below(2) as usize]),
+                _ => format!("noise {}", r.below(1000)),
+            };
+            if r.below(3000) == 0 {
+                boot[e] = t;
+                text = if r.below(2) == 0 { "shutdown".into() } else { "panic".into() };
+            }
+            // Writers' clocks jitter: an uptime a little behind now and then.
+            let jitter = if r.below(10) == 0 { r.below(3000) as f64 / 1000.0 } else { 0.0 };
+            let up = (r.below(30) != 0).then_some((t - boot[e] - jitter).max(0.0));
+            let time = (r.below(100) != 0).then_some(t);
+            rows.push((ecu, time, up, text));
+        }
+        Rand(rows)
+    }
+
+    type RefLife = (u32, LineNo, LineNo, u64, &'static str);
+
+    /// The lifecycles a plain walk finds: (number, first, last, lines, outcome).
+    fn reference(src: &Rand, d: &LifecycleDef) -> Vec<RefLife> {
+        let matches = |q: Option<&Rule>, row: LineNo| {
+            q.and_then(Rule::query)
+                .is_some_and(|q| q.clone().bind(SCHEMA).unwrap().matches_event(&mut Event::from_source(src, row)))
+        };
+        let tol = d.reset().map_or(DEFAULT_TOLERANCE, |r| r.tolerance);
+        let mut out: Vec<RefLife> = Vec::new();
+        let (mut last_up, mut last_t): (Option<f64>, Option<f64>) = (None, None);
+        let mut marker: Option<&'static str> = None;
+        for row in 0..src.line_count() {
+            if d.lines().is_some() && !matches(d.lines(), row) {
+                continue;
+            }
+            let (t, up) = (src.time(row), src.uptime(row));
+            let back = d.reset().is_some() && matches!((up, last_up), (Some(u), Some(p)) if u < p - tol);
+            let gap = matches!((d.gap(), t, last_t), (Some(g), Some(t), Some(p)) if t - p > g);
+            let by_start = matches(d.start(), row);
+            if out.is_empty() || by_start || back || gap {
+                if let Some(l) = out.last_mut() {
+                    let ended = if !by_start && !back && gap { "lost" } else { "unclean" };
+                    l.4 = marker.unwrap_or(ended);
+                }
+                out.push((out.len() as u32 + 1, row, row, 0, "open"));
+                (last_up, last_t, marker) = (None, None, None);
+            }
+            let l = out.last_mut().unwrap();
+            l.2 = row;
+            l.3 += 1;
+            if up.is_some() {
+                last_up = up;
+            }
+            if t.is_some() {
+                last_t = t;
+            }
+            if matches(d.planned(), row) {
+                marker = Some("planned");
+            }
+            if matches(d.crash(), row) {
+                marker = Some("crash");
+            }
+        }
+        if let (Some(l), Some(m)) = (out.last_mut(), marker) {
+            l.4 = m;
+        }
+        out
+    }
+
+    const SPECS: &[&str] = &[
+        "a: lines ecu == A; reset uptime; planned raw == shutdown; crash raw == panic",
+        "b: lines ecu == B; reset uptime tolerance 500ms; start raw == boot",
+        "all: reset uptime tolerance 2s; gap 60s; crash raw == panic",
+        "g: lines ecu == A; gap 30s; planned raw == shutdown",
+        "s: start raw == boot",
+        "z: lines ecu == A; reset uptime tolerance 0s",
+    ];
+
+    #[test]
+    fn lifecycles_match_a_plain_walk() {
+        for seed in [7, 0x5eed, 0xdead_beef] {
+            // More lines than a chunk, so chunk boundaries are crossed.
+            let src = log(seed, 150_000);
+            for spec in SPECS {
+                let d = def(spec).linked(&Signals::default());
+                let l = d.lifecycles(&src, &Progress::new()).unwrap();
+                let got: Vec<RefLife> =
+                    l.lives.iter().map(|x| (x.number, x.first, x.last, x.lines, x.outcome.as_str())).collect();
+                let want = reference(&src, &d);
+                assert_eq!(got.len(), want.len(), "seed {seed} {spec}");
+                for (g, w) in got.iter().zip(&want) {
+                    assert_eq!(g, w, "seed {seed} {spec}");
+                }
+                assert!(l.lives.iter().all(|x| x.lines > 0 && x.first <= x.last));
+                for f in &l.findings {
+                    let x = &l.lives[f.life];
+                    assert!(x.first <= f.row && f.row <= x.last, "seed {seed} {spec}: {f:?} outside {x:?}");
+                }
+            }
+        }
+    }
+
+    fn bytes(v: ValueRef<'_>) -> Vec<u8> {
+        match v {
+            ValueRef::Enum(t) => t.to_vec(),
+            ValueRef::Num(n) => n.to_string().into_bytes(),
+        }
+    }
+
+    #[test]
+    fn bound_signals_follow_their_lifecycle() {
+        let src = log(42, 120_000);
+        let mut sig = Signals::default();
+        for s in [
+            "lifecycle a: lines ecu == A; reset uptime; planned raw == shutdown",
+            r"s:enum:per(a):default(none)=ecu == A AND /^s=(?<s>\w+)/",
+            r"t:enum:per(a)=/^s=(?<t>\w+)/",
+        ] {
+            sig.set(SignalDef::parse_spec(s).unwrap());
+        }
+        let life = sig.lifecycles().next().unwrap().lifecycles(&src, &Progress::new()).unwrap();
+        assert!(life.lives.len() > 5, "{}", life.summary());
+        for name in ["s", "t"] {
+            let d = sig.get(name).unwrap();
+            let series = d.series(&src, &Progress::new()).unwrap();
+            let events: Vec<(LineNo, Vec<u8>)> = series.iter().map(|(r, v)| (r, bytes(v))).collect();
+            // The state is the last event since the row's lifecycle started
+            // (before the first one: since the log's start), else the default.
+            for row in (0..src.line_count()).step_by(37) {
+                let since = life.at(row).map_or(0, |(_, l)| l.first);
+                let want = events.iter().rev().find(|(r, _)| *r <= row && *r >= since).map(|(_, v)| v.clone());
+                let want = want.or_else(|| d.default_value().map(|v| v.to_string().into_bytes()));
+                let got = series.state_at(row).map(|(_, v)| bytes(v));
+                assert_eq!(got, want, "@{name} at row {row}");
+            }
+        }
+        // Filters agree on the fast and the naive paths.
+        let f = |q: &str| Filter::Query(Query::compile(q).unwrap().with_signals(&sig).unwrap());
+        for q in ["@s == none", "@s == busy AND @a == 2", "@s.changed", "@t == idle", "@a.event", "NOT @t == done"] {
+            run_on(&src, &f(q));
+        }
+    }
+}
+
+/// Spec lines made of random pieces never panic: they parse, or they fail
+/// with an error inside the text.
+mod fuzz {
+    use super::*;
+    use crate::signal::SignalDef;
+
+    const PIECES: &[&str] = &[
+        "a",
+        "ecu1",
+        ":",
+        ";",
+        " ",
+        "  ",
+        "(",
+        ")",
+        "{",
+        "}",
+        "=",
+        "@",
+        "@up",
+        "uptime",
+        "reset",
+        "tolerance",
+        "5s",
+        "500ms",
+        "-1s",
+        "x",
+        "lines",
+        "start",
+        "gap",
+        "planned",
+        "crash",
+        "late",
+        "lifecycle ",
+        "off ",
+        "per(",
+        "default(",
+        "enum",
+        "num",
+        "time",
+        "filtered",
+        "ecu == A",
+        "raw ~ /x/",
+        "/(?<v>\\d+)/",
+        "{sys.of ecu=A}",
+        "{sys.x",
+        "sys.x}",
+        "é",
+        "ż",
+        "日本",
+        "\t",
+        "\"",
+        "AND",
+        "NOT",
+        "$",
+        "1e309",
+        "0x10",
+        "ms",
+        "h",
+    ];
+
+    const CLAUSES: &[&str] = &[
+        "lines ecu == A",
+        "lines {sys.of ecu=é}",
+        "start raw ~ /boot/",
+        "reset uptime",
+        "reset uptime tolerance 1.5s",
+        "reset @up tolerance 250ms",
+        "gap 30s",
+        "gap 1h",
+        "planned {sys.x}",
+        "crash raw == \"日本\"",
+        "late 2m",
+        "late 0s",
+        "reset",
+        "gap",
+        "start",
+        "lines ecu ==",
+        "reset uptime tolerance",
+        "planned {sys",
+        "crash {x}",
+        "late -1s",
+        "bogus 1",
+        "",
+        " ",
+    ];
+    const PARTS: &[&str] = &[
+        "num",
+        "enum",
+        "time",
+        "all",
+        "filtered",
+        "per(a)",
+        "per(1)",
+        "default(0)",
+        "default(x)",
+        "default()",
+        "per()",
+        "nope",
+    ];
+
+    #[test]
+    fn random_specs_never_panic() {
+        let mut r = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = || {
+            r ^= r << 13;
+            r ^= r >> 7;
+            r ^= r << 17;
+            r
+        };
+        let (mut lives, mut signals) = (0, 0);
+        for k in 0..50_000 {
+            let n = 1 + next() % 12;
+            let mut s: String = (0..n).map(|_| PIECES[(next() % PIECES.len() as u64) as usize]).collect();
+            // Every other one is made of clauses, valid or broken, so more
+            // of them parse and the round trip is tried.
+            if k % 2 == 0 {
+                let m = 1 + next() % 5;
+                let cl: Vec<&str> = (0..m).map(|_| CLAUSES[(next() % CLAUSES.len() as u64) as usize]).collect();
+                s = format!("n{k}: {}", cl.join("; "));
+                if next() % 3 == 0 {
+                    let parts: Vec<&str> =
+                        (0..next() % 4).map(|_| PARTS[(next() % PARTS.len() as u64) as usize]).collect();
+                    let head = if parts.is_empty() { String::new() } else { format!(":{}", parts.join(":")) };
+                    s = format!(r"v{head}=/v=(?<v>\w+)/");
+                }
+            }
+            match LifecycleDef::parse_spec(&s) {
+                Ok(d) => {
+                    lives += 1;
+                    // What it writes back reads back the same.
+                    let back = LifecycleDef::parse_spec(&d.spec())
+                        .unwrap_or_else(|e| panic!("{s:?} -> {:?}: {}", d.spec(), e.msg));
+                    assert_eq!(back.spec(), d.spec(), "{s:?}");
+                }
+                Err(e) => assert!(e.pos <= s.len(), "{s:?}: {} at {}", e.msg, e.pos),
+            }
+            if let Ok(d) = SignalDef::parse_spec(&s) {
+                signals += 1;
+                let back = SignalDef::parse_spec(&d.spec()).unwrap_or_else(|e| panic!("{s:?} -> {:?}: {e}", d.spec()));
+                assert_eq!(back.spec(), d.spec(), "{s:?}");
+            }
+            if let Err(e) = Rule::parse(&s) {
+                assert!(e.pos <= s.len(), "{s:?}: {} at {}", e.msg, e.pos);
+            }
+        }
+        assert!(lives > 500 && signals > 10, "parsed {lives} lifecycles, {signals} signals");
+    }
+}
+
+/// Edge cases found by stress testing (2026-11-07).
+mod edges {
+    use super::*;
+    use crate::Filter;
+    use crate::engine::search::tests::run_on;
+
+    #[test]
+    fn an_empty_log_and_lines_that_match_nothing() {
+        let empty = Src(vec![]);
+        assert!(run("a: reset uptime", &empty).lives.is_empty());
+        let l = run("c: lines ecu == C; reset uptime", &two_ecus());
+        assert!(l.lives.is_empty());
+        assert_eq!(l.summary(), "0 lifecycles");
+        assert_eq!(l.at(3), None);
+    }
+
+    #[test]
+    fn a_first_line_without_an_uptime_is_no_reason_to_give_up() {
+        // Its first line has none (a message without tmsp), later ones do.
+        let src = Src(vec![
+            (Some("A"), Some(1.0), None, "a"),
+            (Some("A"), Some(2.0), Some(20.0), "b"),
+            (Some("A"), Some(3.0), Some(0.5), "c"),
+        ]);
+        assert_eq!(lives(&run("a: reset uptime", &src)), [(1, 0, "unclean"), (2, 2, "open")]);
+    }
+
+    #[test]
+    fn a_finding_that_repeats_is_counted_once_per_lifecycle() {
+        // No lines: A's and B's uptimes interleave; with a start line the
+        // reset isn't the rule, so every step back is a missed reset.
+        let mut rows = Vec::new();
+        for i in 0..300 {
+            rows.push((Some("A"), None, Some(100.0 + i as f64), "a"));
+            rows.push((Some("B"), None, Some(10.0 + i as f64), "b"));
+        }
+        let l = run("all: start raw == boot; late 1000s", &Src(rows));
+        assert_eq!(l.findings.len(), 1, "{:?}", l.findings);
+        let f = &l.findings[0];
+        assert_eq!((f.kind, f.row, f.count), (FindingKind::MissedReset, 1, 300));
+        assert!(f.detail.contains("the first of 300 times") && f.detail.contains("several writers"), "{}", f.detail);
+    }
+
+    #[test]
+    fn a_single_line() {
+        let src = Src(vec![(Some("A"), Some(1.0), Some(1.0), "shutdown")]);
+        assert_eq!(lives(&run("a: reset uptime; planned raw == shutdown", &src)), [(1, 0, "planned")]);
+    }
+
+    #[test]
+    fn a_start_line_that_is_also_a_marker_ends_nothing_before_it() {
+        // A "crash" line that starts a lifecycle marks the new one.
+        let src = Src(vec![(None, None, None, "x"), (None, None, None, "boot crash"), (None, None, None, "y")]);
+        let l = run("a: start raw ~ /boot/; crash raw ~ /crash/", &src);
+        assert_eq!(lives(&l), [(1, 0, "unclean"), (2, 1, "crash")]);
+    }
+
+    #[test]
+    fn the_reset_signal_may_reset_with_the_lifecycle_itself() {
+        // `up` is bound to `a`, and `a` resets on `up`: no loop.
+        let src = Src(vec![
+            (None, None, None, "up=10"),
+            (None, None, None, "up=20"),
+            (None, None, None, "up=1"),
+            (None, None, None, "up=2"),
+        ]);
+        let mut sig = Signals::default();
+        sig.set(SignalDef::parse_spec("lifecycle a: reset @up").unwrap());
+        sig.set(SignalDef::parse_spec(r"up:per(a)=/up=(?<up>\d+)/").unwrap());
+        let f = Filter::Query(Query::compile("@a == 2").unwrap().with_signals(&sig).unwrap());
+        assert_eq!(run_on(&src, &f), [2, 3]);
+    }
+
+    #[test]
+    fn a_filtered_signal_keeps_its_lifecycle() {
+        let src = Src(vec![
+            (Some("A"), None, Some(1.0), "s=x"),
+            (Some("A"), None, Some(20.0), "s=y"),
+            (Some("A"), None, Some(0.5), "z"),
+        ]);
+        let mut sig = Signals::default();
+        sig.set(SignalDef::parse_spec("lifecycle a: reset uptime").unwrap());
+        sig.set(SignalDef::parse_spec(r"s:enum:filtered:per(a):default(none)=/s=(?<s>\w+)/").unwrap());
+        let d = sig.get("s").unwrap();
+        let kept = d.series(&src, &Progress::new()).unwrap().within(&[0, 2]);
+        // Line 2 is in A's second lifecycle: the default again.
+        assert_eq!(kept.state_at(2).map(|(r, v)| (r, d.format(v))), Some((None, "none".into())));
+        assert_eq!(kept.state_at(1).map(|(r, v)| (r, d.format(v))), Some((Some(0), "x".into())));
+    }
+}
+
+/// Two DLT files, one per ECU, merged by time: a lifecycle per ECU over the
+/// merged rows, a bound signal, and filters on both paths.
+mod merged {
+    use super::*;
+    use crate::engine::search::tests::run_on;
+    use crate::input::concat::Concat;
+    use crate::input::dlt::writer::{Msg, Value};
+    use crate::input::merged::Merged;
+    use crate::{DltFile, Filter, Level};
+
+    /// (seconds, uptime in s, text) per message of one ECU.
+    fn dlt(ecu: &str, msgs: &[(u32, f64, &str)]) -> Box<dyn LogSource> {
+        let mut bytes = Vec::new();
+        for (secs, up, text) in msgs {
+            let mut m = Msg::log(Level::Info, ecu, "APP", "CTX", vec![Value::Str((*text).into()).into()]);
+            m.secs = *secs;
+            m.timestamp = Some((up * 10_000.0) as u32);
+            m.encode(&mut bytes);
+        }
+        Box::new(DltFile::from_bytes(format!("{ecu}.dlt"), bytes))
+    }
+
+    #[test]
+    fn lifecycles_over_files_merged_by_time() {
+        // A reboots at 30 (planned), B at 25 (unclean).
+        let a = dlt(
+            "A",
+            &[(10, 1.0, "s=up"), (20, 11.0, "s=busy"), (29, 20.0, "shutdown"), (30, 0.5, "x"), (40, 10.5, "s=up")],
+        );
+        let b = dlt("B", &[(11, 2.0, "b"), (24, 15.0, "b"), (25, 0.2, "b"), (35, 10.2, "b")]);
+        let src = Merged::new(Concat::new(vec![a, b]).unwrap(), &Progress::new()).unwrap();
+        // Merged rows: 10A 11B 20A 24B 25B 29A 30A 35B 40A.
+        let text = |r: LineNo| src.line_text(r).unwrap().into_owned();
+        assert!(text(1).contains('b') && text(6).contains('x'), "{}", text(6));
+        let mut sig = Signals::default();
+        for s in [
+            "lifecycle a: lines ecu == A; reset uptime; planned payload ~ /shutdown/",
+            "lifecycle b: lines ecu == B; reset uptime",
+            r"s:enum:per(a):default(off)=ecu == A AND payload ~ /s=(?<s>\w+)/",
+        ] {
+            sig.set(SignalDef::parse_spec(s).unwrap());
+        }
+        let la = sig.lifecycles().find(|l| l.name() == "a").unwrap().lifecycles(&src, &Progress::new()).unwrap();
+        let lb = sig.lifecycles().find(|l| l.name() == "b").unwrap().lifecycles(&src, &Progress::new()).unwrap();
+        assert_eq!(lives(&la), [(1, 0, "planned"), (2, 6, "open")]);
+        assert_eq!(lives(&lb), [(1, 1, "unclean"), (2, 4, "open")]);
+        let f = |q: &str| run_on(&src, &Filter::Query(Query::compile(q).unwrap().with_signals(&sig).unwrap()));
+        // A's state resets at its reboot (row 6), on every line after.
+        assert_eq!(f("@s == busy"), [2, 3, 4, 5]);
+        assert_eq!(f("@s == off"), [6, 7]);
+        assert_eq!(f("@a == 2 AND ecu == B"), [7]);
+        assert_eq!(f("@b == 2"), [4, 5, 6, 7, 8]);
+    }
+}

@@ -60,7 +60,7 @@ Within one lifecycle, `time − uptime` is the boot time and should stay constan
 | false reset | a start line or a gap started one but the uptime kept counting |
 | late start | its first line has an uptime above `late`: its early lines are missing (or the log started during it) |
 
-The definition wins: lifecycles follow what was written; a mismatch is only reported.
+The definition wins: lifecycles follow what was written; a mismatch is only reported. A finding that repeats is listed once per lifecycle with how often (stress test, 2026-11-07: a lifecycle over several ECUs' uptimes had 2 M missed resets; now `missed reset ×90838`, with a hint to give it one writer's lines).
 
 ## Signals bound to a lifecycle
 
@@ -87,6 +87,14 @@ ota(s):enum:per(ecu1):default(idle)=ecu == ECU1 AND /OTA state=(?<s>\w+)/
 Its lines come from the engine (the fast path for `ecu == ECU1`); the start and marker queries too. Then one walk over its lines in order; their time and uptime are read in parallel chunks. Nothing per line is kept: a few numbers per lifecycle. Cached per source.
 
 512 MiB DLT (6.25 M messages, 3 ECUs; `gen_dlt` simulates reboots), release, Windows: `ecu1: lines ecu == ECU1; reset uptime; planned payload ~ /shutdown requested/` 158 ms (16 lifecycles), `gw` 153 ms (12); `apid == NAV AND level >= WARN` unchanged at 16–17 ms. (v1, one key over all ECUs: 267 ms.)
+
+## Stress tests (2026-11-07)
+
+- **Random logs against a plain reference** (`lifecycle/tests.rs` → `stress`): 3 seeds × 6 definitions over 150 000 lines (across chunk boundaries; jitter, gaps, lines without an ECU, a time or an uptime): the lifecycles found equal a line-by-line walk's; a bound signal's state equals the last event since its lifecycle started; filters agree on the fast and naive paths.
+- **Fuzzed specs** (`fuzz`): 50 000 lifecycle and signal specs from random pieces and clauses: no panic, error positions inside the text, what is written back reads back the same.
+- **Edges** (`edges`, `merged`): an empty log, lines matching nothing, one line, a start line that is also a marker, a reset signal bound to its own lifecycle, a filtered bound signal, two DLT files merged by time.
+- **Found and fixed:** a lifecycle whose first line carried no uptime said its lines carry none (now any of its first thousand); repeated findings (above).
+- **512 MiB DLT and the same as a pcap:** three per-ECU lifecycles 145–152 ms each; the pcap finds the same lifecycles (its times are the datagrams'); bound-signal filters 167–206 ms including the detection; a whole-log start-line lifecycle 193 ms (546 ms before findings were counted).
 
 ## Not built yet
 

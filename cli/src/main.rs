@@ -435,9 +435,10 @@ fn lifecycles(
         for x in &l.findings {
             if json {
                 issues.push(format!(
-                    "  {{\"kind\": {}, \"line\": {}, \"lifecycle\": {}, \"detail\": {}}}",
+                    "  {{\"kind\": {}, \"line\": {}, \"count\": {}, \"lifecycle\": {}, \"detail\": {}}}",
                     js(x.kind.as_str()),
                     x.row + 1,
+                    x.count,
                     js(&label(x.life)),
                     js(&x.detail)
                 ));

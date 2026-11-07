@@ -300,6 +300,8 @@ pub struct Finding {
     /// Index into [`Lifecycles::lives`].
     pub life: usize,
     pub detail: String,
+    /// How often it happened in its lifecycle (`row` is the first).
+    pub count: u64,
 }
 
 /// The lifecycles found in a source.
@@ -711,7 +713,9 @@ impl LifecycleDef {
             _ => (None, true),
         };
         let reset_on = self.reset.is_some();
-        let has_uptime = n > 0 && source.uptime(row_at(0)).is_some();
+        // Some lines may carry none (a DLT message without tmsp): any of the
+        // first thousand will do.
+        let has_uptime = (0..n.min(1000)).any(|i| source.uptime(row_at(i)).is_some());
         if matches!(self.reset.as_ref().map(|r| &r.value), Some(ResetValue::Uptime)) && n > 0 && !has_uptime {
             return Err(crate::Error::Format(format!(
                 "lifecycle '{}': its lines carry no uptime (DLT: the tmsp header field); reset on a signal instead",
@@ -838,18 +842,32 @@ impl LifecycleDef {
                                     "a lifecycle started here ({}) but the uptime kept counting ({p:.1} s → {u:.1} s)",
                                     by.as_str()
                                 ),
+                                count: 1,
                             });
                         }
                         (last_up, last_time, bsum, bn, marker) = (None, None, 0.0, 0, None);
                     }
                     None if back => {
                         let (u, p) = (up.unwrap_or_default(), last_up.unwrap_or_default());
-                        out.findings.push(Finding {
-                            kind: FindingKind::MissedReset,
-                            row,
-                            life: out.lives.len() - 1,
-                            detail: format!("uptime went back {p:.1} s → {u:.1} s, but no lifecycle started"),
-                        });
+                        // Once per lifecycle, counted (stress test, 2026-11-07: a
+                        // lifecycle over several writers' uptimes had 2 M).
+                        let life = out.lives.len() - 1;
+                        let seen = out
+                            .findings
+                            .iter_mut()
+                            .rev()
+                            .take_while(|f| f.life == life)
+                            .find(|f| f.kind == FindingKind::MissedReset);
+                        match seen {
+                            Some(f) => f.count += 1,
+                            None => out.findings.push(Finding {
+                                kind: FindingKind::MissedReset,
+                                row,
+                                life,
+                                detail: format!("uptime went back {p:.1} s → {u:.1} s, but no lifecycle started"),
+                                count: 1,
+                            }),
+                        }
                     }
                     None => {}
                 }
@@ -895,8 +913,18 @@ impl LifecycleDef {
                     row: l.first,
                     life: i,
                     detail: format!("first line at uptime {u:.1} s: its early lines are missing{note}"),
+                    count: 1,
                 });
             }
+        }
+        for f in out.findings.iter_mut().filter(|f| f.count > 1) {
+            f.detail += &format!(" (the first of {} times in this lifecycle", f.count);
+            // Many: its lines are likely of several writers, each with its uptime.
+            f.detail += if f.count >= 100 {
+                "; its lines may mix several writers' uptimes: give it the lines of one)"
+            } else {
+                ")"
+            };
         }
         out.findings.sort_by_key(|f| f.row);
         Ok(out)

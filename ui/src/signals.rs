@@ -887,8 +887,10 @@ fn lifecycles_list(ui: &mut egui::Ui, signals: &Signals, file: &dyn LogSource, o
                                 out.filter = Some(nfd);
                             }
                             for f in l.findings_of(i) {
+                                let times = if f.count > 1 { format!(" ×{}", f.count) } else { String::new() };
                                 let r = ui.link(
-                                    RichText::new(format!("⚠ {}", f.kind.as_str())).color(ui.visuals().warn_fg_color),
+                                    RichText::new(format!("⚠ {}{times}", f.kind.as_str()))
+                                        .color(ui.visuals().warn_fg_color),
                                 );
                                 if r.on_hover_text(format!("Line {}: {}\nClick to go there", f.row + 1, f.detail))
                                     .clicked()
