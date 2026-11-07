@@ -220,6 +220,8 @@ pub struct Output {
     pub goto: Option<LineNo>,
     /// Filter by this NFD (a lifecycle's "filter to it").
     pub filter: Option<String>,
+    /// Open the Checks pane on this lifecycle's results (name, number).
+    pub checks: Option<(String, u32)>,
     pub fibex: Option<FibexAction>,
     /// The picked FIBEX arguments changed.
     pub args_changed: bool,
@@ -283,10 +285,13 @@ pub struct Input<'a> {
     pub arg_picks: &'a mut Vec<nerka_core::Argument>,
     /// The query library: lifecycles reuse its queries.
     pub library: &'a Library,
+    /// The checks' results on this tab's file: shown per lifecycle.
+    pub check_results: &'a [(String, crate::checks::Outcome)],
 }
 
 pub fn signals_panel(ui: &mut egui::Ui, st: &mut SignalsUi, input: Input<'_>) -> Output {
-    let Input { signals, generation, saved, file, line, plot, views, kept, fibex, arg_picks, library } = input;
+    let Input { signals, generation, saved, file, line, plot, views, kept, fibex, arg_picks, library, check_results } =
+        input;
     let mut out = Output::default();
     ui.horizontal(|ui| {
         ui.heading("Signals");
@@ -535,7 +540,7 @@ pub fn signals_panel(ui: &mut egui::Ui, st: &mut SignalsUi, input: Input<'_>) ->
                 out.saved_changed = true;
             }
 
-            lifecycles_list(ui, signals, file, &mut out);
+            lifecycles_list(ui, signals, file, check_results, &mut out);
             // A lifecycle edited: its form's fields.
 
             ui.separator();
@@ -819,7 +824,13 @@ fn library_rule(lib: &Library, id: &str) -> String {
 
 /// The lifecycles found, per definition: a row each (click: go to its first
 /// line; ▾ filter: filter to it), and the findings.
-fn lifecycles_list(ui: &mut egui::Ui, signals: &Signals, file: &dyn LogSource, out: &mut Output) {
+fn lifecycles_list(
+    ui: &mut egui::Ui,
+    signals: &Signals,
+    file: &dyn LogSource,
+    checks: &[(String, crate::checks::Outcome)],
+    out: &mut Output,
+) {
     for def in signals.lifecycles() {
         ui.separator();
         if let Some(q) = def.unresolved().first() {
@@ -885,6 +896,25 @@ fn lifecycles_list(ui: &mut egui::Ui, signals: &Signals, file: &dyn LogSource, o
                                     nfd += &format!(" AND ({})", lines.source());
                                 }
                                 out.filter = Some(nfd);
+                            }
+                            // What the checks found in it (owner, 2026-11-07).
+                            let (issues, facts, lines) = crate::checks::of_lifecycle(checks, def.name(), x.number);
+                            if !lines.is_empty() {
+                                let text = match (issues, facts) {
+                                    (0, f) => RichText::new(format!("✔ ℹ{f}")).color(ui.visuals().weak_text_color()),
+                                    (n, f) => RichText::new(format!("⚠{n} ℹ{f}")).color(ui.visuals().error_fg_color),
+                                };
+                                let tip = format!(
+                                    "{}
+Click: the Checks pane",
+                                    lines.join(
+                                        "
+"
+                                    )
+                                );
+                                if ui.link(text).on_hover_text(tip).clicked() {
+                                    out.checks = Some((def.name().to_owned(), x.number));
+                                }
                             }
                             for f in l.findings_of(i) {
                                 let times = if f.count > 1 { format!(" ×{}", f.count) } else { String::new() };

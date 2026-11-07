@@ -14,19 +14,27 @@
 //! spec   := NAME ":" clause ( ";" clause )*
 //! clause := "lines" RULE                     -- the lines it looks at
 //!         | "per" LIFECYCLE                  -- a result per lifecycle
+//!         | "issue" | "fact"                 -- what it is (default: from its test)
+//!         | "labels" LABEL ( "," LABEL )*     -- groups, switched on and off together
 //!         | test
-//! test   := "exists"                         -- issue: any of its lines (default)
+//! test   := "exists"                         -- issue: each of its lines; fact: how many
 //!         | "count" [ OP NUMBER ]            -- fact: how many; with OP: an issue when it holds
-//!         | "rate" NUMBER "per" DUR          -- issue: more than NUMBER of them in a DUR window
-//!         | "gap" DUR                        -- issue: its lines stop for longer
-//!         | "then" RULE "within" DUR         -- issue: one of its lines, then RULE within DUR
-//!         | "missing" RULE "within" DUR      -- issue: one of its lines, no RULE within DUR after
-//!         | "value" ( "first" | "last" | "min" | "max" )
-//!                                            -- fact: what its first named group (?<name>…) captures
+//!         | "rate" NUMBER "per" DUR          -- issue: more than NUMBER in a DUR window;
+//!                                            -- fact: the most in one window
+//!         | "gap" DUR                        -- issue: its lines stop for longer; fact: the longest stop
+//!         | "then" RULE "within" DUR         -- issue: one of its lines, then RULE within DUR;
+//!         | "missing" RULE "within" DUR      --   or no RULE within DUR; fact: how often
+//!         | "value" PICK [ OP NUMBER ]       -- fact: what its first named group (?<name>…)
+//!                                            -- captures; with OP: an issue when it holds
+//! PICK   := "first" | "last" | "min" | "max"
 //! OP     := ">" | ">=" | "<" | "<=" | "==" | "!="
 //! RULE   := NFD | "{" PACK.QUERY ( NAME "=" VALUE )* "}"
 //! DUR    := NUMBER [ "ms" | "s" | "m" | "h" ]
 //! ```
+//!
+//! Every test measures something; the kind says how it shows (owner,
+//! 2026-11-07: issue or fact is a choice): a fact shows the measure, an
+//! issue whether (and how often) the problem shows up.
 //!
 //! e.g. `stall: lines {net.down}; missing {ota.progress} within 30s; per ecu1`
 //! or `temp: lines /temp=(?<t>\d+)/; value max; per ecu1`.
@@ -131,7 +139,7 @@ impl Pick {
 #[derive(Debug, Clone)]
 pub enum Test {
     Exists,
-    Count(Option<(Op, f64)>),
+    Count,
     Rate { max: u64, window: f64 },
     Gap(f64),
     Then { rule: Rule, within: f64 },
@@ -140,9 +148,11 @@ pub enum Test {
 }
 
 impl Test {
-    pub fn kind(&self) -> Kind {
+    /// Its kind when the check doesn't say: a count or a value without a
+    /// condition is a fact.
+    fn default_kind(&self, cond: bool) -> Kind {
         match self {
-            Test::Count(None) | Test::Value(_) => Kind::Fact,
+            Test::Count | Test::Value(_) if !cond => Kind::Fact,
             _ => Kind::Issue,
         }
     }
@@ -151,8 +161,7 @@ impl Test {
         let d = crate::lifecycle::format_duration;
         match self {
             Test::Exists => "exists".into(),
-            Test::Count(None) => "count".into(),
-            Test::Count(Some((op, n))) => format!("count {} {n}", op.as_str()),
+            Test::Count => "count".into(),
             Test::Rate { max, window } => format!("rate {max} per {}", d(*window)),
             Test::Gap(g) => format!("gap {}", d(*g)),
             Test::Then { rule, within } => format!("then {} within {}", rule.text(), d(*within)),
@@ -179,6 +188,10 @@ pub struct CheckDef {
     lines: Option<Rule>,
     per: Option<String>,
     test: Test,
+    /// A condition on a count or a value (`count >= 3`, `value max > 90`).
+    cond: Option<(Op, f64)>,
+    kind: Kind,
+    labels: Vec<String>,
     /// Switched off: kept, not run.
     off: bool,
 }
@@ -252,6 +265,17 @@ impl CheckDef {
             return Err(err(format!("'{name}' isn't a name (letters, digits and _, not first a digit)"), lead));
         }
         let (mut lines, mut per, mut test) = (None, None, None);
+        let (mut cond, mut kind, mut labels): (Option<(Op, f64)>, Option<Kind>, Vec<String>) = (None, None, Vec::new());
+        // `OP NUMBER` after a count or a value; `text` starts at `pos`.
+        let condition = |text: &str, pos: usize| -> Result<(Op, f64), DslError> {
+            let (op, n) = text.split_once(char::is_whitespace).unwrap_or((text, ""));
+            let op =
+                Op::parse(op).ok_or_else(|| err(format!("expected >, >=, <, <=, == or != but found '{op}'"), pos))?;
+            let n_at = pos + text.len() - n.trim_start().len();
+            let n: f64 =
+                n.trim().parse().map_err(|_| err(format!("expected a number but found '{}'", n.trim()), n_at))?;
+            Ok((op, n))
+        };
         let mut at = colon + 1;
         for clause in spec[colon + 1..].split(';') {
             let start = at + clause.len() - clause.trim_start().len();
@@ -292,18 +316,23 @@ impl CheckDef {
                     per = Some(rest.to_ascii_lowercase());
                     continue;
                 }
+                "issue" | "fact" if rest.is_empty() => {
+                    kind = Some(if word.eq_ignore_ascii_case("issue") { Kind::Issue } else { Kind::Fact });
+                    continue;
+                }
+                "labels" => {
+                    labels = rest.split(',').map(|l| l.trim().to_owned()).filter(|l| !l.is_empty()).collect();
+                    if labels.is_empty() {
+                        return Err(err("'labels' needs a label".into(), start + word.len()));
+                    }
+                    continue;
+                }
                 "exists" if rest.is_empty() => Test::Exists,
-                "count" if rest.is_empty() => Test::Count(None),
                 "count" => {
-                    let (op, n) = rest.split_once(char::is_whitespace).unwrap_or((rest, ""));
-                    let op = Op::parse(op)
-                        .ok_or_else(|| err(format!("expected >, >=, <, <=, == or != but found '{op}'"), rest_at))?;
-                    let n_at = rest_at + rest.len() - n.trim_start().len();
-                    let n: f64 = n
-                        .trim()
-                        .parse()
-                        .map_err(|_| err(format!("expected a number but found '{}'", n.trim()), n_at))?;
-                    Test::Count(Some((op, n)))
+                    if !rest.is_empty() {
+                        cond = Some(condition(rest, rest_at)?);
+                    }
+                    Test::Count
                 }
                 "rate" => {
                     let mut w = rest.splitn(3, char::is_whitespace);
@@ -323,16 +352,26 @@ impl CheckDef {
                     let (rule, within) = within("missing")?;
                     Test::Missing { rule, within }
                 }
-                "value" => Test::Value(match rest.to_ascii_lowercase().as_str() {
-                    "first" => Pick::First,
-                    "last" => Pick::Last,
-                    "min" => Pick::Min,
-                    "max" => Pick::Max,
-                    _ => return Err(err(format!("expected first, last, min or max but found '{rest}'"), rest_at)),
-                }),
+                "value" => {
+                    let (pick, more) = rest.split_once(char::is_whitespace).unwrap_or((rest, ""));
+                    let p = match pick.to_ascii_lowercase().as_str() {
+                        "first" => Pick::First,
+                        "last" => Pick::Last,
+                        "min" => Pick::Min,
+                        "max" => Pick::Max,
+                        _ => return Err(err(format!("expected first, last, min or max but found '{pick}'"), rest_at)),
+                    };
+                    if !more.trim().is_empty() {
+                        cond = Some(condition(more.trim(), rest_at + rest.len() - more.trim_start().len())?);
+                    }
+                    Test::Value(p)
+                }
                 w => {
                     return Err(err(
-                        format!("unknown clause '{w}' (lines, per; exists, count, rate, gap, then, missing, value)"),
+                        format!(
+                            "unknown clause '{w}' (lines, per, issue, fact, labels; exists, count, rate, gap, then, \
+                             missing, value)"
+                        ),
                         start,
                     ));
                 }
@@ -345,13 +384,12 @@ impl CheckDef {
         let Some(lines) = lines else {
             return Err(err("a check needs its lines: lines QUERY".into(), spec.len()));
         };
-        Ok(CheckDef {
-            name: name.to_ascii_lowercase(),
-            lines: Some(lines),
-            per,
-            test: test.unwrap_or(Test::Exists),
-            off: false,
-        })
+        let test = test.unwrap_or(Test::Exists);
+        let kind = kind.unwrap_or(test.default_kind(cond.is_some()));
+        if kind == Kind::Issue && matches!(test, Test::Value(_)) && cond.is_none() {
+            return Err(err("an issue on a value needs a condition, e.g. value max > 90".into(), spec.len()));
+        }
+        Ok(CheckDef { name: name.to_ascii_lowercase(), lines: Some(lines), per, test, cond, kind, labels, off: false })
     }
 
     /// The spec line [`Self::parse_spec`] reads back.
@@ -360,9 +398,19 @@ impl CheckDef {
         if let Some(l) = &self.lines {
             c.push(format!("lines {}", l.text()));
         }
-        c.push(self.test.text());
+        let mut test = self.test.text();
+        if let Some((op, n)) = self.cond {
+            test += &format!(" {} {n}", op.as_str());
+        }
+        c.push(test);
+        if self.kind != self.test.default_kind(self.cond.is_some()) {
+            c.push(self.kind.as_str().to_owned());
+        }
         if let Some(p) = &self.per {
             c.push(format!("per {p}"));
+        }
+        if !self.labels.is_empty() {
+            c.push(format!("labels {}", self.labels.join(", ")));
         }
         format!("{}{}: {}", if self.off { "off " } else { "" }, self.name, c.join("; "))
     }
@@ -372,7 +420,11 @@ impl CheckDef {
     }
 
     pub fn kind(&self) -> Kind {
-        self.test.kind()
+        self.kind
+    }
+
+    pub fn labels(&self) -> &[String] {
+        &self.labels
     }
 
     pub fn per(&self) -> Option<&str> {
@@ -504,50 +556,91 @@ impl CheckDef {
             }
         };
         let issue = |count: u64, ev: Vec<Evidence>| (if count == 0 { Verdict::Ok } else { Verdict::Issue(count) }, ev);
+        let fact = |v: String, ev: Vec<Evidence>| (Verdict::Fact(Some(v)), ev);
+        let as_fact = self.kind == Kind::Fact;
+        // A count or a value: a fact, or an issue when the condition holds
+        // (a count without one: when there is any).
+        let judged = |v: f64, ev: Vec<Evidence>| match self.cond {
+            Some((op, n)) if op.test(v, n) => (Verdict::Issue(1), ev),
+            None if v > 0.0 => (Verdict::Issue(1), ev),
+            _ => (Verdict::Ok, ev),
+        };
         match &self.test {
+            Test::Exists if as_fact => {
+                let first = mine.first().map(|&r| Evidence { rows: vec![r], note: "the first".into() });
+                fact(mine.len().to_string(), first.into_iter().collect())
+            }
             Test::Exists => {
                 for &r in mine {
                     add(&mut ev, vec![r], String::new());
                 }
                 issue(count, ev)
             }
-            Test::Count(None) => (
-                Verdict::Fact(Some(mine.len().to_string())),
-                mine.first().map(|&r| Evidence { rows: vec![r], note: "the first".into() }).into_iter().collect(),
-            ),
-            Test::Count(Some((op, n))) => {
-                let c = mine.len() as f64;
-                if op.test(c, *n) {
-                    let rows = mine.iter().take(MAX_EVIDENCE).copied().collect();
-                    (Verdict::Issue(1), vec![Evidence { rows, note: format!("{c} lines ({} {n})", op.as_str()) }])
+            Test::Count => {
+                let first = mine.first().map(|&r| Evidence { rows: vec![r], note: "the first".into() });
+                if as_fact {
+                    fact(mine.len().to_string(), first.into_iter().collect())
                 } else {
-                    (Verdict::Ok, Vec::new())
+                    let rows: Vec<LineNo> = mine.iter().take(MAX_EVIDENCE).copied().collect();
+                    let ev = if rows.is_empty() {
+                        Vec::new()
+                    } else {
+                        vec![Evidence { rows, note: format!("{} lines", mine.len()) }]
+                    };
+                    judged(mine.len() as f64, ev)
                 }
             }
             Test::Rate { max, window } => {
-                // More than `max` in a window: one burst per stretch.
+                // More than `max` in a window: one burst per stretch; as a
+                // fact, the most in one window.
                 let ts: Vec<(LineNo, f64)> = mine.iter().filter_map(|&r| Some((r, time(r)?))).collect();
-                let (mut lo, mut burst_end) = (0usize, f64::NEG_INFINITY);
+                let (mut lo, mut burst_end, mut most) = (0usize, f64::NEG_INFINITY, (0usize, 0usize, 0usize));
                 for hi in 0..ts.len() {
                     while ts[hi].1 - ts[lo].1 > *window {
                         lo += 1;
                     }
-                    if (hi - lo + 1) as u64 > *max && ts[lo].1 > burst_end {
+                    let n = hi - lo + 1;
+                    if n > most.0 {
+                        most = (n, lo, hi);
+                    }
+                    if n as u64 > *max && ts[lo].1 > burst_end {
                         burst_end = ts[hi].1 + window;
-                        add(&mut ev, vec![ts[lo].0, ts[hi].0], format!("{} lines within {}", hi - lo + 1, d(*window)));
+                        add(&mut ev, vec![ts[lo].0, ts[hi].0], format!("{n} lines within {}", d(*window)));
                     }
                 }
-                issue(count, ev)
+                if as_fact {
+                    let ev = if most.0 == 0 {
+                        Vec::new()
+                    } else {
+                        vec![Evidence {
+                            rows: vec![ts[most.1].0, ts[most.2].0],
+                            note: format!("{} within {}", most.0, d(*window)),
+                        }]
+                    };
+                    fact(most.0.to_string(), ev)
+                } else {
+                    issue(count, ev)
+                }
             }
             Test::Gap(g) => {
                 let ts: Vec<(LineNo, f64)> = mine.iter().filter_map(|&r| Some((r, time(r)?))).collect();
+                let mut longest: Option<(f64, LineNo, LineNo)> = None;
                 for w in ts.windows(2) {
                     let dt = w[1].1 - w[0].1;
+                    if longest.is_none_or(|l| dt > l.0) {
+                        longest = Some((dt, w[0].0, w[1].0));
+                    }
                     if dt > *g {
                         add(&mut ev, vec![w[0].0, w[1].0], format!("none for {}", d(dt)));
                     }
                 }
-                issue(count, ev)
+                match (as_fact, longest) {
+                    (true, Some((dt, a, b))) => {
+                        fact(d(dt), vec![Evidence { rows: vec![a, b], note: format!("none for {}", d(dt)) }])
+                    }
+                    (true, None) => (Verdict::Fact(None), Vec::new()),
+                    (false, _) => issue(count, ev),
+                }
             }
             Test::Then { within, .. } | Test::Missing { within, .. } => {
                 let then = matches!(self.test, Test::Then { .. });
@@ -569,7 +662,7 @@ impl CheckDef {
                         _ => {}
                     }
                 }
-                issue(count, ev)
+                if as_fact { fact(count.to_string(), ev) } else { issue(count, ev) }
             }
             Test::Value(p) => {
                 let Some(series) = values else { return (Verdict::Fact(None), Vec::new()) };
@@ -587,18 +680,25 @@ impl CheckDef {
                         .reduce(|a, b| if (*p == Pick::Max) == (b.1 > a.1) { b } else { a })
                         .map(|(r, n)| (r, ValueRef::Num(n))),
                 };
-                match pick {
-                    Some((r, v)) => {
-                        let text = match v {
-                            ValueRef::Num(n) => n.to_string(),
-                            ValueRef::Enum(t) => String::from_utf8_lossy(t).into_owned(),
-                        };
-                        (
-                            Verdict::Fact(Some(text)),
-                            vec![Evidence { rows: vec![r], note: format!("the {}", p.as_str()) }],
-                        )
+                let Some((r, v)) = pick else {
+                    return if as_fact { (Verdict::Fact(None), Vec::new()) } else { (Verdict::Ok, Vec::new()) };
+                };
+                let text = match v {
+                    ValueRef::Num(n) => n.to_string(),
+                    ValueRef::Enum(t) => String::from_utf8_lossy(t).into_owned(),
+                };
+                let ev = vec![Evidence { rows: vec![r], note: format!("the {}: {text}", p.as_str()) }];
+                if as_fact {
+                    fact(text, ev)
+                } else {
+                    // A value that isn't a number holds no condition.
+                    match text.trim().parse::<f64>() {
+                        Ok(v) => match self.cond {
+                            Some((op, n)) if op.test(v, n) => (Verdict::Issue(1), ev),
+                            _ => (Verdict::Ok, Vec::new()),
+                        },
+                        Err(_) => (Verdict::Ok, Vec::new()),
                     }
-                    None => (Verdict::Fact(None), Vec::new()),
                 }
             }
         }
@@ -652,6 +752,21 @@ impl Checks {
 
     pub fn is_empty(&self) -> bool {
         self.0.is_empty()
+    }
+
+    /// Every label, sorted, each once.
+    pub fn labels(&self) -> Vec<String> {
+        let mut out: Vec<String> = self.0.iter().flat_map(|c| c.labels.iter().cloned()).collect();
+        out.sort();
+        out.dedup();
+        out
+    }
+
+    /// Switch every check with `label` on or off.
+    pub fn set_label_on(&mut self, label: &str, on: bool) {
+        for c in self.0.iter_mut().filter(|c| c.labels.iter().any(|l| l == label)) {
+            c.off = !on;
+        }
     }
 
     pub fn len(&self) -> usize {

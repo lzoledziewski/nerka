@@ -149,6 +149,36 @@ fn values_from_its_lines() {
 }
 
 #[test]
+fn every_test_can_be_a_fact_or_an_issue() {
+    // As facts: the measure.
+    assert_eq!(check("n: lines raw == retry; exists; fact").overall().verdict, fact("4"));
+    let r = check("most: lines raw == retry; rate 1 per 1s; fact");
+    assert_eq!(r.overall().verdict, fact("3"));
+    assert_eq!(r.overall().evidence[0].rows, [1, 4]);
+    let r = check("longest: lines ecu == A; gap 1s; fact; per a");
+    assert_eq!(verdicts(&r)[1], ("a #1".into(), fact("39.0 s")));
+    assert_eq!(r.scopes[1].evidence[0].rows, [2, 5]);
+    let r = check("stalls: lines raw ~ /net down/; missing raw ~ /ota progress/ within 5s; fact; per a");
+    assert_eq!(verdicts(&r), [("overall".into(), fact("1")), ("a #1".into(), fact("1")), ("a #2".into(), fact("0"))]);
+    // As issues: a value with a condition, a count without one (any).
+    let r = check(r"hot: lines /temp=(?<t>\d+)/; value max > 80; per a");
+    assert_eq!(r.kind, Kind::Issue);
+    assert_eq!(verdicts(&r), [("overall".into(), issue(1)), ("a #1".into(), issue(1)), ("a #2".into(), Verdict::Ok)]);
+    assert_eq!(r.scopes[1].evidence[0].note, "the max: 91");
+    assert_eq!(check("any: lines raw == retry; count; issue").overall().verdict, issue(1));
+    assert_eq!(check("none: lines raw == never; count; issue").overall().verdict, Verdict::Ok);
+    let e = CheckDef::parse_spec(r"x: lines /t=(?<t>\d+)/; value max; issue").unwrap_err();
+    assert_eq!(e.msg, "an issue on a value needs a condition, e.g. value max > 90");
+}
+
+#[test]
+fn labels_group_checks() {
+    let d = CheckDef::parse_spec("x: lines raw == y; labels ota, network").unwrap();
+    assert_eq!(d.labels(), ["ota", "network"]);
+    assert_eq!(d.spec(), "x: lines raw == y; exists; labels ota, network");
+}
+
+#[test]
 fn errors_say_why() {
     let run = |spec: &str, sig: &Signals| {
         CheckDef::parse_spec(spec).unwrap().run(&log(), sig, &Progress::new()).unwrap_err().to_string()
@@ -185,6 +215,9 @@ fn specs_round_trip() {
         "stall: lines {net.down}; missing raw ~ /ota/ within 30s; per ecu1",
         r"temp: lines /temp=(?<t>\d+)/; value max",
         "off x: lines raw == y; exists",
+        "f: lines raw == y; rate 3 per 1s; fact; per a; labels net",
+        "g: lines raw == y; count; issue",
+        r"hot: lines /t=(?<t>\d+)/; value max > 90",
     ] {
         let d = CheckDef::parse_spec(s).unwrap_or_else(|e| panic!("{s}: {}", e.msg));
         assert_eq!(d.spec(), s);

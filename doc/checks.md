@@ -42,6 +42,15 @@ A lifecycle's scope is its time span (from its first line to the next one's): li
 
 512 MiB DLT: each check 30–300 ms (a `count` per ECU1 lifecycle 211 ms with the lifecycles; a `gap` on GW's NAV lines 30 ms; a `value max` per lifecycle 302 ms).
 
+## Second round (owner's feedback, 2026-11-07)
+
+- **The pane grew to the whole window:** at most half the window now.
+- **"Didn't notice how to create one":** ➕ New check in the pane's header; the form opens at the top.
+- **Issue or fact is a choice:** every test measures something. As a fact: `exists` how many lines, `count` how many, `rate` the most lines in one window, `gap` the longest stop, `then` / `missing` how often, `value` the value. As an issue: each line / burst / stop / occurrence, or for a count or a value a condition (`count >= 3`, `value max > 90`; a count without one: any line). A check says `fact` or `issue` when it isn't its test's default (a count or a value without a condition is a fact).
+- **Groups:** `labels ota, network`. The pane groups checks by label (a check with several shows under each); a label's box switches all its checks on or off.
+- **Status near lifecycles:** the lifecycle list (Signals panel) shows per lifecycle what its checks found (`⚠2 ℹ3`; hover: each check's result; click: the Checks pane on its first issue). Checks run whenever some are on, not only while the pane is open.
+- **"Cannot build own primitives":** the built-in tests stay as the easy path; building one's own needs a formula over measures (`count(A) > 2 * count(B)`, `exists(crash) AND NOT exists(shutdown)`): to propose next.
+
 ## Next, to decide with the owner
 
 - Marks: the evidence in the log view's gutter, the plot, and a badge in the lifecycle list.

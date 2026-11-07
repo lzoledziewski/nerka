@@ -4125,6 +4125,10 @@ impl App {
                 }
             }
         }
+        // Checks run whenever some are on: the lifecycle list shows them too.
+        if self.saved_checks.iter().any(|c| c.is_on()) {
+            tab.poll_checks(ui.ctx(), &self.saved_checks, self.checks_gen, &self.library);
+        }
         if self.show_signals {
             let line = tab.current_line();
             let saved = &mut self.saved_signals;
@@ -4146,6 +4150,7 @@ impl App {
                         fibex: fibex.as_deref(),
                         arg_picks: &mut tab.arg_picks,
                         library: &self.library,
+                        check_results: &tab.check_results,
                     };
                     signals::signals_panel(ui, &mut tab.signals_ui, input)
                 })
@@ -4185,12 +4190,31 @@ impl App {
             {
                 tab.start_search(ui.ctx());
             }
+            // A lifecycle's checks: the pane, on its first issue (else result).
+            if let Some((life, n)) = out.checks {
+                self.show_checks = true;
+                let label = format!("{life} #{n}");
+                let found = |issue: bool| {
+                    tab.check_results.iter().find_map(|(name, r)| {
+                        let r = r.as_ref().ok()?;
+                        let i = r.scopes.iter().position(|s| {
+                            s.scope.label == label
+                                && (!issue || matches!(s.verdict, nerka_core::check::Verdict::Issue(_)))
+                        })?;
+                        Some((name.clone(), i))
+                    })
+                };
+                tab.checks_ui.selected = found(true).or_else(|| found(false));
+            }
         }
         if self.show_checks {
-            tab.poll_checks(ui.ctx(), &self.saved_checks, self.checks_gen, &self.library);
+            // At most half the window: its results wrap (owner, 2026-11-07:
+            // it grew to the whole window).
+            let max = (ui.available_width() * 0.5).max(320.0);
             let out = egui::Panel::right("checks")
                 .resizable(true)
                 .default_size(440.0)
+                .max_size(max)
                 .show(ui, |ui| {
                     let input = checks::Input {
                         saved: &mut self.saved_checks,
@@ -4591,6 +4615,7 @@ query timeouts  labels: vision
                         fibex: Some(&*fibex),
                         arg_picks: &mut tab.arg_picks,
                         library: &Library::new(),
+                        check_results: &[],
                     };
                     changed = signals::signals_panel(ui, &mut tab.signals_ui, input).args_changed;
                 });
