@@ -18,6 +18,7 @@
 //!   expansion into plain NFD.
 
 pub mod bookmarks;
+pub mod check;
 pub mod dsl;
 pub mod engine;
 pub mod event;

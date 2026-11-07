@@ -375,8 +375,21 @@ fn build(
     };
     let x_of = |row: LineNo| clock.at(file, clock_series.as_ref(), row);
     let mut lanes = Vec::new();
+    // A plotted lifecycle is a line where each starts, no lane (owner,
+    // 2026-11-07: lifecycles on and off in the plot): its span counts.
+    let mut life_span = (f64::INFINITY, f64::NEG_INFINITY);
     for name in &state.plotted {
         let Some(def) = signals.get(name) else { continue };
+        if let Some(life) = def.as_lifecycle() {
+            let lives = life.cached(file).ok_or("Finding lifecycles…")?;
+            if let Some(first) = lives.lives.first() {
+                let last = file.line_count().saturating_sub(1);
+                for x in [x_of(first.first), x_of(last)].into_iter().flatten() {
+                    life_span = (life_span.0.min(x), life_span.1.max(x));
+                }
+            }
+            continue;
+        }
         let series = series_of(def).ok_or("Collecting events…")?;
         let mut ids: HashMap<Vec<u8>, usize> = HashMap::new();
         let mut labels = Vec::new();
@@ -443,7 +456,7 @@ fn build(
     let full = lanes
         .iter()
         .filter(|l| !l.xs.is_empty())
-        .fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), l| (lo.min(l.xs[0]), hi.max(l.xs[l.xs.len() - 1])));
+        .fold(life_span, |(lo, hi), l| (lo.min(l.xs[0]), hi.max(l.xs[l.xs.len() - 1])));
     let full = if full.0 < full.1 {
         full
     } else if full.0.is_finite() {
@@ -1065,10 +1078,11 @@ pub fn plot_panel(ui: &mut egui::Ui, state: &mut PlotState, src: Source<'_>) -> 
     }
 
     // ----- lifecycles: a line where each starts (red after one that ended
-    // badly), labelled at the top of the lanes (owner, 2026-11-06) -----
+    // badly), labelled at the top of the lanes (owner, 2026-11-06); only
+    // those plotted (owner, 2026-11-07) -----
     // Labels only where they don't run into the one before.
     let mut label_end = f32::NEG_INFINITY;
-    for def in signals.lifecycles() {
+    for def in signals.lifecycles().filter(|d| state.is_plotted(d.name())) {
         let Some(l) = def.cached(file) else { continue };
         for (i, life) in l.lives.iter().enumerate() {
             let Some(x) = clock.at(file, clock_series.as_ref(), life.first).filter(|x| (x0..=x1).contains(x)) else {
@@ -1833,6 +1847,18 @@ mod tests {
         // default (no point where an event is on the start line).
         assert_eq!((lane.name.as_str(), pts), ("s", vec![(0, false), (2, false), (4, true)]));
         assert_eq!(lane.labels[lane.ys[2] as usize], "idle");
+
+        // A lifecycle plotted (owner, 2026-11-07: on and off in the plot):
+        // no lane, its starts drawn; alone, the plot spans its lifecycles.
+        let clock = Clock::of(&file, &signals);
+        let state = PlotState { plotted: vec!["a".into()], ..Default::default() };
+        let data = build(&state, &signals, &file, &clock, &mut series_of).unwrap();
+        assert!(data.lanes.is_empty());
+        let x = |r| clock.at(&file, None, r).unwrap();
+        assert_eq!(data.full, (x(0), x(4)));
+        let state = PlotState { plotted: vec!["a".into(), "s".into()], ..Default::default() };
+        let data = build(&state, &signals, &file, &clock, &mut series_of).unwrap();
+        assert_eq!(data.lanes.iter().map(|l| l.name.as_str()).collect::<Vec<_>>(), ["s"]);
     }
 
     /// A right-click menu with a text field: clicking into the field keeps

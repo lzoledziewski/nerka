@@ -497,6 +497,16 @@ enum Builtin {
     Time,
     /// A lifecycle: its number for the line's key.
     Life(Arc<LifecycleDef>),
+    /// A check's occurrences in one source ([`crate::check`]).
+    Check(Arc<CheckEvents>),
+}
+
+/// The events a check gives its signal: rows of the whole source it ran
+/// on (`key`), ascending, a value each.
+#[derive(Debug)]
+pub struct CheckEvents {
+    key: (usize, LineNo),
+    events: Vec<(LineNo, SignalValue)>,
 }
 
 #[derive(Debug, Clone)]
@@ -680,6 +690,40 @@ impl SignalDef {
         }
     }
 
+    /// A check as a signal (owner, 2026-11-07: checks cascade, "implicit,
+    /// a signal with values"): `events` of `source` (rows ascending), bound
+    /// to the check's lifecycle `per`, `default` where none set it; the
+    /// check's name is `check`.
+    pub(crate) fn from_check(
+        name: &str,
+        check: &str,
+        kind: SignalKind,
+        source: &dyn LogSource,
+        events: Vec<(LineNo, SignalValue)>,
+        per: Option<&str>,
+        default: Option<SignalValue>,
+    ) -> SignalDef {
+        SignalDef {
+            name: name.to_ascii_lowercase(),
+            kind,
+            group: check.to_owned(),
+            per: per.map(str::to_owned),
+            default,
+            builtin: Builtin::Check(Arc::new(CheckEvents { key: source_key(source), events })),
+            ..SignalDef::source_time()
+        }
+    }
+
+    /// Whether a check gives it (not saved; the check's result).
+    pub fn is_check(&self) -> bool {
+        matches!(self.builtin, Builtin::Check(_))
+    }
+
+    /// The check that gives it, by name.
+    pub fn check_name(&self) -> Option<&str> {
+        self.is_check().then_some(self.group.as_str())
+    }
+
     /// Whether this is a built-in the source gives (`@time`, `@uptime`).
     pub fn is_from_source(&self) -> bool {
         matches!(self.builtin, Builtin::Time)
@@ -816,6 +860,7 @@ impl SignalDef {
         match &self.builtin {
             Builtin::Time => return "time:time (the file's own time)".into(),
             Builtin::Life(l) => return format!("{off}lifecycle {}", l.spec()),
+            Builtin::Check(_) => return format!("{}:{} (a check's result)", self.name, self.kind.as_str()),
             Builtin::No => {}
         }
         if let Some(i) = self.argument {
@@ -854,7 +899,7 @@ impl SignalDef {
         match self.builtin {
             Builtin::Time => return ev.source()?.time(ev.line()).map(SignalValue::Num),
             // Known from the whole source only.
-            Builtin::Life(_) => return None,
+            Builtin::Life(_) | Builtin::Check(_) => return None,
             Builtin::No => {}
         }
         if let Some(index) = self.argument {
@@ -921,6 +966,21 @@ impl SignalDef {
                 }
                 return Ok(SignalSeries { key: source_key(source), parts, life, default: None });
             }
+            // The check's occurrences, per file; none in another source.
+            Builtin::Check(c) => {
+                let mine = c.key == source_key(source);
+                for (first, n, key) in leaves(source) {
+                    let found: Vec<(LineNo, SignalValue)> = if mine {
+                        let a = c.events.partition_point(|e| e.0 < first);
+                        let b = c.events.partition_point(|e| e.0 < first + n);
+                        c.events[a..b].iter().map(|(r, v)| (r - first, v.clone())).collect()
+                    } else {
+                        Vec::new()
+                    };
+                    parts.push((first, key, Arc::new(Events::build(found, self.kind))));
+                }
+                return Ok(SignalSeries { key: source_key(source), parts, life, default });
+            }
             Builtin::No => {}
         }
         match source.parts() {
@@ -942,7 +1002,7 @@ impl SignalDef {
             Some(l) => Some(l.cached(source)?),
             None => None,
         };
-        if matches!(self.builtin, Builtin::Life(_)) {
+        if matches!(self.builtin, Builtin::Life(_) | Builtin::Check(_)) {
             return self.series(source, &Progress::new()).ok();
         }
         let parts = leaves(source)
@@ -1155,7 +1215,7 @@ impl Signals {
             "# nerka signals: [off] NAME[(GROUP)][:KIND][:SCOPE][:per(LIFECYCLE)][:default(VALUE)]=QUERY \
              or [off] lifecycle NAME: CLAUSES, one per line\n",
         );
-        for d in self.iter().filter(|d| !d.is_from_source() && d.queries.is_empty()) {
+        for d in self.iter().filter(|d| !d.is_from_source() && !d.is_check() && d.queries.is_empty()) {
             out += &d.spec();
             out.push('\n');
         }
@@ -1355,6 +1415,17 @@ fn positive_regexes(e: &Expr, neg: bool, f: &mut dyn FnMut(&Regex)) {
         }
         Expr::Cond(_) => {}
     }
+}
+
+/// The first named group of `q`'s positive regexes, if any.
+pub(crate) fn first_group(q: &Query) -> Option<String> {
+    let mut out = None;
+    positive_regexes(q.expr(), false, &mut |re| {
+        if out.is_none() {
+            out = re.capture_names().flatten().next().map(str::to_owned);
+        }
+    });
+    out
 }
 
 /// The text `group` captured in the first positive regex that has the

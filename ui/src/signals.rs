@@ -212,6 +212,10 @@ pub struct Output {
     pub close: bool,
     /// A saved signal was added, changed or removed.
     pub saved_changed: bool,
+    /// The signal the form added or updated (by name).
+    pub adopted: Option<String>,
+    /// Show this check in the Checks pane (a check's signal was clicked).
+    pub open_check: Option<String>,
     /// A kind chosen for a query signal.
     pub kind: Option<(String, SignalKind)>,
     /// A scope chosen for a signal.
@@ -220,6 +224,8 @@ pub struct Output {
     pub goto: Option<LineNo>,
     /// Filter by this NFD (a lifecycle's "filter to it").
     pub filter: Option<String>,
+    /// Open the Checks pane on this lifecycle's results (name, number).
+    pub checks: Option<(String, u32)>,
     pub fibex: Option<FibexAction>,
     /// The picked FIBEX arguments changed.
     pub args_changed: bool,
@@ -283,10 +289,13 @@ pub struct Input<'a> {
     pub arg_picks: &'a mut Vec<nerka_core::Argument>,
     /// The query library: lifecycles reuse its queries.
     pub library: &'a Library,
+    /// The checks' results on this tab's file: shown per lifecycle.
+    pub check_results: &'a [(String, crate::checks::Outcome)],
 }
 
 pub fn signals_panel(ui: &mut egui::Ui, st: &mut SignalsUi, input: Input<'_>) -> Output {
-    let Input { signals, generation, saved, file, line, plot, views, kept, fibex, arg_picks, library } = input;
+    let Input { signals, generation, saved, file, line, plot, views, kept, fibex, arg_picks, library, check_results } =
+        input;
     let mut out = Output::default();
     ui.horizontal(|ui| {
         ui.heading("Signals");
@@ -336,7 +345,12 @@ pub fn signals_panel(ui: &mut egui::Ui, st: &mut SignalsUi, input: Input<'_>) ->
                         ui.label("");
                     } else {
                         let mut on = plot.is_plotted(d.name());
-                        if ui.checkbox(&mut on, "").on_hover_text("Plot it (its state over time)").changed() {
+                        let tip = if d.as_lifecycle().is_some() {
+                            "Plot it: a line where each lifecycle starts (red after one that ended badly)"
+                        } else {
+                            "Plot it (its state over time)"
+                        };
+                        if ui.checkbox(&mut on, "").on_hover_text(tip).changed() {
                             plot.toggle(d.name());
                         }
                     }
@@ -347,6 +361,8 @@ pub fn signals_panel(ui: &mut egui::Ui, st: &mut SignalsUi, input: Input<'_>) ->
                             "lifecycle: {}\nThe number of the lifecycle each line is in; an event where one starts",
                             l.spec()
                         )
+                    } else if let Some(c) = d.check_name() {
+                        check_hover(c, d)
                     } else {
                         let mut h = format!("group: {}\n{}", d.group(), d.query().source());
                         if let Some(p) = d.per() {
@@ -446,7 +462,13 @@ pub fn signals_panel(ui: &mut egui::Ui, st: &mut SignalsUi, input: Input<'_>) ->
                             ui.label("");
                         }
                     }
-                    if d.queries().is_empty() {
+                    if let Some(c) = d.check_name() {
+                        // Read-only: the check is edited in the Checks pane.
+                        let tip = format!("{}\nClick: the check in the Checks pane", check_hover(c, d));
+                        if ui.link(RichText::new("check").weak()).on_hover_text(tip).clicked() {
+                            out.open_check = Some(c.to_owned());
+                        }
+                    } else if d.queries().is_empty() {
                         ui.horizontal(|ui| {
                             let mut on = true;
                             if ui
@@ -535,7 +557,7 @@ pub fn signals_panel(ui: &mut egui::Ui, st: &mut SignalsUi, input: Input<'_>) ->
                 out.saved_changed = true;
             }
 
-            lifecycles_list(ui, signals, file, &mut out);
+            lifecycles_list(ui, signals, file, check_results, &mut out);
             // A lifecycle edited: its form's fields.
 
             ui.separator();
@@ -571,6 +593,7 @@ pub fn signals_panel(ui: &mut egui::Ui, st: &mut SignalsUi, input: Input<'_>) ->
                                 egui::TextEdit::singleline(&mut d.name).hint_text("speed").desired_width(f32::INFINITY),
                             );
                             ui.end_row();
+                            name_taken_row(ui, signals, &d.name);
                             ui.label("Kind");
                             ui.horizontal(|ui| {
                                 ui.radio_value(&mut d.kind, SignalKind::Num, "num")
@@ -655,6 +678,7 @@ pub fn signals_panel(ui: &mut egui::Ui, st: &mut SignalsUi, input: Input<'_>) ->
                                     {
                                         saved.remove(&old);
                                     }
+                                    out.adopted = Some(def.name().to_owned());
                                     saved.set(def.with_scope(scope));
                                     st.draft = Draft::default();
                                     out.saved_changed = true;
@@ -706,6 +730,7 @@ fn lifecycle_form(ui: &mut egui::Ui, d: &mut Draft, lib: &Library, signals: &Sig
         ui.label("Name");
         ui.add(egui::TextEdit::singleline(&mut d.name).hint_text("ecu1").desired_width(f32::INFINITY));
         ui.end_row();
+        name_taken_row(ui, signals, &d.name);
         ui.label("Its lines").on_hover_text("The lines of the entity (empty: every line), e.g. ecu == ECU1");
         rule_field(ui, "life_lines", &mut f.lines, "ecu == ECU1  (empty: every line)", lib);
         ui.end_row();
@@ -770,7 +795,7 @@ fn preview(f: &LifeForm, name: &str, lib: &Library, signals: &Signals, file: &dy
 
 /// A query field of a lifecycle: NFD, or a library query `{pack.query}`
 /// picked with 📚 or dropped from the Library.
-fn rule_field(ui: &mut egui::Ui, id: &str, text: &mut String, hint: &str, lib: &Library) {
+pub(crate) fn rule_field(ui: &mut egui::Ui, id: &str, text: &mut String, hint: &str, lib: &Library) {
     ui.horizontal(|ui| {
         let w = (ui.available_width() - 34.0).max(80.0);
         let r = ui.add(egui::TextEdit::singleline(text).code_editor().hint_text(hint).desired_width(w));
@@ -819,7 +844,13 @@ fn library_rule(lib: &Library, id: &str) -> String {
 
 /// The lifecycles found, per definition: a row each (click: go to its first
 /// line; ▾ filter: filter to it), and the findings.
-fn lifecycles_list(ui: &mut egui::Ui, signals: &Signals, file: &dyn LogSource, out: &mut Output) {
+fn lifecycles_list(
+    ui: &mut egui::Ui,
+    signals: &Signals,
+    file: &dyn LogSource,
+    checks: &[(String, crate::checks::Outcome)],
+    out: &mut Output,
+) {
     for def in signals.lifecycles() {
         ui.separator();
         if let Some(q) = def.unresolved().first() {
@@ -885,6 +916,25 @@ fn lifecycles_list(ui: &mut egui::Ui, signals: &Signals, file: &dyn LogSource, o
                                     nfd += &format!(" AND ({})", lines.source());
                                 }
                                 out.filter = Some(nfd);
+                            }
+                            // What the checks found in it (owner, 2026-11-07).
+                            let (issues, facts, lines) = crate::checks::of_lifecycle(checks, def.name(), x.number);
+                            if !lines.is_empty() {
+                                let text = match (issues, facts) {
+                                    (0, f) => RichText::new(format!("✔ ℹ{f}")).color(ui.visuals().weak_text_color()),
+                                    (n, f) => RichText::new(format!("⚠{n} ℹ{f}")).color(ui.visuals().error_fg_color),
+                                };
+                                let tip = format!(
+                                    "{}
+Click: the Checks pane",
+                                    lines.join(
+                                        "
+"
+                                    )
+                                );
+                                if ui.link(text).on_hover_text(tip).clicked() {
+                                    out.checks = Some((def.name().to_owned(), x.number));
+                                }
                             }
                             for f in l.findings_of(i) {
                                 let times = if f.count > 1 { format!(" ×{}", f.count) } else { String::new() };
@@ -1235,6 +1285,35 @@ fn kind_cell(ui: &mut egui::Ui, d: &SignalDef, out: &mut Output) {
     if kind != d.kind() {
         out.kind = Some((d.name().to_owned(), kind));
     }
+}
+
+/// A grid row saying that a check makes a signal of this name: the new
+/// signal takes it, and the check's isn't made (owner, 2026-11-07: that
+/// was silent).
+fn name_taken_row(ui: &mut egui::Ui, signals: &Signals, name: &str) {
+    let Some(check) = signals.get(name.trim()).and_then(|d| d.check_name()) else { return };
+    ui.label("");
+    ui.colored_label(
+        ui.visuals().warn_fg_color,
+        format!("⚠ Check '{check}' makes @{}: this one takes the name, and the check's signal isn't made", name.trim()),
+    );
+    ui.end_row();
+}
+
+/// What a check's signal is (owner, 2026-11-07: listed with the others,
+/// to try).
+fn check_hover(check: &str, d: &SignalDef) -> String {
+    let per = d.per().map(|p| format!(", from 0 again in each lifecycle of {p}")).unwrap_or_default();
+    let value = if d.default_value().is_some() {
+        format!("its value counts them{per}")
+    } else {
+        "its value is what the fact measures there".to_owned()
+    };
+    format!(
+        "From check '{check}': an event where it finds something; {value}.\nUse it in queries and other checks \
+         (@{0}.event, @{0} > 0). Edit or switch it off in the Checks pane.",
+        d.name()
+    )
 }
 
 /// The scope: all lines, or only the lines the filter keeps.

@@ -31,6 +31,7 @@
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod checks;
 mod icon;
 mod icon_art;
 mod instance;
@@ -78,6 +79,8 @@ fn main() -> eframe::Result {
     // `--signal SPEC` (as for the CLI): signals for this session (saved
     // with the others once the Signals panel changes them).
     let mut signals = Signals::default();
+    // Checks given with --check: this session only (not saved unless edited).
+    let mut startup_checks = nerka_core::check::Checks::default();
     // `--plot NAME`: plot these signals.
     let mut plotted: Vec<String> = Vec::new();
     // `--fibex FILE`: FIBEX files for DLT non-verbose messages.
@@ -171,6 +174,14 @@ fn main() -> eframe::Result {
                 }
                 continue;
             }
+            Some("--check") => {
+                let spec = value();
+                match nerka_core::check::CheckDef::parse_spec(&spec) {
+                    Ok(c) => startup_checks.set(c),
+                    Err(e) => eprintln!("nerka-gui: --check {spec}: {} (at column {})", e.msg, e.pos + 1),
+                }
+                continue;
+            }
             Some("--new-window") => {
                 new_window = true;
                 continue;
@@ -230,11 +241,16 @@ fn main() -> eframe::Result {
             app.load_history();
             app.load_prefs();
             app.load_saved_signals();
+            app.load_checks();
             if !fibex.is_empty() {
                 app.set_fibex(&cc.egui_ctx, fibex);
             }
+            for c in startup_checks.iter() {
+                app.add_session_check(c.clone());
+            }
+            app.show_checks |= !startup_checks.is_empty();
             for d in signals.iter() {
-                app.saved_signals.set((**d).clone());
+                app.add_session_signal((**d).clone());
             }
             app.load_library();
             app.presets.load();
@@ -579,6 +595,17 @@ struct Tab {
     /// Collects the signals' events for the panel (the engine keeps them
     /// with each definition).
     signals_job: Option<Job<()>>,
+    /// The Checks pane's state, the checks' results on this tab's file, the
+    /// job running them and what they ran with.
+    checks_ui: checks::ChecksUi,
+    check_results: Vec<(String, checks::Outcome)>,
+    /// The job, and the generation of `own_signals` it ran with.
+    checks_job: Option<(Job<nerka_core::check::CheckRun>, u64)>,
+    checks_key: Option<(usize, u64, u64, String)>,
+    /// The tab's signals without the checks' (`signals` adds them once the
+    /// checks ran), and their generation.
+    own_signals: Signals,
+    own_gen: u64,
     /// Shared with the plot's own window.
     plot: plot::SharedPlot,
     /// What `signals` was built from: (saved signals' generation, choices'
@@ -1082,6 +1109,12 @@ impl Tab {
             signals_gen: 0,
             signals_ui: signals::SignalsUi::default(),
             signals_job: None,
+            checks_ui: Default::default(),
+            check_results: Vec::new(),
+            checks_job: None,
+            checks_key: None,
+            own_signals: Signals::default(),
+            own_gen: 0,
             plot: Default::default(),
             signals_key: None,
             query_kind: Default::default(),
@@ -1368,8 +1401,46 @@ impl Tab {
         if let Some(e) = s.resolve_lifecycles(lib).into_iter().next() {
             self.status = e;
         }
+        // The checks' signals come back when they ran with these.
+        self.own_signals = s.clone();
+        self.own_gen += 1;
         self.signals = s;
         self.signals_changed(ctx);
+    }
+
+    /// Run the checks on the tab's file in the background when they, the
+    /// signals (lifecycles), the library queries they use or the file
+    /// changed; take the results of a finished run.
+    fn poll_checks(&mut self, ctx: &egui::Context, checks: &nerka_core::check::Checks, checks_gen: u64, lib: &Library) {
+        if let Some((job, gen_)) = &self.checks_job
+            && let Poll::Done(r, _) = job.poll()
+        {
+            // The tab's signals plus each check's (owner, 2026-11-07: checks
+            // cascade): filters and the plot use them. A run with signals
+            // that changed since is dropped.
+            if let Ok(run) = r
+                && *gen_ == self.own_gen
+            {
+                self.check_results = run.results;
+                self.signals = run.signals;
+                self.signals_changed(ctx);
+            }
+            self.checks_job = None;
+        }
+        let Some(file) = self.file.clone() else { return };
+        let queries: Vec<Option<&str>> =
+            checks.iter().flat_map(|c| c.unresolved()).map(|id| lib.get(id).map(|(_, q)| q.text.as_str())).collect();
+        let key = (file.data_id(), self.own_gen, checks_gen, format!("{queries:?}"));
+        if self.checks_key.as_ref() == Some(&key) {
+            return;
+        }
+        self.checks_key = Some(key);
+        if let Some((j, _)) = self.checks_job.take() {
+            j.cancel();
+        }
+        let (checks, signals, lib) = (checks.clone(), self.own_signals.clone(), lib.clone());
+        let job = Job::spawn(ctx, move |p| checks.run_all(&*file, &signals, &lib, p));
+        self.checks_job = Some((job, self.own_gen));
     }
 
     /// Collect the events of every signal in the background, so the panel
@@ -2673,12 +2744,37 @@ fn term_lines(terms: &[Term]) -> Vec<ChipLine<'_>> {
         .collect()
 }
 
+/// Definitions given on the command line, by name, each with the saved
+/// one it replaced: they last the session, unless the user adds or edits
+/// one in the GUI (then it is theirs, and saved).
+struct SessionOnly<T>(Vec<(String, Option<T>)>);
+
+impl<T> Default for SessionOnly<T> {
+    fn default() -> Self {
+        SessionOnly(Vec::new())
+    }
+}
+
+impl<T> SessionOnly<T> {
+    fn add(&mut self, name: &str, replaced: Option<T>) {
+        if !self.0.iter().any(|(n, _)| n.eq_ignore_ascii_case(name)) {
+            self.0.push((name.to_owned(), replaced));
+        }
+    }
+
+    /// The user added or edited `name`: saved from now on.
+    fn adopt(&mut self, name: &str) {
+        self.0.retain(|(n, _)| !n.eq_ignore_ascii_case(name));
+    }
+}
+
 #[derive(Default)]
 struct App {
     tabs: Vec<Tab>,
     active: usize,
     show_bookmarks: bool,
     show_signals: bool,
+    show_checks: bool,
     /// Text of the Ctrl+G dialog while it is open.
     goto: Option<String>,
     /// The About dialog is open.
@@ -2720,6 +2816,13 @@ struct App {
     /// Signals the user defined, for every tab; saved in
     /// `<config>/nerka/signals`. The generation changes with them.
     saved_signals: Signals,
+    /// The user's checks (`<config>/nerka/checks`), and a generation that
+    /// changes with them.
+    saved_checks: nerka_core::check::Checks,
+    /// `--check` and `--signal` definitions: for this session only.
+    session_checks: SessionOnly<nerka_core::check::CheckDef>,
+    session_signals: SessionOnly<nerka_core::SignalDef>,
+    checks_gen: u64,
     saved_gen: u64,
     /// FIBEX files for DLT non-verbose messages (this session), read into
     /// one catalog that every DLT tab is opened with.
@@ -2900,6 +3003,14 @@ fn search_history_path() -> Option<PathBuf> {
     nerka_core::config_dir().map(|d| d.join("search-history"))
 }
 
+fn checks_path() -> Option<PathBuf> {
+    // Tests never touch the user's checks.
+    if cfg!(test) {
+        return None;
+    }
+    nerka_core::config_dir().map(|d| d.join("checks"))
+}
+
 fn signals_path() -> Option<PathBuf> {
     // Tests never touch the user's signals.
     if cfg!(test) {
@@ -3050,6 +3161,66 @@ impl App {
         }
     }
 
+    /// A `--check`: shown and run like a saved one, not saved.
+    fn add_session_check(&mut self, c: nerka_core::check::CheckDef) {
+        self.session_checks.add(c.name(), self.saved_checks.get(c.name()).cloned());
+        self.saved_checks.set(c);
+    }
+
+    /// A `--signal`: used like a saved one, not saved.
+    fn add_session_signal(&mut self, d: nerka_core::SignalDef) {
+        self.session_signals.add(d.name(), self.saved_signals.get(d.name()).map(|o| (**o).clone()));
+        self.saved_signals.set(d);
+    }
+
+    /// The saved checks without the session's: where one replaced a saved
+    /// check, that one (owner, 2026-11-07: test checks given with --check
+    /// ended up in the file at the next edit).
+    fn checks_to_save(&self) -> nerka_core::check::Checks {
+        let mut keep = self.saved_checks.clone();
+        for (name, replaced) in &self.session_checks.0 {
+            keep.remove(name);
+            if let Some(o) = replaced {
+                keep.set(o.clone());
+            }
+        }
+        keep
+    }
+
+    /// The saved signals without the session's (as [`Self::checks_to_save`]).
+    fn signals_to_save(&self) -> Signals {
+        let mut keep = self.saved_signals.clone();
+        for (name, replaced) in &self.session_signals.0 {
+            keep.remove(name);
+            if let Some(o) = replaced {
+                keep.set(o.clone());
+            }
+        }
+        keep
+    }
+
+    fn load_checks(&mut self) {
+        let Some(path) = checks_path() else { return };
+        let Ok(text) = std::fs::read_to_string(&path) else { return };
+        let (c, errors) = nerka_core::check::Checks::parse_text(&text);
+        self.saved_checks = c;
+        if !errors.is_empty() {
+            self.status = format!("{}: {}", path.display(), errors.join("; "));
+        }
+    }
+
+    fn save_checks(&mut self) {
+        self.checks_gen += 1;
+        let Some(path) = checks_path() else { return };
+        let write = path
+            .parent()
+            .map_or(Ok(()), std::fs::create_dir_all)
+            .and_then(|_| std::fs::write(&path, self.checks_to_save().to_text()));
+        if let Err(e) = write {
+            self.status = format!("Could not save checks to {}: {e}", path.display());
+        }
+    }
+
     fn load_saved_signals(&mut self) {
         let Some(path) = signals_path() else { return };
         let Ok(text) = std::fs::read_to_string(&path) else { return };
@@ -3066,7 +3237,7 @@ impl App {
         let write = path
             .parent()
             .map_or(Ok(()), std::fs::create_dir_all)
-            .and_then(|_| std::fs::write(&path, self.saved_signals.to_text()));
+            .and_then(|_| std::fs::write(&path, self.signals_to_save().to_text()));
         if let Err(e) = write {
             self.status = format!("Could not save signals to {}: {e}", path.display());
         }
@@ -3868,6 +4039,9 @@ impl App {
                     "Values the lines of this tab carry, captured by a regex group: filter with @name \
                      (@speed > 100, @gear == D)",
                 );
+                let checks = self.saved_checks.iter().filter(|c| c.is_on()).count();
+                ui.toggle_value(&mut self.show_checks, format!("✔ Checks ({checks})"))
+                    .on_hover_text("Issues and facts found in the file, overall and per lifecycle");
                 ui.toggle_value(&mut self.show_library, format!("📚 Library ({queries})")).on_hover_text(
                     "Saved queries from packs (*.nerka-pack): pick them for the filter or the search \
                      (Ctrl+Shift+L)",
@@ -3949,6 +4123,7 @@ impl App {
         // Saved after the tab is done with (the panel changed them), and
         // FIBEX files chosen there (every DLT tab reads its file again).
         let mut save_signals = false;
+        let mut save_checks = false;
         let mut fibex_action = None;
         let show_bookmarks = self.show_bookmarks;
         let mut focus_search = std::mem::take(&mut self.focus_search);
@@ -4033,6 +4208,9 @@ impl App {
                 }
             }
         }
+        // Checks run whenever some are on: the lifecycle list shows them
+        // too, and their signals are the tab's (none on: none).
+        tab.poll_checks(ui.ctx(), &self.saved_checks, self.checks_gen, &self.library);
         if self.show_signals {
             let line = tab.current_line();
             let saved = &mut self.saved_signals;
@@ -4054,6 +4232,7 @@ impl App {
                         fibex: fibex.as_deref(),
                         arg_picks: &mut tab.arg_picks,
                         library: &self.library,
+                        check_results: &tab.check_results,
                     };
                     signals::signals_panel(ui, &mut tab.signals_ui, input)
                 })
@@ -4078,6 +4257,9 @@ impl App {
                     }
                 }
             }
+            if let Some(name) = &out.adopted {
+                self.session_signals.adopt(name);
+            }
             if out.saved_changed {
                 save_signals = true;
             }
@@ -4092,6 +4274,61 @@ impl App {
                 && tab.set_filter("query", &nfd)
             {
                 tab.start_search(ui.ctx());
+            }
+            // A check's signal clicked: the check in the Checks pane.
+            if let Some(name) = out.open_check {
+                self.show_checks = true;
+                tab.checks_ui.selected = Some((name, 0));
+            }
+            // A lifecycle's checks: the pane, on its first issue (else result).
+            if let Some((life, n)) = out.checks {
+                self.show_checks = true;
+                let label = format!("{life} #{n}");
+                let found = |issue: bool| {
+                    tab.check_results.iter().find_map(|(name, r)| {
+                        let r = r.as_ref().ok()?;
+                        let i = r.scopes.iter().position(|s| {
+                            s.scope.label == label
+                                && (!issue || matches!(s.verdict, nerka_core::check::Verdict::Issue(_)))
+                        })?;
+                        Some((name.clone(), i))
+                    })
+                };
+                tab.checks_ui.selected = found(true).or_else(|| found(false));
+            }
+        }
+        if self.show_checks {
+            // At most half the window: its results wrap (owner, 2026-11-07:
+            // it grew to the whole window).
+            let max = (ui.available_width() * 0.5).max(320.0);
+            let out = egui::Panel::right("checks")
+                .resizable(true)
+                .default_size(440.0)
+                .max_size(max)
+                .show(ui, |ui| {
+                    let input = checks::Input {
+                        saved: &mut self.saved_checks,
+                        results: &tab.check_results,
+                        running: tab.checks_job.is_some(),
+                        file: &*file,
+                        signals: &tab.signals,
+                        library: &self.library,
+                        plot: &mut plot::lock(&tab.plot),
+                    };
+                    checks::checks_panel(ui, &mut tab.checks_ui, input)
+                })
+                .inner;
+            if out.close {
+                self.show_checks = false;
+            }
+            if let Some(name) = &out.adopted {
+                self.session_checks.adopt(name);
+            }
+            if out.changed {
+                save_checks = true;
+            }
+            if let Some(line) = out.goto {
+                tab.goto_line(line);
             }
         }
         let search_history = &self.search_history;
@@ -4225,6 +4462,9 @@ impl App {
         if save_signals {
             self.save_saved_signals();
         }
+        if save_checks {
+            self.save_checks();
+        }
         match fibex_action {
             Some(signals::FibexAction::Add) => {
                 if let Some(paths) = rfd::FileDialog::new()
@@ -4253,6 +4493,33 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Owner, 2026-11-07: checks given with --check (test runs) ended up in
+    /// the saved file at the next edit. They last the session; one the user
+    /// adds or edits is theirs.
+    #[test]
+    fn startup_definitions_last_the_session() {
+        use nerka_core::check::CheckDef;
+        let check = |s: &str| CheckDef::parse_spec(s).unwrap();
+        let mut app = App::default();
+        app.saved_checks.set(check("mine: lines raw == a"));
+        app.saved_checks.set(check("both: lines raw == b"));
+        app.add_session_check(check("test: lines raw == t"));
+        app.add_session_check(check("Both: lines raw == c"));
+        assert_eq!(app.saved_checks.len(), 3, "shown and run");
+        let text = app.checks_to_save().to_text();
+        assert!(text.contains("mine: lines raw == a") && text.contains("both: lines raw == b"), "{text}");
+        assert!(!text.contains("test:") && !text.contains("raw == c"), "{text}");
+        app.session_checks.adopt("TEST");
+        assert!(app.checks_to_save().to_text().contains("test: lines raw == t"));
+
+        let signal = |s: &str| nerka_core::SignalDef::parse_spec(s).unwrap();
+        app.saved_signals.set(signal(r"v=/v=(?<v>\d+)/"));
+        app.add_session_signal(signal(r"v=/volts=(?<v>\d+)/"));
+        app.add_session_signal(signal(r"w=/w=(?<w>\d+)/"));
+        let text = app.signals_to_save().to_text();
+        assert!(text.contains("/v=(?<v>") && !text.contains("volts") && !text.contains("w=/w="), "{text}");
+    }
 
     const LOG: &str = "\
 [INFO] cam1 frame drop
@@ -4469,6 +4736,7 @@ query timeouts  labels: vision
                         fibex: Some(&*fibex),
                         arg_picks: &mut tab.arg_picks,
                         library: &Library::new(),
+                        check_results: &[],
                     };
                     changed = signals::signals_panel(ui, &mut tab.signals_ui, input).args_changed;
                 });

@@ -249,7 +249,7 @@ fn spec_errors_say_where() {
     bad("boot: planned raw ~ /x/", 23, "needs a start, reset or gap");
     bad("boot: gap 1s; planned {sys.x", 28, "expected '}'");
     bad("boot: gap 1s; planned {shutdown}", 23, "expected a library query");
-    bad("boot: gap 1s; planned {sys.x cam}", 29, "expected NAME=VALUE");
+    bad("boot: gap 1s; planned {sys.x cam=1 b}", 35, "expected NAME=VALUE");
 }
 
 #[test]
