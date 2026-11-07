@@ -1357,6 +1357,17 @@ fn positive_regexes(e: &Expr, neg: bool, f: &mut dyn FnMut(&Regex)) {
     }
 }
 
+/// The first named group of `q`'s positive regexes, if any.
+pub(crate) fn first_group(q: &Query) -> Option<String> {
+    let mut out = None;
+    positive_regexes(q.expr(), false, &mut |re| {
+        if out.is_none() {
+            out = re.capture_names().flatten().next().map(str::to_owned);
+        }
+    });
+    out
+}
+
 /// The text `group` captured in the first positive regex that has the
 /// group and matches its text (the line, or its field).
 fn capture(e: &Expr, group: &str, ev: &mut Event<'_>) -> Option<Vec<u8>> {

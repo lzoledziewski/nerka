@@ -12,6 +12,7 @@
 //!     nerka --signal 'v=/v=(?<v>\d+)/' filter '@v > 100' app.log   (signals)
 //!     nerka --fibex ecu1.xml filter 'apid == NAV' trace.dlt         (non-verbose DLT)
 //!     nerka --lifecycle 'ecu1: lines ecu == ECU1; reset uptime' lifecycles trace.dlt   (ECU1's boots)
+//!     nerka --check 'stall: lines raw ~ /net down/; missing raw ~ /ota/ within 30s' check trace.dlt
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -61,6 +62,12 @@ struct Cli {
     /// (`@ecu1`, its number); signals reset with it with `:per(ecu1)`.
     #[arg(long, global = true, value_name = "SPEC")]
     lifecycle: Vec<String>,
+    /// Define a check (repeatable): NAME: lines QUERY; TEST[; per
+    /// LIFECYCLE], e.g. 'storm: lines raw ~ /retry/; rate 20 per 10s'.
+    /// Tests: exists, count [OP N], rate N per DUR, gap DUR, then QUERY
+    /// within DUR, missing QUERY within DUR, value first|last|min|max.
+    #[arg(long, global = true, value_name = "SPEC")]
+    check: Vec<String>,
     /// Show times (DLT's time column, signals) in this computer's local
     /// time and read times without a zone as local; default: UTC.
     #[arg(long = "local-time", global = true)]
@@ -128,6 +135,23 @@ enum Cmd {
     Marks { file: PathBuf },
     /// Print a 1-based inclusive range of lines.
     Lines { file: PathBuf, from: u64, to: u64 },
+    /// Run the checks (`--check`) on a file: issues and facts, overall and
+    /// per lifecycle (`per`).
+    Check {
+        file: PathBuf,
+        /// Only this check (default: all defined).
+        #[arg(short = 'n', long)]
+        name: Option<String>,
+        /// Print JSON.
+        #[arg(long)]
+        json: bool,
+        /// Fail (exit status 1) if an issue shows up.
+        #[arg(long)]
+        strict: bool,
+        /// Also print the evidence: up to this many places per result.
+        #[arg(short = 'e', long, value_name = "N", default_value_t = 0)]
+        evidence: usize,
+    },
     /// Print the lifecycles (`--lifecycle`) of a file: when each starts and
     /// how it ends, and where the definition and the uptime disagree
     /// (findings, on stderr).
@@ -480,6 +504,110 @@ fn lifecycles(
     Ok(findings)
 }
 
+/// Run the `--check` checks on `file` (all, or the one named); returns how
+/// many results are issues.
+fn checks(
+    file: &PathBuf,
+    name: Option<&str>,
+    json: bool,
+    evidence: usize,
+    packs: &[PathBuf],
+    out: &mut impl Write,
+) -> Result<usize> {
+    use nerka_core::check::{CheckDef, Verdict};
+    let mut defs = Vec::new();
+    for spec in CHECKS.get_or_init(Default::default) {
+        let d = CheckDef::parse_spec(spec).map_err(|e| {
+            anyhow::anyhow!(
+                "--check: {}\n  {spec}\n  {}^",
+                e.msg,
+                " ".repeat(spec[..e.pos.min(spec.len())].chars().count())
+            )
+        })?;
+        if name.is_none_or(|n| d.name().eq_ignore_ascii_case(n)) {
+            defs.push(d);
+        }
+    }
+    if defs.is_empty() {
+        anyhow::bail!("no check defined: use --check 'NAME: lines QUERY; TEST'");
+    }
+    if defs.iter().any(|d| !d.unresolved().is_empty()) {
+        let lib = library(packs)?;
+        defs = defs
+            .into_iter()
+            .map(|d| d.resolved(&lib))
+            .collect::<std::result::Result<_, _>>()
+            .map_err(|e| anyhow::anyhow!(e))?;
+    }
+    let (f, _) = open(file)?;
+    let signals = SIGNALS.get_or_init(Default::default).for_source(&*f);
+    let (mut issues, mut rows) = (0, Vec::new());
+    if !json {
+        writeln!(out, "check\tkind\tscope\tresult")?;
+    }
+    for d in defs {
+        let t = Instant::now();
+        let r = d.run(&*f, &signals, &Progress::new())?;
+        let took = t.elapsed();
+        for s in &r.scopes {
+            let shown = match &s.verdict {
+                Verdict::Ok => "ok".to_owned(),
+                Verdict::Issue(n) => format!("{n}x"),
+                Verdict::Fact(Some(v)) => v.clone(),
+                Verdict::Fact(None) => "-".into(),
+            };
+            if matches!(s.verdict, Verdict::Issue(_)) {
+                issues += 1;
+            }
+            if json {
+                let verdict = match &s.verdict {
+                    Verdict::Ok => "\"ok\"".to_owned(),
+                    Verdict::Issue(n) => format!("{{\"issue\": {n}}}"),
+                    Verdict::Fact(v) => format!("{{\"fact\": {}}}", v.as_deref().map_or("null".into(), js)),
+                };
+                let ev: Vec<String> = s
+                    .evidence
+                    .iter()
+                    .take(evidence.max(1))
+                    .map(|e| {
+                        let lines: Vec<String> = e.rows.iter().map(|r| (r + 1).to_string()).collect();
+                        format!("{{\"lines\": [{}], \"note\": {}}}", lines.join(", "), js(&e.note))
+                    })
+                    .collect();
+                rows.push(format!(
+                    "  {{\"check\": {}, \"kind\": {}, \"scope\": {}, \"first_line\": {}, \"end_line\": {}, \
+                     \"verdict\": {verdict}, \"evidence\": [{}]}}",
+                    js(&r.name),
+                    js(r.kind.as_str()),
+                    js(&s.scope.label),
+                    s.scope.from + 1,
+                    s.scope.to,
+                    ev.join(", ")
+                ));
+            } else {
+                writeln!(out, "{}\t{}\t{}\t{shown}", r.name, r.kind.as_str(), s.scope.label)?;
+                for e in s.evidence.iter().take(evidence) {
+                    let lines: Vec<String> = e.rows.iter().map(|r| (r + 1).to_string()).collect();
+                    let text = f.line_text(e.rows[0]).unwrap_or_default();
+                    let note = if e.note.is_empty() { String::new() } else { format!(" ({})", e.note) };
+                    writeln!(out, "\t\t\tline {}{note}: {text}", lines.join(" -> "))?;
+                }
+            }
+        }
+        if !json {
+            out.flush()?;
+            eprintln!("{}: {took:.2?}", r.name);
+        }
+    }
+    if json {
+        writeln!(out, "{{\"results\": [\n{}\n ]}}", rows.join(",\n"))?;
+    }
+    Ok(issues)
+}
+
+/// The `--check` specs, set once in `main`.
+static CHECKS: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+
 /// A JSON string.
 fn js(s: &str) -> String {
     let mut o = String::with_capacity(s.len() + 2);
@@ -574,6 +702,7 @@ fn run() -> Result<()> {
         }
     }
     SIGNALS.set(signals).expect("set once");
+    CHECKS.set(cli.check.clone()).expect("set once");
     let stdout = std::io::stdout().lock();
     let mut out = BufWriter::with_capacity(1 << 16, stdout);
 
@@ -668,6 +797,13 @@ fn run() -> Result<()> {
                 } else {
                     writeln!(out, "{name} {}: {text}\n    # {note}", l + 1)?;
                 }
+            }
+        }
+        Cmd::Check { file, name, json, strict, evidence } => {
+            let issues = checks(&file, name.as_deref(), json, evidence, &cli.pack, &mut out)?;
+            if strict && issues > 0 {
+                out.flush()?;
+                anyhow::bail!("{issues} issue{} found", if issues == 1 { "" } else { "s" });
             }
         }
         Cmd::Lifecycles { file, name, json, strict, count } => {

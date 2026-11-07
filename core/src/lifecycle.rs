@@ -157,7 +157,7 @@ impl Rule {
     }
 
     /// Expanded with `lib`.
-    fn resolved(&self, lib: &Library) -> Result<Rule, String> {
+    pub(crate) fn resolved(&self, lib: &Library) -> Result<Rule, String> {
         let Rule::Library { id, params, .. } = self else { return Ok(self.clone()) };
         let sel = Selection { include: vec![Pick::Query(id.clone())], ..Selection::default() };
         let values: Params =

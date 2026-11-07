@@ -770,7 +770,7 @@ fn preview(f: &LifeForm, name: &str, lib: &Library, signals: &Signals, file: &dy
 
 /// A query field of a lifecycle: NFD, or a library query `{pack.query}`
 /// picked with 📚 or dropped from the Library.
-fn rule_field(ui: &mut egui::Ui, id: &str, text: &mut String, hint: &str, lib: &Library) {
+pub(crate) fn rule_field(ui: &mut egui::Ui, id: &str, text: &mut String, hint: &str, lib: &Library) {
     ui.horizontal(|ui| {
         let w = (ui.available_width() - 34.0).max(80.0);
         let r = ui.add(egui::TextEdit::singleline(text).code_editor().hint_text(hint).desired_width(w));
