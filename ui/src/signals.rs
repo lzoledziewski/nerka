@@ -326,6 +326,7 @@ pub fn signals_panel(ui: &mut egui::Ui, st: &mut SignalsUi, input: Input<'_>) ->
             // (owner, 2026-10-28: a fixed cut wasted a wide panel).
             let fit = value_room(ui, signals);
             let mut remove = None;
+            let mut switch: Option<(String, bool)> = None;
             let mut remove_arg: Option<String> = None;
             let mut edit = None;
             egui::Grid::new("signals").num_columns(6).striped(true).show(ui, |ui| {
@@ -447,6 +448,14 @@ pub fn signals_panel(ui: &mut egui::Ui, st: &mut SignalsUi, input: Input<'_>) ->
                     }
                     if d.queries().is_empty() {
                         ui.horizontal(|ui| {
+                            let mut on = true;
+                            if ui
+                                .checkbox(&mut on, "")
+                                .on_hover_text("On: computed and usable in queries. Off: kept, not computed")
+                                .changed()
+                            {
+                                switch = Some((d.name().to_owned(), on));
+                            }
                             if ui.small_button("✎").on_hover_text("Edit").clicked() {
                                 edit = Some((*d).clone());
                             }
@@ -473,7 +482,40 @@ pub fn signals_panel(ui: &mut egui::Ui, st: &mut SignalsUi, input: Input<'_>) ->
                     }
                     ui.end_row();
                 }
+                // The saved ones switched off: listed, to switch on again.
+                for d in saved.iter().filter(|d| !d.is_on()) {
+                    ui.label("");
+                    let what = if d.as_lifecycle().is_some() { "lifecycle" } else { d.kind().as_str() };
+                    ui.label(RichText::new(format!("@{}", d.name())).monospace().weak()).on_hover_text(format!(
+                        "Off: kept, not computed
+{}",
+                        d.spec()
+                    ));
+                    ui.weak(what);
+                    ui.label("");
+                    ui.weak("off");
+                    ui.horizontal(|ui| {
+                        let mut on = false;
+                        if ui.checkbox(&mut on, "").on_hover_text("Switch it on").changed() {
+                            switch = Some((d.name().to_owned(), on));
+                        }
+                        if ui.small_button("✎").on_hover_text("Edit").clicked() {
+                            edit = Some((*d).clone());
+                        }
+                        if ui.small_button("−").on_hover_text("Remove (from every tab)").clicked() {
+                            remove = Some(d.name().to_owned());
+                        }
+                    });
+                    ui.end_row();
+                }
             });
+            if let Some((name, on)) = switch
+                && let Some(d) = saved.get(&name)
+            {
+                let d = (**d).clone().with_on(on);
+                saved.set(d);
+                out.saved_changed = true;
+            }
             if let Some(d) = edit {
                 st.draft = Draft::of(&d);
                 st.editing = Some(d.name().to_owned());
@@ -603,13 +645,11 @@ pub fn signals_panel(ui: &mut egui::Ui, st: &mut SignalsUi, input: Input<'_>) ->
                         if ui.button(label).clicked() {
                             match st.draft.build() {
                                 Ok(def) => {
-                                    // An edit keeps the signal's scope.
-                                    let scope = st
-                                        .editing
-                                        .as_deref()
-                                        .and_then(|n| saved.get(n))
-                                        .map(|o| o.scope())
-                                        .unwrap_or_default();
+                                    // An edit keeps the signal's scope, and its being off.
+                                    let old = st.editing.as_deref().and_then(|n| saved.get(n));
+                                    let scope = old.map(|o| o.scope()).unwrap_or_default();
+                                    let on = old.is_none_or(|o| o.is_on());
+                                    let def = def.with_on(on);
                                     if let Some(old) = st.editing.take()
                                         && old != def.name()
                                     {
@@ -789,9 +829,18 @@ fn lifecycles_list(ui: &mut egui::Ui, signals: &Signals, file: &dyn LogSource, o
             );
             continue;
         }
-        let Some(l) = def.cached(file) else {
-            ui.weak(format!("Lifecycles @{}: finding them…", def.name()));
-            continue;
+        let l = match def.done(file) {
+            None => {
+                ui.weak(format!("Lifecycles @{}: finding them…", def.name()));
+                continue;
+            }
+            // Why none were found (owner, 2026-11-07: it said "finding them…" for good).
+            Some(Err(e)) => {
+                ui.colored_label(ui.visuals().error_fg_color, format!("Lifecycles @{}: {e}", def.name()))
+                    .on_hover_text("Edit it (✎), or switch it off");
+                continue;
+            }
+            Some(Ok(l)) => l,
         };
         let header = format!("Lifecycles @{}: {}", def.name(), l.summary());
         egui::CollapsingHeader::new(RichText::new(header).strong())

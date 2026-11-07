@@ -1328,7 +1328,8 @@ impl Tab {
         }
         self.signals_key = Some(key);
         let mut s = Signals::default().for_source(&*file);
-        for d in saved.iter() {
+        // The saved ones switched on (owner, 2026-11-07: off keeps them).
+        for d in saved.iter().filter(|d| d.is_on()) {
             s.set((**d).clone());
         }
         // FIBEX arguments picked in the Signals panel.

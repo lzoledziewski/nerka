@@ -43,8 +43,9 @@
 //! Spec text (CLI `--signal`, the saved file; one line each):
 //!
 //! ```text
-//! spec  := NAME [ "(" GROUP ")" ] ( ":" PART )* "=" QUERY
-//!        | "lifecycle " LIFECYCLE-SPEC            -- crate::lifecycle
+//! spec  := [ "off " ] NAME [ "(" GROUP ")" ] ( ":" PART )* "=" QUERY
+//!        | [ "off " ] "lifecycle " LIFECYCLE-SPEC -- crate::lifecycle
+//!                                           -- off: kept, not computed
 //! PART  := KIND | SCOPE | "per(" LIFECYCLE ")" | "default(" VALUE ")"
 //! KIND  := num | enum | time           -- default num
 //! SCOPE := all | filtered              -- default all
@@ -513,6 +514,9 @@ pub struct SignalDef {
     life: Option<Arc<LifecycleDef>>,
     /// Its state where no event set it.
     default: Option<SignalValue>,
+    /// Switched off: kept (saved) but not computed nor usable in queries
+    /// (owner, 2026-11-07); `off ` before its spec line.
+    off: bool,
     /// The selection queries it comes from (their names); empty for one
     /// the user defined.
     queries: Vec<String>,
@@ -557,6 +561,7 @@ impl SignalDef {
             per: None,
             life: None,
             default: None,
+            off: false,
             queries: Vec::new(),
             argument: None,
         })
@@ -587,6 +592,7 @@ impl SignalDef {
             per: None,
             life: None,
             default: None,
+            off: false,
             queries: vec![from.to_owned()],
             argument: Some(index),
         })
@@ -652,6 +658,7 @@ impl SignalDef {
             per: None,
             life: None,
             default: None,
+            off: false,
             queries: Vec::new(),
             argument: None,
         }
@@ -740,8 +747,22 @@ impl SignalDef {
         Ok(self)
     }
 
+    /// Whether it is on (computed, usable in queries).
+    pub fn is_on(&self) -> bool {
+        !self.off
+    }
+
+    /// The same definition switched on or off.
+    pub fn with_on(mut self, on: bool) -> SignalDef {
+        self.off = !on;
+        self
+    }
+
     /// Parse one spec line (module docs).
     pub fn parse_spec(spec: &str) -> Result<SignalDef, SignalError> {
+        if let Some(rest) = spec.trim_start().strip_prefix("off ") {
+            return SignalDef::parse_spec(rest).map(|d| d.with_on(false));
+        }
         if let Some(rest) = spec.trim_start().strip_prefix("lifecycle ") {
             return LifecycleDef::parse_spec(rest)
                 .map(SignalDef::lifecycle)
@@ -791,9 +812,10 @@ impl SignalDef {
 
     /// The spec line [`Self::parse_spec`] reads back.
     pub fn spec(&self) -> String {
+        let off = if self.off { "off " } else { "" };
         match &self.builtin {
             Builtin::Time => return "time:time (the file's own time)".into(),
-            Builtin::Life(l) => return format!("lifecycle {}", l.spec()),
+            Builtin::Life(l) => return format!("{off}lifecycle {}", l.spec()),
             Builtin::No => {}
         }
         if let Some(i) = self.argument {
@@ -803,7 +825,7 @@ impl SignalDef {
         let scope = if self.scope == SignalScope::Filtered { ":filtered" } else { "" };
         let per = self.per.as_ref().map(|p| format!(":per({p})")).unwrap_or_default();
         let default = self.default.as_ref().map(|d| format!(":default({d})")).unwrap_or_default();
-        format!("{}{group}:{}{scope}{per}{default}={}", self.name, self.kind.as_str(), self.query.source())
+        format!("{off}{}{group}:{}{scope}{per}{default}={}", self.name, self.kind.as_str(), self.query.source())
     }
 
     pub fn name(&self) -> &str {
@@ -1100,6 +1122,13 @@ impl Signals {
         errors
     }
 
+    /// Only those switched on, linked among themselves.
+    pub fn on(&self) -> Signals {
+        let mut s = Signals(self.0.iter().filter(|d| d.is_on()).cloned().collect());
+        s.link();
+        s
+    }
+
     /// The lifecycles defined.
     pub fn lifecycles(&self) -> impl Iterator<Item = &Arc<LifecycleDef>> {
         self.0.iter().filter_map(|d| d.as_lifecycle())
@@ -1123,8 +1152,8 @@ impl Signals {
     /// the saved file: a spec line each.
     pub fn to_text(&self) -> String {
         let mut out = String::from(
-            "# nerka signals: NAME[(GROUP)][:KIND][:SCOPE][:per(LIFECYCLE)][:default(VALUE)]=QUERY \
-             or lifecycle NAME[(KEY)]: CLAUSES, one per line\n",
+            "# nerka signals: [off] NAME[(GROUP)][:KIND][:SCOPE][:per(LIFECYCLE)][:default(VALUE)]=QUERY \
+             or [off] lifecycle NAME: CLAUSES, one per line\n",
         );
         for d in self.iter().filter(|d| !d.is_from_source() && d.queries.is_empty()) {
             out += &d.spec();

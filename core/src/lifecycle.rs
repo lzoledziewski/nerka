@@ -71,7 +71,9 @@ pub struct Reset {
     pub tolerance: f64,
 }
 
-type Cache = Arc<Mutex<Vec<((usize, LineNo), Arc<Lifecycles>)>>>;
+/// Per source: the lifecycles found, or why they couldn't be (kept, so a
+/// UI can say so instead of waiting).
+type Cache = Arc<Mutex<Vec<((usize, LineNo), Result<Arc<Lifecycles>, String>)>>>;
 
 /// A query clause: NFD, or a library query by name with its parameters
 /// (expanded by [`LifecycleDef::resolved`]).
@@ -635,25 +637,35 @@ impl LifecycleDef {
     /// this definition and its copies.
     pub fn lifecycles(&self, source: &dyn LogSource, progress: &Progress) -> crate::Result<Arc<Lifecycles>> {
         let key = source_key(source);
-        if let Some(l) = self.cached(source) {
-            return Ok(l);
+        if let Some(r) = self.done(source) {
+            return r.map_err(crate::Error::Format);
         }
-        let l = Arc::new(self.detect(source, progress)?);
+        let r = match self.detect(source, progress) {
+            Ok(l) => Ok(Arc::new(l)),
+            // Not an answer: asked again later.
+            Err(crate::Error::Cancelled) => return Err(crate::Error::Cancelled),
+            Err(e) => Err(e.to_string()),
+        };
         let mut cache = self.cache.lock().unwrap_or_else(|e| e.into_inner());
         if !cache.iter().any(|(k, _)| *k == key) {
             if cache.len() >= 16 {
-                cache.remove(0);
+                drop(cache.remove(0));
             }
-            cache.push((key, l.clone()));
+            cache.push((key, r.clone()));
         }
-        Ok(l)
+        r.map_err(crate::Error::Format)
+    }
+
+    /// The lifecycles, or why there are none, if worked out already.
+    pub fn done(&self, source: &dyn LogSource) -> Option<Result<Arc<Lifecycles>, String>> {
+        let key = source_key(source);
+        let cache = self.cache.lock().unwrap_or_else(|e| e.into_inner());
+        cache.iter().find(|(k, _)| *k == key).map(|(_, r)| r.clone())
     }
 
     /// The lifecycles if found already.
     pub fn cached(&self, source: &dyn LogSource) -> Option<Arc<Lifecycles>> {
-        let key = source_key(source);
-        let cache = self.cache.lock().unwrap_or_else(|e| e.into_inner());
-        cache.iter().find(|(k, _)| *k == key).map(|(_, l)| l.clone())
+        self.done(source)?.ok()
     }
 
     fn hits(&self, q: &Option<Rule>, source: &dyn LogSource, progress: &Progress) -> crate::Result<Vec<LineNo>> {

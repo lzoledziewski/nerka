@@ -420,6 +420,35 @@ mod signals {
     }
 
     #[test]
+    fn switched_off_definitions_are_kept_but_not_used() {
+        let sig = signals(&["off lifecycle a: lines ecu == A; reset uptime", r"off n:num=/n=(?<n>\d+)/", OTA]);
+        // Saved as they are, off.
+        let (back, errors) = Signals::parse_text(&sig.to_text());
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(back.get("a").unwrap().spec(), "off lifecycle a: lines ecu == A; reset uptime");
+        assert_eq!(back.get("n").unwrap().spec(), r"off n:num=/n=(?<n>\d+)/");
+        // Only those on are used: a signal bound to an off lifecycle isn't linked.
+        let on = sig.on();
+        assert_eq!(on.iter().map(|d| d.name()).collect::<Vec<_>>(), ["ota"]);
+        assert!(Query::compile("@n > 1").unwrap().with_signals(&on).is_err());
+        let err = Query::compile("@ota == idle").unwrap().with_signals(&on).unwrap_err();
+        assert!(err.msg.contains("which isn't defined"), "{}", err.msg);
+    }
+
+    #[test]
+    fn why_no_lifecycles_were_found_is_kept() {
+        let d = def("a: reset @nope").linked(&Signals::default());
+        let src = ota();
+        assert!(d.done(&src).is_none());
+        assert!(d.lifecycles(&src, &Progress::new()).is_err());
+        assert_eq!(
+            d.done(&src).unwrap().unwrap_err(),
+            "lifecycle 'a': no signal @nope (define it, or reset on uptime)"
+        );
+        assert!(d.cached(&src).is_none());
+    }
+
+    #[test]
     fn there_is_no_built_in_uptime_signal() {
         // Whose uptime would it be? Lifecycles read it from their own lines.
         let sig = Signals::default().for_source(&ota());
