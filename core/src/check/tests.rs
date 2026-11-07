@@ -110,6 +110,31 @@ fn rates_find_bursts() {
     assert_eq!(check("storm: lines raw == retry; rate 3 per 1s").overall().verdict, Verdict::Ok);
 }
 
+/// Review finding R4: times that go back (two overlapping files one after
+/// another) must not make a burst out of lines 10 s apart. Ignored until
+/// the owner decides how checks treat times out of order.
+#[test]
+#[ignore = "R4: checks assume rows in time order (doc/review/2026-11-07-findings.md)"]
+fn rates_with_times_going_back() {
+    // File A: 100 s .. 130 s; then file B: 105 s .. 135 s. Every retry is
+    // 10 s from the one before it in its own file.
+    let src = Src(vec![
+        ("A", 100.0, 0.0, "retry"),
+        ("A", 110.0, 0.0, "retry"),
+        ("A", 120.0, 0.0, "retry"),
+        ("A", 130.0, 0.0, "retry"),
+        ("B", 105.0, 0.0, "retry"),
+        ("B", 115.0, 0.0, "retry"),
+        ("B", 125.0, 0.0, "retry"),
+        ("B", 135.0, 0.0, "retry"),
+    ]);
+    let r = CheckDef::parse_spec("storm: lines raw == retry; rate 2 per 1s")
+        .unwrap()
+        .run(&src, &Signals::default(), &Progress::new())
+        .unwrap();
+    assert_eq!(r.overall().verdict, Verdict::Ok, "{:?}", r.overall().evidence);
+}
+
 #[test]
 fn gaps_between_its_lines() {
     let r = check("quiet: lines ecu == A; gap 30s; per a");
