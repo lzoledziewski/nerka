@@ -26,7 +26,11 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 #[derive(Parser)]
-#[command(name = "nerka", version, about = "Fast regex log analysis")]
+#[command(
+    name = "nerka",
+    version,
+    about = "Fast log analysis: filter, search, signals, lifecycles and checks over text, JSON, DLT and captures"
+)]
 struct Cli {
     /// Load query packs from a .nerka-pack file or a directory of them
     /// (repeatable), besides the per-user pack directory.

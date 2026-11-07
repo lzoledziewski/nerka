@@ -55,7 +55,7 @@ impl Concat {
         let Some(first) = parts.first() else { return Err(Error::Format("no files to open".into())) };
         let k = kind(first.as_ref());
         if let Some(other) = parts.iter().find(|p| kind(p.as_ref()) != k) {
-            return Err(Error::Format(format!(
+            return Err(Error::MixedKinds(format!(
                 "{} is {} but {} is {}: only files of one kind open as one view",
                 file_name(first.name()),
                 kind_name(first.as_ref()),

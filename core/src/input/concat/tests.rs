@@ -117,6 +117,7 @@ fn dlt_files_and_captures_are_one_kind() {
     let d: Box<dyn LogSource> = Box::new(DltFile::from_bytes("d.dlt", dlt_bytes(&["NAV"])));
     let Err(e) = Concat::new(vec![text("x/app.log", "a\n"), d]) else { panic!("mixed kinds") };
     assert_eq!(e.to_string(), "app.log is plain text but d.dlt is DLT: only files of one kind open as one view");
+    assert!(matches!(e, crate::Error::MixedKinds(_)), "a variant of its own: the GUI opens such files as tabs");
 }
 
 #[test]

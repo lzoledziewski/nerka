@@ -1597,7 +1597,7 @@ impl Tab {
                         }
                         Err(nerka_core::Error::Cancelled) => return false,
                         // Several files of different kinds: opened as tabs.
-                        Err(nerka_core::Error::Format(why)) if self.paths.len() > 1 && why.contains("one kind") => {
+                        Err(nerka_core::Error::MixedKinds(why)) if self.paths.len() > 1 => {
                             self.mixed = Some(why);
                             return false;
                         }
