@@ -267,6 +267,8 @@ pub struct Output {
     pub close: bool,
     /// A check was added, changed, switched or removed.
     pub changed: bool,
+    /// The check the form added or updated (by name).
+    pub adopted: Option<String>,
     pub goto: Option<LineNo>,
 }
 
@@ -621,6 +623,7 @@ fn form_ui(
                     {
                         saved.remove(&old);
                     }
+                    out.adopted = Some(c.name().to_owned());
                     saved.set(c.with_on(on));
                     *f = Form::default();
                     st.form_open = false;

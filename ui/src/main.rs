@@ -246,11 +246,11 @@ fn main() -> eframe::Result {
                 app.set_fibex(&cc.egui_ctx, fibex);
             }
             for c in startup_checks.iter() {
-                app.saved_checks.set(c.clone());
+                app.add_session_check(c.clone());
             }
             app.show_checks |= !startup_checks.is_empty();
             for d in signals.iter() {
-                app.saved_signals.set((**d).clone());
+                app.add_session_signal((**d).clone());
             }
             app.load_library();
             app.presets.load();
@@ -2744,6 +2744,30 @@ fn term_lines(terms: &[Term]) -> Vec<ChipLine<'_>> {
         .collect()
 }
 
+/// Definitions given on the command line, by name, each with the saved
+/// one it replaced: they last the session, unless the user adds or edits
+/// one in the GUI (then it is theirs, and saved).
+struct SessionOnly<T>(Vec<(String, Option<T>)>);
+
+impl<T> Default for SessionOnly<T> {
+    fn default() -> Self {
+        SessionOnly(Vec::new())
+    }
+}
+
+impl<T> SessionOnly<T> {
+    fn add(&mut self, name: &str, replaced: Option<T>) {
+        if !self.0.iter().any(|(n, _)| n.eq_ignore_ascii_case(name)) {
+            self.0.push((name.to_owned(), replaced));
+        }
+    }
+
+    /// The user added or edited `name`: saved from now on.
+    fn adopt(&mut self, name: &str) {
+        self.0.retain(|(n, _)| !n.eq_ignore_ascii_case(name));
+    }
+}
+
 #[derive(Default)]
 struct App {
     tabs: Vec<Tab>,
@@ -2795,6 +2819,9 @@ struct App {
     /// The user's checks (`<config>/nerka/checks`), and a generation that
     /// changes with them.
     saved_checks: nerka_core::check::Checks,
+    /// `--check` and `--signal` definitions: for this session only.
+    session_checks: SessionOnly<nerka_core::check::CheckDef>,
+    session_signals: SessionOnly<nerka_core::SignalDef>,
     checks_gen: u64,
     saved_gen: u64,
     /// FIBEX files for DLT non-verbose messages (this session), read into
@@ -3134,6 +3161,44 @@ impl App {
         }
     }
 
+    /// A `--check`: shown and run like a saved one, not saved.
+    fn add_session_check(&mut self, c: nerka_core::check::CheckDef) {
+        self.session_checks.add(c.name(), self.saved_checks.get(c.name()).cloned());
+        self.saved_checks.set(c);
+    }
+
+    /// A `--signal`: used like a saved one, not saved.
+    fn add_session_signal(&mut self, d: nerka_core::SignalDef) {
+        self.session_signals.add(d.name(), self.saved_signals.get(d.name()).map(|o| (**o).clone()));
+        self.saved_signals.set(d);
+    }
+
+    /// The saved checks without the session's: where one replaced a saved
+    /// check, that one (owner, 2026-11-07: test checks given with --check
+    /// ended up in the file at the next edit).
+    fn checks_to_save(&self) -> nerka_core::check::Checks {
+        let mut keep = self.saved_checks.clone();
+        for (name, replaced) in &self.session_checks.0 {
+            keep.remove(name);
+            if let Some(o) = replaced {
+                keep.set(o.clone());
+            }
+        }
+        keep
+    }
+
+    /// The saved signals without the session's (as [`Self::checks_to_save`]).
+    fn signals_to_save(&self) -> Signals {
+        let mut keep = self.saved_signals.clone();
+        for (name, replaced) in &self.session_signals.0 {
+            keep.remove(name);
+            if let Some(o) = replaced {
+                keep.set(o.clone());
+            }
+        }
+        keep
+    }
+
     fn load_checks(&mut self) {
         let Some(path) = checks_path() else { return };
         let Ok(text) = std::fs::read_to_string(&path) else { return };
@@ -3150,7 +3215,7 @@ impl App {
         let write = path
             .parent()
             .map_or(Ok(()), std::fs::create_dir_all)
-            .and_then(|_| std::fs::write(&path, self.saved_checks.to_text()));
+            .and_then(|_| std::fs::write(&path, self.checks_to_save().to_text()));
         if let Err(e) = write {
             self.status = format!("Could not save checks to {}: {e}", path.display());
         }
@@ -3172,7 +3237,7 @@ impl App {
         let write = path
             .parent()
             .map_or(Ok(()), std::fs::create_dir_all)
-            .and_then(|_| std::fs::write(&path, self.saved_signals.to_text()));
+            .and_then(|_| std::fs::write(&path, self.signals_to_save().to_text()));
         if let Err(e) = write {
             self.status = format!("Could not save signals to {}: {e}", path.display());
         }
@@ -4192,6 +4257,9 @@ impl App {
                     }
                 }
             }
+            if let Some(name) = &out.adopted {
+                self.session_signals.adopt(name);
+            }
             if out.saved_changed {
                 save_signals = true;
             }
@@ -4247,6 +4315,9 @@ impl App {
                 .inner;
             if out.close {
                 self.show_checks = false;
+            }
+            if let Some(name) = &out.adopted {
+                self.session_checks.adopt(name);
             }
             if out.changed {
                 save_checks = true;
@@ -4417,6 +4488,33 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Owner, 2026-11-07: checks given with --check (test runs) ended up in
+    /// the saved file at the next edit. They last the session; one the user
+    /// adds or edits is theirs.
+    #[test]
+    fn startup_definitions_last_the_session() {
+        use nerka_core::check::CheckDef;
+        let check = |s: &str| CheckDef::parse_spec(s).unwrap();
+        let mut app = App::default();
+        app.saved_checks.set(check("mine: lines raw == a"));
+        app.saved_checks.set(check("both: lines raw == b"));
+        app.add_session_check(check("test: lines raw == t"));
+        app.add_session_check(check("Both: lines raw == c"));
+        assert_eq!(app.saved_checks.len(), 3, "shown and run");
+        let text = app.checks_to_save().to_text();
+        assert!(text.contains("mine: lines raw == a") && text.contains("both: lines raw == b"), "{text}");
+        assert!(!text.contains("test:") && !text.contains("raw == c"), "{text}");
+        app.session_checks.adopt("TEST");
+        assert!(app.checks_to_save().to_text().contains("test: lines raw == t"));
+
+        let signal = |s: &str| nerka_core::SignalDef::parse_spec(s).unwrap();
+        app.saved_signals.set(signal(r"v=/v=(?<v>\d+)/"));
+        app.add_session_signal(signal(r"v=/volts=(?<v>\d+)/"));
+        app.add_session_signal(signal(r"w=/w=(?<w>\d+)/"));
+        let text = app.signals_to_save().to_text();
+        assert!(text.contains("/v=(?<v>") && !text.contains("volts") && !text.contains("w=/w="), "{text}");
+    }
 
     const LOG: &str = "\
 [INFO] cam1 frame drop

@@ -212,6 +212,8 @@ pub struct Output {
     pub close: bool,
     /// A saved signal was added, changed or removed.
     pub saved_changed: bool,
+    /// The signal the form added or updated (by name).
+    pub adopted: Option<String>,
     /// A kind chosen for a query signal.
     pub kind: Option<(String, SignalKind)>,
     /// A scope chosen for a signal.
@@ -661,6 +663,7 @@ pub fn signals_panel(ui: &mut egui::Ui, st: &mut SignalsUi, input: Input<'_>) ->
                                     {
                                         saved.remove(&old);
                                     }
+                                    out.adopted = Some(def.name().to_owned());
                                     saved.set(def.with_scope(scope));
                                     st.draft = Draft::default();
                                     out.saved_changed = true;
