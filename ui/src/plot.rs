@@ -903,7 +903,7 @@ pub fn plot_panel(ui: &mut egui::Ui, state: &mut PlotState, src: Source<'_>) -> 
         // The state at the left edge is the last event before it.
         let from = i0.saturating_sub(1);
         match lane.kind {
-            SignalKind::Enum => draw_bands(&painter, lane, area, from, i1, |x| to_px(x, x0, x1), &font),
+            SignalKind::Enum => draw_bands(&painter, lane, area, from, i1, |x| to_px(x, x0, x1), &font, weak),
             _ => {
                 let markers = state.markers.get(&lane.name).map_or(&[][..], Vec::as_slice);
                 let (lo, hi) = match state.y.get(&lane.name).copied().unwrap_or(YAxis::All) {
@@ -1606,7 +1606,57 @@ fn draw_pieces(
     }
 }
 
-/// An enum's state: bands coloured by value, labelled where wide enough.
+/// A band of an enum lane, in pixels.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Band {
+    /// One value (its id; NaN: unset), from an event or assumed (a default).
+    Value { from: f32, to: f32, y: f64, assumed: bool },
+    /// The value changes within these pixels: no one value to show.
+    Mixed { from: f32, to: f32 },
+}
+
+/// The bands of points `from..to` of `lane` in `area`. Runs of one value
+/// (a default is a run of its own) narrower than a pixel gather in a mixed
+/// band (owner, 2026-11-07: a colour there looked like one value, and
+/// zooming in showed another).
+fn bands(lane: &Lane, area: Rect, from: usize, to: usize, to_px: impl Fn(f64) -> f32) -> Vec<Band> {
+    let end = to.min(lane.xs.len());
+    let mut out = Vec::new();
+    let mut mixed: Option<(f32, f32)> = None;
+    let mut i = from;
+    while i < end {
+        let assumed = lane.assumed.get(i).copied().unwrap_or(false);
+        let mut j = i + 1;
+        while j < end && !assumed && lane.ys[j].to_bits() == lane.ys[i].to_bits() && !lane.assumed[j] {
+            j += 1;
+        }
+        let start = to_px(lane.xs[i]).max(area.min.x);
+        let stop = if j < lane.xs.len() { to_px(lane.xs[j]) } else { area.max.x }.min(area.max.x);
+        if start >= area.max.x {
+            break;
+        }
+        if stop - start < 1.0 {
+            mixed = Some(match mixed {
+                Some((a, b)) => (a.min(start), b.max(stop)),
+                None => (start, stop),
+            });
+        } else {
+            if let Some((a, b)) = mixed.take() {
+                out.push(Band::Mixed { from: a, to: b.max(a + 1.0) });
+            }
+            out.push(Band::Value { from: start, to: stop, y: lane.ys[i], assumed });
+        }
+        i = j;
+    }
+    if let Some((a, b)) = mixed {
+        out.push(Band::Mixed { from: a, to: b.max(a + 1.0) });
+    }
+    out
+}
+
+/// An enum's state: bands coloured by value, labelled where wide enough;
+/// grey where it changes within a pixel.
+#[allow(clippy::too_many_arguments)]
 fn draw_bands(
     painter: &egui::Painter,
     lane: &Lane,
@@ -1615,55 +1665,43 @@ fn draw_bands(
     to: usize,
     to_px: impl Fn(f64) -> f32,
     font: &FontId,
+    mixed_color: Color32,
 ) {
-    let end = to.min(lane.xs.len());
-    let mut i = from;
-    // The last pixel column painted: runs narrower than a pixel share one,
-    // which shows the first of them.
-    let mut painted = f32::NEG_INFINITY;
-    while i < end {
-        // Unset (a lifecycle started, no default): no band.
-        if !lane.ys[i].is_finite() {
-            i += 1;
-            continue;
-        }
-        let id = lane.ys[i] as usize;
-        let assumed = lane.assumed.get(i).copied().unwrap_or(false);
-        // The run of events with this value (a default is a run of its own).
-        let start = to_px(lane.xs[i]).max(area.min.x);
-        let mut j = i + 1;
-        while j < end && !assumed && lane.ys[j] == lane.ys[i] && !lane.assumed[j] {
-            j += 1;
-        }
-        let stop = if j < lane.xs.len() { to_px(lane.xs[j]) } else { area.max.x }.min(area.max.x);
-        let start = start.max(painted);
-        let stop = stop.max(start.floor() + 1.0);
-        if start < stop && start < area.max.x {
-            painted = stop;
-            let band = Rect::from_min_max(pos2(start, area.min.y), pos2(stop, area.max.y));
-            let c = crate::library::palette(id + 3);
-            if assumed {
-                // A default: assumed, not from the log (owner, 2026-11-06).
-                painter.rect_filled(band, 0.0, c.gamma_multiply(0.15));
-                let s = Stroke::new(1.0, c);
-                let (t, b) = (area.min.y + 0.5, area.max.y - 0.5);
-                painter.extend(egui::Shape::dashed_line(&[pos2(start, t), pos2(stop, t)], s, 4.0, 3.0));
-                painter.extend(egui::Shape::dashed_line(&[pos2(start, b), pos2(stop, b)], s, 4.0, 3.0));
-            } else {
-                painter.rect_filled(band, 0.0, c.gamma_multiply(0.45));
+    for b in bands(lane, area, from, to, to_px) {
+        match b {
+            Band::Mixed { from, to } => {
+                let band = Rect::from_min_max(pos2(from, area.min.y), pos2(to, area.max.y));
+                painter.rect_filled(band, 0.0, mixed_color.gamma_multiply(0.35));
             }
-            let label = &lane.labels[id];
-            if band.width() > 8.0 * label.chars().count() as f32 + 6.0 {
-                painter.text(
-                    band.left_center() + vec2(3.0, 0.0),
-                    Align2::LEFT_CENTER,
-                    label,
-                    font.clone(),
-                    Color32::BLACK,
-                );
+            // Unset (a lifecycle started, no default): no band.
+            Band::Value { y, .. } if !y.is_finite() => {}
+            Band::Value { from, to, y, assumed } => {
+                let id = y as usize;
+                let band = Rect::from_min_max(pos2(from, area.min.y), pos2(to, area.max.y));
+                let c = crate::library::palette(id + 3);
+                if assumed {
+                    // A default: assumed, not from the log (owner, 2026-11-06).
+                    painter.rect_filled(band, 0.0, c.gamma_multiply(0.15));
+                    let s = Stroke::new(1.0, c);
+                    let (t, b) = (area.min.y + 0.5, area.max.y - 0.5);
+                    painter.extend(egui::Shape::dashed_line(&[pos2(from, t), pos2(to, t)], s, 4.0, 3.0));
+                    painter.extend(egui::Shape::dashed_line(&[pos2(from, b), pos2(to, b)], s, 4.0, 3.0));
+                } else {
+                    painter.rect_filled(band, 0.0, c.gamma_multiply(0.45));
+                }
+                let label = &lane.labels[id];
+                let label = if assumed { format!("{label} (default)") } else { label.clone() };
+                if band.width() > 8.0 * label.chars().count() as f32 + 6.0 {
+                    painter.text(
+                        band.left_center() + vec2(3.0, 0.0),
+                        Align2::LEFT_CENTER,
+                        label,
+                        font.clone(),
+                        Color32::BLACK,
+                    );
+                }
             }
         }
-        i = j;
     }
 }
 
@@ -1733,6 +1771,38 @@ mod tests {
 
     /// A signal bound to a lifecycle of two ECUs: a lane per ECU, a
     /// default point (assumed) where each lifecycle starts, its events.
+    /// Values changing within a pixel are one grey band, not the colour of
+    /// the first of them (bug, owner, 2026-11-07).
+    #[test]
+    fn values_changing_within_a_pixel_are_mixed() {
+        // a, b, a, b at x 0.0, 0.1, 0.2, 0.3, then a from 1 to 5, b from 5.
+        let lane = Lane {
+            name: "s".into(),
+            signal: "s".into(),
+            kind: SignalKind::Enum,
+            xs: vec![0.0, 0.1, 0.2, 0.3, 1.0, 5.0],
+            ys: vec![0.0, 1.0, 0.0, 1.0, 0.0, 1.0],
+            rows: vec![0, 1, 2, 3, 4, 5],
+            assumed: vec![false, false, false, false, true, false],
+            labels: vec!["a".into(), "b".into()],
+            y_range: (0.0, 1.0),
+        };
+        let area = Rect::from_min_max(pos2(0.0, 0.0), pos2(10.0, 10.0));
+        // One pixel per x unit.
+        let got = bands(&lane, area, 0, lane.xs.len(), |x| x as f32);
+        assert_eq!(
+            got,
+            [
+                Band::Mixed { from: 0.0, to: 1.0 },
+                Band::Value { from: 1.0, to: 5.0, y: 0.0, assumed: true },
+                Band::Value { from: 5.0, to: 10.0, y: 1.0, assumed: false },
+            ]
+        );
+        // Zoomed in, each is its own band.
+        let got = bands(&lane, area, 0, 4, |x| x as f32 * 100.0);
+        assert!(got.iter().all(|b| matches!(b, Band::Value { .. })), "{got:?}");
+    }
+
     #[test]
     fn a_bound_signal_resets_where_its_lifecycle_starts() {
         use nerka_core::input::dlt::writer::{Msg, Value};
