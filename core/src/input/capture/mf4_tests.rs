@@ -26,7 +26,7 @@ impl W {
             self.0.extend_from_slice(&l.to_le_bytes());
         }
         self.0.extend_from_slice(data);
-        while self.0.len() % 8 != 0 {
+        while !self.0.len().is_multiple_of(8) {
             self.0.push(0);
         }
         at

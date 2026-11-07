@@ -159,10 +159,12 @@ fn date(s: &str) -> Option<(i64, &str, Option<(i64, i64)>)> {
         |y: i64, m: i64, d: i64| ((1..=12).contains(&m) && (1..=31).contains(&d)).then(|| days_from_civil(y, m, d));
     let b = s.as_bytes();
     // 2025-10-17, 2025/10/17, 2025.10.17
-    if b.len() >= 10 && b[4] == b[7] && matches!(b[4], b'-' | b'/' | b'.') {
-        if let (Some(y), Some(m), Some(d)) = (num(&s[..4]), num(&s[5..7]), num(&s[8..10])) {
-            return Some((ymd(y, m, d)?, &s[10..], None));
-        }
+    if b.len() >= 10
+        && b[4] == b[7]
+        && matches!(b[4], b'-' | b'/' | b'.')
+        && let (Some(y), Some(m), Some(d)) = (num(&s[..4]), num(&s[5..7]), num(&s[8..10]))
+    {
+        return Some((ymd(y, m, d)?, &s[10..], None));
     }
     // 17.10.2025
     if let [d, m, rest] = s.splitn(3, '.').collect::<Vec<_>>()[..]

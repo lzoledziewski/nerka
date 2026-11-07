@@ -697,10 +697,10 @@ fn run() -> Result<()> {
         signals.set(SignalDef::lifecycle(def));
     }
     // Library queries in lifecycles, from the packs.
-    if signals.lifecycles().any(|l| !l.unresolved().is_empty()) {
-        if let Some(e) = signals.resolve_lifecycles(&library(&cli.pack)?).into_iter().next() {
-            anyhow::bail!("{e}");
-        }
+    if signals.lifecycles().any(|l| !l.unresolved().is_empty())
+        && let Some(e) = signals.resolve_lifecycles(&library(&cli.pack)?).into_iter().next()
+    {
+        anyhow::bail!("{e}");
     }
     SIGNALS.set(signals).expect("set once");
     CHECKS.set(cli.check.clone()).expect("set once");

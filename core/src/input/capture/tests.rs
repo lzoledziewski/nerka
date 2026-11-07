@@ -102,7 +102,7 @@ fn pcap_file(link: u32, frames: &[(u32, Vec<u8>)]) -> Vec<u8> {
 }
 
 fn block(ty: u32, mut body: Vec<u8>) -> Vec<u8> {
-    while body.len() % 4 != 0 {
+    while !body.len().is_multiple_of(4) {
         body.push(0);
     }
     let n = (12 + body.len()) as u32;
