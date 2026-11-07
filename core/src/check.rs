@@ -562,11 +562,6 @@ impl CheckDef {
         let as_fact = self.kind == Kind::Fact;
         // A count or a value: a fact, or an issue when the condition holds
         // (a count without one: when there is any).
-        let judged = |v: f64, ev: Vec<Evidence>| match self.cond {
-            Some((op, n)) if op.test(v, n) => (Verdict::Issue(1), ev),
-            None if v > 0.0 => (Verdict::Issue(1), ev),
-            _ => (Verdict::Ok, ev),
-        };
         match &self.test {
             Test::Exists if as_fact => {
                 let first = mine.first().map(|&r| Evidence { rows: vec![r], note: "the first".into() });
@@ -581,16 +576,24 @@ impl CheckDef {
             Test::Count => {
                 let first = mine.first().map(|&r| Evidence { rows: vec![r], note: "the first".into() });
                 if as_fact {
-                    fact(mine.len().to_string(), first.into_iter().collect())
-                } else {
-                    let rows: Vec<LineNo> = mine.iter().take(MAX_EVIDENCE).copied().collect();
-                    let ev = if rows.is_empty() {
-                        Vec::new()
-                    } else {
-                        vec![Evidence { rows, note: format!("{} lines", mine.len()) }]
-                    };
-                    judged(mine.len() as f64, ev)
+                    return fact(mine.len().to_string(), first.into_iter().collect());
                 }
+                // An issue where the condition holds (none: any line): as
+                // often as there are lines, each one evidence (bug, owner,
+                // 2026-11-07: it said 1x, its lines chained in one).
+                let n = mine.len() as f64;
+                let holds = match self.cond {
+                    Some((op, k)) => op.test(n, k),
+                    None => n > 0.0,
+                };
+                if !holds || mine.is_empty() {
+                    return (Verdict::Ok, Vec::new());
+                }
+                let why = self.cond.map(|(op, k)| format!("{n} lines {} {k}", op.as_str())).unwrap_or_default();
+                for &r in mine {
+                    add(&mut ev, vec![r], why.clone());
+                }
+                issue(count, ev)
             }
             Test::Rate { max, window } => {
                 // More than `max` in a window: one burst per stretch; as a
@@ -712,7 +715,9 @@ pub fn shown_duration(d: f64) -> String {
     if d < 1.0 {
         format!("{:.0} ms", d * 1000.0)
     } else if d < 60.0 {
-        format!("{:.1} s", d)
+        // To the ms: a stop of 1.04 s shown as "1.0 s" looked shorter than
+        // the 1 s it exceeded.
+        format!("{:.3} s", d)
     } else if d < 3600.0 {
         format!("{} min {} s", (d / 60.0) as u64, (d % 60.0) as u64)
     } else {

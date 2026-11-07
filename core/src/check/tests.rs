@@ -95,8 +95,10 @@ fn counts_are_facts_or_issues() {
     let r = check("n: lines raw == retry; count; per a");
     assert_eq!(r.kind, Kind::Fact);
     assert_eq!(verdicts(&r), [("overall".into(), fact("4")), ("a #1".into(), fact("3")), ("a #2".into(), fact("1"))]);
+    // As an issue: as often as there are lines, where the condition holds.
     let r = check("many: lines raw == retry; count >= 3; per a");
-    assert_eq!(verdicts(&r), [("overall".into(), issue(1)), ("a #1".into(), issue(1)), ("a #2".into(), Verdict::Ok)]);
+    assert_eq!(verdicts(&r), [("overall".into(), issue(4)), ("a #1".into(), issue(3)), ("a #2".into(), Verdict::Ok)]);
+    assert_eq!(r.scopes[1].evidence.iter().map(|e| e.rows.clone()).collect::<Vec<_>>(), [[1], [3], [4]]);
 }
 
 #[test]
@@ -114,7 +116,7 @@ fn gaps_between_its_lines() {
     // 1 s -> 40 s in the first lifecycle; the second is busy.
     assert_eq!(verdicts(&r), [("overall".into(), issue(1)), ("a #1".into(), issue(1)), ("a #2".into(), Verdict::Ok)]);
     assert_eq!(r.overall().evidence[0].rows, [2, 5]);
-    assert_eq!(r.overall().evidence[0].note, "none for 39.0 s");
+    assert_eq!(r.overall().evidence[0].note, "none for 39.000 s");
 }
 
 #[test]
@@ -156,7 +158,7 @@ fn every_test_can_be_a_fact_or_an_issue() {
     assert_eq!(r.overall().verdict, fact("3"));
     assert_eq!(r.overall().evidence[0].rows, [1, 4]);
     let r = check("longest: lines ecu == A; gap 1s; fact; per a");
-    assert_eq!(verdicts(&r)[1], ("a #1".into(), fact("39.0 s")));
+    assert_eq!(verdicts(&r)[1], ("a #1".into(), fact("39.000 s")));
     assert_eq!(r.scopes[1].evidence[0].rows, [2, 5]);
     let r = check("stalls: lines raw ~ /net down/; missing raw ~ /ota progress/ within 5s; fact; per a");
     assert_eq!(verdicts(&r), [("overall".into(), fact("1")), ("a #1".into(), fact("1")), ("a #2".into(), fact("0"))]);
@@ -165,7 +167,7 @@ fn every_test_can_be_a_fact_or_an_issue() {
     assert_eq!(r.kind, Kind::Issue);
     assert_eq!(verdicts(&r), [("overall".into(), issue(1)), ("a #1".into(), issue(1)), ("a #2".into(), Verdict::Ok)]);
     assert_eq!(r.scopes[1].evidence[0].note, "the max: 91");
-    assert_eq!(check("any: lines raw == retry; count; issue").overall().verdict, issue(1));
+    assert_eq!(check("any: lines raw == retry; count; issue").overall().verdict, issue(4));
     assert_eq!(check("none: lines raw == never; count; issue").overall().verdict, Verdict::Ok);
     let e = CheckDef::parse_spec(r"x: lines /t=(?<t>\d+)/; value max; issue").unwrap_err();
     assert_eq!(e.msg, "an issue on a value needs a condition, e.g. value max > 90");
@@ -286,4 +288,153 @@ fn spec_errors_say_where() {
     bad("x: lines raw == y; per 1a", 23, "'per' needs a lifecycle's name");
     bad("x: lines raw == y; often", 19, "unknown clause 'often'");
     bad("off x: lines", 12, "'lines' needs a query");
+}
+
+/// Every test as a fact and as an issue, on a random log: the two agree in
+/// every scope (owner, 2026-11-07: "how many" as an issue didn't match
+/// "how many" as a fact).
+mod consistency {
+    use super::*;
+
+    type RandRow = (&'static str, f64, f64, String);
+
+    struct Rand(Vec<RandRow>);
+
+    impl LogSource for Rand {
+        fn name(&self) -> &str {
+            "rand"
+        }
+        fn line_count(&self) -> LineNo {
+            self.0.len() as LineNo
+        }
+        fn line_bytes(&self, line: LineNo) -> Option<Cow<'_, [u8]>> {
+            self.0.get(line as usize).map(|r| Cow::Borrowed(r.3.as_bytes()))
+        }
+        fn schema(&self) -> &[FieldDef] {
+            SCHEMA
+        }
+        fn field(&self, line: LineNo, id: FieldId) -> Option<FieldValue<'_>> {
+            let row = self.0.get(line as usize)?;
+            (id == 0).then(|| FieldValue::Str(row.0.as_bytes().into()))
+        }
+        fn time(&self, line: LineNo) -> Option<f64> {
+            Some(self.0.get(line as usize)?.1)
+        }
+        fn uptime(&self, line: LineNo) -> Option<f64> {
+            Some(self.0.get(line as usize)?.2)
+        }
+    }
+
+    /// ECU A rebooting every ~2000 lines; "err" lines in bursts, "req" /
+    /// "ack" pairs (some acks late or missing), `v=` values, gaps.
+    fn log(seed: u64) -> Rand {
+        let mut r = seed;
+        let mut next = move || {
+            r ^= r << 13;
+            r ^= r >> 7;
+            r ^= r << 17;
+            r
+        };
+        let (mut t, mut boot) = (0.0, 0.0);
+        let mut rows = Vec::new();
+        for i in 0..20_000 {
+            t += (next() % 50) as f64 / 1000.0;
+            if next() % 3000 == 0 {
+                t += 5.0;
+            }
+            if i % 2000 == 1999 {
+                boot = t;
+            }
+            let ecu = if next() % 2 == 0 { "A" } else { "B" };
+            let text = match next() % 30 {
+                0..=2 => "err".to_owned(),
+                3 => "req".to_owned(),
+                4 => "ack".to_owned(),
+                5 => format!("v={}", next() % 100),
+                _ => "x".to_owned(),
+            };
+            rows.push((ecu, t, t - boot, text));
+        }
+        Rand(rows)
+    }
+
+    fn run(src: &Rand, spec: &str) -> CheckResult {
+        let mut sig = Signals::default();
+        sig.set(SignalDef::parse_spec("lifecycle a: lines ecu == A; reset uptime").unwrap());
+        CheckDef::parse_spec(spec)
+            .unwrap_or_else(|e| panic!("{spec}: {}", e.msg))
+            .run(src, &sig, &Progress::new())
+            .unwrap()
+    }
+
+    fn num(v: &Verdict) -> f64 {
+        match v {
+            Verdict::Fact(Some(s)) => s.trim_end_matches(" s").parse().unwrap_or_else(|_| panic!("{s}")),
+            Verdict::Fact(None) => 0.0,
+            v => panic!("not a fact: {v:?}"),
+        }
+    }
+
+    fn times(v: &Verdict) -> u64 {
+        match v {
+            Verdict::Ok => 0,
+            Verdict::Issue(n) => *n,
+            v => panic!("not an issue: {v:?}"),
+        }
+    }
+
+    #[test]
+    fn facts_and_issues_agree() {
+        for seed in [3, 77, 0xfeed] {
+            let src = log(seed);
+            let both = |test: &str| {
+                let f = run(&src, &format!("f: lines raw == err; {test}; fact; per a"));
+                let i = run(&src, &format!("i: lines raw == err; {test}; issue; per a"));
+                assert_eq!(f.scopes.len(), i.scopes.len());
+                assert!(f.scopes.len() > 5, "lifecycles: {}", f.scopes.len());
+                f.scopes.into_iter().zip(i.scopes).map(|(a, b)| (a.verdict, b)).collect::<Vec<_>>()
+            };
+            // Shows up / how many: the issue happens as often as the fact counts,
+            // each line its own evidence.
+            for test in ["exists", "count"] {
+                for (f, i) in both(test) {
+                    assert_eq!(times(&i.verdict), num(&f) as u64, "seed {seed} {test} {}", i.scope.label);
+                    assert!(i.evidence.iter().all(|e| e.rows.len() == 1));
+                }
+            }
+            // A condition on the count.
+            let f = run(&src, "f: lines raw == err; count; per a");
+            let i = run(&src, "i: lines raw == err; count >= 60; per a");
+            for (f, i) in f.scopes.iter().zip(&i.scopes) {
+                let n = num(&f.verdict);
+                assert_eq!(times(&i.verdict), if n >= 60.0 { n as u64 } else { 0 }, "seed {seed} {}", i.scope.label);
+            }
+            // Too many at once: an issue exactly when the most in a window is above it.
+            for (f, i) in both("rate 4 per 200ms") {
+                assert_eq!(times(&i.verdict) > 0, num(&f) > 4.0, "seed {seed} rate {}", i.scope.label);
+            }
+            // Stops: an issue exactly when the longest stop is longer.
+            for (f, i) in both("gap 1s") {
+                let longest = match &f {
+                    Verdict::Fact(Some(s)) => s.trim_end_matches(" s").parse::<f64>().unwrap_or(0.0),
+                    _ => 0.0,
+                };
+                assert_eq!(times(&i.verdict) > 0, longest > 1.0, "seed {seed} gap {} ({f:?})", i.scope.label);
+            }
+            // Followed or not: the fact counts the issue's occurrences.
+            for test in ["then raw == ack within 100ms", "missing raw == ack within 100ms"] {
+                let f = run(&src, &format!("f: lines raw == req; {test}; fact; per a"));
+                let i = run(&src, &format!("i: lines raw == req; {test}; per a"));
+                for (f, i) in f.scopes.iter().zip(&i.scopes) {
+                    assert_eq!(times(&i.verdict), num(&f.verdict) as u64, "seed {seed} {test} {}", i.scope.label);
+                }
+            }
+            // A value: an issue exactly when the condition holds on it.
+            let f = run(&src, r"f: lines /v=(?<v>\d+)/; value max; per a");
+            let i = run(&src, r"i: lines /v=(?<v>\d+)/; value max > 97; per a");
+            for (f, i) in f.scopes.iter().zip(&i.scopes) {
+                assert_eq!(times(&i.verdict) > 0, num(&f.verdict) > 97.0, "seed {seed} value {}", i.scope.label);
+            }
+        }
+    }
 }
