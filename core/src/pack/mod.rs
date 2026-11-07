@@ -239,7 +239,7 @@ impl Library {
         let io_err = |e: std::io::Error| PackError { file: file.clone(), pos: None, msg: e.to_string() };
         let text = std::fs::read_to_string(&file).map_err(io_err)?;
         let new = change(&file, &text)?;
-        std::fs::write(&file, &new).map_err(io_err)?;
+        crate::write_atomic(&file, &new).map_err(io_err)?;
         self.packs[i] = parse_pack(&file, &new)?;
         Ok(())
     }

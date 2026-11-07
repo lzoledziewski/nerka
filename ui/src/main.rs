@@ -3215,7 +3215,7 @@ impl App {
         let write = path
             .parent()
             .map_or(Ok(()), std::fs::create_dir_all)
-            .and_then(|_| std::fs::write(&path, self.checks_to_save().to_text()));
+            .and_then(|_| nerka_core::write_atomic(&path, self.checks_to_save().to_text()));
         if let Err(e) = write {
             self.status = format!("Could not save checks to {}: {e}", path.display());
         }
@@ -3237,7 +3237,7 @@ impl App {
         let write = path
             .parent()
             .map_or(Ok(()), std::fs::create_dir_all)
-            .and_then(|_| std::fs::write(&path, self.signals_to_save().to_text()));
+            .and_then(|_| nerka_core::write_atomic(&path, self.signals_to_save().to_text()));
         if let Err(e) = write {
             self.status = format!("Could not save signals to {}: {e}", path.display());
         }
@@ -3629,7 +3629,7 @@ impl App {
         let file = std::env::temp_dir().join(format!("nerka-move-{}-{}.nerka-preset", std::process::id(), self.moves));
         self.moves += 1;
         let res = std::env::current_exe().and_then(|exe| {
-            std::fs::write(&file, t.to_preset("moved tab").serialize())?;
+            nerka_core::write_atomic(&file, t.to_preset("moved tab").serialize())?;
             let mut cmd = std::process::Command::new(exe);
             cmd.arg("--new-window").arg("--preset-file").arg(&file);
             for p in &self.pack_paths {

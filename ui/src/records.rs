@@ -33,7 +33,7 @@ pub fn remember(path: &Path, split: Option<&RecordSplit>) -> std::io::Result<()>
     if let Some(dir) = file.parent() {
         std::fs::create_dir_all(dir)?;
     }
-    std::fs::write(file, memo.iter().map(|(p, s)| format!("{s}\t{}\n", p.display())).collect::<String>())
+    nerka_core::write_atomic(file, memo.iter().map(|(p, s)| format!("{s}\t{}\n", p.display())).collect::<String>())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

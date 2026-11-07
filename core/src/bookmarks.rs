@@ -76,7 +76,7 @@ impl Bookmarks {
                 r => r,
             };
         }
-        std::fs::write(path, self.anchored(source).serialize())
+        crate::write_atomic(path, self.anchored(source).serialize())
     }
 
     /// Bookmarks of a view of several files, one after another: each

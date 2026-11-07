@@ -17,6 +17,7 @@
 //! * [`pack`] — query packs (the search manager's library) and their
 //!   expansion into plain NFD.
 
+pub mod atomic;
 pub mod bookmarks;
 pub mod check;
 pub mod dsl;
@@ -32,6 +33,7 @@ pub mod session;
 pub mod signal;
 pub mod time;
 
+pub use atomic::write_atomic;
 pub use bookmarks::Bookmarks;
 pub use dsl::{DslError, Query};
 pub use engine::index::LineIndex;
