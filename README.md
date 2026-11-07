@@ -61,6 +61,11 @@ your logs carry. Everything runs locally, with no backend: a desktop viewer
   end of the line or as a column; copying takes them along as `// note`),
   and `bookmark` is a field in queries:
   `level >= ERROR OR bookmark` keeps your marked lines in a filter.
+- **Settings bundles:** packs, presets, plots, checks and signals export
+  into one readable `.nerka-bundle` file and import from one, with a preview
+  of what each item would change (⚙ Settings → Settings bundle;
+  `nerka export` / `nerka import`). Every item carries a format number, so a
+  later nerka upgrades what an earlier one wrote.
 - **Tabs and windows:** one tab per file (or set of files); opening a file
   from the shell hands it to the nerka window focused last; windows can be
   named.
@@ -121,6 +126,8 @@ nerka --signal 'gear:enum=/gear=(?<gear>\w+)/' filter '@gear == D' app.log   # s
 nerka --fibex ecu1.xml filter 'apid == NAV' trace.dlt     # DLT non-verbose messages decoded
 nerka --local-time lines trace.dlt 1 20                  # local time (CLI: UTC by default; GUI: local, ⚙ Settings)
 nerka --signal 'up1=ecu == ECU1 AND tmsp ~ /(?<up1>\d+)/' filter '@up1.changed AND @up1 < 10000' trace.dlt   # ECU1 resets
+nerka export -o mine.nerka-bundle --only packs --only check:storm   # settings bundle
+nerka import --dry-run theirs.nerka-bundle                # what it would change; then without --dry-run
 ```
 
 `nerka help <command>` lists every option.
@@ -145,6 +152,7 @@ nerka --signal 'up1=ecu == ECU1 AND tmsp ~ /(?<up1>\d+)/' filter '@up1.changed A
 - [doc/search-manager.md](doc/search-manager.md): query packs, expansion, library and selection.
 - [doc/search-modes.md](doc/search-modes.md): Auto, Text and NFD modes.
 - [doc/sources-and-signals.md](doc/sources-and-signals.md): input formats and signals (what a signal is, what's next).
+- [doc/bundles.md](doc/bundles.md): settings bundles (export, import) and how formats are upgraded.
 - [CLAUDE.md](CLAUDE.md): guide for contributors and AI agents (commands, rules).
 
 ## Contributing

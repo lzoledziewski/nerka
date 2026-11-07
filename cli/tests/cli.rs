@@ -188,3 +188,85 @@ fn checks_report_issues_and_strict_fails() {
     let o = nerka(&["--check", spec, "check", "--json", s(&f)]);
     assert!(out(&o).trim_start().starts_with(['{', '[']) && out(&o).contains("\"errs\""), "{}", out(&o));
 }
+
+/// `nerka` with its own config home, `home/nerka` (Windows and Unix).
+fn nerka_at(home: &Path, args: &[&str]) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_nerka"))
+        .args(args)
+        .env("APPDATA", home)
+        .env("LOCALAPPDATA", home)
+        .env("XDG_CONFIG_HOME", home)
+        .env("XDG_CACHE_HOME", home)
+        .output()
+        .expect("run nerka")
+}
+
+#[test]
+fn export_and_import_a_settings_bundle() {
+    let d = dir("bundle");
+    let (mine, theirs) = (d.join("mine"), d.join("theirs"));
+    let cfg = mine.join("nerka");
+    std::fs::create_dir_all(cfg.join("packs")).unwrap();
+    std::fs::write(cfg.join("packs/vision.nerka-pack"), "pack vision\n\nquery cam\n    apid == CAM\n").unwrap();
+    std::fs::write(cfg.join("checks"), "storm: lines level >= ERROR; rate 25 per 1s\nlost: lines /x/; exists\n")
+        .unwrap();
+    let bundle = d.join("mine.nerka-bundle");
+    let o = nerka_at(&mine, &["export", "-o", s(&bundle), "--only", "packs", "--only", "check:storm"]);
+    assert!(o.status.success(), "{}", err(&o));
+    assert_eq!(err(&o), "nerka: exported 1 pack, 1 check\n");
+    let text = std::fs::read_to_string(&bundle).unwrap();
+    assert!(text.starts_with("nerka-bundle 1\n"), "{text}");
+    assert!(text.contains("@@ check storm format 1\n") && !text.contains("lost"), "{text}");
+    // An earlier nerka's folder got its format file.
+    assert!(cfg.join("format").is_file());
+
+    // Theirs has another storm.
+    let tcfg = theirs.join("nerka");
+    std::fs::create_dir_all(&tcfg).unwrap();
+    std::fs::write(tcfg.join("checks"), "storm: lines level >= WARN; exists\n").unwrap();
+    let o = nerka_at(&theirs, &["import", "--dry-run", s(&bundle)]);
+    assert!(o.status.success(), "{}", err(&o));
+    assert_eq!(
+        out(&o),
+        "new        pack vision: add\ndifferent  check storm: keep both (as storm_imported)\ndry run: 2 items would be written\n"
+    );
+    assert!(!tcfg.join("packs").exists());
+    let o = nerka_at(&theirs, &["import", s(&bundle)]);
+    assert!(o.status.success(), "{}", err(&o));
+    assert!(out(&o).ends_with("imported: 1 added, 1 kept both\n"), "{}", out(&o));
+    assert_eq!(
+        std::fs::read_to_string(tcfg.join("checks")).unwrap(),
+        "storm: lines level >= WARN; exists\nstorm_imported: lines level >= ERROR; rate 25 per 1s\n"
+    );
+    let o = nerka_at(&theirs, &["packs"]);
+    assert!(out(&o).starts_with("vision  ("), "{}", out(&o));
+    // Taking theirs replaces the line.
+    let o = nerka_at(&theirs, &["import", "--conflicts", "theirs", s(&bundle)]);
+    assert!(out(&o).contains("same       pack vision: —\n"), "{}", out(&o));
+    assert!(out(&o).contains("imported: 1 replaced (replaced ones backed up to "), "{}", out(&o));
+    let checks = std::fs::read_to_string(tcfg.join("checks")).unwrap();
+    assert!(checks.starts_with("storm: lines level >= ERROR; rate 25 per 1s\n"), "{checks}");
+}
+
+#[test]
+fn import_says_what_it_cant_read() {
+    let d = dir("bundle-bad");
+    let home = d.join("home");
+    let bad = d.join("bad.nerka-bundle");
+    std::fs::write(&bad, "nerka-bundle 1\n@@ check ok format 1\nok: lines /x/; exists\n@@ check no format 9\nno: x\n")
+        .unwrap();
+    let o = nerka_at(&home, &["import", s(&bad)]);
+    assert_eq!(o.status.code(), Some(1));
+    assert!(out(&o).contains("new        check ok: add\n"), "{}", out(&o));
+    assert!(out(&o).contains("invalid    check no: made by a newer nerka: check format 9"), "{}", out(&o));
+    assert_eq!(err(&o), "nerka: 1 invalid item(s) not imported\n");
+    assert!(std::fs::read_to_string(home.join("nerka/checks")).unwrap().contains("ok: lines /x/; exists"));
+    std::fs::write(&bad, "pack vision\n").unwrap();
+    let o = nerka_at(&home, &["import", s(&bad)]);
+    assert_eq!(o.status.code(), Some(1));
+    assert!(err(&o).contains("bad.nerka-bundle:1:1: not a nerka bundle"), "{}", err(&o));
+    let o = nerka_at(&home, &["export", "--only", "prefs"]);
+    assert!(err(&o).contains("--only prefs: 'prefs' isn't pack, preset, plot, check or signal"), "{}", err(&o));
+    let o = nerka_at(&home, &["export", "--only", "check:nope"]);
+    assert!(err(&o).contains("--only check:nope: no such check"), "{}", err(&o));
+}

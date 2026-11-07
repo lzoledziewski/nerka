@@ -13,9 +13,12 @@
 //!     nerka --fibex ecu1.xml filter 'apid == NAV' trace.dlt         (non-verbose DLT)
 //!     nerka --lifecycle 'ecu1: lines ecu == ECU1; reset uptime' lifecycles trace.dlt   (ECU1's boots)
 //!     nerka --check 'stall: lines raw ~ /net down/; missing raw ~ /ota/ within 30s' check trace.dlt
+//!     nerka export -o mine.nerka-bundle --only packs --only check:storm   (settings bundle)
+//!     nerka import --dry-run theirs.nerka-bundle
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
+use nerka_core::bundle::{Bundle, Choice, Item, Kind, Status, Store};
 use nerka_core::pack::{self, Expansion, Library, ParamValue, Params, Pick, Role, Selection};
 use nerka_core::{
     Bookmarks, Filter, LogSource, Matcher, MatcherOptions, Progress, Query, SearchSet, SignalDef, Signals, search,
@@ -174,6 +177,38 @@ enum Cmd {
         #[arg(long, value_name = "QUERY")]
         count: Option<String>,
     },
+    /// Export the analysis setup of the per-user config folder (packs,
+    /// presets, plots, checks, signals) as a settings bundle.
+    Export {
+        /// Write the bundle to FILE (default: stdout).
+        #[arg(short = 'o', long, value_name = "FILE")]
+        output: Option<PathBuf>,
+        /// Only these items (repeatable): a KIND (pack, preset, plot, check,
+        /// signal; or plural) or KIND:NAME.
+        #[arg(long, value_name = "KIND[:NAME]")]
+        only: Vec<String>,
+    },
+    /// Import a settings bundle into the per-user config folder: a line per
+    /// item (new, same, different, invalid) and what was done with it.
+    /// Exits 1 if an item was invalid (the others are imported).
+    Import {
+        /// The bundle (`-`: stdin).
+        file: PathBuf,
+        /// Only print what it would do.
+        #[arg(long)]
+        dry_run: bool,
+        /// Items that differ from yours: keep both (theirs renamed
+        /// NAME_imported), take theirs (yours backed up first), or keep mine.
+        #[arg(long, value_enum, default_value_t = Conflicts::Both)]
+        conflicts: Conflicts,
+    },
+}
+
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum Conflicts {
+    Both,
+    Theirs,
+    Mine,
 }
 
 #[derive(clap::Args)]
@@ -258,6 +293,93 @@ fn library(extra: &[PathBuf]) -> Result<Library> {
         lib.load(p)?;
     }
     Ok(lib)
+}
+
+/// The per-user config folder.
+fn store() -> Result<Store> {
+    Store::user().context("no per-user config folder (APPDATA, XDG_CONFIG_HOME or HOME isn't set)")
+}
+
+/// `nerka export`: the bundle to `output` or stdout, what is in it to stderr.
+fn export(output: Option<&Path>, only: &[String], out: &mut impl Write) -> Result<()> {
+    let mut picks: Vec<(Kind, Option<&str>)> = Vec::new();
+    for o in only {
+        let (k, name) = o.split_once(':').map_or((o.as_str(), None), |(k, n)| (k, Some(n)));
+        let kind =
+            Kind::parse(k).with_context(|| format!("--only {o}: '{k}' isn't pack, preset, plot, check or signal"))?;
+        picks.push((kind, name));
+    }
+    let takes =
+        |(k, n): &(Kind, Option<&str>), i: &Item| *k == i.kind && n.is_none_or(|n| n.eq_ignore_ascii_case(&i.name));
+    let (bundle, errors) = store()?.export(&|i| picks.is_empty() || picks.iter().any(|p| takes(p, i)));
+    for e in &errors {
+        eprintln!("nerka: not exported: {e}");
+    }
+    for p in &picks {
+        if p.1.is_some() && !bundle.items.iter().any(|i| takes(p, i)) {
+            anyhow::bail!("--only {}:{}: no such {} in the config folder", p.0, p.1.unwrap_or_default(), p.0);
+        }
+    }
+    let text = bundle.to_text();
+    match output {
+        Some(path) => nerka_core::write_atomic(path, &text).with_context(|| format!("writing {}", path.display()))?,
+        None => out.write_all(text.as_bytes())?,
+    }
+    let counts: Vec<String> = Kind::ALL
+        .iter()
+        .filter_map(|&k| {
+            let n = bundle.items.iter().filter(|i| i.kind == k).count();
+            (n > 0).then(|| format!("{n} {}", if n == 1 { k.as_str() } else { k.plural() }))
+        })
+        .collect();
+    eprintln!("nerka: exported {}", if counts.is_empty() { "nothing".to_owned() } else { counts.join(", ") });
+    Ok(())
+}
+
+/// `nerka import`: the plan, a line per item, then what was done.
+fn import(file: &Path, dry_run: bool, conflicts: Conflicts, out: &mut impl Write) -> Result<()> {
+    let text = if file == Path::new("-") {
+        std::io::read_to_string(std::io::stdin())?
+    } else {
+        std::fs::read_to_string(file).with_context(|| format!("reading {}", file.display()))?
+    };
+    let bundle = Bundle::parse(&file.display().to_string(), &text)?;
+    let store = store()?;
+    let mut plan = store.plan(&bundle);
+    plan.set_conflicts(match conflicts {
+        Conflicts::Both => Choice::Both,
+        Conflicts::Theirs => Choice::Take,
+        Conflicts::Mine => Choice::Skip,
+    });
+    for p in &plan.items {
+        match &p.status {
+            Status::Invalid(why) => writeln!(out, "{:<9}  {} {}: {why}", p.status_text(), p.kind, p.name)?,
+            _ => writeln!(out, "{:<9}  {} {}: {}", p.status_text(), p.kind, p.name, p.choice_text(p.choice))?,
+        }
+    }
+    for n in &plan.notes {
+        writeln!(out, "note: {n}")?;
+    }
+    if dry_run {
+        writeln!(
+            out,
+            "dry run: {} item{} would be written",
+            plan.changes(),
+            if plan.changes() == 1 { "" } else { "s" }
+        )?;
+    } else {
+        let done = store.apply(&plan);
+        writeln!(out, "imported: {}", done.summary())?;
+        if !done.errors.is_empty() {
+            out.flush()?;
+            anyhow::bail!("{} item(s) not written", done.errors.len());
+        }
+    }
+    if plan.invalid() > 0 {
+        out.flush()?;
+        anyhow::bail!("{} invalid item(s) not imported", plan.invalid());
+    }
+    Ok(())
 }
 
 /// Compile an NFD query for a source, with a caret under the error.
@@ -665,6 +787,10 @@ fn main() -> std::process::ExitCode {
 
 fn run() -> Result<()> {
     let cli = Cli::parse();
+    // A config folder written by an earlier nerka: to this one's formats.
+    if let Some(m) = nerka_core::bundle::Store::user().and_then(|s| s.upgrade().message()) {
+        eprintln!("nerka: {m}");
+    }
     let mut options = nerka_core::OpenOptions::default();
     if !cli.dlt_port.is_empty() {
         options.capture.dlt_udp_ports = cli.dlt_port.clone();
@@ -784,6 +910,8 @@ fn run() -> Result<()> {
                 }
             }
         }
+        Cmd::Export { output, only } => export(output.as_deref(), &only, &mut out)?,
+        Cmd::Import { file, dry_run, conflicts } => import(&file, dry_run, conflicts, &mut out)?,
         Cmd::Marks { file } => {
             let (f, _) = open(&file)?;
             let marks = Bookmarks::load_for(&file, &*f)?;
