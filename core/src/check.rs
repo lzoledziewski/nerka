@@ -261,8 +261,10 @@ impl CheckDef {
         };
         let lead = spec.len() - spec.trim_start().len();
         let name = spec[..colon].trim();
-        if !is_name(name) {
-            return Err(err(format!("'{name}' isn't a name (letters, digits and _, not first a digit)"), lead));
+        // Any text names a check (owner, 2026-11-07: "Fusa Faults from
+        // aurix"); `:` and `;` end it and its clauses.
+        if name.is_empty() || name.contains(';') {
+            return Err(err("a check needs a name before ':'".into(), lead));
         }
         let (mut lines, mut per, mut test) = (None, None, None);
         let (mut cond, mut kind, mut labels): (Option<(Op, f64)>, Option<Kind>, Vec<String>) = (None, None, Vec::new());
@@ -389,7 +391,7 @@ impl CheckDef {
         if kind == Kind::Issue && matches!(test, Test::Value(_)) && cond.is_none() {
             return Err(err("an issue on a value needs a condition, e.g. value max > 90".into(), spec.len()));
         }
-        Ok(CheckDef { name: name.to_ascii_lowercase(), lines: Some(lines), per, test, cond, kind, labels, off: false })
+        Ok(CheckDef { name: name.to_owned(), lines: Some(lines), per, test, cond, kind, labels, off: false })
     }
 
     /// The spec line [`Self::parse_spec`] reads back.
@@ -740,7 +742,7 @@ impl Checks {
 
     /// Add `c`, replacing one of the same name.
     pub fn set(&mut self, c: CheckDef) {
-        match self.0.iter_mut().find(|d| d.name == c.name) {
+        match self.0.iter_mut().find(|d| d.name.eq_ignore_ascii_case(&c.name)) {
             Some(d) => *d = c,
             None => self.0.push(c),
         }

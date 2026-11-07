@@ -172,6 +172,40 @@ fn every_test_can_be_a_fact_or_an_issue() {
 }
 
 #[test]
+fn names_and_library_queries_may_hold_spaces() {
+    // Bug (owner, 2026-11-07): "Fusa Faults from aurix", {Aurix_logs.Fusa Fault}.
+    let d = CheckDef::parse_spec("Fusa Faults from aurix: lines {Aurix_logs.Fusa Fault}; count").unwrap();
+    assert_eq!(d.name(), "Fusa Faults from aurix");
+    assert_eq!(d.unresolved(), ["Aurix_logs.Fusa Fault"]);
+    assert_eq!(d.spec(), "Fusa Faults from aurix: lines {Aurix_logs.Fusa Fault}; count");
+    let p = CheckDef::parse_spec("x: lines {sys.drops of cam cam=CAM1 n=2}; exists").unwrap();
+    assert_eq!(p.unresolved(), ["sys.drops of cam"]);
+    assert_eq!(p.spec(), "x: lines {sys.drops of cam cam=CAM1 n=2}; exists");
+    let dir = std::env::temp_dir().join(format!("nerka-check-space-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let pack = dir.join("Aurix_logs.nerka-pack");
+    std::fs::write(
+        &pack,
+        "pack Aurix_logs
+
+query \"Fusa Fault\"
+  raw == retry
+",
+    )
+    .unwrap();
+    let mut lib = Library::new();
+    lib.load(&pack).unwrap();
+    let r = d.resolved(&lib).unwrap().run(&log(), &signals(), &Progress::new()).unwrap();
+    assert_eq!(r.overall().verdict, fact("4"));
+    std::fs::remove_dir_all(&dir).ok();
+    // Checks are the same check whatever their names' case.
+    let mut c = Checks::default();
+    c.set(CheckDef::parse_spec("Big One: lines raw == a").unwrap());
+    c.set(CheckDef::parse_spec("big one: lines raw == b").unwrap());
+    assert_eq!(c.len(), 1);
+}
+
+#[test]
 fn labels_group_checks() {
     let d = CheckDef::parse_spec("x: lines raw == y; labels ota, network").unwrap();
     assert_eq!(d.labels(), ["ota", "network"]);
@@ -235,7 +269,7 @@ fn spec_errors_say_where() {
         assert!(e.msg.contains(msg), "{s}: {}", e.msg);
     };
     bad("x lines raw == y", 0, "expected NAME:");
-    bad("1x: lines raw == y", 0, "isn't a name");
+    bad(": lines raw == y", 0, "needs a name");
     bad("x: exists", 9, "needs its lines");
     bad("x: lines", 8, "'lines' needs a query");
     bad("x: lines level >= LOUD", 18, "unknown level");

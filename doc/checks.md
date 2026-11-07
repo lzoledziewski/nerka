@@ -51,6 +51,8 @@ A lifecycle's scope is its time span (from its first line to the next one's): li
 - **Status near lifecycles:** the lifecycle list (Signals panel) shows per lifecycle what its checks found (`⚠2 ℹ3`; hover: each check's result; click: the Checks pane on its first issue). Checks run whenever some are on, not only while the pane is open.
 - **"Cannot build own primitives":** the built-in tests stay as the easy path; building one's own needs a formula over measures (`count(A) > 2 * count(B)`, `exists(crash) AND NOT exists(shutdown)`): to propose next.
 
+- **Bugs (owner, 2026-11-07):** a check's name had to be an identifier: any text now (not `:` or `;`; the same check whatever the case). A library query whose name has spaces (`{Aurix_logs.Fusa Fault}`) read the rest of its name as a broken parameter: its name is everything before the first `NAME=VALUE` word (lifecycles too).
+
 ## Next, to decide with the owner
 
 - Marks: the evidence in the log view's gutter, the plot, and a badge in the lifecycle list.

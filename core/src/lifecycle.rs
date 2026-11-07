@@ -100,8 +100,11 @@ impl Rule {
         let Some(inner) = inner.strip_suffix('}') else {
             return Err(DslError { msg: "expected '}' after the library query".into(), pos: lead + t.len() });
         };
-        let mut words = inner.split_whitespace();
-        let id = words.next().unwrap_or_default();
+        // Its name may hold spaces (owner, 2026-11-07: `{Aurix_logs.Fusa
+        // Fault}`): the parameters are the `NAME=VALUE` words after it.
+        let words: Vec<&str> = inner.split_whitespace().collect();
+        let first_param = words.iter().position(|w| w.contains('=')).unwrap_or(words.len());
+        let id = words[..first_param].join(" ");
         if !id.contains('.') {
             return Err(DslError {
                 msg: format!("expected a library query (pack.query) but found '{id}'"),
@@ -109,7 +112,7 @@ impl Rule {
             });
         }
         let mut params = Vec::new();
-        for w in words {
+        for &w in &words[first_param..] {
             let Some((k, v)) = w.split_once('=') else {
                 return Err(DslError {
                     msg: format!("expected NAME=VALUE but found '{w}'"),
@@ -118,7 +121,7 @@ impl Rule {
             };
             params.push((k.to_owned(), v.to_owned()));
         }
-        Ok(Rule::Library { id: id.to_owned(), params, query: None })
+        Ok(Rule::Library { id, params, query: None })
     }
 
     /// A library query by name.

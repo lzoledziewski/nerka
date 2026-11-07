@@ -669,6 +669,7 @@ mod tests {
             r"h: lines /t=(?<t>\d+)/; value max; per ecu1",
             r"i: lines /t=(?<t>\d+)/; value max > 90",
             "j: lines raw == y; count; issue",
+            "Fusa Faults from aurix: lines {Aurix_logs.Fusa Fault}; count; per perf",
         ] {
             let d = CheckDef::parse_spec(spec).unwrap();
             let back = CheckDef::parse_spec(&Form::of(&d).spec()).unwrap_or_else(|e| panic!("{spec}: {}", e.msg));
