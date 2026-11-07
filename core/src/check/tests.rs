@@ -484,6 +484,31 @@ mod as_signals {
             "the tab's @retries (temps 91, 60, 60), not the check's"
         );
         assert!(!r.signals.get("retries").unwrap().is_check());
+        // Said, not silent (owner, 2026-11-07).
+        assert_eq!(
+            result(&r, "retries").signal_note.as_deref(),
+            Some("its signal @retries isn't made: a signal of the tab is named @retries (rename the check)")
+        );
+        assert_eq!(result(&r, "hot").signal_note, None);
+    }
+
+    /// Two checks whose names make the same signal: the first in the list
+    /// makes it, the other says so.
+    #[test]
+    fn two_checks_of_one_signal_name() {
+        let c = checks(&[
+            "Net down: lines raw ~ /net down/",
+            "net_down: lines raw == retry",
+            "uses: lines @net_down.event",
+        ]);
+        let r = run(&c, &signals());
+        assert_eq!(result(&r, "Net down").signal_note, None);
+        assert_eq!(
+            result(&r, "net_down").signal_note.as_deref(),
+            Some("its signal @net_down isn't made: check 'Net down' makes @net_down already (rename the check)")
+        );
+        assert_eq!(filter("@net_down.event", &r.signals), [2, 7]);
+        assert_eq!(result(&r, "uses").overall().verdict, issue(2));
     }
 
     #[test]

@@ -296,6 +296,9 @@ pub struct CheckResult {
     pub scopes: Vec<ScopeResult>,
     /// The lifecycle it runs per.
     pub per: Option<String>,
+    /// Why its signal isn't made, if it isn't: the name is taken (owner,
+    /// 2026-11-07: a conflict was silent, like a check that finds nothing).
+    pub signal_note: Option<String>,
 }
 
 impl CheckResult {
@@ -726,7 +729,13 @@ impl CheckDef {
                 measure: j.measure,
             });
         }
-        Ok(CheckResult { name: self.name.clone(), kind: self.kind(), scopes: out, per: self.per.clone() })
+        Ok(CheckResult {
+            name: self.name.clone(),
+            kind: self.kind(),
+            scopes: out,
+            per: self.per.clone(),
+            signal_note: None,
+        })
     }
 
     /// Several tests' verdicts on one scope as the check's: an issue when
@@ -1095,6 +1104,17 @@ impl Checks {
             on.iter().map(|c| c.resolved(lib).map_err(|e| format!("check '{}': {e}", c.name))).collect();
         // The checks whose signals each uses.
         let own: Vec<String> = on.iter().map(|c| signal_name(&c.name)).collect();
+        // Who has each check's signal name already: a signal of the tab, or
+        // a check before it in the list. Its signal isn't made then.
+        let taken: Vec<Option<String>> = (0..on.len())
+            .map(|i| {
+                if signals.get(&own[i]).is_some() {
+                    return Some(format!("a signal of the tab is named @{}", own[i]));
+                }
+                let j = own.iter().position(|o| *o == own[i]).expect("itself");
+                (j < i).then(|| format!("check '{}' makes @{} already", on[j].name, own[i]))
+            })
+            .collect();
         let theirs = |n: &str| signals.get(n).is_none().then(|| own.iter().position(|o| o == n)).flatten();
         let needs: Vec<Vec<usize>> = defs
             .iter()
@@ -1118,11 +1138,15 @@ impl Checks {
                     r => r.map_err(|e| e.to_string()),
                 },
             };
-            if let Ok(res) = &r
-                && signals.get(&own[i]).is_none()
-            {
-                sig.set(res.signal(source));
-            }
+            let r = r.map(|mut res| {
+                match &taken[i] {
+                    None => sig.set(res.signal(source)),
+                    Some(who) => {
+                        res.signal_note = Some(format!("its signal @{} isn't made: {who} (rename the check)", own[i]))
+                    }
+                }
+                res
+            });
             results[i] = Some(r);
         }
         // What is left uses itself, or checks that use it.

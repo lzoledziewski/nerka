@@ -588,6 +588,7 @@ pub fn signals_panel(ui: &mut egui::Ui, st: &mut SignalsUi, input: Input<'_>) ->
                                 egui::TextEdit::singleline(&mut d.name).hint_text("speed").desired_width(f32::INFINITY),
                             );
                             ui.end_row();
+                            name_taken_row(ui, signals, &d.name);
                             ui.label("Kind");
                             ui.horizontal(|ui| {
                                 ui.radio_value(&mut d.kind, SignalKind::Num, "num")
@@ -724,6 +725,7 @@ fn lifecycle_form(ui: &mut egui::Ui, d: &mut Draft, lib: &Library, signals: &Sig
         ui.label("Name");
         ui.add(egui::TextEdit::singleline(&mut d.name).hint_text("ecu1").desired_width(f32::INFINITY));
         ui.end_row();
+        name_taken_row(ui, signals, &d.name);
         ui.label("Its lines").on_hover_text("The lines of the entity (empty: every line), e.g. ecu == ECU1");
         rule_field(ui, "life_lines", &mut f.lines, "ecu == ECU1  (empty: every line)", lib);
         ui.end_row();
@@ -1278,6 +1280,19 @@ fn kind_cell(ui: &mut egui::Ui, d: &SignalDef, out: &mut Output) {
     if kind != d.kind() {
         out.kind = Some((d.name().to_owned(), kind));
     }
+}
+
+/// A grid row saying that a check makes a signal of this name: the new
+/// signal takes it, and the check's isn't made (owner, 2026-11-07: that
+/// was silent).
+fn name_taken_row(ui: &mut egui::Ui, signals: &Signals, name: &str) {
+    let Some(check) = signals.get(name.trim()).and_then(|d| d.check_name()) else { return };
+    ui.label("");
+    ui.colored_label(
+        ui.visuals().warn_fg_color,
+        format!("⚠ Check '{check}' makes @{}: this one takes the name, and the check's signal isn't made", name.trim()),
+    );
+    ui.end_row();
 }
 
 /// What a check's signal is (owner, 2026-11-07: listed with the others,

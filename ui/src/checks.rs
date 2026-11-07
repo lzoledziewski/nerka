@@ -283,6 +283,10 @@ enum Act {
 pub fn checks_panel(ui: &mut egui::Ui, st: &mut ChecksUi, input: Input<'_>) -> Output {
     let Input { saved, results, running, file, signals, library, plot } = input;
     let mut out = Output::default();
+    // Long names, errors, notes and lines wrap: the pane must fit the room
+    // it has (owner, 2026-11-07: with long lines its left part went under
+    // the log view).
+    ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
     ui.horizontal(|ui| {
         ui.heading("Checks");
         ui.weak("ℹ").on_hover_text(
@@ -410,7 +414,7 @@ pub fn checks_panel(ui: &mut egui::Ui, st: &mut ChecksUi, input: Input<'_>) -> O
         }
         egui::ScrollArea::vertical().id_salt("check_evidence").show(ui, |ui| {
             for e in s.evidence.iter().take(300) {
-                ui.horizontal(|ui| {
+                ui.horizontal_wrapped(|ui| {
                     let lines: Vec<String> = e.rows.iter().map(|r| (r + 1).to_string()).collect();
                     if ui.link(RichText::new(format!("line {}", lines.join(" → "))).monospace()).clicked() {
                         out.goto = Some(e.rows[0]);
@@ -433,6 +437,11 @@ pub fn checks_panel(ui: &mut egui::Ui, st: &mut ChecksUi, input: Input<'_>) -> O
 
 /// One check: on/off, its name and kind, ✎, −; then its results, overall │
 /// per lifecycle.
+/// Why a check's signal isn't made (its name is taken), from its result.
+fn signal_note<'a>(results: &'a [(String, Outcome)], name: &str) -> Option<&'a str> {
+    results.iter().find(|(n, _)| n == name)?.1.as_ref().ok()?.signal_note.as_deref()
+}
+
 fn check_row(
     ui: &mut egui::Ui,
     st: &mut ChecksUi,
@@ -442,7 +451,7 @@ fn check_row(
     plot: &mut crate::plot::PlotState,
     act: &mut Option<Act>,
 ) {
-    ui.horizontal(|ui| {
+    ui.horizontal_wrapped(|ui| {
         let mut on = c.is_on();
         if ui.checkbox(&mut on, "").on_hover_text("On: run on every tab. Off: kept, not run").changed() {
             *act = Some(Act::Switch(c.name().to_owned(), on));
@@ -460,7 +469,11 @@ fn check_row(
              filters use it too (@{sig}.event, @{sig} > 0).",
             if c.per().is_some() { " per lifecycle" } else { "" }
         );
-        if ui.add_enabled(c.is_on(), egui::Button::selectable(plotted, "📈")).on_hover_text(tip).clicked() {
+        let made = signal_note(results, c.name()).is_none();
+        let button = egui::Button::selectable(plotted && made, "📈");
+        let r = ui.add_enabled(c.is_on() && made, button).on_hover_text(tip);
+        let r = r.on_disabled_hover_text(signal_note(results, c.name()).unwrap_or("Off: not run"));
+        if r.clicked() {
             plot.toggle(&sig);
             plot.shown = true;
         }
@@ -471,6 +484,12 @@ fn check_row(
             *act = Some(Act::Remove(c.name().to_owned()));
         }
     });
+    if let Some(note) = signal_note(results, c.name()) {
+        ui.horizontal_wrapped(|ui| {
+            ui.add_space(22.0);
+            ui.colored_label(ui.visuals().warn_fg_color, format!("⚠ {note}"));
+        });
+    }
     let result = results.iter().find(|(n, _)| n == c.name()).map(|(_, r)| r);
     ui.horizontal_wrapped(|ui| {
         ui.add_space(22.0);
@@ -522,7 +541,7 @@ fn form_ui(
     let f = &mut st.form;
     egui::Grid::new("check_form_grid").num_columns(2).spacing([8.0, 6.0]).show(ui, |ui| {
         ui.label("Name");
-        ui.add(egui::TextEdit::singleline(&mut f.name).hint_text("ota_stall").desired_width(f32::INFINITY));
+        ui.add(egui::TextEdit::singleline(&mut f.name).hint_text("ota_stall").desired_width(ui.available_width()));
         ui.end_row();
         ui.label("Its lines").on_hover_text(
             "The lines it looks at: NFD or a library query. Other checks' signals work too: @name.event for \
@@ -563,7 +582,7 @@ fn form_ui(
     if let Some(i) = drop_test {
         f.tests.remove(i);
     }
-    ui.horizontal(|ui| {
+    ui.horizontal_wrapped(|ui| {
         if ui
             .button("➕ Another test")
             .on_hover_text("Several tests in one check: an issue when all of them (or any) find one")
@@ -602,7 +621,7 @@ fn form_ui(
         });
         ui.end_row();
         ui.label("Labels").on_hover_text("Groups: switch every check of a label on or off at once");
-        ui.add(egui::TextEdit::singleline(&mut f.labels).hint_text("ota, network").desired_width(f32::INFINITY));
+        ui.add(egui::TextEdit::singleline(&mut f.labels).hint_text("ota, network").desired_width(ui.available_width()));
         ui.end_row();
     });
     if f.tests.len() == 1 {
@@ -610,9 +629,28 @@ fn form_ui(
         ui.weak(format!("Shows {}", if f.kind == Kind::Issue { issue } else { fact }));
     }
     if !f.name.trim().is_empty() {
-        ui.weak(format!("Its signal: @{} (an event where it finds something)", signal_name(&f.name)));
+        let sig = signal_name(&f.name);
+        let mine = |c: &str| st.editing.as_deref().is_some_and(|e| e.eq_ignore_ascii_case(c));
+        match signals.get(&sig) {
+            Some(d) if d.check_name().is_some_and(|c| !mine(c) && !c.eq_ignore_ascii_case(f.name.trim())) => {
+                let c = d.check_name().unwrap_or_default();
+                ui.colored_label(
+                    ui.visuals().warn_fg_color,
+                    format!("⚠ Its signal @{sig} won't be made: check '{c}' makes it already (rename one)"),
+                );
+            }
+            Some(d) if !d.is_check() => {
+                ui.colored_label(
+                    ui.visuals().warn_fg_color,
+                    format!("⚠ Its signal @{sig} won't be made: a signal of the tab has the name (rename one)"),
+                );
+            }
+            _ => {
+                ui.weak(format!("Its signal: @{sig} (an event where it finds something)"));
+            }
+        }
     }
-    ui.horizontal(|ui| {
+    ui.horizontal_wrapped(|ui| {
         let label = if st.editing.is_some() { "Update" } else { "Add" };
         if ui.button(label).clicked() {
             match CheckDef::parse_spec(&f.spec()) {
@@ -793,6 +831,95 @@ pub fn of_lifecycle(results: &[(String, Outcome)], lifecycle: &str, number: u32)
 #[cfg(test)]
 mod tests {
     use super::*;
+    use nerka_core::check::{Evidence, Scope, ScopeResult};
+
+    /// Every text shape's visible rect (within its clip rect).
+    fn texts(shapes: &[egui::epaint::ClippedShape]) -> Vec<(String, egui::Rect)> {
+        fn walk(s: &egui::Shape, clip: egui::Rect, out: &mut Vec<(String, egui::Rect)>) {
+            match s {
+                egui::Shape::Text(t) => {
+                    let r = t.visual_bounding_rect().intersect(clip);
+                    if r.is_positive() {
+                        out.push((t.galley.text().to_owned(), r));
+                    }
+                }
+                egui::Shape::Vec(v) => v.iter().for_each(|s| walk(s, clip, out)),
+                _ => {}
+            }
+        }
+        let mut out = Vec::new();
+        shapes.iter().for_each(|c| walk(&c.shape, c.clip_rect, &mut out));
+        out
+    }
+
+    /// Owner, 2026-11-07: with long lines in the pane, its left part
+    /// couldn't be seen. Long names, errors, notes, log lines and queries
+    /// stay within the pane.
+    #[test]
+    fn long_lines_stay_in_the_pane() {
+        let long = "x".repeat(40) + &" word".repeat(60);
+        let line = format!("2026-11-07 12:00:00 ECU1 NAV {}", "payload ".repeat(60));
+        let file = nerka_core::TextFile::from_bytes("t", format!("{line}\n{line}\n").into_bytes());
+        let mut saved = Checks::default();
+        let name = format!("a check with a rather long name {}", "and more ".repeat(6));
+        saved.set(CheckDef::parse_spec(&format!("{name}: lines raw ~ /payload/; exists")).unwrap());
+        saved.set(CheckDef::parse_spec("broken: lines raw ~ /x/; exists").unwrap());
+        let scope = Scope { label: "overall".into(), life: None, from: 0, to: 2 };
+        let ev = Evidence { rows: vec![0, 1], note: long.clone() };
+        let ok = CheckResult {
+            name: name.clone(),
+            kind: Kind::Issue,
+            per: None,
+            signal_note: Some(long.clone()),
+            scopes: vec![ScopeResult {
+                scope,
+                verdict: Verdict::Issue(1),
+                evidence: vec![ev],
+                marks: vec![1],
+                measure: None,
+            }],
+        };
+        let results = vec![(name.clone(), Ok(ok)), ("broken".to_owned(), Err(long.clone()))];
+        let mut st = ChecksUi { selected: Some((name, 0)), form_open: true, ..Default::default() };
+        st.form.lines = long.replace(' ', "_");
+        st.form.name = long.clone();
+        let (signals, lib) = (Signals::default(), Library::new());
+        let ctx = egui::Context::default();
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1200.0, 900.0));
+        for _ in 0..4 {
+            let input = egui::RawInput { screen_rect: Some(screen), ..Default::default() };
+            let mut plot = crate::plot::PlotState::default();
+            // A narrow pane (the Signals panel open beside it): its content
+            // must fit, or the pane pushes under the log view.
+            let (mut room, mut used) = (0.0, 0.0);
+            let mut full = ctx.run_ui(input, |ui| {
+                egui::Panel::right("checks").resizable(false).exact_size(340.0).show(ui, |ui| {
+                    room = ui.max_rect().width();
+                    let input = Input {
+                        saved: &mut saved,
+                        results: &results,
+                        running: false,
+                        file: &file,
+                        signals: &signals,
+                        library: &lib,
+                        plot: &mut plot,
+                    };
+                    checks_panel(ui, &mut st, input);
+                    used = ui.min_rect().width();
+                });
+            });
+            full.textures_delta.clear();
+            assert!(used <= room + 0.5, "the pane's content is {used:.0} wide in {room:.0}");
+            // What shows stays in the pane.
+            let left = screen.max.x - 340.0;
+            let outside: Vec<_> = texts(&full.shapes)
+                .into_iter()
+                .filter(|(_, r)| r.min.x < left - 1.0 || r.max.x > screen.max.x + 1.0)
+                .map(|(t, r)| format!("{:.60} at {:.0}..{:.0}", t, r.min.x, r.max.x))
+                .collect();
+            assert!(outside.is_empty(), "{outside:#?}");
+        }
+    }
 
     #[test]
     fn the_form_round_trips_specs() {

@@ -547,6 +547,9 @@ fn checks(
             continue;
         }
         let r = r.map_err(|e| anyhow::anyhow!(e))?;
+        if let Some(note) = &r.signal_note {
+            eprintln!("check '{}': {note}", r.name);
+        }
         for s in &r.scopes {
             let shown = match &s.verdict {
                 Verdict::Ok => "ok".to_owned(),
