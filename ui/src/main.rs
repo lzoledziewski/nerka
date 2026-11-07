@@ -178,7 +178,7 @@ fn main() -> eframe::Result {
                 let spec = value();
                 match nerka_core::check::CheckDef::parse_spec(&spec) {
                     Ok(c) => startup_checks.set(c),
-                    Err(e) => eprintln!("nerka-gui: --check {spec}: {} (at column {})", e.msg, e.pos + 1),
+                    Err(e) => eprintln!("nerka-gui: --check {spec}: {}", e.at(&spec)),
                 }
                 continue;
             }
@@ -408,8 +408,8 @@ fn read_box(
         Mode::Text => (text(pattern, options.clone()), Preview::None),
         Mode::Query => match Query::compile_in(pattern, schema, signals) {
             Ok(q) => (Ok(Filter::Query(q)), Preview::None),
-            Err(e) if pattern.trim().is_empty() => (Err(format!("Query error: {e}")), Preview::None),
-            Err(e) => (Err(format!("Query error: {e}")), Preview::QueryError(e.to_string())),
+            Err(e) if pattern.trim().is_empty() => (Err(format!("Query error: {}", e.at(pattern))), Preview::None),
+            Err(e) => (Err(format!("Query error: {}", e.at(pattern))), Preview::QueryError(e.at(pattern))),
         },
         Mode::Auto => {
             // Phrases and plain text are literal, or regexes with Regex ticked.
