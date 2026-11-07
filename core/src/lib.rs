@@ -23,6 +23,7 @@ pub mod engine;
 pub mod event;
 pub mod history;
 pub mod input;
+pub mod lifecycle;
 pub mod pack;
 pub mod plot;
 pub mod preset;

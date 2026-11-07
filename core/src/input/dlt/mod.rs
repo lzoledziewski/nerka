@@ -201,6 +201,11 @@ impl Protocol for Dlt {
         let frame = self.frame(&m)?;
         frame.arg(m.payload().get(4..)?, m.big_endian(), index)
     }
+
+    /// `tmsp`: the ECU's uptime in 0.1 ms units.
+    fn uptime(&self, msg: &[u8], at: &Origin<'_>) -> Option<f64> {
+        Dlt::message(msg, at)?.timestamp().map(|t| f64::from(t) / 10_000.0)
+    }
 }
 
 /// A `.dlt` file's storage header: the message's time and ECU id, and the

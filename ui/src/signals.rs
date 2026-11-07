@@ -6,10 +6,15 @@
 //! messages are chosen here too (owner, 2026-10-24). Core does the
 //! capturing and decoding; the panel only edits definitions and shows
 //! values.
+//!
+//! Lifecycles (`doc/lifecycles.md`) are defined here too (a lifecycle is a
+//! signal: `@boot`), signals are bound to one (`per`) with a default, and
+//! the lifecycles found are listed under the signals, with their findings.
 
 use crate::plot::PlotState;
 use eframe::egui::{self, RichText};
-use nerka_core::{LineNo, LogSource, SearchResult, SignalDef, SignalKind, SignalScope, SignalSeries, Signals};
+use nerka_core::lifecycle::{self, LifecycleDef};
+use nerka_core::{Library, LineNo, LogSource, SearchResult, SignalDef, SignalKind, SignalScope, SignalSeries, Signals};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -35,16 +40,169 @@ pub struct SignalsUi {
 }
 
 struct Draft {
+    /// A lifecycle, not a signal.
+    life: bool,
     name: String,
     kind: SignalKind,
     group: String,
     query: String,
+    /// The lifecycle it resets with (empty: none) and its default.
+    per: String,
+    default: String,
+    /// A lifecycle's rules (`doc/lifecycles.md`): its lines, what starts
+    /// one, how one ends. Queries are NFD or `{pack.query}`.
+    life_form: LifeForm,
     error: Option<String>,
+}
+
+/// The lifecycle form's fields.
+struct LifeForm {
+    lines: String,
+    on_start: bool,
+    start: String,
+    on_reset: bool,
+    /// `uptime` or `@signal`.
+    reset: String,
+    tolerance: String,
+    on_gap: bool,
+    gap: String,
+    planned: String,
+    crash: String,
+    late: String,
+    /// What the last preview found (or why it couldn't).
+    preview: Option<Result<String, String>>,
+}
+
+impl Default for LifeForm {
+    fn default() -> Self {
+        let d = |v: f64| lifecycle::format_duration(v);
+        LifeForm {
+            lines: String::new(),
+            on_start: false,
+            start: String::new(),
+            on_reset: true,
+            reset: "uptime".into(),
+            tolerance: d(lifecycle::DEFAULT_TOLERANCE),
+            on_gap: false,
+            gap: "30s".into(),
+            planned: String::new(),
+            crash: String::new(),
+            late: d(lifecycle::DEFAULT_LATE),
+            preview: None,
+        }
+    }
+}
+
+impl LifeForm {
+    fn of(l: &LifecycleDef) -> LifeForm {
+        let text = |r: Option<&lifecycle::Rule>| r.map(|r| r.text()).unwrap_or_default();
+        let mut f = LifeForm {
+            lines: text(l.lines()),
+            start: text(l.start()),
+            planned: text(l.planned()),
+            crash: text(l.crash()),
+            late: lifecycle::format_duration(l.late()),
+            ..LifeForm::default()
+        };
+        f.on_start = l.start().is_some();
+        f.on_reset = l.reset().is_some();
+        if let Some(r) = l.reset() {
+            f.reset = match &r.value {
+                lifecycle::ResetValue::Uptime => "uptime".into(),
+                lifecycle::ResetValue::Signal(s) => format!("@{s}"),
+            };
+            f.tolerance = lifecycle::format_duration(r.tolerance);
+        }
+        f.on_gap = l.gap().is_some();
+        if let Some(g) = l.gap() {
+            f.gap = lifecycle::format_duration(g);
+        }
+        f
+    }
+
+    /// The definition the fields describe; an error names the field.
+    fn build(&self, name: &str) -> Result<LifecycleDef, String> {
+        let q = |what: &str, e: nerka_core::DslError| format!("{what}: {} (at column {})", e.msg, e.pos + 1);
+        let dur = |what: &str, t: &str| {
+            lifecycle::parse_duration(t).ok_or_else(|| format!("{what}: '{t}' isn't a duration (30s, 500ms, 2m)"))
+        };
+        let mut d = LifecycleDef::new(name)?
+            .with_lines(&self.lines)
+            .map_err(|e| q("Its lines", e))?
+            .with_start(if self.on_start { &self.start } else { "" })
+            .map_err(|e| q("Starts on a line", e))?
+            .with_planned(&self.planned)
+            .map_err(|e| q("Planned", e))?
+            .with_crash(&self.crash)
+            .map_err(|e| q("Crash", e))?
+            .with_late(dur("Late start above", &self.late)?);
+        if self.on_start && self.start.trim().is_empty() {
+            return Err("Starts on a line: which line? Give a query".into());
+        }
+        if self.on_reset {
+            let r = self.reset.trim();
+            let value = if r.eq_ignore_ascii_case("uptime") {
+                lifecycle::ResetValue::Uptime
+            } else if let Some(s) = r.strip_prefix('@').filter(|s| !s.is_empty()) {
+                lifecycle::ResetValue::Signal(s.to_ascii_lowercase())
+            } else {
+                return Err(format!("Uptime goes back: '{r}' isn't uptime or a signal (@name)"));
+            };
+            let tolerance = dur("Uptime goes back", &self.tolerance)?;
+            d = d.with_reset(Some(lifecycle::Reset { value, tolerance }));
+        }
+        if self.on_gap {
+            d = d.with_gap(Some(dur("Its lines stop", &self.gap)?));
+        }
+        d.check()?;
+        Ok(d)
+    }
 }
 
 impl Default for Draft {
     fn default() -> Self {
-        Draft { name: String::new(), kind: SignalKind::Num, group: String::new(), query: String::new(), error: None }
+        Draft {
+            life: false,
+            name: String::new(),
+            kind: SignalKind::Num,
+            group: String::new(),
+            query: String::new(),
+            per: String::new(),
+            default: String::new(),
+            life_form: LifeForm::default(),
+            error: None,
+        }
+    }
+}
+
+impl Draft {
+    /// The form filled with `d`.
+    fn of(d: &SignalDef) -> Draft {
+        if let Some(l) = d.as_lifecycle() {
+            return Draft { life: true, name: l.name().to_owned(), life_form: LifeForm::of(l), ..Draft::default() };
+        }
+        Draft {
+            name: d.name().to_owned(),
+            kind: d.kind(),
+            group: if d.group() == d.name() { String::new() } else { d.group().to_owned() },
+            query: d.query().source().to_owned(),
+            per: d.per().unwrap_or_default().to_owned(),
+            default: d.default_value().map(|v| v.to_string()).unwrap_or_default(),
+            ..Draft::default()
+        }
+    }
+
+    /// The definition the form describes.
+    fn build(&self) -> Result<SignalDef, String> {
+        if self.life {
+            return self.life_form.build(&self.name).map(SignalDef::lifecycle);
+        }
+        let group = (!self.group.trim().is_empty()).then_some(self.group.as_str());
+        let per = (!self.per.trim().is_empty()).then_some(self.per.as_str());
+        let default = (!self.default.trim().is_empty()).then_some(self.default.as_str());
+        SignalDef::new(&self.name, self.kind, &self.query, group)
+            .and_then(|d| d.with_per(per).with_default(default))
+            .map_err(|e| e.to_string())
     }
 }
 
@@ -60,6 +218,8 @@ pub struct Output {
     pub scope: Option<(String, SignalScope)>,
     /// Go to this line (the event that set a state was clicked).
     pub goto: Option<LineNo>,
+    /// Filter by this NFD (a lifecycle's "filter to it").
+    pub filter: Option<String>,
     pub fibex: Option<FibexAction>,
     /// The picked FIBEX arguments changed.
     pub args_changed: bool,
@@ -121,10 +281,12 @@ pub struct Input<'a> {
     pub fibex: Option<&'a nerka_core::Fibex>,
     /// The FIBEX arguments this tab uses as signals.
     pub arg_picks: &'a mut Vec<nerka_core::Argument>,
+    /// The query library: lifecycles reuse its queries.
+    pub library: &'a Library,
 }
 
 pub fn signals_panel(ui: &mut egui::Ui, st: &mut SignalsUi, input: Input<'_>) -> Output {
-    let Input { signals, generation, saved, file, line, plot, views, kept, fibex, arg_picks } = input;
+    let Input { signals, generation, saved, file, line, plot, views, kept, fibex, arg_picks, library } = input;
     let mut out = Output::default();
     ui.horizontal(|ui| {
         ui.heading("Signals");
@@ -164,6 +326,7 @@ pub fn signals_panel(ui: &mut egui::Ui, st: &mut SignalsUi, input: Input<'_>) ->
             // (owner, 2026-10-28: a fixed cut wasted a wide panel).
             let fit = value_room(ui, signals);
             let mut remove = None;
+            let mut switch: Option<(String, bool)> = None;
             let mut remove_arg: Option<String> = None;
             let mut edit = None;
             egui::Grid::new("signals").num_columns(6).striped(true).show(ui, |ui| {
@@ -177,10 +340,25 @@ pub fn signals_panel(ui: &mut egui::Ui, st: &mut SignalsUi, input: Input<'_>) ->
                             plot.toggle(d.name());
                         }
                     }
-                    let hover = if d.is_from_source() {
+                    let hover = if d.kind() == SignalKind::Time && d.is_from_source() {
                         "time\nThe file's own time of each line (DLT: when the logger received it)".to_owned()
+                    } else if let Some(l) = d.as_lifecycle() {
+                        format!(
+                            "lifecycle: {}\nThe number of the lifecycle each line is in; an event where one starts",
+                            l.spec()
+                        )
                     } else {
-                        format!("group: {}\n{}", d.group(), d.query().source())
+                        let mut h = format!("group: {}\n{}", d.group(), d.query().source());
+                        if let Some(p) = d.per() {
+                            h += &format!("\nResets at each new lifecycle '{p}'");
+                            if !d.is_linked() {
+                                h += " (not defined!)";
+                            }
+                        }
+                        if let Some(v) = d.default_value() {
+                            h += &format!("\nDefault: {v} (where no event set it)");
+                        }
+                        h
                     };
                     // Long names keep their end, where they differ.
                     let name = crate::plot::name_tail(&format!("@{}", d.name()), 32);
@@ -188,8 +366,12 @@ pub fn signals_panel(ui: &mut egui::Ui, st: &mut SignalsUi, input: Input<'_>) ->
                     kind_cell(ui, d, &mut out);
                     scope_cell(ui, d, &mut out);
                     if d.is_from_source() {
-                        let (shown, t) = match file.time(line) {
-                            Some(t) => (fit_time(t, fit + SUFFIX), nerka_core::time::format_time(t, 6)),
+                        let v = d.source_value(file, line);
+                        let (shown, t) = match v {
+                            Some(t) if d.kind() == SignalKind::Time => {
+                                (fit_time(t, fit + SUFFIX), nerka_core::time::format_time(t, 6))
+                            }
+                            Some(u) => (format!("{u:.4} s"), format!("{u} s")),
                             None => ("—".to_owned(), "—".to_owned()),
                         };
                         ui.label(RichText::new(shown).monospace())
@@ -202,9 +384,27 @@ pub fn signals_panel(ui: &mut egui::Ui, st: &mut SignalsUi, input: Input<'_>) ->
                     match bound {
                         Some(Ok(_)) => match views.series(d, file, kept, generation) {
                             // The state on the cursor line, and the event that set it.
-                            Some(series) => match series.state(line) {
-                                Some((row, v)) => {
+                            Some(series) => match series.state_at(line) {
+                                Some((None, v)) => {
                                     let full = d.format(v);
+                                    ui.label(
+                                        RichText::new(format!("{}  (default)", short_value(&full, fit)))
+                                            .monospace()
+                                            .italics()
+                                            .weak(),
+                                    )
+                                    .on_hover_text(format!(
+                                        "{full}: the default, assumed. No event set it yet{}",
+                                        d.per().map(|p| format!(" in this lifecycle ({p})")).unwrap_or_default()
+                                    ));
+                                }
+                                Some((Some(row), v)) => {
+                                    // A lifecycle's number: "#2".
+                                    let full = if d.as_lifecycle().is_some() {
+                                        format!("#{}", d.format(v))
+                                    } else {
+                                        d.format(v)
+                                    };
                                     let v = match v {
                                         nerka_core::ValueRef::Num(t) if d.kind() == SignalKind::Time => {
                                             fit_time(t, fit)
@@ -248,6 +448,14 @@ pub fn signals_panel(ui: &mut egui::Ui, st: &mut SignalsUi, input: Input<'_>) ->
                     }
                     if d.queries().is_empty() {
                         ui.horizontal(|ui| {
+                            let mut on = true;
+                            if ui
+                                .checkbox(&mut on, "")
+                                .on_hover_text("On: computed and usable in queries. Off: kept, not computed")
+                                .changed()
+                            {
+                                switch = Some((d.name().to_owned(), on));
+                            }
                             if ui.small_button("✎").on_hover_text("Edit").clicked() {
                                 edit = Some((*d).clone());
                             }
@@ -274,15 +482,42 @@ pub fn signals_panel(ui: &mut egui::Ui, st: &mut SignalsUi, input: Input<'_>) ->
                     }
                     ui.end_row();
                 }
+                // The saved ones switched off: listed, to switch on again.
+                for d in saved.iter().filter(|d| !d.is_on()) {
+                    ui.label("");
+                    let what = if d.as_lifecycle().is_some() { "lifecycle" } else { d.kind().as_str() };
+                    ui.label(RichText::new(format!("@{}", d.name())).monospace().weak()).on_hover_text(format!(
+                        "Off: kept, not computed
+{}",
+                        d.spec()
+                    ));
+                    ui.weak(what);
+                    ui.label("");
+                    ui.weak("off");
+                    ui.horizontal(|ui| {
+                        let mut on = false;
+                        if ui.checkbox(&mut on, "").on_hover_text("Switch it on").changed() {
+                            switch = Some((d.name().to_owned(), on));
+                        }
+                        if ui.small_button("✎").on_hover_text("Edit").clicked() {
+                            edit = Some((*d).clone());
+                        }
+                        if ui.small_button("−").on_hover_text("Remove (from every tab)").clicked() {
+                            remove = Some(d.name().to_owned());
+                        }
+                    });
+                    ui.end_row();
+                }
             });
+            if let Some((name, on)) = switch
+                && let Some(d) = saved.get(&name)
+            {
+                let d = (**d).clone().with_on(on);
+                saved.set(d);
+                out.saved_changed = true;
+            }
             if let Some(d) = edit {
-                st.draft = Draft {
-                    name: d.name().to_owned(),
-                    kind: d.kind(),
-                    group: if d.group() == d.name() { String::new() } else { d.group().to_owned() },
-                    query: d.query().source().to_owned(),
-                    error: None,
-                };
+                st.draft = Draft::of(&d);
                 st.editing = Some(d.name().to_owned());
             }
             if let Some(name) = remove_arg {
@@ -300,62 +535,121 @@ pub fn signals_panel(ui: &mut egui::Ui, st: &mut SignalsUi, input: Input<'_>) ->
                 out.saved_changed = true;
             }
 
+            lifecycles_list(ui, signals, file, &mut out);
+            // A lifecycle edited: its form's fields.
+
             ui.separator();
             // Folded until wanted (an edit opens it): the list stays short.
-            let title = if st.editing.is_some() { "Edit signal" } else { "New signal" };
+            let title = match (st.editing.is_some(), st.draft.life) {
+                (true, true) => "Edit lifecycle",
+                (true, false) => "Edit signal",
+                (false, _) => "New signal or lifecycle",
+            };
             egui::CollapsingHeader::new(RichText::new(title).strong())
                 .id_salt("signal_form")
                 .default_open(false)
                 .open(st.editing.is_some().then_some(true))
                 .show(ui, |ui| {
                     ui.weak("Saved for every tab and the next start");
+                    let lifecycle_names: Vec<String> = signals.lifecycles().map(|l| l.name().to_owned()).collect();
                     let d = &mut st.draft;
-                    egui::Grid::new("signal_form").num_columns(2).show(ui, |ui| {
-                        ui.label("Name");
-                        ui.add(egui::TextEdit::singleline(&mut d.name).hint_text("speed").desired_width(f32::INFINITY));
-                        ui.end_row();
-                        ui.label("Kind");
+                    if st.editing.is_none() {
                         ui.horizontal(|ui| {
-                            ui.radio_value(&mut d.kind, SignalKind::Num, "num")
-                                .on_hover_text("The capture read as a number");
-                            ui.radio_value(&mut d.kind, SignalKind::Enum, "enum").on_hover_text("The captured text");
-                            ui.radio_value(&mut d.kind, SignalKind::Time, "time").on_hover_text(
+                            ui.radio_value(&mut d.life, false, "Signal");
+                            ui.radio_value(&mut d.life, true, "Lifecycle").on_hover_text(
+                                "When one entity (an ECU, an application) starts and how it ends, numbered. \
+                                 A signal too (@name: its number); signals can reset with it.",
+                            );
+                        });
+                    }
+                    if d.life {
+                        lifecycle_form(ui, d, library, signals, file);
+                    } else {
+                        egui::Grid::new("signal_form").num_columns(2).show(ui, |ui| {
+                            ui.label("Name");
+                            ui.add(
+                                egui::TextEdit::singleline(&mut d.name).hint_text("speed").desired_width(f32::INFINITY),
+                            );
+                            ui.end_row();
+                            ui.label("Kind");
+                            ui.horizontal(|ui| {
+                                ui.radio_value(&mut d.kind, SignalKind::Num, "num")
+                                    .on_hover_text("The capture read as a number");
+                                ui.radio_value(&mut d.kind, SignalKind::Enum, "enum")
+                                    .on_hover_text("The captured text");
+                                ui.radio_value(&mut d.kind, SignalKind::Time, "time").on_hover_text(
                     "The capture read as a time: 2026-10-17 10:00:01.5, 10:00:01.5 (a time of day) or seconds. \
                  The first time signal is the tab's clock for plots.",
                 );
+                            });
+                            ui.end_row();
+                            ui.label("Group");
+                            ui.add(
+                                egui::TextEdit::singleline(&mut d.group)
+                                    .hint_text("same as the name")
+                                    .desired_width(f32::INFINITY),
+                            )
+                            .on_hover_text("The named regex group (?<group>…) the value is taken from");
+                            ui.end_row();
+                            ui.label("Per");
+                            let shown = if d.per.is_empty() { "(no lifecycle)".to_owned() } else { d.per.clone() };
+                            let before = d.per.clone();
+                            egui::ComboBox::from_id_salt("signal_per")
+                                .selected_text(shown)
+                                .show_ui(ui, |ui| {
+                                    ui.selectable_value(&mut d.per, String::new(), "(no lifecycle)");
+                                    for n in &lifecycle_names {
+                                        ui.selectable_value(&mut d.per, n.clone(), n);
+                                    }
+                                })
+                                .response
+                                .on_hover_text(
+                                    "Reset its state each time this lifecycle starts. Its query still decides its \
+                                     lines: picking a lifecycle fills an empty query with the lifecycle's lines.",
+                                );
+                            // An empty query starts with the lifecycle's lines (owner, 2026-11-07).
+                            if d.per != before
+                                && d.query.trim().is_empty()
+                                && let Some(lines) = signals
+                                    .lifecycles()
+                                    .find(|l| l.name() == d.per)
+                                    .and_then(|l| l.lines())
+                                    .and_then(|r| r.query())
+                            {
+                                d.query = format!("{} AND ", lines.source());
+                            }
+                            ui.end_row();
+                            ui.label("Default");
+                            ui.add(
+                                egui::TextEdit::singleline(&mut d.default)
+                                    .hint_text("none (unset)")
+                                    .desired_width(f32::INFINITY),
+                            )
+                            .on_hover_text(
+                                "Its state where no event set it (in its lifecycle, else its file), shown as assumed. \
+                             Not an event.",
+                            );
+                            ui.end_row();
                         });
-                        ui.end_row();
-                        ui.label("Group");
+                        ui.label("Query (NFD); a row carries the value when it matches:");
                         ui.add(
-                            egui::TextEdit::singleline(&mut d.group)
-                                .hint_text("same as the name")
-                                .desired_width(f32::INFINITY),
-                        )
-                        .on_hover_text("The named regex group (?<group>…) the value is taken from");
-                        ui.end_row();
-                    });
-                    ui.label("Query (NFD); a row carries the value when it matches:");
-                    ui.add(
-                        egui::TextEdit::multiline(&mut d.query)
-                            .code_editor()
-                            .desired_rows(2)
-                            .desired_width(f32::INFINITY)
-                            .hint_text(r"payload ~ /speed=(?<speed>\d+)/"),
-                    );
+                            egui::TextEdit::multiline(&mut d.query)
+                                .code_editor()
+                                .desired_rows(2)
+                                .desired_width(f32::INFINITY)
+                                .hint_text(r"payload ~ /speed=(?<speed>\d+)/"),
+                        );
+                    }
                     ui.horizontal(|ui| {
                         let label = if st.editing.is_some() { "Update" } else { "Add" };
                         if ui.button(label).clicked() {
-                            let d = &st.draft;
-                            let group = (!d.group.trim().is_empty()).then_some(d.group.as_str());
-                            match SignalDef::new(&d.name, d.kind, &d.query, group) {
+                            match st.draft.build() {
                                 Ok(def) => {
-                                    // An edit keeps the signal's scope.
-                                    let scope = st
-                                        .editing
-                                        .as_deref()
-                                        .and_then(|n| saved.get(n))
-                                        .map(|o| o.scope())
-                                        .unwrap_or_default();
+                                    // An edit keeps the signal's scope, and its being off.
+                                    let old = st.editing.as_deref().and_then(|n| saved.get(n));
+                                    let scope = old.map(|o| o.scope()).unwrap_or_default();
+                                    let on = old.is_none_or(|o| o.is_on());
+                                    let def = def.with_on(on);
                                     if let Some(old) = st.editing.take()
                                         && old != def.name()
                                     {
@@ -365,7 +659,7 @@ pub fn signals_panel(ui: &mut egui::Ui, st: &mut SignalsUi, input: Input<'_>) ->
                                     st.draft = Draft::default();
                                     out.saved_changed = true;
                                 }
-                                Err(e) => st.draft.error = Some(e.to_string()),
+                                Err(e) => st.draft.error = Some(e),
                             }
                         }
                         if st.editing.is_some() && ui.button("Cancel").clicked() {
@@ -401,6 +695,215 @@ pub fn signals_panel(ui: &mut egui::Ui, st: &mut SignalsUi, input: Input<'_>) ->
         }
     }
     out
+}
+
+/// The lifecycle form: its name, its lines, what starts one, how one ends;
+/// each query is NFD or a library query (📚, or dropped from the Library);
+/// Preview tries it on the file.
+fn lifecycle_form(ui: &mut egui::Ui, d: &mut Draft, lib: &Library, signals: &Signals, file: &dyn LogSource) {
+    let f = &mut d.life_form;
+    egui::Grid::new("lifecycle_form").num_columns(2).spacing([8.0, 6.0]).show(ui, |ui| {
+        ui.label("Name");
+        ui.add(egui::TextEdit::singleline(&mut d.name).hint_text("ecu1").desired_width(f32::INFINITY));
+        ui.end_row();
+        ui.label("Its lines").on_hover_text("The lines of the entity (empty: every line), e.g. ecu == ECU1");
+        rule_field(ui, "life_lines", &mut f.lines, "ecu == ECU1  (empty: every line)", lib);
+        ui.end_row();
+        ui.label("Starts when");
+        ui.vertical(|ui| {
+            ui.horizontal(|ui| {
+                ui.checkbox(&mut f.on_reset, "its uptime goes back")
+                    .on_hover_text("The uptime its lines carry (DLT: tmsp), or a numeric signal (@name)");
+                ui.add_enabled(f.on_reset, egui::TextEdit::singleline(&mut f.reset).desired_width(70.0))
+                    .on_hover_text("uptime: what its lines carry (DLT: tmsp, in seconds); or @signal");
+                ui.label("by more than");
+                ui.add_enabled(f.on_reset, egui::TextEdit::singleline(&mut f.tolerance).desired_width(48.0))
+                    .on_hover_text("Lines of different writers interleave: smaller steps back aren't a reboot");
+            });
+            ui.horizontal(|ui| {
+                ui.checkbox(&mut f.on_start, "one of its lines matches");
+            });
+            if f.on_start {
+                rule_field(ui, "life_start", &mut f.start, "payload ~ /booting/", lib);
+            }
+            ui.horizontal(|ui| {
+                ui.checkbox(&mut f.on_gap, "its lines stop for");
+                ui.add_enabled(f.on_gap, egui::TextEdit::singleline(&mut f.gap).desired_width(48.0));
+                ui.weak("(ends one as lost)");
+            });
+        });
+        ui.end_row();
+        ui.label("Ended as planned by");
+        rule_field(ui, "life_planned", &mut f.planned, "payload ~ /shutdown/", lib);
+        ui.end_row();
+        ui.label("Ended as a crash by");
+        rule_field(ui, "life_crash", &mut f.crash, "payload ~ /watchdog/", lib);
+        ui.end_row();
+        ui.label("Late start above").on_hover_text("A lifecycle whose first line has a higher uptime started late");
+        ui.add(egui::TextEdit::singleline(&mut f.late).desired_width(48.0));
+        ui.end_row();
+    });
+    ui.horizontal(|ui| {
+        if ui.button("👁 Preview").on_hover_text("Find its lifecycles in this file").clicked() {
+            f.preview = Some(preview(f, &d.name, lib, signals, file));
+        }
+        match &f.preview {
+            Some(Ok(s)) => {
+                ui.label(s);
+            }
+            Some(Err(e)) => {
+                ui.colored_label(ui.visuals().error_fg_color, e);
+            }
+            None => {}
+        }
+    });
+}
+
+/// What the form's lifecycle finds in `file` (a summary), or why it can't.
+fn preview(f: &LifeForm, name: &str, lib: &Library, signals: &Signals, file: &dyn LogSource) -> Result<String, String> {
+    let name = if name.trim().is_empty() { "preview" } else { name };
+    let def = f.build(name)?.resolved(lib)?.linked(signals);
+    let l = def.lifecycles(file, &nerka_core::Progress::new()).map_err(|e| e.to_string())?;
+    let first = l.lives.first().map(|x| format!(" (first on line {})", x.first + 1)).unwrap_or_default();
+    Ok(format!("{}{first}", l.summary()))
+}
+
+/// A query field of a lifecycle: NFD, or a library query `{pack.query}`
+/// picked with 📚 or dropped from the Library.
+fn rule_field(ui: &mut egui::Ui, id: &str, text: &mut String, hint: &str, lib: &Library) {
+    ui.horizontal(|ui| {
+        let w = (ui.available_width() - 34.0).max(80.0);
+        let r = ui.add(egui::TextEdit::singleline(text).code_editor().hint_text(hint).desired_width(w));
+        if crate::library::hovering_query(&r) {
+            ui.painter().rect_stroke(
+                r.rect,
+                2.0,
+                egui::Stroke::new(1.5, ui.visuals().selection.stroke.color),
+                egui::StrokeKind::Outside,
+            );
+        }
+        if let Some(q) = crate::library::dropped_query(&r) {
+            *text = library_rule(lib, &q);
+        }
+        r.on_hover_text("NFD, or a library query: {pack.query name=value} (📚, or drag one from the Library)");
+        ui.menu_button("📚", |ui| {
+            ui.set_max_height(320.0);
+            egui::ScrollArea::vertical().id_salt(("rule_pick", id)).show(ui, |ui| {
+                if lib.packs().is_empty() {
+                    ui.weak("No query packs loaded");
+                }
+                for p in lib.packs() {
+                    ui.label(RichText::new(&p.name).strong());
+                    for q in &p.queries {
+                        let full = format!("{}.{}", p.name, q.id);
+                        let r = ui.button(&full);
+                        let r = if q.note.is_empty() { r } else { r.on_hover_text(&q.note) };
+                        if r.clicked() {
+                            *text = library_rule(lib, &full);
+                            ui.close();
+                        }
+                    }
+                }
+            });
+        })
+        .response
+        .on_hover_text("Use a query from the library (kept by its name: a fix in its pack reaches here)");
+    });
+}
+
+/// `{pack.query}`, with its parameters to fill in (`{vision.drops cam=}`).
+fn library_rule(lib: &Library, id: &str) -> String {
+    let params = lib.get(id).map(|(_, q)| q.params.clone()).unwrap_or_default();
+    lifecycle::Rule::library(id, params.into_iter().map(|p| (p, String::new())).collect()).text()
+}
+
+/// The lifecycles found, per definition: a row each (click: go to its first
+/// line; ▾ filter: filter to it), and the findings.
+fn lifecycles_list(ui: &mut egui::Ui, signals: &Signals, file: &dyn LogSource, out: &mut Output) {
+    for def in signals.lifecycles() {
+        ui.separator();
+        if let Some(q) = def.unresolved().first() {
+            ui.colored_label(
+                ui.visuals().error_fg_color,
+                format!("Lifecycle @{}: library query {q} isn't loaded", def.name()),
+            );
+            continue;
+        }
+        let l = match def.done(file) {
+            None => {
+                ui.weak(format!("Lifecycles @{}: finding them…", def.name()));
+                continue;
+            }
+            // Why none were found (owner, 2026-11-07: it said "finding them…" for good).
+            Some(Err(e)) => {
+                ui.colored_label(ui.visuals().error_fg_color, format!("Lifecycles @{}: {e}", def.name()))
+                    .on_hover_text("Edit it (✎), or switch it off");
+                continue;
+            }
+            Some(Ok(l)) => l,
+        };
+        let header = format!("Lifecycles @{}: {}", def.name(), l.summary());
+        egui::CollapsingHeader::new(RichText::new(header).strong())
+            .id_salt(("lifecycles", def.name()))
+            .default_open(true)
+            .show(ui, |ui| {
+                egui::Grid::new(("lifecycles_grid", def.name())).num_columns(5).striped(true).show(ui, |ui| {
+                    for h in ["#", "line", "duration", "outcome", ""] {
+                        ui.weak(h);
+                    }
+                    ui.end_row();
+                    for (i, x) in l.lives.iter().enumerate() {
+                        ui.label(x.number.to_string());
+                        let start = x.first_time.map(|t| nerka_core::time::format_time(t, 3)).unwrap_or_default();
+                        if ui
+                            .link(RichText::new((x.first + 1).to_string()).monospace())
+                            .on_hover_text(format!(
+                                "Started by {} on line {}{}\nClick to go there",
+                                x.started_by.as_str(),
+                                x.first + 1,
+                                if start.is_empty() { String::new() } else { format!(" at {start}") }
+                            ))
+                            .clicked()
+                        {
+                            out.goto = Some(x.first);
+                        }
+                        ui.label(x.duration().map(|d| format!("{d:.1} s")).unwrap_or_default());
+                        let color =
+                            if x.outcome.is_bad() { ui.visuals().error_fg_color } else { ui.visuals().text_color() };
+                        let r = ui.colored_label(color, x.outcome.as_str());
+                        if let Some(m) = x.marker {
+                            r.on_hover_text(format!("Its {} marker is on line {}", x.outcome.as_str(), m + 1));
+                        }
+                        ui.horizontal(|ui| {
+                            if ui
+                                .small_button("▾ filter")
+                                .on_hover_text("Filter to its lines in this lifecycle")
+                                .clicked()
+                            {
+                                let mut nfd = format!("@{} == {}", def.name(), x.number);
+                                if let Some(lines) = def.lines().and_then(|r| r.query()) {
+                                    nfd += &format!(" AND ({})", lines.source());
+                                }
+                                out.filter = Some(nfd);
+                            }
+                            for f in l.findings_of(i) {
+                                let times = if f.count > 1 { format!(" ×{}", f.count) } else { String::new() };
+                                let r = ui.link(
+                                    RichText::new(format!("⚠ {}{times}", f.kind.as_str()))
+                                        .color(ui.visuals().warn_fg_color),
+                                );
+                                if r.on_hover_text(format!("Line {}: {}\nClick to go there", f.row + 1, f.detail))
+                                    .clicked()
+                                {
+                                    out.goto = Some(f.row);
+                                }
+                            }
+                        });
+                        ui.end_row();
+                    }
+                });
+            });
+    }
 }
 
 /// What follows a value in its cell (`  • event`, `  ↑ 12345`), in characters.
@@ -715,6 +1218,10 @@ fn arg_row(
 /// The kind: a choice for a query signal (inferred from its values until
 /// chosen), else a label.
 fn kind_cell(ui: &mut egui::Ui, d: &SignalDef, out: &mut Output) {
+    if d.as_lifecycle().is_some() {
+        ui.weak("lifecycle");
+        return;
+    }
     if d.queries().is_empty() {
         ui.weak(d.kind().as_str());
         return;
@@ -732,7 +1239,7 @@ fn kind_cell(ui: &mut egui::Ui, d: &SignalDef, out: &mut Output) {
 
 /// The scope: all lines, or only the lines the filter keeps.
 fn scope_cell(ui: &mut egui::Ui, d: &SignalDef, out: &mut Output) {
-    if d.is_from_source() {
+    if d.is_builtin() {
         ui.label("");
         return;
     }
@@ -750,6 +1257,52 @@ fn scope_cell(ui: &mut egui::Ui, d: &SignalDef, out: &mut Output) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The form makes what it is filled with, lifecycles and bound
+    /// signals too, and says what is wrong.
+    #[test]
+    fn the_form_round_trips_lifecycles_and_bound_signals() {
+        for spec in [
+            "lifecycle ecu1: lines ecu == ECU1; reset uptime; planned {sys.shutdown}",
+            "lifecycle run: start raw ~ /boot/; gap 30s; crash raw ~ /panic/; late 20s",
+            "lifecycle up: reset @up tolerance 500ms",
+            r"ota(s):enum:per(ecu1):default(idle)=/OTA state=(?<s>\w+)/",
+            r"n:num:default(0)=/n=(?<n>\d+)/",
+        ] {
+            let d = SignalDef::parse_spec(spec).unwrap();
+            assert_eq!(Draft::of(&d).build().unwrap().spec(), d.spec(), "{spec}");
+        }
+        // Each field's error names the field.
+        let life = |f: LifeForm| Draft { life: true, name: "ecu1".into(), life_form: f, ..Draft::default() }.build();
+        let e = life(LifeForm { lines: "ecu ==".into(), ..LifeForm::default() }).unwrap_err();
+        assert!(e.starts_with("Its lines: "), "{e}");
+        let e = life(LifeForm { on_gap: true, gap: "soon".into(), ..LifeForm::default() }).unwrap_err();
+        assert_eq!(e, "Its lines stop: 'soon' isn't a duration (30s, 500ms, 2m)");
+        let e = life(LifeForm { on_reset: false, ..LifeForm::default() }).unwrap_err();
+        assert_eq!(e, "a lifecycle needs a start, reset or gap clause");
+        let e = life(LifeForm { reset: "tmsp".into(), ..LifeForm::default() }).unwrap_err();
+        assert!(e.contains("isn't uptime or a signal"), "{e}");
+        // A library query from the picker comes with its parameters to fill.
+        let dir = std::env::temp_dir().join(format!("nerka-gui-rule-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let pack = dir.join("v.nerka-pack");
+        std::fs::write(
+            &pack,
+            "pack v
+
+query drops(cam)
+  raw ~ /$cam drop/
+",
+        )
+        .unwrap();
+        let mut lib = Library::new();
+        lib.load(&pack).unwrap();
+        assert_eq!(library_rule(&lib, "v.drops"), "{v.drops cam=}");
+        std::fs::remove_dir_all(&dir).ok();
+        let draft =
+            Draft { name: "n".into(), query: r"/n=(?<n>\d+)/".into(), default: "many".into(), ..Draft::default() };
+        assert_eq!(draft.build().unwrap_err(), "default 'many' isn't a number");
+    }
 
     fn fibex() -> nerka_core::Fibex {
         // A folder per call: tests run in parallel, and each removes its own.

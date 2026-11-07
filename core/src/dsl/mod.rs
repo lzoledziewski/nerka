@@ -79,9 +79,7 @@ mod auto;
 mod parser;
 
 use crate::event::{Event, FieldDef, FieldId, FieldKind, FieldValue, Level};
-use crate::signal::{
-    SignalDef, SignalKind, SignalScope, SignalSeries, SignalView, Signals, ValueRef, source_key, view_at,
-};
+use crate::signal::{SignalDef, SignalKind, SignalScope, SignalSeries, SignalView, Signals, ValueRef};
 use crate::time::{TIME_OF_DAY_END, parse_time};
 use crate::{Bookmarks, LineNo, LogSource, Progress};
 use regex::bytes::Regex;
@@ -457,6 +455,16 @@ impl SignalCond {
             };
             return Err(DslError { msg: format!("unknown signal '@{}' ({known})", self.name), pos: self.pos });
         };
+        if !def.is_linked() {
+            return Err(DslError {
+                msg: format!(
+                    "'@{}' resets per lifecycle '{}', which isn't defined",
+                    self.name,
+                    def.per().unwrap_or_default()
+                ),
+                pos: self.pos,
+            });
+        }
         if def.scope() == SignalScope::Filtered {
             return Err(DslError {
                 msg: format!(
@@ -516,26 +524,22 @@ impl SignalCond {
         let Some(def) = &self.def else { return false };
         let line = ev.line();
         match ev.source() {
-            // The source's own time: every line is an event.
+            // The source's own time or uptime: every line is an event.
             Some(src) if def.is_from_source() => {
-                let t = src.time(line);
+                let t = def.source_value(src, line);
                 let v = match self.view {
-                    SignalView::Changed if line > 0 && src.time(line - 1) == t => None,
+                    SignalView::Changed if line > 0 && def.source_value(src, line - 1) == t => None,
                     _ => t,
                 };
                 self.test(v.map(ValueRef::Num))
             }
             Some(src) => {
-                let key = source_key(src);
-                if let Some((events, row)) = self.series.as_ref().and_then(|s| s.locate(key, line)) {
-                    return self.test(view_at(events, row, self.view));
+                if let Some(v) = self.series.as_ref().and_then(|s| s.view(src, line, self.view)) {
+                    return self.test(v);
                 }
                 // Not prepared for this source: the definition's cache.
                 match def.series(src, &Progress::new()) {
-                    Ok(series) => match series.locate(key, line) {
-                        Some((events, row)) => self.test(view_at(events, row, self.view)),
-                        None => self.test(None),
-                    },
+                    Ok(series) => self.test(series.view(src, line, self.view).flatten()),
                     Err(_) => false,
                 }
             }
@@ -760,7 +764,7 @@ impl Query {
                         _,
                         FieldTest::Float(CmpOp::Ne, _) | FieldTest::Str(CmpOp::Ne, _) | FieldTest::Time(CmpOp::Ne, ..),
                     ) => None,
-                    _ => s.def.as_ref().filter(|d| !d.is_from_source())?.query().prefilter(),
+                    _ => s.def.as_ref().filter(|d| !d.is_builtin())?.query().prefilter(),
                 },
                 _ => None,
             }

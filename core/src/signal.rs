@@ -30,20 +30,36 @@
 //! every line, or only the lines the tab's filter keeps (for the panel and
 //! the plot; a filter can't use such a signal, it would depend on itself).
 //!
+//! **Lifecycles** ([`crate::lifecycle`], `doc/lifecycles.md`): a lifecycle
+//! is a signal too (`@ecu1`: the number of the lifecycle a line is in, an
+//! event where one starts). A signal bound to one (`per(ecu1)`) only
+//! resets at each start (owner, 2026-11-07: its own query decides its
+//! lines): its state on a line is the last event since the line's
+//! lifecycle started (not the file's), else its `default`, else unset.
+//! A default isn't an event (`.event` and `.changed` don't see it); a UI
+//! shows it as assumed. Without `per`, a default applies from each file's
+//! start.
+//!
 //! Spec text (CLI `--signal`, the saved file; one line each):
 //!
 //! ```text
-//! spec  := NAME [ "(" GROUP ")" ] [ ":" KIND ] [ ":" SCOPE ] "=" QUERY
+//! spec  := [ "off " ] NAME [ "(" GROUP ")" ] ( ":" PART )* "=" QUERY
+//!        | [ "off " ] "lifecycle " LIFECYCLE-SPEC -- crate::lifecycle
+//!                                           -- off: kept, not computed
+//! PART  := KIND | SCOPE | "per(" LIFECYCLE ")" | "default(" VALUE ")"
 //! KIND  := num | enum | time           -- default num
 //! SCOPE := all | filtered              -- default all
 //! GROUP := regex group name            -- default NAME
+//! VALUE := a number (num) or text (enum); time signals take none
 //! ```
 //!
-//! e.g. `speed=/speed=(?<speed>\d+)/` or `gear(g):enum=apid == NAV AND payload ~ /gear (?<g>\w)/`.
+//! e.g. `speed=/speed=(?<speed>\d+)/`, `gear(g):enum=apid == NAV AND payload ~ /gear (?<g>\w)/`
+//! or `ota(s):enum:per(boot):default(idle)=/OTA state=(?<s>\w+)/`.
 
 use crate::dsl::{Cond, DslError, Expr, FieldTest, Query};
 use crate::engine::search::{Filter, Matcher, scan};
 use crate::event::{Event, FieldDef, FieldValue};
+use crate::lifecycle::{LifecycleDef, Lifecycles};
 use crate::time::{TIME_OF_DAY_END, format_time, parse_time};
 use crate::{LineNo, LogSource, Progress};
 use rayon::prelude::*;
@@ -180,6 +196,16 @@ impl Events {
         Events { rows, values }
     }
 
+    /// The last event on a row at or before `limit` (before it, if not
+    /// `inclusive`); `None` for `limit` means every row.
+    fn last_until(&self, limit: Option<LineNo>, inclusive: bool) -> Option<usize> {
+        let n = match limit {
+            Some(l) => self.rows.partition_point(|&r| if inclusive { r <= l } else { r < l }),
+            None => self.rows.len(),
+        };
+        n.checked_sub(1)
+    }
+
     pub fn len(&self) -> usize {
         self.rows.len()
     }
@@ -248,18 +274,86 @@ pub struct SignalSeries {
     key: (usize, LineNo),
     /// (first line in the source, key of the file's own source, events).
     parts: Vec<(LineNo, (usize, LineNo), Arc<Events>)>,
+    /// The lifecycles of a signal bound to one (or of a lifecycle).
+    life: Option<Arc<Lifecycles>>,
+    /// The state where no event set it (in its lifecycle, or its file).
+    default: Option<SignalValue>,
 }
 
 impl SignalSeries {
-    /// The events and the file-local row for `row` of the source `key`
-    /// (the whole source, or one of its files, as the engine scans them).
-    pub(crate) fn locate(&self, key: (usize, LineNo), row: LineNo) -> Option<(&Events, LineNo)> {
+    /// The part and its file-local row for `row` of the source `key` (the
+    /// whole source, or one of its files, as the engine scans them).
+    fn locate_part(&self, key: (usize, LineNo), row: LineNo) -> Option<(usize, LineNo)> {
         if key == self.key {
             let i = self.parts.partition_point(|p| p.0 <= row).checked_sub(1)?;
-            let (first, _, ev) = &self.parts[i];
-            return Some((ev, row - first));
+            return Some((i, row - self.parts[i].0));
         }
-        self.parts.iter().find(|p| p.1 == key).map(|(_, _, ev)| (&**ev, row))
+        self.parts.iter().position(|p| p.1 == key).map(|i| (i, row))
+    }
+
+    /// The lifecycles it is bound to.
+    pub fn lifecycles(&self) -> Option<&Arc<Lifecycles>> {
+        self.life.as_ref()
+    }
+
+    /// The value of `view` at `line` of `src` (the whole source or one of
+    /// its parts, as the engine scans them): the outer `None` if `src`
+    /// isn't one of them. Follows the lifecycle and the default.
+    pub fn view(&self, src: &dyn LogSource, line: LineNo, view: SignalView) -> Option<Option<ValueRef<'_>>> {
+        let (p, local) = self.locate_part(source_key(src), line)?;
+        let ev = &*self.parts[p].2;
+        let default = self.default.as_ref().map(SignalValue::as_ref);
+        let bound = self.bound(p, local);
+        Some(match (view, bound) {
+            (SignalView::State, None) => view_at(ev, local, view).or(default),
+            (SignalView::State, Some(first)) => self.state_since(p, local, first, true).map(|x| x.1).or(default),
+            (SignalView::Event, _) => view_at(ev, local, view),
+            (SignalView::Changed, None) => view_at(ev, local, view),
+            (SignalView::Changed, Some(first)) => {
+                let v = view_at(ev, local, SignalView::Event);
+                let before = self.state_since(p, local, first, false).map(|x| x.1).or(default);
+                v.filter(|v| before != Some(*v))
+            }
+        })
+    }
+
+    /// The state at `row` of the whole source `src` (that the series was
+    /// made for): the row of the event that set it (`None`: the default,
+    /// assumed) and its value.
+    pub fn state_at(&self, row: LineNo) -> Option<(Option<LineNo>, ValueRef<'_>)> {
+        let default = || self.default.as_ref().map(|d| (None, d.as_ref()));
+        let Some((p, local)) = self.locate_part(self.key, row) else { return default() };
+        match self.bound(p, local) {
+            Some(first) => self.state_since(p, local, first, true).map(|(r, v)| (Some(r), v)).or_else(default),
+            None => self.state(row).map(|(r, v)| (Some(r), v)).or_else(default),
+        }
+    }
+
+    /// The first row of the lifecycle of row `local` of part `p`, if the
+    /// signal is bound and a lifecycle has started there.
+    fn bound(&self, p: usize, local: LineNo) -> Option<LineNo> {
+        let (_, l) = self.life.as_ref()?.at(self.parts[p].0 + local)?;
+        Some(l.first)
+    }
+
+    /// The last event at or before (`inclusive`) or before `local` of part
+    /// `p`, within its lifecycle (from `first`): its row in the source and
+    /// value. Looks back through earlier files.
+    fn state_since(&self, p: usize, local: LineNo, first: LineNo, inclusive: bool) -> Option<(LineNo, ValueRef<'_>)> {
+        let mut q = p;
+        let mut limit = Some(local);
+        loop {
+            let (start, _, ev) = &self.parts[q];
+            if let Some(i) = ev.last_until(limit, inclusive) {
+                let (r, v) = ev.get(i);
+                return (start + r >= first).then_some((start + r, v));
+            }
+            if *start <= first || q == 0 {
+                return None;
+            }
+            q -= 1;
+            limit = None;
+        }
     }
 
     fn whole(&self, row: LineNo) -> Option<(&Events, LineNo, LineNo)> {
@@ -311,7 +405,7 @@ impl SignalSeries {
                 (*first, *key, Arc::new(ev.within(&local)))
             })
             .collect();
-        SignalSeries { key: self.key, parts }
+        SignalSeries { key: self.key, parts, life: self.life.clone(), default: self.default.clone() }
     }
 
     pub fn is_empty(&self) -> bool {
@@ -394,6 +488,17 @@ pub enum SignalError {
     Spec(String),
 }
 
+/// Where a signal's values come from, if not from a capture.
+#[derive(Debug, Clone)]
+enum Builtin {
+    /// A capture (or a message's argument).
+    No,
+    /// The built-in `@time`: the source's own time of each line.
+    Time,
+    /// A lifecycle: its number for the line's key.
+    Life(Arc<LifecycleDef>),
+}
+
 #[derive(Debug, Clone)]
 pub struct SignalDef {
     name: String,
@@ -401,9 +506,17 @@ pub struct SignalDef {
     group: String,
     query: Query,
     cache: Cache,
-    /// The built-in `@time`: the source's own time of each line.
-    from_source: bool,
+    builtin: Builtin,
     scope: SignalScope,
+    /// The lifecycle it is bound to (`per(NAME)`), and that lifecycle once
+    /// [`Signals`] links it.
+    per: Option<String>,
+    life: Option<Arc<LifecycleDef>>,
+    /// Its state where no event set it.
+    default: Option<SignalValue>,
+    /// Switched off: kept (saved) but not computed nor usable in queries
+    /// (owner, 2026-11-07); `off ` before its spec line.
+    off: bool,
     /// The selection queries it comes from (their names); empty for one
     /// the user defined.
     queries: Vec<String>,
@@ -443,8 +556,12 @@ impl SignalDef {
             group: group.to_owned(),
             query,
             cache: Cache::default(),
-            from_source: false,
+            builtin: Builtin::No,
             scope: SignalScope::All,
+            per: None,
+            life: None,
+            default: None,
+            off: false,
             queries: Vec::new(),
             argument: None,
         })
@@ -470,8 +587,12 @@ impl SignalDef {
             group: name.to_owned(),
             query: Query::compile(query).map_err(SignalError::Query)?,
             cache: Cache::default(),
-            from_source: false,
+            builtin: Builtin::No,
             scope: SignalScope::All,
+            per: None,
+            life: None,
+            default: None,
+            off: false,
             queries: vec![from.to_owned()],
             argument: Some(index),
         })
@@ -532,57 +653,179 @@ impl SignalDef {
             group: "time".into(),
             query: Query::compile("/(?<time>)/").expect("valid"),
             cache: Cache::default(),
-            from_source: true,
+            builtin: Builtin::Time,
             scope: SignalScope::All,
+            per: None,
+            life: None,
+            default: None,
+            off: false,
             queries: Vec::new(),
             argument: None,
         }
     }
 
-    /// Whether this is the built-in `@time` ([`Self::source_time`]).
+    /// A lifecycle as a signal (`@boot`): the lifecycle's number for the
+    /// line's key; an event where one starts.
+    pub fn lifecycle(def: LifecycleDef) -> SignalDef {
+        let name = def.name().to_owned();
+        let life = Arc::new(def);
+        SignalDef {
+            group: name.clone(),
+            name,
+            kind: SignalKind::Num,
+            per: Some(life.name().to_owned()),
+            life: Some(life.clone()),
+            builtin: Builtin::Life(life),
+            ..SignalDef::source_time()
+        }
+    }
+
+    /// Whether this is a built-in the source gives (`@time`, `@uptime`).
     pub fn is_from_source(&self) -> bool {
-        self.from_source
+        matches!(self.builtin, Builtin::Time)
+    }
+
+    /// Whether its values don't come from its query (a built-in or a
+    /// lifecycle).
+    pub fn is_builtin(&self) -> bool {
+        !matches!(self.builtin, Builtin::No)
+    }
+
+    /// The value the source itself gives `line`, for `@time` and `@uptime`.
+    pub fn source_value(&self, source: &dyn LogSource, line: LineNo) -> Option<f64> {
+        match self.builtin {
+            Builtin::Time => source.time(line),
+            _ => None,
+        }
+    }
+
+    /// The lifecycle, for one made by [`Self::lifecycle`].
+    pub fn as_lifecycle(&self) -> Option<&Arc<LifecycleDef>> {
+        match &self.builtin {
+            Builtin::Life(l) => Some(l),
+            _ => None,
+        }
+    }
+
+    /// The lifecycle it is bound to (`per(NAME)`), by name.
+    pub fn per(&self) -> Option<&str> {
+        self.per.as_deref()
+    }
+
+    /// Whether `per` names a lifecycle [`Signals`] found.
+    pub fn is_linked(&self) -> bool {
+        self.per.is_none() || self.life.is_some()
+    }
+
+    /// Its state where no event set it.
+    pub fn default_value(&self) -> Option<&SignalValue> {
+        self.default.as_ref()
+    }
+
+    /// The same signal bound to lifecycle `per` (`None`: to none).
+    pub fn with_per(mut self, per: Option<&str>) -> SignalDef {
+        self.per = per.map(|p| p.trim().to_ascii_lowercase()).filter(|p| !p.is_empty());
+        self.life = None;
+        self.cache = Cache::default();
+        self
+    }
+
+    /// The same signal with a default state (checked against its kind).
+    pub fn with_default(mut self, default: Option<&str>) -> Result<SignalDef, SignalError> {
+        self.default = match default.map(str::trim).filter(|d| !d.is_empty()) {
+            None => None,
+            Some(d) => Some(match self.kind {
+                SignalKind::Num => parse_num(d.as_bytes())
+                    .map(SignalValue::Num)
+                    .ok_or_else(|| SignalError::Spec(format!("default '{d}' isn't a number")))?,
+                SignalKind::Enum => SignalValue::Enum(d.as_bytes().to_vec()),
+                SignalKind::Time => {
+                    return Err(SignalError::Spec("a time signal takes no default".into()));
+                }
+            }),
+        };
+        Ok(self)
+    }
+
+    /// Whether it is on (computed, usable in queries).
+    pub fn is_on(&self) -> bool {
+        !self.off
+    }
+
+    /// The same definition switched on or off.
+    pub fn with_on(mut self, on: bool) -> SignalDef {
+        self.off = !on;
+        self
     }
 
     /// Parse one spec line (module docs).
     pub fn parse_spec(spec: &str) -> Result<SignalDef, SignalError> {
+        if let Some(rest) = spec.trim_start().strip_prefix("off ") {
+            return SignalDef::parse_spec(rest).map(|d| d.with_on(false));
+        }
+        if let Some(rest) = spec.trim_start().strip_prefix("lifecycle ") {
+            return LifecycleDef::parse_spec(rest)
+                .map(SignalDef::lifecycle)
+                .map_err(|e| SignalError::Spec(format!("lifecycle: {} (at column {})", e.msg, e.pos + 1)));
+        }
         let bad = || SignalError::Spec(format!("'{spec}' isn't NAME[(GROUP)][:KIND][:SCOPE]=QUERY"));
         let (head, query) = spec.split_once('=').ok_or_else(bad)?;
         let mut it = head.split(':');
         let head = it.next().unwrap_or_default();
-        let (mut kind, mut scope) = (SignalKind::Num, SignalScope::All);
+        let (mut kind, mut scope, mut per, mut default) = (SignalKind::Num, SignalScope::All, None, None);
         for w in it {
-            match w.trim().to_ascii_lowercase().as_str() {
+            let w = w.trim();
+            let lower = w.to_ascii_lowercase();
+            let arg = |key: &str| {
+                lower.starts_with(key).then(|| w[key.len()..].strip_suffix(')')).flatten().map(str::to_owned)
+            };
+            if let Some(p) = arg("per(") {
+                per = Some(p);
+                continue;
+            }
+            if let Some(d) = arg("default(") {
+                default = Some(d);
+                continue;
+            }
+            match lower.as_str() {
                 "all" => scope = SignalScope::All,
                 "filtered" => scope = SignalScope::Filtered,
-                k => {
-                    kind = SignalKind::parse(k).ok_or_else(|| {
-                        SignalError::Spec(format!(
-                            "unknown kind or scope '{}' (num, enum, time; all, filtered)",
-                            w.trim()
-                        ))
-                    })?
-                }
+                k => kind = SignalKind::parse(k).ok_or_else(|| {
+                    SignalError::Spec(format!(
+                        "unknown kind or scope '{w}' (num, enum, time; all, filtered; per(LIFECYCLE), default(VALUE))"
+                    ))
+                })?,
             }
         }
         let (name, group) = match head.split_once('(') {
             Some((n, g)) => (n, Some(g.trim().strip_suffix(')').ok_or_else(bad)?)),
             None => (head, None),
         };
-        Ok(SignalDef::new(name, kind, query, group)?.with_scope(scope))
+        if per.as_deref().is_some_and(|p| !is_name(p.trim())) {
+            return Err(SignalError::Spec(format!("per({}): not a lifecycle's name", per.unwrap_or_default())));
+        }
+        SignalDef::new(name, kind, query, group)?
+            .with_scope(scope)
+            .with_per(per.as_deref())
+            .with_default(default.as_deref())
     }
 
     /// The spec line [`Self::parse_spec`] reads back.
     pub fn spec(&self) -> String {
-        if self.from_source {
-            return "time:time (the file's own time)".into();
+        let off = if self.off { "off " } else { "" };
+        match &self.builtin {
+            Builtin::Time => return "time:time (the file's own time)".into(),
+            Builtin::Life(l) => return format!("{off}lifecycle {}", l.spec()),
+            Builtin::No => {}
         }
         if let Some(i) = self.argument {
             return format!("{}:{} = argument {i} of {}", self.name, self.kind.as_str(), self.query.source());
         }
         let group = if self.group == self.name { String::new() } else { format!("({})", self.group) };
         let scope = if self.scope == SignalScope::Filtered { ":filtered" } else { "" };
-        format!("{}{group}:{}{scope}={}", self.name, self.kind.as_str(), self.query.source())
+        let per = self.per.as_ref().map(|p| format!(":per({p})")).unwrap_or_default();
+        let default = self.default.as_ref().map(|d| format!(":default({d})")).unwrap_or_default();
+        format!("{off}{}{group}:{}{scope}{per}{default}={}", self.name, self.kind.as_str(), self.query.source())
     }
 
     pub fn name(&self) -> &str {
@@ -608,8 +851,11 @@ impl SignalDef {
 
     /// The value row `ev` carries, if any.
     pub fn value(&self, ev: &mut Event<'_>) -> Option<SignalValue> {
-        if self.from_source {
-            return ev.source()?.time(ev.line()).map(SignalValue::Num);
+        match self.builtin {
+            Builtin::Time => return ev.source()?.time(ev.line()).map(SignalValue::Num),
+            // Known from the whole source only.
+            Builtin::Life(_) => return None,
+            Builtin::No => {}
         }
         if let Some(index) = self.argument {
             if !self.query.matches_event(ev) {
@@ -652,9 +898,30 @@ impl SignalDef {
     /// then from the cache this definition (and every copy of it) keeps.
     pub fn series(&self, source: &dyn LogSource, progress: &Progress) -> crate::Result<SignalSeries> {
         let mut parts = Vec::new();
-        if self.from_source {
+        let life = match &self.life {
+            Some(l) => Some(l.lifecycles(source, progress)?),
+            None => None,
+        };
+        let default = self.default.clone();
+        match &self.builtin {
             // Every line is an event: the source answers directly.
-            return Ok(SignalSeries { key: source_key(source), parts });
+            Builtin::Time => {
+                return Ok(SignalSeries { key: source_key(source), parts, life: None, default: None });
+            }
+            // Events where lifecycles start, per file.
+            Builtin::Life(_) => {
+                let lifes = life.clone().expect("a lifecycle is bound to itself");
+                for (first, n, key) in leaves(source) {
+                    let lives: Vec<_> =
+                        lifes.lives.iter().filter(|l| l.first >= first && l.first < first + n).collect();
+                    let rows = lives.iter().map(|l| l.first - first).collect();
+                    let nums = lives.iter().map(|l| f64::from(l.number)).collect();
+                    let ev = Events::numbers(rows, nums, SignalKind::Num);
+                    parts.push((first, key, Arc::new(ev)));
+                }
+                return Ok(SignalSeries { key: source_key(source), parts, life, default: None });
+            }
+            Builtin::No => {}
         }
         match source.parts() {
             Some(ps) => {
@@ -665,26 +932,29 @@ impl SignalDef {
             }
             None => parts.push((0, source_key(source), self.events(source, progress)?)),
         }
-        Ok(SignalSeries { key: source_key(source), parts })
+        Ok(SignalSeries { key: source_key(source), parts, life, default })
     }
 
     /// The series if every file's events are cached already (a UI can
     /// show values without waiting).
     pub fn cached_series(&self, source: &dyn LogSource) -> Option<SignalSeries> {
-        let leaves: Vec<(LineNo, (usize, LineNo))> = match source.parts() {
-            Some(ps) => ps.iter().map(|p| (p.first, source_key(p.source.as_ref()))).collect(),
-            None => vec![(0, source_key(source))],
+        let life = match &self.life {
+            Some(l) => Some(l.cached(source)?),
+            None => None,
         };
-        let parts = leaves
+        if matches!(self.builtin, Builtin::Life(_)) {
+            return self.series(source, &Progress::new()).ok();
+        }
+        let parts = leaves(source)
             .into_iter()
-            .map(|(first, key)| self.cached(key).map(|ev| (first, key, ev)))
+            .map(|(first, _, key)| self.cached(key).map(|ev| (first, key, ev)))
             .collect::<Option<Vec<_>>>()?;
-        Some(SignalSeries { key: source_key(source), parts })
+        Some(SignalSeries { key: source_key(source), parts, life, default: self.default.clone() })
     }
 
     /// Progress units [`Self::series`] still has to do on `source`.
     pub(crate) fn series_work(&self, source: &dyn LogSource) -> u64 {
-        if self.from_source {
+        if !matches!(self.builtin, Builtin::No) {
             return 0;
         }
         match source.parts() {
@@ -739,7 +1009,7 @@ impl SignalDef {
         // per line) must not go through a list of enums first. `filter_map`,
         // not rayon's `flatten`: that makes a parallel iterator per item
         // (several times slower here).
-        let ev = Arc::new(match self.kind {
+        let ev = match self.kind {
             SignalKind::Enum => Events::build(values.filter_map(|v| v).collect(), self.kind),
             _ => {
                 let (rows, nums): (Vec<LineNo>, Vec<f64>) = values
@@ -748,7 +1018,8 @@ impl SignalDef {
                     .unzip();
                 Events::numbers(rows, nums, self.kind)
             }
-        });
+        };
+        let ev = Arc::new(ev);
         let mut cache = self.cache.lock().unwrap_or_else(|e| e.into_inner());
         if !cache.iter().any(|(k, _)| *k == key) {
             if cache.len() >= CACHED_FILES {
@@ -775,20 +1046,92 @@ impl Signals {
             Some(d) => *d = Arc::new(def),
             None => self.0.push(Arc::new(def)),
         }
+        self.link();
     }
 
-    /// These signals plus the built-in `@time` when `source` knows its
-    /// lines' times (unless a signal is named `time` already).
+    /// Give lifecycles the signals they use and bound signals their
+    /// lifecycle (by name). Only what changed is replaced, so caches stay.
+    fn link(&mut self) {
+        let snapshot = self.clone();
+        for d in &mut self.0 {
+            if let Builtin::Life(l) = &d.builtin {
+                let linked = l.linked(&snapshot);
+                if !linked.same_links(l) {
+                    let l = Arc::new(linked);
+                    let mut new = (**d).clone();
+                    new.builtin = Builtin::Life(l.clone());
+                    new.life = Some(l);
+                    *d = Arc::new(new);
+                }
+            }
+        }
+        let lifes: Vec<Arc<LifecycleDef>> = self.0.iter().filter_map(|d| d.as_lifecycle().cloned()).collect();
+        for d in &mut self.0 {
+            if matches!(d.builtin, Builtin::Life(_)) {
+                continue;
+            }
+            let want = d.per.as_ref().and_then(|p| lifes.iter().find(|l| l.name() == p.as_str())).cloned();
+            let same = match (&want, &d.life) {
+                (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+                (None, None) => true,
+                _ => false,
+            };
+            if !same {
+                let mut new = (**d).clone();
+                new.life = want;
+                *d = Arc::new(new);
+            }
+        }
+    }
+
+    /// These signals plus the built-ins `@time` and `@uptime` when `source`
+    /// knows its lines' times and uptimes (unless a signal has the name).
     pub fn for_source(&self, source: &dyn LogSource) -> Signals {
         let mut s = self.clone();
-        if source.line_count() > 0 && source.time(0).is_some() && s.get("time").is_none() {
+        let some = source.line_count() > 0;
+        if some && source.time(0).is_some() && s.get("time").is_none() {
             s.0.insert(0, Arc::new(SignalDef::source_time()));
         }
+        s.link();
         s
     }
 
     pub fn remove(&mut self, name: &str) {
         self.0.retain(|d| !d.name.eq_ignore_ascii_case(name));
+        self.link();
+    }
+
+    /// Expand the library queries the lifecycles use with `lib`; the
+    /// errors (a query not loaded), one per lifecycle.
+    pub fn resolve_lifecycles(&mut self, lib: &crate::pack::Library) -> Vec<String> {
+        let mut errors = Vec::new();
+        for d in &mut self.0 {
+            let Builtin::Life(l) = &d.builtin else { continue };
+            match l.resolved(lib) {
+                Ok(r) => {
+                    let r = Arc::new(r);
+                    let mut new = (**d).clone();
+                    new.builtin = Builtin::Life(r.clone());
+                    new.life = Some(r);
+                    *d = Arc::new(new);
+                }
+                Err(e) => errors.push(format!("lifecycle '{}': {e}", l.name())),
+            }
+        }
+        self.link();
+        errors
+    }
+
+    /// Only those switched on, linked among themselves.
+    pub fn on(&self) -> Signals {
+        let mut s = Signals(self.0.iter().filter(|d| d.is_on()).cloned().collect());
+        s.link();
+        s
+    }
+
+    /// The lifecycles defined.
+    pub fn lifecycles(&self) -> impl Iterator<Item = &Arc<LifecycleDef>> {
+        self.0.iter().filter_map(|d| d.as_lifecycle())
     }
 
     pub fn iter(&self) -> impl Iterator<Item = &Arc<SignalDef>> {
@@ -808,8 +1151,11 @@ impl Signals {
     /// The signals the user defined (not from queries or the source) as
     /// the saved file: a spec line each.
     pub fn to_text(&self) -> String {
-        let mut out = String::from("# nerka signals: NAME[(GROUP)][:KIND][:SCOPE]=QUERY, one per line\n");
-        for d in self.iter().filter(|d| !d.from_source && d.queries.is_empty()) {
+        let mut out = String::from(
+            "# nerka signals: [off] NAME[(GROUP)][:KIND][:SCOPE][:per(LIFECYCLE)][:default(VALUE)]=QUERY \
+             or [off] lifecycle NAME: CLAUSES, one per line\n",
+        );
+        for d in self.iter().filter(|d| !d.is_from_source() && d.queries.is_empty()) {
             out += &d.spec();
             out.push('\n');
         }
@@ -965,9 +1311,17 @@ impl Clock {
     }
 }
 
-fn is_name(s: &str) -> bool {
+pub(crate) fn is_name(s: &str) -> bool {
     let mut c = s.chars();
     c.next().is_some_and(|f| f.is_ascii_alphabetic() || f == '_') && c.all(|x| x.is_ascii_alphanumeric() || x == '_')
+}
+
+/// `(first line, line count, cache key)` of each file of `source`.
+fn leaves(source: &dyn LogSource) -> Vec<(LineNo, LineNo, (usize, LineNo))> {
+    match source.parts() {
+        Some(ps) => ps.iter().map(|p| (p.first, p.source.line_count(), source_key(p.source.as_ref()))).collect(),
+        None => vec![(0, source.line_count(), source_key(source))],
+    }
 }
 
 /// Decimal, float or `0x` hex, surrounding blanks ignored; finite only.

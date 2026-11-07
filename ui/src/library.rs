@@ -624,6 +624,19 @@ impl Picks {
 }
 
 /// Dragged between the panes.
+/// A library query being dragged over `r` (to drop it there).
+pub fn hovering_query(r: &egui::Response) -> bool {
+    matches!(r.dnd_hover_payload::<Drag>().as_deref(), Some(Drag::Library(_)))
+}
+
+/// A library query dropped on `r` (dragged from the Library), by name.
+pub fn dropped_query(r: &egui::Response) -> Option<String> {
+    match r.dnd_release_payload::<Drag>()?.as_ref() {
+        Drag::Library(id) => Some(id.clone()),
+        _ => None,
+    }
+}
+
 #[derive(Debug, Clone)]
 enum Drag {
     Library(String),

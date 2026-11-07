@@ -1307,8 +1307,14 @@ impl Tab {
     /// chosen here).
     fn refresh_signals(&mut self, ctx: &egui::Context, lib: &Library, saved: &Signals, saved_gen: u64) {
         let Some(file) = self.file.clone() else { return };
+        // The library queries lifecycles use: an edit there finds them again.
+        let lifecycle_queries: Vec<Option<&str>> = saved
+            .lifecycles()
+            .flat_map(|l| l.unresolved())
+            .map(|id| lib.get(id).map(|(_, q)| q.text.as_str()))
+            .collect();
         let fingerprint = format!(
-            "{:?}{:?}",
+            "{:?}{:?}{lifecycle_queries:?}",
             self.picks
                 .nodes
                 .iter()
@@ -1322,7 +1328,8 @@ impl Tab {
         }
         self.signals_key = Some(key);
         let mut s = Signals::default().for_source(&*file);
-        for d in saved.iter() {
+        // The saved ones switched on (owner, 2026-11-07: off keeps them).
+        for d in saved.iter().filter(|d| d.is_on()) {
             s.set((**d).clone());
         }
         // FIBEX arguments picked in the Signals panel.
@@ -1356,6 +1363,10 @@ impl Tab {
                     s.set(d.with_scope(scope));
                 }
             }
+        }
+        // Library queries in lifecycles, expanded; what isn't loaded says so.
+        if let Some(e) = s.resolve_lifecycles(lib).into_iter().next() {
+            self.status = e;
         }
         self.signals = s;
         self.signals_changed(ctx);
@@ -2313,6 +2324,7 @@ impl Tab {
                     // The filter queries' line colours, as in the main view.
                     lines: lines.as_ref(),
                     notes: self.notes,
+                    lifecycles: None,
                 },
             );
             self.view_output(&out, true, |row| hits.lines[row as usize]);
@@ -2439,6 +2451,7 @@ impl Tab {
             None => row,
         };
         let rows = self.main_rows();
+        let boundaries = self.lifecycle_boundaries(file);
         let out = log_view(
             ui,
             "main",
@@ -2454,9 +2467,25 @@ impl Tab {
                 search: marks.as_ref(),
                 lines: lines.as_ref(),
                 notes: self.notes,
+                lifecycles: Some(&boundaries),
             },
         );
         self.view_output(&out, false, line_of_row);
+    }
+
+    /// Where the tab's lifecycles start (found already), for the view.
+    fn lifecycle_boundaries(&self, file: &dyn LogSource) -> Vec<view::Boundary> {
+        let mut out = Vec::new();
+        for def in self.signals.lifecycles() {
+            let Some(l) = def.cached(file) else { continue };
+            for (i, life) in l.lives.iter().enumerate() {
+                let bad = i > 0 && l.lives[i - 1].outcome.is_bad();
+                out.push(view::Boundary { line: life.first, label: format!("{} #{}", def.name(), life.number), bad });
+            }
+        }
+        out.sort_by_key(|b| b.line);
+        out.dedup_by_key(|b| b.line);
+        out
     }
 }
 
@@ -4024,6 +4053,7 @@ impl App {
                         kept: tab.session.result(),
                         fibex: fibex.as_deref(),
                         arg_picks: &mut tab.arg_picks,
+                        library: &self.library,
                     };
                     signals::signals_panel(ui, &mut tab.signals_ui, input)
                 })
@@ -4057,6 +4087,11 @@ impl App {
             }
             if let Some(line) = out.goto {
                 tab.goto_line(line);
+            }
+            if let Some(nfd) = out.filter
+                && tab.set_filter("query", &nfd)
+            {
+                tab.start_search(ui.ctx());
             }
         }
         let search_history = &self.search_history;
@@ -4433,6 +4468,7 @@ query timeouts  labels: vision
                         kept: None,
                         fibex: Some(&*fibex),
                         arg_picks: &mut tab.arg_picks,
+                        library: &Library::new(),
                     };
                     changed = signals::signals_panel(ui, &mut tab.signals_ui, input).args_changed;
                 });

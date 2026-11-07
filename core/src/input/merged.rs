@@ -152,6 +152,10 @@ impl LogSource for Merged {
         self.inner.argument(self.line(row)?, index)
     }
 
+    fn uptime(&self, row: LineNo) -> Option<f64> {
+        self.inner.uptime(self.line(row)?)
+    }
+
     /// Bookmarks are kept per file: see [`Self::reordered`].
     fn anchor(&self, row: LineNo) -> Option<Anchor> {
         self.inner.anchor(self.line(row)?)
