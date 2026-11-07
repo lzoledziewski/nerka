@@ -345,7 +345,12 @@ pub fn signals_panel(ui: &mut egui::Ui, st: &mut SignalsUi, input: Input<'_>) ->
                         ui.label("");
                     } else {
                         let mut on = plot.is_plotted(d.name());
-                        if ui.checkbox(&mut on, "").on_hover_text("Plot it (its state over time)").changed() {
+                        let tip = if d.as_lifecycle().is_some() {
+                            "Plot it: a line where each lifecycle starts (red after one that ended badly)"
+                        } else {
+                            "Plot it (its state over time)"
+                        };
+                        if ui.checkbox(&mut on, "").on_hover_text(tip).changed() {
                             plot.toggle(d.name());
                         }
                     }

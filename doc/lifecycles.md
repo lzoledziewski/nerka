@@ -15,7 +15,7 @@ Lifecycles are the groundwork for **checks** (known-issue signatures that run on
 - **No ambiguous `@uptime` (2026-11-07).** v1 had a built-in `@uptime` signal: in a view of several ECUs it mixes their clocks. Now `reset uptime` means the uptime **its lines** carry, so whose uptime it is follows from the lines. There is no `@uptime` signal.
 - **Binding a signal only resets it (2026-11-07, "A").** `per(ecu1)` resets the signal's state each time `ecu1` starts; the signal's own query decides its lines (no hidden filter; one ECU's state can reset on another's reboot, e.g. the gateway's). Picking a lifecycle in the form fills an empty query with the lifecycle's lines.
 - **Reuse library queries (2026-11-07).** Every query of a lifecycle can be a library query by name, `{pack.query param=value}`, so a fix in its pack reaches every lifecycle using it.
-- **Defaults are dashed (2026-11-06).** A default is assumed, not from the log: dashed in the plot, `idle (default)` in the panel. Boundaries show in the plot and the log view ("lifecycle boundaries are nice").
+- **Defaults are dashed (2026-11-06).** A default is assumed, not from the log: dashed in the plot, `idle (default)` in the panel. Boundaries show in the plot and the log view ("lifecycle boundaries are nice"). In the plot only for the lifecycles ticked in the Signals panel (owner, 2026-11-07: "lifecycles enable-able in plots"; before, every lifecycle's starts were drawn): a ticked lifecycle is its starts, no lane; ticked alone, the plot spans its lifecycles. The log view still shows every lifecycle's boundaries.
 
 ## Definition
 
