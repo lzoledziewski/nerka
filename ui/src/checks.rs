@@ -5,7 +5,7 @@
 //! (owner, 2026-11-07: built in small steps with feedback).
 
 use eframe::egui::{self, RichText};
-use nerka_core::check::{CheckDef, CheckResult, Checks, Kind, Verdict};
+use nerka_core::check::{CheckDef, CheckResult, Checks, Kind, Op, Part, Test, Verdict, signal_name};
 use nerka_core::{Library, LineNo, LogSource, Signals};
 
 /// A check's result on the tab's file, or why it couldn't run.
@@ -27,20 +27,44 @@ pub struct ChecksUi {
 struct Form {
     name: String,
     lines: String,
-    test: TestChoice,
+    /// Its tests (owner, 2026-11-07: several in one check); one at first.
+    tests: Vec<TestForm>,
+    /// Several tests: an issue when any finds one (else all).
+    any: bool,
     kind: Kind,
-    /// A condition on a count or a value: an operator (empty: none) and a number.
-    op: String,
-    number: String,
-    /// `rate`'s count, and the duration of `rate`, `gap`, `then`, `missing`.
-    max: String,
-    window: String,
-    other: String,
-    pick: String,
     per: String,
     labels: String,
     error: Option<String>,
     preview: Option<Result<String, String>>,
+}
+
+/// One test's fields.
+#[derive(Clone)]
+struct TestForm {
+    test: TestChoice,
+    /// A condition on a count or a value: an operator (empty: none) and a number.
+    op: String,
+    number: String,
+    /// `rate`'s count, and the duration of `rate` and `gap`.
+    max: String,
+    window: String,
+    pick: String,
+    /// A sequence's steps.
+    steps: Vec<StepForm>,
+}
+
+/// One step of a sequence: followed by (`then`) or not (`missing`).
+#[derive(Clone)]
+struct StepForm {
+    missing: bool,
+    query: String,
+    within: String,
+}
+
+impl Default for StepForm {
+    fn default() -> Self {
+        StepForm { missing: false, query: String::new(), within: "10s".into() }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -49,19 +73,17 @@ enum TestChoice {
     Count,
     Rate,
     Gap,
-    Then,
-    Missing,
+    Steps,
     Value,
 }
 
 impl TestChoice {
-    const ALL: [TestChoice; 7] = [
+    const ALL: [TestChoice; 6] = [
         TestChoice::Exists,
         TestChoice::Count,
         TestChoice::Rate,
         TestChoice::Gap,
-        TestChoice::Then,
-        TestChoice::Missing,
+        TestChoice::Steps,
         TestChoice::Value,
     ];
 
@@ -71,8 +93,7 @@ impl TestChoice {
             TestChoice::Count => "how many",
             TestChoice::Rate => "too many at once",
             TestChoice::Gap => "stops for too long",
-            TestChoice::Then => "followed by",
-            TestChoice::Missing => "not followed by",
+            TestChoice::Steps => "followed (or not) by",
             TestChoice::Value => "a value",
         }
     }
@@ -84,8 +105,10 @@ impl TestChoice {
             TestChoice::Count => ("the count compares so (none: any line)", "how many lines"),
             TestChoice::Rate => ("each burst of more than N within the window", "the most lines in one window"),
             TestChoice::Gap => ("each stop longer than this", "the longest stop"),
-            TestChoice::Then => ("each line followed by the other within the time", "how often"),
-            TestChoice::Missing => ("each line not followed by the other within the time", "how often"),
+            TestChoice::Steps => (
+                "each of its lines whose 'followed by' steps happen, and a 'not followed by' step doesn't",
+                "how often",
+            ),
             TestChoice::Value => {
                 ("the value compares so", "the value its query's first named group (?<name>…) captures")
             }
@@ -98,19 +121,92 @@ impl TestChoice {
     }
 }
 
+impl Default for TestForm {
+    fn default() -> Self {
+        TestForm {
+            test: TestChoice::Exists,
+            op: String::new(),
+            number: "1".into(),
+            max: "10".into(),
+            window: "10s".into(),
+            pick: "max".into(),
+            steps: vec![StepForm::default()],
+        }
+    }
+}
+
+impl TestForm {
+    /// Its clauses.
+    fn spec(&self) -> String {
+        let cond = if self.test.has_condition() && !self.op.is_empty() {
+            format!(" {} {}", self.op, self.number.trim())
+        } else {
+            String::new()
+        };
+        match self.test {
+            TestChoice::Exists => "exists".to_owned(),
+            TestChoice::Count => format!("count{cond}"),
+            TestChoice::Rate => format!("rate {} per {}", self.max.trim(), self.window.trim()),
+            TestChoice::Gap => format!("gap {}", self.window.trim()),
+            TestChoice::Steps => self
+                .steps
+                .iter()
+                .map(|s| {
+                    let word = if s.missing { "missing" } else { "then" };
+                    format!("{word} {} within {}", s.query.trim(), s.within.trim())
+                })
+                .collect::<Vec<_>>()
+                .join("; "),
+            TestChoice::Value => format!("value {}{cond}", self.pick),
+        }
+    }
+
+    fn of(p: &Part) -> TestForm {
+        let d = nerka_core::lifecycle::format_duration;
+        let mut f = TestForm::default();
+        if let Some((op, n)) = p.cond {
+            (f.op, f.number) = (op_text(op).into(), n.to_string());
+        }
+        match &p.test {
+            Test::Exists => f.test = TestChoice::Exists,
+            Test::Count => f.test = TestChoice::Count,
+            Test::Rate { max, window } => (f.test, f.max, f.window) = (TestChoice::Rate, max.to_string(), d(*window)),
+            Test::Gap(g) => (f.test, f.window) = (TestChoice::Gap, d(*g)),
+            Test::Steps(steps) => {
+                f.test = TestChoice::Steps;
+                f.steps = steps
+                    .iter()
+                    .map(|s| StepForm { missing: s.missing, query: s.rule.text(), within: d(s.within) })
+                    .collect();
+            }
+            Test::Value(pick) => {
+                f.test = TestChoice::Value;
+                f.pick = format!("{pick:?}").to_ascii_lowercase();
+            }
+        }
+        f
+    }
+}
+
+fn op_text(op: Op) -> &'static str {
+    match op {
+        Op::Gt => ">",
+        Op::Ge => ">=",
+        Op::Lt => "<",
+        Op::Le => "<=",
+        Op::Eq => "==",
+        Op::Ne => "!=",
+    }
+}
+
 impl Default for Form {
     fn default() -> Self {
         Form {
             name: String::new(),
             lines: String::new(),
-            test: TestChoice::Exists,
+            tests: vec![TestForm::default()],
+            any: false,
             kind: Kind::Issue,
-            op: String::new(),
-            number: "1".into(),
-            max: "10".into(),
-            window: "10s".into(),
-            other: String::new(),
-            pick: "max".into(),
             per: String::new(),
             labels: String::new(),
             error: None,
@@ -122,21 +218,12 @@ impl Default for Form {
 impl Form {
     /// The spec line the form describes.
     fn spec(&self) -> String {
-        let cond = if self.test.has_condition() && !self.op.is_empty() {
-            format!(" {} {}", self.op, self.number.trim())
-        } else {
-            String::new()
-        };
-        let test = match self.test {
-            TestChoice::Exists => "exists".to_owned(),
-            TestChoice::Count => format!("count{cond}"),
-            TestChoice::Rate => format!("rate {} per {}", self.max.trim(), self.window.trim()),
-            TestChoice::Gap => format!("gap {}", self.window.trim()),
-            TestChoice::Then => format!("then {} within {}", self.other.trim(), self.window.trim()),
-            TestChoice::Missing => format!("missing {} within {}", self.other.trim(), self.window.trim()),
-            TestChoice::Value => format!("value {}{cond}", self.pick),
-        };
-        let mut spec = format!("{}: lines {}; {test}; {}", self.name.trim(), self.lines.trim(), self.kind.as_str());
+        let tests: Vec<String> = self.tests.iter().map(TestForm::spec).collect();
+        let mut spec = format!("{}: lines {}; {}", self.name.trim(), self.lines.trim(), tests.join("; "));
+        if self.tests.len() > 1 && self.any {
+            spec += "; any";
+        }
+        spec += &format!("; {}", self.kind.as_str());
         if !self.per.is_empty() {
             spec += &format!("; per {}", self.per);
         }
@@ -148,49 +235,16 @@ impl Form {
 
     /// The form filled with a saved check.
     fn of(c: &CheckDef) -> Form {
-        let mut f = Form { kind: c.kind(), labels: c.labels().join(", "), ..Form::default() };
-        let spec = c.spec();
-        let spec = spec.strip_prefix("off ").unwrap_or(&spec);
-        let Some((name, rest)) = spec.split_once(':') else { return f };
-        f.name = name.trim().into();
-        let cond = |f: &mut Form, r: &str| {
-            if let Some((op, n)) = r.split_once(' ') {
-                (f.op, f.number) = (op.into(), n.into());
-            }
-        };
-        for clause in rest.split(';').map(str::trim) {
-            let (w, r) = clause.split_once(' ').unwrap_or((clause, ""));
-            let within = |r: &str| match r.rsplit_once(" within ") {
-                Some((q, d)) => (q.to_owned(), d.to_owned()),
-                None => (r.to_owned(), "10s".into()),
-            };
-            match w {
-                "lines" => f.lines = r.into(),
-                "per" => f.per = r.into(),
-                "exists" => f.test = TestChoice::Exists,
-                "count" => {
-                    f.test = TestChoice::Count;
-                    cond(&mut f, r);
-                }
-                "rate" => {
-                    f.test = TestChoice::Rate;
-                    if let Some((n, d)) = r.split_once(" per ") {
-                        (f.max, f.window) = (n.into(), d.into());
-                    }
-                }
-                "gap" => (f.test, f.window) = (TestChoice::Gap, r.into()),
-                "then" => (f.test, (f.other, f.window)) = (TestChoice::Then, within(r)),
-                "missing" => (f.test, (f.other, f.window)) = (TestChoice::Missing, within(r)),
-                "value" => {
-                    f.test = TestChoice::Value;
-                    let (pick, more) = r.split_once(' ').unwrap_or((r, ""));
-                    f.pick = pick.into();
-                    cond(&mut f, more);
-                }
-                _ => {}
-            }
+        Form {
+            name: c.name().to_owned(),
+            lines: c.lines_text(),
+            tests: c.parts().iter().map(TestForm::of).collect(),
+            any: c.is_any(),
+            kind: c.kind(),
+            per: c.per().unwrap_or_default().to_owned(),
+            labels: c.labels().join(", "),
+            ..Form::default()
         }
-        f
     }
 }
 
@@ -204,6 +258,8 @@ pub struct Input<'a> {
     pub file: &'a dyn LogSource,
     pub signals: &'a Signals,
     pub library: &'a Library,
+    /// Plotting a check plots its signal.
+    pub plot: &'a mut crate::plot::PlotState,
 }
 
 #[derive(Default)]
@@ -223,7 +279,7 @@ enum Act {
 }
 
 pub fn checks_panel(ui: &mut egui::Ui, st: &mut ChecksUi, input: Input<'_>) -> Output {
-    let Input { saved, results, running, file, signals, library } = input;
+    let Input { saved, results, running, file, signals, library, plot } = input;
     let mut out = Output::default();
     ui.horizontal(|ui| {
         ui.heading("Checks");
@@ -310,7 +366,7 @@ pub fn checks_panel(ui: &mut egui::Ui, st: &mut ChecksUi, input: Input<'_>) -> O
                 });
             }
             for c in members {
-                ui.indent((label, c.name()), |ui| check_row(ui, st, c, results, running, &mut act));
+                ui.indent((label, c.name()), |ui| check_row(ui, st, c, results, running, plot, &mut act));
             }
         }
     });
@@ -381,6 +437,7 @@ fn check_row(
     c: &CheckDef,
     results: &[(String, Outcome)],
     running: bool,
+    plot: &mut crate::plot::PlotState,
     act: &mut Option<Act>,
 ) {
     ui.horizontal(|ui| {
@@ -392,6 +449,19 @@ fn check_row(
         let name = RichText::new(format!("{icon} {}", c.name())).strong();
         ui.label(if c.is_on() { name } else { name.weak() }).on_hover_text(c.spec());
         ui.weak(c.kind().as_str());
+        // Its signal: plotted only when asked (owner, 2026-11-07: a check
+        // on, not plotted; low-priority ones would clutter the plot).
+        let sig = signal_name(c.name());
+        let plotted = plot.is_plotted(&sig);
+        let tip = format!(
+            "Plot @{sig}: an event where it finds something, its value counting them{}. Other checks and \
+             filters use it too (@{sig}.event, @{sig} > 0).",
+            if c.per().is_some() { " per lifecycle" } else { "" }
+        );
+        if ui.add_enabled(c.is_on(), egui::Button::selectable(plotted, "📈")).on_hover_text(tip).clicked() {
+            plot.toggle(&sig);
+            plot.shown = true;
+        }
         if ui.small_button("✎").on_hover_text("Edit").clicked() {
             *act = Some(Act::Edit(c.name().to_owned()));
         }
@@ -452,84 +522,72 @@ fn form_ui(
         ui.label("Name");
         ui.add(egui::TextEdit::singleline(&mut f.name).hint_text("ota_stall").desired_width(f32::INFINITY));
         ui.end_row();
-        ui.label("Its lines").on_hover_text("The lines it looks at: NFD or a library query");
+        ui.label("Its lines").on_hover_text(
+            "The lines it looks at: NFD or a library query. Other checks' signals work too: @name.event for \
+             where another check found something",
+        );
         crate::signals::rule_field(ui, "check_lines", &mut f.lines, "payload ~ /net down/", lib);
         ui.end_row();
-        ui.label("Test");
-        let before = f.test;
-        egui::ComboBox::from_id_salt("check_test").selected_text(f.test.label()).show_ui(ui, |ui| {
-            for t in TestChoice::ALL {
-                let (issue, fact) = t.help();
-                ui.selectable_value(&mut f.test, t, t.label())
-                    .on_hover_text(format!("As an issue: {issue}\nAs a fact: {fact}"));
-            }
-        });
-        // A count or a value is a fact unless it has a condition.
-        if f.test != before {
-            f.kind = if f.test.has_condition() { Kind::Fact } else { Kind::Issue };
-        }
-        ui.end_row();
-        match f.test {
-            TestChoice::Exists | TestChoice::Count => {}
-            TestChoice::Rate => {
-                ui.label("More than");
+    });
+    // Its tests, each in a frame: the test, its fields, − to drop it.
+    let several = f.tests.len() > 1;
+    let mut drop_test = None;
+    for (i, t) in f.tests.iter_mut().enumerate() {
+        egui::Frame::group(ui.style()).show(ui, |ui| {
+            egui::Grid::new(("check_test_grid", i)).num_columns(2).spacing([8.0, 6.0]).show(ui, |ui| {
+                ui.label(if several { format!("Test {}", i + 1) } else { "Test".into() });
                 ui.horizontal(|ui| {
-                    ui.add(egui::TextEdit::singleline(&mut f.max).desired_width(50.0));
-                    ui.label("within");
-                    ui.add(egui::TextEdit::singleline(&mut f.window).desired_width(60.0));
+                    let before = t.test;
+                    egui::ComboBox::from_id_salt(("check_test", i)).selected_text(t.test.label()).show_ui(ui, |ui| {
+                        for c in TestChoice::ALL {
+                            let (issue, fact) = c.help();
+                            ui.selectable_value(&mut t.test, c, c.label())
+                                .on_hover_text(format!("As an issue: {issue}\nAs a fact: {fact}"));
+                        }
+                    });
+                    // A count or a value is a fact unless it has a condition.
+                    if t.test != before && !several {
+                        f.kind = if t.test.has_condition() { Kind::Fact } else { Kind::Issue };
+                    }
+                    if several && ui.small_button("−").on_hover_text("Remove this test").clicked() {
+                        drop_test = Some(i);
+                    }
                 });
                 ui.end_row();
-            }
-            TestChoice::Gap => {
-                ui.label("For longer than");
-                ui.add(egui::TextEdit::singleline(&mut f.window).desired_width(60.0));
-                ui.end_row();
-            }
-            TestChoice::Then | TestChoice::Missing => {
-                ui.label(if f.test == TestChoice::Then { "Followed by" } else { "Not followed by" });
-                crate::signals::rule_field(ui, "check_other", &mut f.other, "payload ~ /ota progress/", lib);
-                ui.end_row();
-                ui.label("Within");
-                ui.add(egui::TextEdit::singleline(&mut f.window).desired_width(60.0));
-                ui.end_row();
-            }
-            TestChoice::Value => {
-                ui.label("Value");
-                ui.horizontal(|ui| {
-                    for p in ["first", "last", "min", "max"] {
-                        ui.radio_value(&mut f.pick, p.to_owned(), p);
-                    }
-                })
-                .response
-                .on_hover_text("Of what its lines' query's first named group (?<name>…) captures");
-                ui.end_row();
-            }
+                test_fields(ui, i, t, f.kind, lib);
+            });
+        });
+    }
+    if let Some(i) = drop_test {
+        f.tests.remove(i);
+    }
+    ui.horizontal(|ui| {
+        if ui
+            .button("➕ Another test")
+            .on_hover_text("Several tests in one check: an issue when all of them (or any) find one")
+            .clicked()
+        {
+            f.tests.push(TestForm::default());
+            f.kind = Kind::Issue;
         }
+        if f.tests.len() > 1 {
+            ui.label("An issue when");
+            ui.radio_value(&mut f.any, false, "all find one");
+            ui.radio_value(&mut f.any, true, "any finds one");
+        }
+    });
+    egui::Grid::new("check_form_grid_2").num_columns(2).spacing([8.0, 6.0]).show(ui, |ui| {
         ui.label("It is");
         ui.horizontal(|ui| {
-            let (issue, fact) = f.test.help();
+            let (issue, fact) = f.tests[0].test.help();
             ui.radio_value(&mut f.kind, Kind::Issue, "an issue").on_hover_text(format!("Shows {issue}"));
-            ui.radio_value(&mut f.kind, Kind::Fact, "a fact").on_hover_text(format!("Shows {fact}"));
+            ui.add_enabled_ui(f.tests.len() == 1, |ui| {
+                ui.radio_value(&mut f.kind, Kind::Fact, "a fact")
+                    .on_hover_text(format!("Shows {fact}"))
+                    .on_disabled_hover_text("A fact has one test");
+            });
         });
         ui.end_row();
-        if f.test.has_condition() && f.kind == Kind::Issue {
-            ui.label("When");
-            ui.horizontal(|ui| {
-                let shown = if f.op.is_empty() { "(any)".to_owned() } else { f.op.clone() };
-                egui::ComboBox::from_id_salt("check_op").width(60.0).selected_text(shown).show_ui(ui, |ui| {
-                    if f.test == TestChoice::Count {
-                        ui.selectable_value(&mut f.op, String::new(), "(any)");
-                    }
-                    for op in [">", ">=", "<", "<=", "==", "!="] {
-                        ui.selectable_value(&mut f.op, op.to_owned(), op);
-                    }
-                });
-                if !f.op.is_empty() {
-                    ui.add(egui::TextEdit::singleline(&mut f.number).desired_width(60.0));
-                }
-            });
-            ui.end_row();
-        }
         ui.label("For");
         let lifecycles: Vec<String> = signals.lifecycles().map(|l| l.name().to_owned()).collect();
         let shown = if f.per.is_empty() { "the whole log".to_owned() } else { format!("each lifecycle of {}", f.per) };
@@ -545,8 +603,13 @@ fn form_ui(
         ui.add(egui::TextEdit::singleline(&mut f.labels).hint_text("ota, network").desired_width(f32::INFINITY));
         ui.end_row();
     });
-    let (issue, fact) = f.test.help();
-    ui.weak(format!("Shows {}", if f.kind == Kind::Issue { issue } else { fact }));
+    if f.tests.len() == 1 {
+        let (issue, fact) = f.tests[0].test.help();
+        ui.weak(format!("Shows {}", if f.kind == Kind::Issue { issue } else { fact }));
+    }
+    if !f.name.trim().is_empty() {
+        ui.weak(format!("Its signal: @{} (an event where it finds something)", signal_name(&f.name)));
+    }
     ui.horizontal(|ui| {
         let label = if st.editing.is_some() { "Update" } else { "Add" };
         if ui.button(label).clicked() {
@@ -589,6 +652,100 @@ fn form_ui(
     }
 }
 
+/// One test's own fields (grid rows).
+fn test_fields(ui: &mut egui::Ui, i: usize, t: &mut TestForm, kind: Kind, lib: &Library) {
+    match t.test {
+        TestChoice::Exists | TestChoice::Count => {}
+        TestChoice::Rate => {
+            ui.label("More than");
+            ui.horizontal(|ui| {
+                ui.add(egui::TextEdit::singleline(&mut t.max).desired_width(50.0));
+                ui.label("within");
+                ui.add(egui::TextEdit::singleline(&mut t.window).desired_width(60.0));
+            });
+            ui.end_row();
+        }
+        TestChoice::Gap => {
+            ui.label("For longer than");
+            ui.add(egui::TextEdit::singleline(&mut t.window).desired_width(60.0));
+            ui.end_row();
+        }
+        TestChoice::Steps => {
+            // Each step after the one before (the first: after its line).
+            let mut drop_step = None;
+            let n = t.steps.len();
+            for (k, s) in t.steps.iter_mut().enumerate() {
+                ui.horizontal(|ui| {
+                    egui::ComboBox::from_id_salt(("check_step_kind", i, k))
+                        .width(130.0)
+                        .selected_text(if s.missing { "not followed by" } else { "followed by" })
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(&mut s.missing, false, "followed by")
+                                .on_hover_text("Must happen for the sequence to go on");
+                            ui.selectable_value(&mut s.missing, true, "not followed by")
+                                .on_hover_text("Expected: the issue is that it doesn't happen");
+                        });
+                    if n > 1 && ui.small_button("−").on_hover_text("Remove this step").clicked() {
+                        drop_step = Some(k);
+                    }
+                });
+                ui.vertical(|ui| {
+                    let id = format!("check_step_{i}_{k}");
+                    crate::signals::rule_field(ui, &id, &mut s.query, "payload ~ /ota progress/", lib);
+                    ui.horizontal(|ui| {
+                        ui.label("within");
+                        ui.add(egui::TextEdit::singleline(&mut s.within).desired_width(60.0));
+                        ui.weak(if k == 0 { "of its line" } else { "of the step before" });
+                    });
+                });
+                ui.end_row();
+            }
+            if let Some(k) = drop_step {
+                t.steps.remove(k);
+            }
+            ui.label("");
+            if ui
+                .small_button("➕ Step")
+                .on_hover_text("Then another line within a time of this one: 'followed by' steps come first")
+                .clicked()
+            {
+                let missing = t.steps.last().is_some_and(|s| s.missing);
+                t.steps.push(StepForm { missing, ..StepForm::default() });
+            }
+            ui.end_row();
+        }
+        TestChoice::Value => {
+            ui.label("Value");
+            ui.horizontal(|ui| {
+                for p in ["first", "last", "min", "max"] {
+                    ui.radio_value(&mut t.pick, p.to_owned(), p);
+                }
+            })
+            .response
+            .on_hover_text("Of what its lines' query's first named group (?<name>…) captures");
+            ui.end_row();
+        }
+    }
+    if t.test.has_condition() && kind == Kind::Issue {
+        ui.label("When");
+        ui.horizontal(|ui| {
+            let shown = if t.op.is_empty() { "(any)".to_owned() } else { t.op.clone() };
+            egui::ComboBox::from_id_salt(("check_op", i)).width(60.0).selected_text(shown).show_ui(ui, |ui| {
+                if t.test == TestChoice::Count {
+                    ui.selectable_value(&mut t.op, String::new(), "(any)");
+                }
+                for op in [">", ">=", "<", "<=", "==", "!="] {
+                    ui.selectable_value(&mut t.op, op.to_owned(), op);
+                }
+            });
+            if !t.op.is_empty() {
+                ui.add(egui::TextEdit::singleline(&mut t.number).desired_width(60.0));
+            }
+        });
+        ui.end_row();
+    }
+}
+
 /// What the form's check finds on `file`, in one line.
 fn preview(spec: &str, file: &dyn LogSource, signals: &Signals, lib: &Library) -> Result<String, String> {
     let c = CheckDef::parse_spec(spec).map_err(|e| e.msg)?.resolved(lib)?;
@@ -605,28 +762,6 @@ fn preview(spec: &str, file: &dyn LogSource, signals: &Signals, lib: &Library) -
         })
         .collect::<Vec<_>>()
         .join(" · "))
-}
-
-/// Run every check that is on, on `file`: their results by name.
-pub fn run_all(
-    checks: &Checks,
-    file: &dyn LogSource,
-    signals: &Signals,
-    lib: &Library,
-    progress: &nerka_core::Progress,
-) -> nerka_core::Result<Vec<(String, Outcome)>> {
-    let mut out = Vec::new();
-    for c in checks.iter().filter(|c| c.is_on()) {
-        let r = match c.resolved(lib) {
-            Ok(c) => match c.run(file, signals, progress) {
-                Err(nerka_core::Error::Cancelled) => return Err(nerka_core::Error::Cancelled),
-                r => r.map_err(|e| e.to_string()),
-            },
-            Err(e) => Err(format!("check '{}': {e}", c.name())),
-        };
-        out.push((c.name().to_owned(), r));
-    }
-    Ok(out)
 }
 
 /// What the checks found in one lifecycle (`lifecycle #number`): how many
@@ -670,6 +805,10 @@ mod tests {
             r"i: lines /t=(?<t>\d+)/; value max > 90",
             "j: lines raw == y; count; issue",
             "Fusa Faults from aurix: lines {Aurix_logs.Fusa Fault}; count; per perf",
+            "k: lines raw == a; then raw == b within 1s; then raw == c within 2s; missing raw == d within 3s",
+            "l: lines raw == y; count >= 3; gap 30s; per a",
+            "m: lines raw == y; rate 2 per 1s; gap 30s; any",
+            r"n: lines @flow.event; value max > 3; count; then {net.down} within 500ms",
         ] {
             let d = CheckDef::parse_spec(spec).unwrap();
             let back = CheckDef::parse_spec(&Form::of(&d).spec()).unwrap_or_else(|e| panic!("{spec}: {}", e.msg));

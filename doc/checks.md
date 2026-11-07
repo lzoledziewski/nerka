@@ -57,6 +57,18 @@ A lifecycle's scope is its time span (from its first line to the next one's): li
 
 - **Signals in checks (owner, 2026-11-07: "can checks reference signals?"):** they couldn't (`unknown signal '@v'`, though the same filter worked). A check's queries (its lines, and `then` / `missing`'s other query) now read the tab's signals that are on, plain or bound to a lifecycle: `lines ecu == ECU1 AND @state == "session timeout"; count; per ecu1`. On the 512 MiB DLT a check finds what the same filter finds (99 729 lines for `@v > 250`; 130 707 for a lifecycle-bound enum); a check without signals is unchanged (26 ms). A check's `value` still reads its own query's named group, not a signal.
 
+## Third round: cascading, plot (owner, 2026-11-07)
+
+Owner: "some of the tests should be able to be cascaded", and plot integration "configurable: enable a check without plotting it (low-priority checks would obscure the plot)". Asked which cascading: a check feeding a check ("could be implicit, e.g. a signal with values, boolean"), several tests in one check, a sequence of steps (not "only inside another's results").
+
+- **A check is a signal** `@name` (its name in lower case, other characters `_`: `Timeout unanswered` → `@timeout_unanswered`). An event where each occurrence shows (its last line: where it is known); its value counts them, 1, 2, 3, …, from 0 again in each lifecycle for a check `per` one. A fact on a rate, a gap or a value carries its measure there instead. So `@x.event` is where it found something (another check's lines: `lines @unanswered.event; rate 2 per 60s; per ecu1`), `@x > 0` is "has happened in this lifecycle", and filters use it too. Checks run in the order they use each other's signals (`Checks::run_all`); a circle, or a check using a failed one, says so. A signal of the tab with the same name wins.
+- **Several tests in one check:** `count >= 3000; gap 700ms` is an issue where both find one (as often as they do together); `any` where one does. A fact has one test.
+- **A sequence of steps:** `then` / `missing` clauses chain, each after the step before: `lines /session timeout/; then /connection established/ within 1s; missing level >= ERROR within 50ms`. `then` steps must happen; a `missing` step is an expectation (the issue is that it doesn't happen; not judged when the scope ends first). One `then` or `missing` is a sequence of one, as before.
+- **Plot:** each check has 📈 (off at first): it plots the check's signal as a lane (a count rising at each occurrence, from 0 in each lifecycle). The Signals panel doesn't list checks' signals; the Checks pane does (hover 📈 for the name).
+- **Form:** ➕ Another test (and all / any); "followed (or not) by" lists steps, each followed by / not followed by, its query and time, ➕ Step. The form shows the check's signal name.
+- **Tests:** steps, several tests, checks as signals (feeding in any order, circles, failures, names), a randomized walk for sequences (random 1–3 step sequences on 20 000-line logs against a plain walk).
+- **512 MiB DLT:** a timeout without its answer per ECU1 lifecycle: 14 960 in the lifecycles; a check counting `@unanswered.event` finds 14 960; bursts of them per lifecycle 5, 13, 1, … `count >= 3000; gap 700ms` per lifecycle: the sum of the two where both find one (6 385 = 6 384 + 1), ok where only one does. Eight checks 0.9 s together; a single check without signals unchanged (25 ms).
+
 ## Next, to decide with the owner
 
 - Marks: the evidence in the log view's gutter, the plot, and a badge in the lifecycle list.

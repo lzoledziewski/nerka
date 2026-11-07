@@ -514,41 +514,39 @@ fn checks(
     packs: &[PathBuf],
     out: &mut impl Write,
 ) -> Result<usize> {
-    use nerka_core::check::{CheckDef, Verdict};
-    let mut defs = Vec::new();
+    use nerka_core::check::{CheckDef, Checks, Verdict};
+    let mut all = Checks::default();
     for spec in CHECKS.get_or_init(Default::default) {
         let d = CheckDef::parse_spec(spec).map_err(|e| {
             anyhow::anyhow!(
-                "--check: {}\n  {spec}\n  {}^",
+                "--check: {}
+  {spec}
+  {}^",
                 e.msg,
                 " ".repeat(spec[..e.pos.min(spec.len())].chars().count())
             )
         })?;
-        if name.is_none_or(|n| d.name().eq_ignore_ascii_case(n)) {
-            defs.push(d);
-        }
+        all.set(d);
     }
-    if defs.is_empty() {
+    if all.iter().all(|d| name.is_some_and(|n| !d.name().eq_ignore_ascii_case(n))) {
         anyhow::bail!("no check defined: use --check 'NAME: lines QUERY; TEST'");
     }
-    if defs.iter().any(|d| !d.unresolved().is_empty()) {
-        let lib = library(packs)?;
-        defs = defs
-            .into_iter()
-            .map(|d| d.resolved(&lib))
-            .collect::<std::result::Result<_, _>>()
-            .map_err(|e| anyhow::anyhow!(e))?;
-    }
+    let lib = if all.iter().any(|d| !d.unresolved().is_empty()) { library(packs)? } else { Default::default() };
     let (f, _) = open(file)?;
     let signals = SIGNALS.get_or_init(Default::default).for_source(&*f);
+    // Every check runs (one may use another's signal); the named one shows.
+    let t = Instant::now();
+    let run = all.run_all(&*f, &signals, &lib, &Progress::new())?;
+    let took = t.elapsed();
     let (mut issues, mut rows) = (0, Vec::new());
     if !json {
-        writeln!(out, "check\tkind\tscope\tresult")?;
+        writeln!(out, "check	kind	scope	result")?;
     }
-    for d in defs {
-        let t = Instant::now();
-        let r = d.run(&*f, &signals, &Progress::new())?;
-        let took = t.elapsed();
+    for (n, r) in run.results {
+        if name.is_some_and(|want| !n.eq_ignore_ascii_case(want)) {
+            continue;
+        }
+        let r = r.map_err(|e| anyhow::anyhow!(e))?;
         for s in &r.scopes {
             let shown = match &s.verdict {
                 Verdict::Ok => "ok".to_owned(),
@@ -594,10 +592,10 @@ fn checks(
                 }
             }
         }
-        if !json {
-            out.flush()?;
-            eprintln!("{}: {took:.2?}", r.name);
-        }
+    }
+    if !json {
+        out.flush()?;
+        eprintln!("checks: {took:.2?}");
     }
     if json {
         writeln!(out, "{{\"results\": [\n{}\n ]}}", rows.join(",\n"))?;

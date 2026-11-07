@@ -24,6 +24,7 @@ cargo run -p nerka-cli -- --records 'start=/\d{4}-\d\d-\d\d/' filter 'level >= E
 cargo run -p nerka-cli -- --lifecycle 'ecu1: lines ecu == ECU1; reset uptime; planned payload ~ /shutdown/' lifecycles trace.dlt   # ECU1's boots
 cargo run -p nerka-cli -- --pack packs/ --lifecycle 'ecu1: lines ecu == ECU1; reset uptime; planned {sys.shutdown}' --signal 'ota(s):enum:per(ecu1):default(idle)=ecu == ECU1 AND /OTA (?<s>\w+)/' filter '@ota == idle' trace.dlt
 cargo run -p nerka-cli -- --check 'storm: lines level >= ERROR; rate 25 per 1s' check -e 2 trace.dlt   # checks: issues and facts
+cargo run -p nerka-cli -- --check 'lost: lines /timeout/; missing /connected/ within 200ms' --check 'bursts: lines @lost.event; rate 2 per 60s' check trace.dlt   # a check feeds a check (@name)
 cargo run -p nerka-cli -- --pack packs/ expand -l ota -p cam=CAM1 --parts   # pack picks -> NFD
 cargo run -p nerka-cli -- --pack packs/ search --in 'level >= WARN' -l ota app.log
 cargo run --release -p nerka-core --example gen_log -- big.log 1024   # 1 GiB test log

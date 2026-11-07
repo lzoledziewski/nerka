@@ -599,8 +599,13 @@ struct Tab {
     /// job running them and what they ran with.
     checks_ui: checks::ChecksUi,
     check_results: Vec<(String, checks::Outcome)>,
-    checks_job: Option<Job<Vec<(String, checks::Outcome)>>>,
+    /// The job, and the generation of `own_signals` it ran with.
+    checks_job: Option<(Job<nerka_core::check::CheckRun>, u64)>,
     checks_key: Option<(usize, u64, u64, String)>,
+    /// The tab's signals without the checks' (`signals` adds them once the
+    /// checks ran), and their generation.
+    own_signals: Signals,
+    own_gen: u64,
     /// Shared with the plot's own window.
     plot: plot::SharedPlot,
     /// What `signals` was built from: (saved signals' generation, choices'
@@ -1108,6 +1113,8 @@ impl Tab {
             check_results: Vec::new(),
             checks_job: None,
             checks_key: None,
+            own_signals: Signals::default(),
+            own_gen: 0,
             plot: Default::default(),
             signals_key: None,
             query_kind: Default::default(),
@@ -1394,6 +1401,9 @@ impl Tab {
         if let Some(e) = s.resolve_lifecycles(lib).into_iter().next() {
             self.status = e;
         }
+        // The checks' signals come back when they ran with these.
+        self.own_signals = s.clone();
+        self.own_gen += 1;
         self.signals = s;
         self.signals_changed(ctx);
     }
@@ -1402,27 +1412,35 @@ impl Tab {
     /// signals (lifecycles), the library queries they use or the file
     /// changed; take the results of a finished run.
     fn poll_checks(&mut self, ctx: &egui::Context, checks: &nerka_core::check::Checks, checks_gen: u64, lib: &Library) {
-        if let Some(job) = &self.checks_job
+        if let Some((job, gen_)) = &self.checks_job
             && let Poll::Done(r, _) = job.poll()
         {
-            if let Ok(results) = r {
-                self.check_results = results;
+            // The tab's signals plus each check's (owner, 2026-11-07: checks
+            // cascade): filters and the plot use them. A run with signals
+            // that changed since is dropped.
+            if let Ok(run) = r
+                && *gen_ == self.own_gen
+            {
+                self.check_results = run.results;
+                self.signals = run.signals;
+                self.signals_changed(ctx);
             }
             self.checks_job = None;
         }
         let Some(file) = self.file.clone() else { return };
         let queries: Vec<Option<&str>> =
             checks.iter().flat_map(|c| c.unresolved()).map(|id| lib.get(id).map(|(_, q)| q.text.as_str())).collect();
-        let key = (file.data_id(), self.signals_gen, checks_gen, format!("{queries:?}"));
+        let key = (file.data_id(), self.own_gen, checks_gen, format!("{queries:?}"));
         if self.checks_key.as_ref() == Some(&key) {
             return;
         }
         self.checks_key = Some(key);
-        if let Some(j) = self.checks_job.take() {
+        if let Some((j, _)) = self.checks_job.take() {
             j.cancel();
         }
-        let (checks, signals, lib) = (checks.clone(), self.signals.clone(), lib.clone());
-        self.checks_job = Some(Job::spawn(ctx, move |p| checks::run_all(&checks, &*file, &signals, &lib, p)));
+        let (checks, signals, lib) = (checks.clone(), self.own_signals.clone(), lib.clone());
+        let job = Job::spawn(ctx, move |p| checks.run_all(&*file, &signals, &lib, p));
+        self.checks_job = Some((job, self.own_gen));
     }
 
     /// Collect the events of every signal in the background, so the panel
@@ -4125,10 +4143,9 @@ impl App {
                 }
             }
         }
-        // Checks run whenever some are on: the lifecycle list shows them too.
-        if self.saved_checks.iter().any(|c| c.is_on()) {
-            tab.poll_checks(ui.ctx(), &self.saved_checks, self.checks_gen, &self.library);
-        }
+        // Checks run whenever some are on: the lifecycle list shows them
+        // too, and their signals are the tab's (none on: none).
+        tab.poll_checks(ui.ctx(), &self.saved_checks, self.checks_gen, &self.library);
         if self.show_signals {
             let line = tab.current_line();
             let saved = &mut self.saved_signals;
@@ -4223,6 +4240,7 @@ impl App {
                         file: &*file,
                         signals: &tab.signals,
                         library: &self.library,
+                        plot: &mut plot::lock(&tab.plot),
                     };
                     checks::checks_panel(ui, &mut tab.checks_ui, input)
                 })

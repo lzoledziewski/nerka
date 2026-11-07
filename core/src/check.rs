@@ -4,9 +4,12 @@
 //! small steps with the owner's feedback).
 //!
 //! A [`CheckDef`] has **its lines** (a query: NFD or a library query), a
-//! scope (overall, or one result per lifecycle) and one **test** on its
-//! lines. [`CheckDef::run`] gives a [`CheckResult`]: per scope a verdict
-//! and the evidence (lines).
+//! scope (overall, or one result per lifecycle) and **tests** on its lines.
+//! [`CheckDef::run`] gives a [`CheckResult`]: per scope a verdict and the
+//! evidence (lines). [`Checks::run_all`] runs a tab's checks; each check
+//! is also a signal (`@name`, [`signal_name`]: an event per occurrence),
+//! which other checks, filters and the plot use (owner, 2026-11-07: checks
+//! cascade).
 //!
 //! Spec text (CLI `--check`, the saved checks file):
 //!
@@ -15,15 +18,20 @@
 //! clause := "lines" RULE                     -- the lines it looks at
 //!         | "per" LIFECYCLE                  -- a result per lifecycle
 //!         | "issue" | "fact"                 -- what it is (default: from its test)
+//!         | "any" | "all"                    -- several tests: an issue when one / all
+//!                                            -- find one (default: all)
 //!         | "labels" LABEL ( "," LABEL )*     -- groups, switched on and off together
-//!         | test
+//!         | test                             -- one or more (a fact has one)
 //! test   := "exists"                         -- issue: each of its lines; fact: how many
 //!         | "count" [ OP NUMBER ]            -- fact: how many; with OP: an issue when it holds
 //!         | "rate" NUMBER "per" DUR          -- issue: more than NUMBER in a DUR window;
 //!                                            -- fact: the most in one window
 //!         | "gap" DUR                        -- issue: its lines stop for longer; fact: the longest stop
-//!         | "then" RULE "within" DUR         -- issue: one of its lines, then RULE within DUR;
-//!         | "missing" RULE "within" DUR      --   or no RULE within DUR; fact: how often
+//!         | "then" RULE "within" DUR         -- a step: RULE's next line within DUR (after its
+//!         | "missing" RULE "within" DUR      --   line, or the step before); steps make one
+//!                                            --   sequence, `then` steps first. Issue: each line
+//!                                            --   whose `then` steps happen and a `missing` step
+//!                                            --   doesn't; fact: how often
 //!         | "value" PICK [ OP NUMBER ]       -- fact: what its first named group (?<name>…)
 //!                                            -- captures; with OP: an issue when it holds
 //! PICK   := "first" | "last" | "min" | "max"
@@ -48,7 +56,7 @@ use crate::dsl::{DslError, Query};
 use crate::engine::search::{Filter, scan};
 use crate::lifecycle::{Lifecycles, Rule, parse_duration};
 use crate::pack::Library;
-use crate::signal::{Clock, SignalDef, SignalKind, Signals, ValueRef, is_name};
+use crate::signal::{Clock, SignalDef, SignalKind, SignalValue, Signals, ValueRef, is_name};
 use crate::{LineNo, LogSource, Progress};
 use std::sync::Arc;
 
@@ -136,15 +144,37 @@ impl Pick {
     }
 }
 
+/// One step of a sequence: the next line of `rule` after the previous
+/// step's line, within `within`. A `then` step must happen for the
+/// sequence to go on; a `missing` step is an expectation: the issue is
+/// that it doesn't happen.
+#[derive(Debug, Clone)]
+pub struct Step {
+    pub rule: Rule,
+    pub within: f64,
+    pub missing: bool,
+}
+
+impl Step {
+    fn text(&self) -> String {
+        let word = if self.missing { "missing" } else { "then" };
+        format!("{word} {} within {}", self.rule.text(), crate::lifecycle::format_duration(self.within))
+    }
+}
+
 /// What a check tests on its lines.
 #[derive(Debug, Clone)]
 pub enum Test {
     Exists,
     Count,
-    Rate { max: u64, window: f64 },
+    Rate {
+        max: u64,
+        window: f64,
+    },
     Gap(f64),
-    Then { rule: Rule, within: f64 },
-    Missing { rule: Rule, within: f64 },
+    /// `then` steps, then `missing` steps (owner, 2026-11-07: "a sequence
+    /// of steps"); one `then` or `missing` is a sequence of one.
+    Steps(Vec<Step>),
     Value(Pick),
 }
 
@@ -165,21 +195,38 @@ impl Test {
             Test::Count => "count".into(),
             Test::Rate { max, window } => format!("rate {max} per {}", d(*window)),
             Test::Gap(g) => format!("gap {}", d(*g)),
-            Test::Then { rule, within } => format!("then {} within {}", rule.text(), d(*within)),
-            Test::Missing { rule, within } => format!("missing {} within {}", rule.text(), d(*within)),
+            Test::Steps(steps) => steps.iter().map(Step::text).collect::<Vec<_>>().join("; "),
             Test::Value(p) => format!("value {}", p.as_str()),
         }
     }
 
-    fn rule(&self) -> Option<&Rule> {
+    fn rules(&self) -> Vec<&Rule> {
         match self {
-            Test::Then { rule, .. } | Test::Missing { rule, .. } => Some(rule),
-            _ => None,
+            Test::Steps(steps) => steps.iter().map(|s| &s.rule).collect(),
+            _ => Vec::new(),
         }
     }
 
     fn needs_time(&self) -> bool {
-        matches!(self, Test::Rate { .. } | Test::Gap(_) | Test::Then { .. } | Test::Missing { .. })
+        matches!(self, Test::Rate { .. } | Test::Gap(_) | Test::Steps(_))
+    }
+}
+
+/// One test of a check and its condition (a count's or a value's: `count
+/// >= 3`, `value max > 90`).
+#[derive(Debug, Clone)]
+pub struct Part {
+    pub test: Test,
+    pub cond: Option<(Op, f64)>,
+}
+
+impl Part {
+    fn text(&self) -> String {
+        let mut t = self.test.text();
+        if let Some((op, n)) = self.cond {
+            t += &format!(" {} {n}", op.as_str());
+        }
+        t
     }
 }
 
@@ -188,9 +235,10 @@ pub struct CheckDef {
     name: String,
     lines: Option<Rule>,
     per: Option<String>,
-    test: Test,
-    /// A condition on a count or a value (`count >= 3`, `value max > 90`).
-    cond: Option<(Op, f64)>,
+    /// Its tests (owner, 2026-11-07: "several tests in one check"): an
+    /// issue when all of them find one, or with `any` when one does.
+    parts: Vec<Part>,
+    any: bool,
     kind: Kind,
     labels: Vec<String>,
     /// Switched off: kept, not run.
@@ -233,6 +281,11 @@ pub struct ScopeResult {
     pub verdict: Verdict,
     /// At most [`MAX_EVIDENCE`].
     pub evidence: Vec<Evidence>,
+    /// Where each occurrence shows (its last line: where it is known),
+    /// all of them, ascending: the check's signal.
+    pub marks: Vec<LineNo>,
+    /// A fact's measure as a signal value (rate, gap, value), at `marks`.
+    pub measure: Option<SignalValue>,
 }
 
 /// A check's results: overall first, then one per lifecycle (`per`).
@@ -241,12 +294,62 @@ pub struct CheckResult {
     pub name: String,
     pub kind: Kind,
     pub scopes: Vec<ScopeResult>,
+    /// The lifecycle it runs per.
+    pub per: Option<String>,
 }
 
 impl CheckResult {
     /// The overall result.
     pub fn overall(&self) -> &ScopeResult {
         &self.scopes[0]
+    }
+
+    /// The check as a signal of `source` (that it ran on), named
+    /// [`signal_name`]: an event where each occurrence shows. Its value
+    /// counts them (1, 2, 3, …; 0 before the first), per lifecycle for a
+    /// check `per` one; a fact on a rate, a gap or a value carries the
+    /// measure instead, where it was found.
+    pub fn signal(&self, source: &dyn LogSource) -> SignalDef {
+        // Per lifecycle: the lifecycles' scopes; else the whole log.
+        let scopes = if self.per.is_some() { &self.scopes[1..] } else { &self.scopes[..1] };
+        let measured = scopes.iter().any(|s| s.measure.is_some());
+        let mut events = Vec::new();
+        for s in scopes {
+            for (i, &r) in s.marks.iter().enumerate() {
+                let v = match &s.measure {
+                    Some(m) => m.clone(),
+                    None => SignalValue::Num((i + 1) as f64),
+                };
+                events.push((r, v));
+            }
+        }
+        events.sort_by_key(|e| e.0);
+        let kind =
+            if events.iter().all(|e| matches!(e.1, SignalValue::Num(_))) { SignalKind::Num } else { SignalKind::Enum };
+        let default = (!measured).then_some(SignalValue::Num(0.0));
+        SignalDef::from_check(&signal_name(&self.name), kind, source, events, self.per.as_deref(), default)
+    }
+}
+
+/// The name of a check's signal: its name in lower case, every run of
+/// other characters than letters and digits one `_` (`Timeout unanswered`
+/// is `@timeout_unanswered`).
+pub fn signal_name(check: &str) -> String {
+    let mut out = String::new();
+    for c in check.trim().chars() {
+        if c.is_ascii_alphanumeric() {
+            out.push(c.to_ascii_lowercase());
+        } else if !out.ends_with('_') {
+            out.push('_');
+        }
+    }
+    let out = out.trim_matches('_').to_owned();
+    if out.is_empty() {
+        "check".into()
+    } else if out.starts_with(|c: char| c.is_ascii_digit()) {
+        format!("check_{out}")
+    } else {
+        out
     }
 }
 
@@ -267,8 +370,8 @@ impl CheckDef {
         if name.is_empty() || name.contains(';') {
             return Err(err("a check needs a name before ':'".into(), lead));
         }
-        let (mut lines, mut per, mut test) = (None, None, None);
-        let (mut cond, mut kind, mut labels): (Option<(Op, f64)>, Option<Kind>, Vec<String>) = (None, None, Vec::new());
+        let (mut lines, mut per, mut parts, mut any): (_, _, Vec<Part>, _) = (None, None, Vec::new(), false);
+        let (mut kind, mut labels): (Option<Kind>, Vec<String>) = (None, Vec::new());
         // `OP NUMBER` after a count or a value; `text` starts at `pos`.
         let condition = |text: &str, pos: usize| -> Result<(Op, f64), DslError> {
             let (op, n) = text.split_once(char::is_whitespace).unwrap_or((text, ""));
@@ -304,6 +407,7 @@ impl CheckDef {
                 let d = rest[i + " within ".len()..].trim();
                 Ok((rule(&rest[..i], rest_at)?, dur(d, rest_at + rest.len() - d.len())?))
             };
+            let mut cond = None;
             let t = match word.to_ascii_lowercase().as_str() {
                 "lines" => {
                     if rest.is_empty() {
@@ -321,6 +425,10 @@ impl CheckDef {
                 }
                 "issue" | "fact" if rest.is_empty() => {
                     kind = Some(if word.eq_ignore_ascii_case("issue") { Kind::Issue } else { Kind::Fact });
+                    continue;
+                }
+                "any" | "all" if rest.is_empty() => {
+                    any = word.eq_ignore_ascii_case("any");
                     continue;
                 }
                 "labels" => {
@@ -347,13 +455,28 @@ impl CheckDef {
                     Test::Rate { max, window: dur(d, rest_at + rest.len() - d.len())? }
                 }
                 "gap" => Test::Gap(dur(rest, rest_at)?),
-                "then" => {
-                    let (rule, within) = within("then")?;
-                    Test::Then { rule, within }
-                }
-                "missing" => {
-                    let (rule, within) = within("missing")?;
-                    Test::Missing { rule, within }
+                // Steps join the check's sequence: `then` steps, then
+                // `missing` ones.
+                w @ ("then" | "missing") => {
+                    let missing = w == "missing";
+                    let (rule, within) = within(w)?;
+                    let step = Step { rule, within, missing };
+                    match parts.iter_mut().find_map(|p| match &mut p.test {
+                        Test::Steps(s) => Some(s),
+                        _ => None,
+                    }) {
+                        Some(steps) => {
+                            if !missing && steps.last().is_some_and(|s| s.missing) {
+                                return Err(err(
+                                    "a 'then' step can't follow a 'missing' one (what must happen comes first)".into(),
+                                    start,
+                                ));
+                            }
+                            steps.push(step);
+                        }
+                        None => parts.push(Part { test: Test::Steps(vec![step]), cond: None }),
+                    }
+                    continue;
                 }
                 "value" => {
                     let (pick, more) = rest.split_once(char::is_whitespace).unwrap_or((rest, ""));
@@ -372,27 +495,29 @@ impl CheckDef {
                 w => {
                     return Err(err(
                         format!(
-                            "unknown clause '{w}' (lines, per, issue, fact, labels; exists, count, rate, gap, then, \
-                             missing, value)"
+                            "unknown clause '{w}' (lines, per, issue, fact, labels, any, all; exists, count, rate, \
+                             gap, then, missing, value)"
                         ),
                         start,
                     ));
                 }
             };
-            if test.is_some() {
-                return Err(err("a check has one test".into(), start));
-            }
-            test = Some(t);
+            parts.push(Part { test: t, cond });
         }
         let Some(lines) = lines else {
             return Err(err("a check needs its lines: lines QUERY".into(), spec.len()));
         };
-        let test = test.unwrap_or(Test::Exists);
-        let kind = kind.unwrap_or(test.default_kind(cond.is_some()));
-        if kind == Kind::Issue && matches!(test, Test::Value(_)) && cond.is_none() {
+        if parts.is_empty() {
+            parts.push(Part { test: Test::Exists, cond: None });
+        }
+        let kind = kind.unwrap_or(default_kind(&parts));
+        if kind == Kind::Fact && parts.len() > 1 {
+            return Err(err("a fact has one test (several tests make an issue)".into(), spec.len()));
+        }
+        if kind == Kind::Issue && parts.iter().any(|p| matches!(p.test, Test::Value(_)) && p.cond.is_none()) {
             return Err(err("an issue on a value needs a condition, e.g. value max > 90".into(), spec.len()));
         }
-        Ok(CheckDef { name: name.to_owned(), lines: Some(lines), per, test, cond, kind, labels, off: false })
+        Ok(CheckDef { name: name.to_owned(), lines: Some(lines), per, parts, any, kind, labels, off: false })
     }
 
     /// The spec line [`Self::parse_spec`] reads back.
@@ -401,12 +526,11 @@ impl CheckDef {
         if let Some(l) = &self.lines {
             c.push(format!("lines {}", l.text()));
         }
-        let mut test = self.test.text();
-        if let Some((op, n)) = self.cond {
-            test += &format!(" {} {n}", op.as_str());
+        c.extend(self.parts.iter().map(Part::text));
+        if self.any {
+            c.push("any".into());
         }
-        c.push(test);
-        if self.kind != self.test.default_kind(self.cond.is_some()) {
+        if self.kind != default_kind(&self.parts) {
             c.push(self.kind.as_str().to_owned());
         }
         if let Some(p) = &self.per {
@@ -443,28 +567,55 @@ impl CheckDef {
         self
     }
 
+    /// Its lines' query, as written.
+    pub fn lines_text(&self) -> String {
+        self.lines.as_ref().map(Rule::text).unwrap_or_default()
+    }
+
+    pub fn parts(&self) -> &[Part] {
+        &self.parts
+    }
+
+    /// Several tests: an issue when any of them finds one (else all).
+    pub fn is_any(&self) -> bool {
+        self.any
+    }
+
     /// Its library queries expanded with `lib`.
     pub fn resolved(&self, lib: &Library) -> Result<CheckDef, String> {
         let mut out = self.clone();
         if let Some(l) = &self.lines {
             out.lines = Some(l.resolved(lib)?);
         }
-        out.test = match &self.test {
-            Test::Then { rule, within } => Test::Then { rule: rule.resolved(lib)?, within: *within },
-            Test::Missing { rule, within } => Test::Missing { rule: rule.resolved(lib)?, within: *within },
-            t => t.clone(),
-        };
+        for p in &mut out.parts {
+            if let Test::Steps(steps) = &mut p.test {
+                for s in steps {
+                    s.rule = s.rule.resolved(lib)?;
+                }
+            }
+        }
         Ok(out)
+    }
+
+    /// Every query it has: its lines', then its steps'.
+    fn rules(&self) -> Vec<&Rule> {
+        self.lines.iter().chain(self.parts.iter().flat_map(|p| p.test.rules())).collect()
     }
 
     /// The library queries it uses, not resolved yet.
     pub fn unresolved(&self) -> Vec<&str> {
-        [self.lines.as_ref(), self.test.rule()]
-            .into_iter()
-            .flatten()
-            .filter(|r| r.query().is_none())
-            .filter_map(Rule::library_id)
-            .collect()
+        self.rules().into_iter().filter(|r| r.query().is_none()).filter_map(Rule::library_id).collect()
+    }
+
+    /// The signals its queries use (`@name`), each once.
+    pub fn signals_used(&self) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        for n in self.rules().into_iter().filter_map(Rule::query).flat_map(Query::signal_names) {
+            if !out.contains(&n) {
+                out.push(n);
+            }
+        }
+        out
     }
 
     /// The lines of `rule`; its `@signal` conditions read the tab's
@@ -490,31 +641,42 @@ impl CheckDef {
     }
 
     /// Run it on `source` with the tab's `signals` (its lifecycle, a time
-    /// signal): overall, and per lifecycle if it has `per`.
+    /// signal, other checks' signals): overall, and per lifecycle if it has
+    /// `per`.
     pub fn run(&self, source: &dyn LogSource, signals: &Signals, progress: &Progress) -> crate::Result<CheckResult> {
         let rows = self.hits(self.lines.as_ref(), source, signals, progress)?;
-        let other = self.hits(self.test.rule(), source, signals, progress)?;
-        // Times, where the test needs them.
+        // Each step's lines, per test.
+        let mut others: Vec<Vec<Vec<LineNo>>> = Vec::with_capacity(self.parts.len());
+        for p in &self.parts {
+            let mut v = Vec::new();
+            for r in p.test.rules() {
+                v.push(self.hits(Some(r), source, signals, progress)?);
+            }
+            others.push(v);
+        }
+        // Times, where a test needs them.
         let clock = Clock::of(source, signals);
         let clock_series = match &clock {
             Clock::Signal(d) => Some(d.series(source, progress)?),
             _ => None,
         };
-        if self.test.needs_time() && !clock.is_time() {
+        if self.parts.iter().any(|p| p.test.needs_time()) && !clock.is_time() {
             return Err(self.fail("its test needs times, and these lines have none (define a time signal)".into()));
         }
         let time = |r: LineNo| clock.at(source, clock_series.as_ref(), r);
         // Values, for `value`: what its first named group captures.
-        let values = match &self.test {
-            Test::Value(p) => {
-                let q = self.lines.as_ref().and_then(Rule::query).expect("hits checked it");
-                let def =
-                    capture(q, if matches!(p, Pick::Min | Pick::Max) { SignalKind::Num } else { SignalKind::Enum })
-                        .map_err(|m| self.fail(m))?;
-                Some(def.series(source, progress)?)
-            }
-            _ => None,
-        };
+        let mut values = Vec::with_capacity(self.parts.len());
+        for p in &self.parts {
+            values.push(match &p.test {
+                Test::Value(pick) => {
+                    let q = self.lines.as_ref().and_then(Rule::query).expect("hits checked it");
+                    let kind = if matches!(pick, Pick::Min | Pick::Max) { SignalKind::Num } else { SignalKind::Enum };
+                    let def = capture(q, kind).map_err(|m| self.fail(m))?;
+                    Some(def.series(source, progress)?)
+                }
+                _ => None,
+            });
+        }
         // Scopes: overall, then each lifecycle's span.
         let n = source.line_count();
         let mut scopes = vec![Scope { label: "overall".into(), life: None, from: 0, to: n }];
@@ -540,70 +702,119 @@ impl CheckDef {
             };
             let (a, b) = within(&rows);
             let mine = &rows[a..b];
-            let (oa, ob) = within(&other);
-            let theirs = &other[oa..ob];
-            let (verdict, evidence) = self.judge(mine, theirs, &time, values.as_ref(), &scope);
-            out.push(ScopeResult { scope, verdict, evidence });
+            // The scope's last time: a missing step is only judged when the
+            // scope lasts long enough.
+            let end = (scope.from..scope.to).rev().take(1000).find_map(time);
+            let mut judged = Vec::with_capacity(self.parts.len());
+            for (i, p) in self.parts.iter().enumerate() {
+                let theirs: Vec<&[LineNo]> = others[i]
+                    .iter()
+                    .map(|v| {
+                        let (a, b) = within(v);
+                        &v[a..b]
+                    })
+                    .collect();
+                let cx = Cx { mine, theirs: &theirs, time: &time, end, values: values[i].as_ref(), scope: &scope };
+                judged.push(self.judge(p, &cx));
+            }
+            let j = self.combine(judged);
+            out.push(ScopeResult {
+                scope,
+                verdict: j.verdict,
+                evidence: j.evidence,
+                marks: j.marks,
+                measure: j.measure,
+            });
         }
-        Ok(CheckResult { name: self.name.clone(), kind: self.kind(), scopes: out })
+        Ok(CheckResult { name: self.name.clone(), kind: self.kind(), scopes: out, per: self.per.clone() })
     }
 
-    /// The verdict on one scope: its lines `mine`, the test's other lines
-    /// `theirs` (both in the scope).
-    fn judge(
-        &self,
-        mine: &[LineNo],
-        theirs: &[LineNo],
-        time: &dyn Fn(LineNo) -> Option<f64>,
-        values: Option<&crate::SignalSeries>,
-        scope: &Scope,
-    ) -> (Verdict, Vec<Evidence>) {
+    /// Several tests' verdicts on one scope as the check's: an issue when
+    /// all (`any`: one) find one, as often as they do together.
+    fn combine(&self, mut judged: Vec<Judged>) -> Judged {
+        if judged.len() == 1 {
+            return judged.pop().expect("one");
+        }
+        let holds: Vec<bool> = judged.iter().map(|j| matches!(j.verdict, Verdict::Issue(_))).collect();
+        let found = if self.any { holds.iter().any(|&h| h) } else { holds.iter().all(|&h| h) };
+        if !found {
+            return Judged::ok();
+        }
+        let (mut count, mut evidence, mut marks) = (0u64, Vec::new(), Vec::new());
+        for ((p, j), _) in self.parts.iter().zip(judged).zip(&holds).filter(|(_, h)| **h) {
+            if let Verdict::Issue(n) = j.verdict {
+                count += n;
+            }
+            let what = p.text();
+            for e in j.evidence {
+                if evidence.len() < MAX_EVIDENCE {
+                    let note = if e.note.is_empty() { what.clone() } else { format!("{what}: {}", e.note) };
+                    evidence.push(Evidence { rows: e.rows, note });
+                }
+            }
+            marks.extend(j.marks);
+        }
+        marks.sort_unstable();
+        marks.dedup();
+        Judged { verdict: Verdict::Issue(count), evidence, marks, measure: None }
+    }
+
+    /// One test's verdict on one scope.
+    fn judge(&self, part: &Part, cx: &Cx<'_>) -> Judged {
+        let Cx { mine, theirs, time, end, values, scope } = *cx;
         let d = shown_duration;
         let mut ev: Vec<Evidence> = Vec::new();
+        let mut marks: Vec<LineNo> = Vec::new();
         let mut count = 0u64;
-        let mut add = |ev: &mut Vec<Evidence>, rows: Vec<LineNo>, note: String| {
+        // An occurrence: counted, its evidence kept up to the cap, its
+        // last line marked.
+        let mut add = |ev: &mut Vec<Evidence>, marks: &mut Vec<LineNo>, rows: Vec<LineNo>, note: String| {
             count += 1;
+            marks.push(*rows.last().expect("rows"));
             if ev.len() < MAX_EVIDENCE {
                 ev.push(Evidence { rows, note });
             }
         };
-        let issue = |count: u64, ev: Vec<Evidence>| (if count == 0 { Verdict::Ok } else { Verdict::Issue(count) }, ev);
-        let fact = |v: String, ev: Vec<Evidence>| (Verdict::Fact(Some(v)), ev);
+        let issue = |count: u64, evidence: Vec<Evidence>, mut marks: Vec<LineNo>| {
+            marks.sort_unstable();
+            let verdict = if count == 0 { Verdict::Ok } else { Verdict::Issue(count) };
+            Judged { verdict, evidence, marks, measure: None }
+        };
+        let fact = |v: String, evidence: Vec<Evidence>, marks: Vec<LineNo>, measure: Option<SignalValue>| Judged {
+            verdict: Verdict::Fact(Some(v)),
+            evidence,
+            marks,
+            measure,
+        };
         let as_fact = self.kind == Kind::Fact;
-        // A count or a value: a fact, or an issue when the condition holds
-        // (a count without one: when there is any).
-        match &self.test {
-            Test::Exists if as_fact => {
-                let first = mine.first().map(|&r| Evidence { rows: vec![r], note: "the first".into() });
-                fact(mine.len().to_string(), first.into_iter().collect())
+        let first = || mine.first().map(|&r| Evidence { rows: vec![r], note: "the first".into() });
+        match &part.test {
+            Test::Exists | Test::Count if as_fact => {
+                fact(mine.len().to_string(), first().into_iter().collect(), mine.to_vec(), None)
             }
             Test::Exists => {
                 for &r in mine {
-                    add(&mut ev, vec![r], String::new());
+                    add(&mut ev, &mut marks, vec![r], String::new());
                 }
-                issue(count, ev)
+                issue(count, ev, marks)
             }
             Test::Count => {
-                let first = mine.first().map(|&r| Evidence { rows: vec![r], note: "the first".into() });
-                if as_fact {
-                    return fact(mine.len().to_string(), first.into_iter().collect());
-                }
                 // An issue where the condition holds (none: any line): as
                 // often as there are lines, each one evidence (bug, owner,
                 // 2026-11-07: it said 1x, its lines chained in one).
                 let n = mine.len() as f64;
-                let holds = match self.cond {
+                let holds = match part.cond {
                     Some((op, k)) => op.test(n, k),
                     None => n > 0.0,
                 };
                 if !holds || mine.is_empty() {
-                    return (Verdict::Ok, Vec::new());
+                    return Judged::ok();
                 }
-                let why = self.cond.map(|(op, k)| format!("{n} lines {} {k}", op.as_str())).unwrap_or_default();
+                let why = part.cond.map(|(op, k)| format!("{n} lines {} {k}", op.as_str())).unwrap_or_default();
                 for &r in mine {
-                    add(&mut ev, vec![r], why.clone());
+                    add(&mut ev, &mut marks, vec![r], why.clone());
                 }
-                issue(count, ev)
+                issue(count, ev, marks)
             }
             Test::Rate { max, window } => {
                 // More than `max` in a window: one burst per stretch; as a
@@ -620,22 +831,19 @@ impl CheckDef {
                     }
                     if n as u64 > *max && ts[lo].1 > burst_end {
                         burst_end = ts[hi].1 + window;
-                        add(&mut ev, vec![ts[lo].0, ts[hi].0], format!("{n} lines within {}", d(*window)));
+                        add(&mut ev, &mut marks, vec![ts[lo].0, ts[hi].0], format!("{n} lines within {}", d(*window)));
                     }
                 }
-                if as_fact {
-                    let ev = if most.0 == 0 {
-                        Vec::new()
-                    } else {
-                        vec![Evidence {
-                            rows: vec![ts[most.1].0, ts[most.2].0],
-                            note: format!("{} within {}", most.0, d(*window)),
-                        }]
-                    };
-                    fact(most.0.to_string(), ev)
-                } else {
-                    issue(count, ev)
+                if !as_fact {
+                    return issue(count, ev, marks);
                 }
+                if most.0 == 0 {
+                    return fact("0".into(), Vec::new(), Vec::new(), None);
+                }
+                let (a, b) = (ts[most.1].0, ts[most.2].0);
+                let note = format!("{} within {}", most.0, d(*window));
+                let m = Some(SignalValue::Num(most.0 as f64));
+                fact(most.0.to_string(), vec![Evidence { rows: vec![a, b], note }], vec![b], m)
             }
             Test::Gap(g) => {
                 let ts: Vec<(LineNo, f64)> = mine.iter().filter_map(|&r| Some((r, time(r)?))).collect();
@@ -646,41 +854,75 @@ impl CheckDef {
                         longest = Some((dt, w[0].0, w[1].0));
                     }
                     if dt > *g {
-                        add(&mut ev, vec![w[0].0, w[1].0], format!("none for {}", d(dt)));
+                        add(&mut ev, &mut marks, vec![w[0].0, w[1].0], format!("none for {}", d(dt)));
                     }
                 }
                 match (as_fact, longest) {
                     (true, Some((dt, a, b))) => {
-                        fact(d(dt), vec![Evidence { rows: vec![a, b], note: format!("none for {}", d(dt)) }])
+                        let e = Evidence { rows: vec![a, b], note: format!("none for {}", d(dt)) };
+                        fact(d(dt), vec![e], vec![b], Some(SignalValue::Num(dt)))
                     }
-                    (true, None) => (Verdict::Fact(None), Vec::new()),
-                    (false, _) => issue(count, ev),
+                    (true, None) => Judged { verdict: Verdict::Fact(None), ..Judged::ok() },
+                    (false, _) => issue(count, ev, marks),
                 }
             }
-            Test::Then { within, .. } | Test::Missing { within, .. } => {
-                let then = matches!(self.test, Test::Then { .. });
-                // The scope's last time: a missing follow-up is only judged
-                // when the scope lasts long enough.
-                let end = (scope.from..scope.to).rev().take(1000).find_map(time);
+            Test::Steps(steps) => {
+                let one = steps.len() == 1;
+                let expects = steps.iter().any(|s| s.missing);
                 for &r in mine {
-                    let Some(t) = time(r) else { continue };
-                    let j = theirs.partition_point(|&x| x <= r);
-                    let next = theirs[j..].iter().map(|&x| (x, time(x))).find(|(_, tx)| tx.is_some());
-                    let followed = next.filter(|(_, tx)| tx.is_some_and(|tx| tx - t <= *within));
-                    match (then, followed) {
-                        (true, Some((x, tx))) => {
-                            add(&mut ev, vec![r, x], format!("followed after {}", d(tx.unwrap_or(t) - t)))
+                    let Some(t0) = time(r) else { continue };
+                    let (mut cur, mut tcur) = (r, t0);
+                    let (mut rows, mut notes) = (vec![r], Vec::new());
+                    // `Some(true)`: an occurrence; `Some(false)`: none.
+                    let mut found = None;
+                    for (k, s) in steps.iter().enumerate() {
+                        let theirs = theirs[k];
+                        let j = theirs.partition_point(|&x| x <= cur);
+                        let next = theirs[j..].iter().find_map(|&x| Some((x, time(x)?)));
+                        let next = next.filter(|(_, tx)| tx - tcur <= s.within);
+                        match (s.missing, next) {
+                            (false, Some((x, tx))) => {
+                                notes.push(if one {
+                                    format!("followed after {}", d(tx - tcur))
+                                } else {
+                                    format!("step {} after {}", k + 2, d(tx - tcur))
+                                });
+                                rows.push(x);
+                                (cur, tcur) = (x, tx);
+                            }
+                            (false, None) => {
+                                found = Some(false);
+                                break;
+                            }
+                            // An expectation met: on to the next step.
+                            (true, Some((x, tx))) => {
+                                rows.push(x);
+                                (cur, tcur) = (x, tx);
+                            }
+                            (true, None) => {
+                                let judged = end.is_some_and(|e| e - tcur >= s.within);
+                                if judged {
+                                    notes.push(if one {
+                                        format!("nothing followed within {}", d(s.within))
+                                    } else {
+                                        format!("no step {} within {}", k + 2, d(s.within))
+                                    });
+                                }
+                                found = Some(judged);
+                                break;
+                            }
                         }
-                        (false, None) if end.is_some_and(|e| e - t >= *within) => {
-                            add(&mut ev, vec![r], format!("nothing followed within {}", d(*within)))
-                        }
-                        _ => {}
+                    }
+                    // Every step went as it says: only `then` steps make an
+                    // occurrence; met expectations don't.
+                    if found.unwrap_or(!expects) {
+                        add(&mut ev, &mut marks, rows, notes.join(", "));
                     }
                 }
-                if as_fact { fact(count.to_string(), ev) } else { issue(count, ev) }
+                if as_fact { fact(count.to_string(), ev, marks, None) } else { issue(count, ev, marks) }
             }
             Test::Value(p) => {
-                let Some(series) = values else { return (Verdict::Fact(None), Vec::new()) };
+                let Some(series) = values else { return Judged { verdict: Verdict::Fact(None), ..Judged::ok() } };
                 let evs: Vec<(LineNo, ValueRef<'_>)> =
                     series.iter().filter(|(r, _)| *r >= scope.from && *r < scope.to).collect();
                 let pick = match p {
@@ -696,7 +938,11 @@ impl CheckDef {
                         .map(|(r, n)| (r, ValueRef::Num(n))),
                 };
                 let Some((r, v)) = pick else {
-                    return if as_fact { (Verdict::Fact(None), Vec::new()) } else { (Verdict::Ok, Vec::new()) };
+                    return if as_fact {
+                        Judged { verdict: Verdict::Fact(None), ..Judged::ok() }
+                    } else {
+                        Judged::ok()
+                    };
                 };
                 let text = match v {
                     ValueRef::Num(n) => n.to_string(),
@@ -704,19 +950,53 @@ impl CheckDef {
                 };
                 let ev = vec![Evidence { rows: vec![r], note: format!("the {}: {text}", p.as_str()) }];
                 if as_fact {
-                    fact(text, ev)
-                } else {
-                    // A value that isn't a number holds no condition.
-                    match text.trim().parse::<f64>() {
-                        Ok(v) => match self.cond {
-                            Some((op, n)) if op.test(v, n) => (Verdict::Issue(1), ev),
-                            _ => (Verdict::Ok, Vec::new()),
-                        },
-                        Err(_) => (Verdict::Ok, Vec::new()),
+                    return fact(text, ev, vec![r], Some(v.to_value()));
+                }
+                // A value that isn't a number holds no condition.
+                match (text.trim().parse::<f64>(), part.cond) {
+                    (Ok(v), Some((op, n))) if op.test(v, n) => {
+                        Judged { verdict: Verdict::Issue(1), evidence: ev, marks: vec![r], measure: None }
                     }
+                    _ => Judged::ok(),
                 }
             }
         }
+    }
+}
+
+/// What a test looks at in one scope.
+#[derive(Clone, Copy)]
+struct Cx<'a> {
+    /// Its lines in the scope.
+    mine: &'a [LineNo],
+    /// Each step's lines in the scope.
+    theirs: &'a [&'a [LineNo]],
+    time: &'a dyn Fn(LineNo) -> Option<f64>,
+    /// The scope's last time.
+    end: Option<f64>,
+    values: Option<&'a crate::SignalSeries>,
+    scope: &'a Scope,
+}
+
+/// One test's verdict on one scope.
+struct Judged {
+    verdict: Verdict,
+    evidence: Vec<Evidence>,
+    marks: Vec<LineNo>,
+    measure: Option<SignalValue>,
+}
+
+impl Judged {
+    fn ok() -> Judged {
+        Judged { verdict: Verdict::Ok, evidence: Vec::new(), marks: Vec::new(), measure: None }
+    }
+}
+
+/// A check's kind when it doesn't say: its test's (several tests: an issue).
+fn default_kind(parts: &[Part]) -> Kind {
+    match parts {
+        [p] => p.test.default_kind(p.cond.is_some()),
+        _ => Kind::Issue,
     }
 }
 
@@ -740,6 +1020,14 @@ fn capture(q: &Query, kind: SignalKind) -> Result<SignalDef, String> {
     let group = crate::signal::first_group(q)
         .ok_or("'value' needs a named group in its lines' query, e.g. /temp=(?<t>\\d+)/")?;
     SignalDef::new("value", kind, q.source(), Some(&group)).map_err(|e| e.to_string())
+}
+
+/// What [`Checks::run_all`] found: each check's result (by name), and the
+/// tab's signals plus the checks' own.
+#[derive(Debug, Clone, Default)]
+pub struct CheckRun {
+    pub results: Vec<(String, Result<CheckResult, String>)>,
+    pub signals: Signals,
 }
 
 /// The checks of a tab, by unique name; saved as spec lines.
@@ -788,6 +1076,72 @@ impl Checks {
 
     pub fn len(&self) -> usize {
         self.0.len()
+    }
+
+    /// Run every check that is on, on `source` with the tab's `signals`
+    /// and library queries from `lib`: a check that uses another's signal
+    /// runs after it (owner, 2026-11-07: checks cascade). The results, in
+    /// the list's order, and the signals with each check's added (where no
+    /// signal of the tab has its name).
+    pub fn run_all(
+        &self,
+        source: &dyn LogSource,
+        signals: &Signals,
+        lib: &Library,
+        progress: &Progress,
+    ) -> crate::Result<CheckRun> {
+        let on: Vec<&CheckDef> = self.0.iter().filter(|c| c.is_on()).collect();
+        let defs: Vec<Result<CheckDef, String>> =
+            on.iter().map(|c| c.resolved(lib).map_err(|e| format!("check '{}': {e}", c.name))).collect();
+        // The checks whose signals each uses.
+        let own: Vec<String> = on.iter().map(|c| signal_name(&c.name)).collect();
+        let theirs = |n: &str| signals.get(n).is_none().then(|| own.iter().position(|o| o == n)).flatten();
+        let needs: Vec<Vec<usize>> = defs
+            .iter()
+            .map(|d| {
+                d.as_ref().map(|d| d.signals_used().iter().filter_map(|n| theirs(n)).collect()).unwrap_or_default()
+            })
+            .collect();
+        let mut results: Vec<Option<Result<CheckResult, String>>> = vec![None; on.len()];
+        let mut sig = signals.clone();
+        loop {
+            let ready = (0..on.len()).find(|&i| results[i].is_none() && needs[i].iter().all(|&j| results[j].is_some()));
+            let Some(i) = ready else { break };
+            let failed = needs[i].iter().find(|&&j| results[j].as_ref().is_some_and(|r| r.is_err()));
+            let r = match (&defs[i], failed) {
+                (Err(e), _) => Err(e.clone()),
+                (Ok(_), Some(&j)) => {
+                    Err(format!("check '{}': uses @{} of check '{}', which failed", on[i].name, own[j], on[j].name))
+                }
+                (Ok(d), None) => match d.run(source, &sig, progress) {
+                    Err(crate::Error::Cancelled) => return Err(crate::Error::Cancelled),
+                    r => r.map_err(|e| e.to_string()),
+                },
+            };
+            if let Ok(res) = &r
+                && signals.get(&own[i]).is_none()
+            {
+                sig.set(res.signal(source));
+            }
+            results[i] = Some(r);
+        }
+        // What is left uses itself, or checks that use it.
+        let results = results
+            .into_iter()
+            .enumerate()
+            .map(|(i, r)| {
+                let r = r.unwrap_or_else(|| {
+                    let names: Vec<String> = needs[i].iter().map(|&j| format!("@{}", own[j])).collect();
+                    Err(format!(
+                        "check '{}': uses {}, which come back to it (checks can't use each other in a circle)",
+                        on[i].name,
+                        names.join(", ")
+                    ))
+                });
+                (on[i].name.clone(), r)
+            })
+            .collect();
+        Ok(CheckRun { results, signals: sig })
     }
 
     pub fn to_text(&self) -> String {

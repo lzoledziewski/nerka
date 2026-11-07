@@ -335,7 +335,8 @@ pub fn signals_panel(ui: &mut egui::Ui, st: &mut SignalsUi, input: Input<'_>) ->
             let mut remove_arg: Option<String> = None;
             let mut edit = None;
             egui::Grid::new("signals").num_columns(6).striped(true).show(ui, |ui| {
-                for d in signals.iter() {
+                // A check's signal shows with its check (the Checks pane).
+                for d in signals.iter().filter(|d| !d.is_check()) {
                     // Plotting a time against time says nothing.
                     if d.kind() == SignalKind::Time {
                         ui.label("");
