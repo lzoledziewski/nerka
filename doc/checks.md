@@ -55,6 +55,8 @@ A lifecycle's scope is its time span (from its first line to the next one's): li
 
 - **Bug (owner, 2026-11-07): "how many" as an issue didn't match "how many" as a fact.** It said 1× (the condition held) with all its lines chained in one piece of evidence. Now it happens as often as there are lines, where its condition holds (none: any line), each line its own evidence. A test (`consistency`) runs every test as a fact and as an issue on random logs and checks they agree in every scope; on the 512 MiB DLT every pair agrees, and the counts equal plain filters' (49 064 overall, 3 295 in ECU1's second lifecycle). Durations show to the ms (a 1.04 s stop showed as "1.0 s" next to an issue for "longer than 1 s").
 
+- **Signals in checks (owner, 2026-11-07: "can checks reference signals?"):** they couldn't (`unknown signal '@v'`, though the same filter worked). A check's queries (its lines, and `then` / `missing`'s other query) now read the tab's signals that are on, plain or bound to a lifecycle: `lines ecu == ECU1 AND @state == "session timeout"; count; per ecu1`. On the 512 MiB DLT a check finds what the same filter finds (99 729 lines for `@v > 250`; 130 707 for a lifecycle-bound enum); a check without signals is unchanged (26 ms). A check's `value` still reads its own query's named group, not a signal.
+
 ## Next, to decide with the owner
 
 - Marks: the evidence in the log view's gutter, the plot, and a badge in the lifecycle list.

@@ -222,6 +222,39 @@ fn errors_say_why() {
     assert_eq!(run("x: lines raw == retry; per nope", &signals()), "check 'x': no lifecycle 'nope' here");
     let e = run("x: lines {sys.retry}", &signals());
     assert_eq!(e, "check 'x': library query {sys.retry} isn't loaded (load its pack)");
+    let e = run("x: lines @nope > 1; count", &signals());
+    assert!(e.starts_with("check 'x': unknown signal '@nope'"), "{e}");
+}
+
+/// Owner, 2026-11-07: "can checks reference signals?" Its lines and the
+/// test's other lines may use the tab's `@signals`, plain or bound to a
+/// lifecycle, and find what the same filter finds.
+#[test]
+fn queries_may_use_signals() {
+    use crate::engine::search::tests::run_on;
+    let mut sig = signals();
+    sig.set(SignalDef::parse_spec(r"t=/temp=(?<t>\d+)/").unwrap());
+    sig.set(SignalDef::parse_spec(r"ota(s):enum:per(a):default(idle)=/ota (?<s>\w+)/").unwrap());
+    let run = |spec: &str| CheckDef::parse_spec(spec).unwrap().run(&log(), &sig, &Progress::new()).unwrap();
+    let rows = |r: &CheckResult| -> Vec<LineNo> {
+        let mut v: Vec<LineNo> = r.scopes[0].evidence.iter().flat_map(|e| e.rows.clone()).collect();
+        v.sort_unstable();
+        v.dedup();
+        v
+    };
+    let filter = |q: &str| run_on(&log(), &Filter::Query(Query::compile(q).unwrap().with_signals(&sig).unwrap()));
+    for q in ["@t > 45", "@t > 45 AND ecu == A", "@ota == idle", "@ota == progress OR @t.event"] {
+        let r = run(&format!("x: lines {q}; exists"));
+        assert_eq!(rows(&r), filter(q), "{q}");
+        let n = filter(q).len().to_string();
+        assert_eq!(run(&format!("x: lines {q}; count")).scopes[0].verdict, fact(&n), "{q}");
+    }
+    // Per lifecycle: the bound signal starts each lifecycle at its default.
+    let r = run("x: lines ecu == A AND @ota == idle; count; per a");
+    assert_eq!(verdicts(&r)[1..], [("a #1".into(), fact("2")), ("a #2".into(), fact("2"))]);
+    // The test's other query too.
+    let r = run("x: lines raw ~ /net down/; then @t > 55 within 2s; per a");
+    assert_eq!(verdicts(&r)[1..], [("a #1".into(), Verdict::Ok), ("a #2".into(), issue(1))]);
 }
 
 #[test]

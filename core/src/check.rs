@@ -42,6 +42,7 @@
 //! A lifecycle's scope is its time span: from its first line to the next
 //! one's ([`crate::lifecycle`]). Tests on time (`rate`, `gap`, `within`)
 //! need the lines' times: the source's, or a `time` signal of the tab.
+//! A check's queries may use the tab's `@signals` (the ones switched on).
 
 use crate::dsl::{DslError, Query};
 use crate::engine::search::{Filter, scan};
@@ -466,13 +467,22 @@ impl CheckDef {
             .collect()
     }
 
-    fn hits(&self, rule: Option<&Rule>, source: &dyn LogSource, progress: &Progress) -> crate::Result<Vec<LineNo>> {
+    /// The lines of `rule`; its `@signal` conditions read the tab's
+    /// `signals` (the ones switched on).
+    fn hits(
+        &self,
+        rule: Option<&Rule>,
+        source: &dyn LogSource,
+        signals: &Signals,
+        progress: &Progress,
+    ) -> crate::Result<Vec<LineNo>> {
         let Some(rule) = rule else { return Ok(Vec::new()) };
         let Some(q) = rule.query() else {
             return Err(self.fail(format!("library query {} isn't loaded (load its pack)", rule.text())));
         };
-        let q = q.clone().bind(source.schema()).map_err(|e| self.fail(e.msg))?;
-        scan(source, &Filter::Query(q), progress)
+        let q = q.clone().with_signals(signals).and_then(|q| q.bind(source.schema())).map_err(|e| self.fail(e.msg))?;
+        let filter = Filter::Query(q).prepare(source, progress)?;
+        scan(source, &filter, progress)
     }
 
     fn fail(&self, msg: String) -> crate::Error {
@@ -482,8 +492,8 @@ impl CheckDef {
     /// Run it on `source` with the tab's `signals` (its lifecycle, a time
     /// signal): overall, and per lifecycle if it has `per`.
     pub fn run(&self, source: &dyn LogSource, signals: &Signals, progress: &Progress) -> crate::Result<CheckResult> {
-        let rows = self.hits(self.lines.as_ref(), source, progress)?;
-        let other = self.hits(self.test.rule(), source, progress)?;
+        let rows = self.hits(self.lines.as_ref(), source, signals, progress)?;
+        let other = self.hits(self.test.rule(), source, signals, progress)?;
         // Times, where the test needs them.
         let clock = Clock::of(source, signals);
         let clock_series = match &clock {
