@@ -5,7 +5,8 @@ version.workspace = true
 # Not on crates.io (yet): released as archives (.github/workflows/release.yml).
 publish = false
 edition.workspace = true
-rust-version.workspace = true
+# egui / eframe 0.37 need Rust 1.95; core and the CLI build on 1.88.
+rust-version = "1.95"
 license.workspace = true
 repository.workspace = true
 authors.workspace = true

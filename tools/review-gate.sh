@@ -43,8 +43,34 @@ fi
 
 echo "== MSRV"
 msrv=$(sed -nE 's/^rust-version *= *"([0-9.]+)".*/\1/p' Cargo.toml)
+ui_msrv=$(sed -nE 's/^rust-version *= *"([0-9.]+)".*/\1/p' ui/Cargo.toml)
+# MSRV-2: no dependency of a crate needs a newer Rust than the crate declares.
+if command -v python >/dev/null 2>&1; then
+  cargo metadata --format-version 1 >"$OUT/metadata.json" 2>/dev/null
+  for c in nerka-cli nerka-gui; do
+    cargo tree -p "$c" -e normal,build --prefix none 2>/dev/null | awk '{print $1}' | sort -u >"$OUT/deps-$c.txt"
+    over=$(python -X utf8 - "$OUT/metadata.json" "$OUT/deps-$c.txt" "$c" <<'EOF'
+import json, sys
+meta, deps, crate = sys.argv[1:4]
+names = set(open(deps, encoding="utf-8").read().split())
+pk = {p["name"]: p for p in json.load(open(meta, encoding="utf-8"))["packages"]}
+v = lambda s: tuple(int(x) for x in s.split("."))
+own = pk[crate].get("rust_version") or "0"
+print(" ".join(f'{n}:{pk[n]["rust_version"]}' for n in sorted(names)
+               if n in pk and pk[n].get("rust_version") and v(pk[n]["rust_version"]) > v(own)))
+EOF
+)
+    if [ -n "$over" ]; then fail MSRV-2 "$c declares a lower rust-version than its dependencies need: $over"
+    else pass MSRV-2 "$c: no dependency needs a newer Rust than it declares"; fi
+  done
+else
+  warn MSRV-2 "python not found: dependencies' rust-version not compared"
+fi
 if [ "$FULL" = 1 ] && rustup toolchain list 2>/dev/null | grep -q "^$msrv"; then
-  run MSRV-1 "builds on the declared rust-version $msrv" cargo "+$msrv" check --workspace --all-targets
+  run MSRV-1 "core and CLI build on rust-version $msrv" cargo "+$msrv" check -p nerka-core -p nerka-cli --all-targets
+  if [ -n "$ui_msrv" ] && rustup toolchain list 2>/dev/null | grep -q "^$ui_msrv"; then
+    run MSRV-1 "GUI builds on rust-version $ui_msrv" cargo "+$ui_msrv" check -p nerka-gui --all-targets
+  fi
 else
   # let-chains (`if let … && let …`) need Rust 1.88.
   if [ -n "$msrv" ] && [ "$(printf '%s\n1.88\n' "$msrv" | sort -V | head -1)" != 1.88 ] &&
