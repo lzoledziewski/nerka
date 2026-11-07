@@ -37,7 +37,12 @@ cargo run --release -p nerka-core --example dlt_to_mf4 -- big.dlt big_z.mf4 --de
 cargo run --release -p nerka-cli -- --unpack-dir cache filter -c --stats 'apid == NAV AND level >= WARN' big_z.mf4  # 1st run unpacks, then cached
 cargo run --release -p nerka-core --example probe_capture -- trace.pcapng log.mf4   # structure of real captures, no payload
 powershell -ExecutionPolicy Bypass -File tools/screenshot.ps1 -Out shot.png -AppArgs app.log  # GUI screenshot (Windows)
+bash tools/review-gate.sh --full                      # review gate: build gates, fuzz, metrics (doc/review/)
+bash tools/bench.sh target/bench 1024 5 > bench.tsv   # the benchmark above as TSV; `tools/bench.sh compare a.tsv b.tsv`
 ```
+
+Reviews (a gate before a merge or release, a deep review each cycle): `doc/review/README.md`,
+checklist `doc/review/checklist.md`, latest findings `doc/review/*-findings.md`.
 
 CI (`.github/workflows/ci.yml`) runs fmt, clippy and tests on Linux and Windows, `cargo deny`, and a DCO sign-off check on pull requests (`CONTRIBUTING.md`; commit with `git commit -s`); `release.yml`
 builds Linux/Windows archives and publishes a pre-release on a `v*` tag.
