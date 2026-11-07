@@ -313,6 +313,11 @@ fn scan_buffer(
             let mut pos = start;
             while pos < end {
                 let Some(m) = pre.find_at(hay, pos) else { break };
+                // An empty match at the haystack's end (`^$`, `x*`) belongs
+                // to the next chunk's first line, which that chunk checks.
+                if m.start() >= end {
+                    break;
+                }
                 let line = source.line_of_offset(m.start() as u64);
                 let content = source.line_bytes(line).unwrap_or_default();
                 let content_end = source.line_start(line) as usize + content.len();
@@ -513,6 +518,25 @@ pub(crate) mod tests {
         let hits = run(&s, "ERROR", Default::default());
         assert_eq!(hits.len(), 200_000_usize.div_ceil(997));
         assert!(hits.iter().all(|l| l % 997 == 0));
+    }
+
+    /// Review finding R-ENG-1: a pattern that can match empty at a line
+    /// start (`^$`, `^`, `x*`) must not report the first line of the next
+    /// chunk, nor report it twice. The fast path is compared to the naive one.
+    #[test]
+    fn empty_matches_at_chunk_ends() {
+        let mut s = String::new();
+        for i in 0..200_000 {
+            s.push_str(&format!("{i:08} payload payload payload payload\n"));
+            if i % 50_000 == 49_999 {
+                s.push('\n');
+            }
+        }
+        for pat in ["^$", "^", "x*", "^\\s*$"] {
+            let f = regex_filter(pat, Default::default());
+            let src = TextFile::from_bytes("t", s.clone().into_bytes());
+            assert_eq!(run_on(&src, &f), naive(&src, &f), "{pat}");
+        }
     }
 
     #[test]

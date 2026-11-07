@@ -1,0 +1,11 @@
+query	median_ms	matches
+big.log search: ERROR	32.1	2002175
+big.log search-v: ERROR	93.9	10011703
+big.log filter: level >= ERROR	31.5	2002175
+big.log filter: level >= WARN AND raw ~ /timeout/	35.7	656099
+big.log filter: level == INFO OR raw ~ /disk/	82.0	6006428
+big.dlt filter: apid == NAV AND level >= WARN	30.4	684022
+big.dlt filter: ecu == ECU1	39.4	4170364
+big.dlt filter: level >= ERROR AND raw ~ /timeout/	62.4	348433
+big.dlt filter: raw ~ /timeout/	286.5	1982576
+big.pcap filter: apid == NAV AND level >= WARN	29.5	684022
