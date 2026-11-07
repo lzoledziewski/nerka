@@ -128,7 +128,7 @@ fn pcapng<'a>(buf: &'a [u8], progress: &Progress, f: &mut dyn FnMut(Frame<'a>)) 
             ifaces.clear();
         }
         let len = u32_at(buf, pos + 4, be) as usize;
-        if len < 12 || len % 4 != 0 || pos + len > buf.len() {
+        if len < 12 || !len.is_multiple_of(4) || pos + len > buf.len() {
             // Corrupt or truncated: nothing after it can be trusted.
             skipped += (buf.len() - pos) as u64;
             pos = buf.len();

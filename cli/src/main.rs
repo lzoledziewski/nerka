@@ -26,7 +26,11 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 #[derive(Parser)]
-#[command(name = "nerka", version, about = "Fast regex log analysis")]
+#[command(
+    name = "nerka",
+    version,
+    about = "Fast log analysis: filter, search, signals, lifecycles and checks over text, JSON, DLT and captures"
+)]
 struct Cli {
     /// Load query packs from a .nerka-pack file or a directory of them
     /// (repeatable), besides the per-user pack directory.
@@ -260,9 +264,8 @@ fn library(extra: &[PathBuf]) -> Result<Library> {
 fn compile(query: &str, source: &dyn LogSource) -> Result<Query> {
     // `--signal` definitions, and `@time` on files that know their time.
     let signals = SIGNALS.get_or_init(Default::default).for_source(source);
-    Query::compile_in(query, source.schema(), &signals).map_err(|e| {
-        anyhow::anyhow!("{e}\n  {query}\n  {}^", " ".repeat(query[..e.pos.min(query.len())].chars().count()))
-    })
+    Query::compile_in(query, source.schema(), &signals)
+        .map_err(|e| anyhow::anyhow!("{}\n  {query}\n  {}", e.at(query), e.caret(query)))
 }
 
 /// `bookmark` in a query: the bookmarks of the log (its `.nerka-marks`),
@@ -523,7 +526,7 @@ fn checks(
   {spec}
   {}^",
                 e.msg,
-                " ".repeat(spec[..e.pos.min(spec.len())].chars().count())
+                " ".repeat(e.column(spec) - 1)
             )
         })?;
         all.set(d);
@@ -687,20 +690,15 @@ fn run() -> Result<()> {
         signals.set(SignalDef::parse_spec(spec).with_context(|| format!("--signal {spec}"))?);
     }
     for spec in &cli.lifecycle {
-        let def = nerka_core::lifecycle::LifecycleDef::parse_spec(spec).map_err(|e| {
-            anyhow::anyhow!(
-                "--lifecycle: {}\n  {spec}\n  {}^",
-                e.msg,
-                " ".repeat(spec[..e.pos.min(spec.len())].chars().count())
-            )
-        })?;
+        let def = nerka_core::lifecycle::LifecycleDef::parse_spec(spec)
+            .map_err(|e| anyhow::anyhow!("--lifecycle: {}\n  {spec}\n  {}^", e.msg, " ".repeat(e.column(spec) - 1)))?;
         signals.set(SignalDef::lifecycle(def));
     }
     // Library queries in lifecycles, from the packs.
-    if signals.lifecycles().any(|l| !l.unresolved().is_empty()) {
-        if let Some(e) = signals.resolve_lifecycles(&library(&cli.pack)?).into_iter().next() {
-            anyhow::bail!("{e}");
-        }
+    if signals.lifecycles().any(|l| !l.unresolved().is_empty())
+        && let Some(e) = signals.resolve_lifecycles(&library(&cli.pack)?).into_iter().next()
+    {
+        anyhow::bail!("{e}");
     }
     SIGNALS.set(signals).expect("set once");
     CHECKS.set(cli.check.clone()).expect("set once");

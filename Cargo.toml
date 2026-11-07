@@ -6,7 +6,9 @@ default-members = ["core", "cli"]
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.86"
+# The engine and the CLI: let-chains need 1.88 (no dependency needs more).
+# The GUI sets its own (egui 0.37 needs 1.95).
+rust-version = "1.88"
 license = "MIT OR Apache-2.0"
 authors = ["Łukasz Żołędziewski <l.zoledziewski@gmail.com>"]
 repository = "https://github.com/lzoledziewski/nerka"

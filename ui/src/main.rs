@@ -178,7 +178,7 @@ fn main() -> eframe::Result {
                 let spec = value();
                 match nerka_core::check::CheckDef::parse_spec(&spec) {
                     Ok(c) => startup_checks.set(c),
-                    Err(e) => eprintln!("nerka-gui: --check {spec}: {} (at column {})", e.msg, e.pos + 1),
+                    Err(e) => eprintln!("nerka-gui: --check {spec}: {}", e.at(&spec)),
                 }
                 continue;
             }
@@ -408,8 +408,8 @@ fn read_box(
         Mode::Text => (text(pattern, options.clone()), Preview::None),
         Mode::Query => match Query::compile_in(pattern, schema, signals) {
             Ok(q) => (Ok(Filter::Query(q)), Preview::None),
-            Err(e) if pattern.trim().is_empty() => (Err(format!("Query error: {e}")), Preview::None),
-            Err(e) => (Err(format!("Query error: {e}")), Preview::QueryError(e.to_string())),
+            Err(e) if pattern.trim().is_empty() => (Err(format!("Query error: {}", e.at(pattern))), Preview::None),
+            Err(e) => (Err(format!("Query error: {}", e.at(pattern))), Preview::QueryError(e.at(pattern))),
         },
         Mode::Auto => {
             // Phrases and plain text are literal, or regexes with Regex ticked.
@@ -1597,7 +1597,7 @@ impl Tab {
                         }
                         Err(nerka_core::Error::Cancelled) => return false,
                         // Several files of different kinds: opened as tabs.
-                        Err(nerka_core::Error::Format(why)) if self.paths.len() > 1 && why.contains("one kind") => {
+                        Err(nerka_core::Error::MixedKinds(why)) if self.paths.len() > 1 => {
                             self.mixed = Some(why);
                             return false;
                         }
@@ -3215,7 +3215,7 @@ impl App {
         let write = path
             .parent()
             .map_or(Ok(()), std::fs::create_dir_all)
-            .and_then(|_| std::fs::write(&path, self.checks_to_save().to_text()));
+            .and_then(|_| nerka_core::write_atomic(&path, self.checks_to_save().to_text()));
         if let Err(e) = write {
             self.status = format!("Could not save checks to {}: {e}", path.display());
         }
@@ -3237,7 +3237,7 @@ impl App {
         let write = path
             .parent()
             .map_or(Ok(()), std::fs::create_dir_all)
-            .and_then(|_| std::fs::write(&path, self.signals_to_save().to_text()));
+            .and_then(|_| nerka_core::write_atomic(&path, self.signals_to_save().to_text()));
         if let Err(e) = write {
             self.status = format!("Could not save signals to {}: {e}", path.display());
         }
@@ -3629,7 +3629,7 @@ impl App {
         let file = std::env::temp_dir().join(format!("nerka-move-{}-{}.nerka-preset", std::process::id(), self.moves));
         self.moves += 1;
         let res = std::env::current_exe().and_then(|exe| {
-            std::fs::write(&file, t.to_preset("moved tab").serialize())?;
+            nerka_core::write_atomic(&file, t.to_preset("moved tab").serialize())?;
             let mut cmd = std::process::Command::new(exe);
             cmd.arg("--new-window").arg("--preset-file").arg(&file);
             for p in &self.pack_paths {

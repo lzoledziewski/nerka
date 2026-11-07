@@ -49,7 +49,7 @@ fn main() -> std::io::Result<()> {
         // About one reboot per ECU in 600 000 messages, after this message;
         // every other one planned (this message says so).
         let reboot = (rng >> 20) % 200_000 == 7;
-        let planned = reboot && (rng >> 44) % 2 == 0;
+        let planned = reboot && (rng >> 44).is_multiple_of(2);
         if planned {
             level = Level::Info;
         }
@@ -73,7 +73,7 @@ fn main() -> std::io::Result<()> {
         m.usecs = (t_100us % 10_000) as i32 * 100;
         m.timestamp = Some((t_100us - booted[e]) as u32);
         m.mcnt = count as u8;
-        if rng % 20 == 0 {
+        if rng.is_multiple_of(20) {
             m.payload = Payload::NonVerbose { id: (rng >> 40) as u32 % 1000, data: (0..(a % 32) as u8).collect() };
         }
         buf.clear();

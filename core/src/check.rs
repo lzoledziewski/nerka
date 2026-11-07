@@ -1187,7 +1187,7 @@ impl Checks {
             }
             match CheckDef::parse_spec(line) {
                 Ok(c) => s.set(c),
-                Err(e) => errors.push(format!("line {}: {} (at column {})", i + 1, e.msg, e.pos + 1)),
+                Err(e) => errors.push(format!("line {}: {}", i + 1, e.at(line))),
             }
         }
         (s, errors)

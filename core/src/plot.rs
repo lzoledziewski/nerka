@@ -126,7 +126,7 @@ impl PlotLayout {
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir).map_err(err)?;
         }
-        std::fs::write(path, text).map_err(err)
+        crate::write_atomic(path, text).map_err(err)
     }
 }
 

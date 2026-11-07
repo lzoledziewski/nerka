@@ -367,10 +367,10 @@ fn finish(file: &str, mut q: PackQuery, mut body: Vec<(usize, &str)>) -> Result<
         )
     };
     let checked = with(false)?;
-    if let Err(e) = crate::dsl::parse(&checked) {
-        if with(true).ok().is_none_or(|t| crate::dsl::parse(&t).is_err()) {
-            return Err(err(file_pos(e.pos), e.msg));
-        }
+    if let Err(e) = crate::dsl::parse(&checked)
+        && with(true).ok().is_none_or(|t| crate::dsl::parse(&t).is_err())
+    {
+        return Err(err(file_pos(e.pos), e.msg));
     }
     Ok(q)
 }

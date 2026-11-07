@@ -62,7 +62,7 @@ impl Server {
         let token = new_token();
         let file = dir.join(std::process::id().to_string());
         let line = format!("{port} {token}\n");
-        std::fs::write(&file, &line).ok()?;
+        nerka_core::write_atomic(&file, &line).ok()?;
         let (tx, rx) = mpsc::channel();
         std::thread::spawn(move || {
             for stream in listener.incoming().flatten() {
@@ -85,7 +85,7 @@ impl Server {
     /// makes this the window that new files go to.
     pub fn set_focused(&mut self, focused: bool) {
         if focused && !self.focused {
-            let _ = std::fs::write(&self.file, &self.line);
+            let _ = nerka_core::write_atomic(&self.file, &self.line);
         }
         self.focused = focused;
     }

@@ -57,7 +57,7 @@ impl Usage {
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)?;
         }
-        std::fs::write(path, self.serialize())
+        crate::write_atomic(path, self.serialize())
     }
 
     pub fn count(&self, id: &str) -> u64 {

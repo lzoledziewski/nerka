@@ -273,7 +273,12 @@ impl Expr {
                     return Err(DslError { msg: format!("unknown signal '@{}'", s.name), pos: s.pos });
                 };
                 let bound = def.bind(schema).map_err(|e| DslError {
-                    msg: format!("signal '@{}': {} (at column {} of its query)", s.name, e.msg, e.pos + 1),
+                    msg: format!(
+                        "signal '@{}': {} (at column {} of its query)",
+                        s.name,
+                        e.msg,
+                        e.column(def.query().source())
+                    ),
                     pos: s.pos,
                 })?;
                 s.def = Some(Arc::new(bound));
@@ -794,6 +799,8 @@ impl Query {
     }
 }
 
+/// `Display` gives the column in bytes (right for ASCII). Where the query
+/// text is at hand, show [`DslError::column`] instead (see [`DslError::at`]).
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error("{msg} (at column {})", .pos + 1)]
 pub struct DslError {
@@ -802,12 +809,56 @@ pub struct DslError {
     pub pos: usize,
 }
 
+impl DslError {
+    /// The 1-based column of the error in `src`, in characters, as a
+    /// caret under the query lines up with it. A position past the end, or
+    /// inside a character, counts up to the character before it.
+    pub fn column(&self, src: &str) -> usize {
+        let mut p = self.pos.min(src.len());
+        while !src.is_char_boundary(p) {
+            p -= 1;
+        }
+        src[..p].chars().count() + 1
+    }
+
+    /// `msg (at column N)` with the column counted in characters of `src`.
+    pub fn at(&self, src: &str) -> String {
+        format!("{} (at column {})", self.msg, self.column(src))
+    }
+
+    /// Spaces and a `^` under the error, for a line that shows `src`.
+    pub fn caret(&self, src: &str) -> String {
+        format!("{}^", " ".repeat(self.column(src) - 1))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn q(s: &str) -> Query {
         Query::compile(s).unwrap_or_else(|e| panic!("{s}: {e}"))
+    }
+
+    /// Review finding R5: columns count characters, so the message and the
+    /// caret agree after non-ASCII text (`pos` stays a byte offset).
+    #[test]
+    fn error_columns_count_characters() {
+        const SCHEMA: &[FieldDef] = &[FieldDef::new("ecu", FieldKind::Str, false)];
+        let src = r#"raw ~ "żółw" AND lvl >= ERROR"#;
+        let e = Query::compile_for(src, SCHEMA).unwrap_err();
+        assert_eq!(e.pos, 20, "a byte offset");
+        assert_eq!(e.column(src), 18);
+        assert!(e.at(src).ends_with("(at column 18)"), "{}", e.at(src));
+        assert_eq!(e.caret(src), format!("{}^", " ".repeat(17)));
+        // A syntax error after them, too.
+        let src = "raw ~ \"ąę\" AND AND";
+        let e = Query::compile(src).unwrap_err();
+        assert_eq!(e.column(src), src.chars().count() - 2);
+        // Positions past the end or inside a character don't panic.
+        let odd = DslError { msg: String::new(), pos: 1 };
+        assert_eq!(odd.column("żx"), 1);
+        assert_eq!(DslError { msg: String::new(), pos: 99 }.column("ab"), 3);
     }
 
     #[test]
