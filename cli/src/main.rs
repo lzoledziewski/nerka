@@ -51,6 +51,16 @@ struct Cli {
     /// Default: 514.
     #[arg(long = "syslog-port", global = true, value_name = "PORT")]
     syslog_port: Vec<u16>,
+    /// A protocol definition (`.ksy`: a Kaitai Struct structure with a
+    /// `-nerka:` section; repeatable) for messages in captures; give it
+    /// ports with --protocol-port. See doc/protocol-definitions.md.
+    #[arg(long, global = true, value_name = "FILE")]
+    protocol: Vec<PathBuf>,
+    /// UDP destination port of a --protocol definition, by its name
+    /// (repeatable): NAME=PORT, e.g. 'MYPROTO=40000'. A native protocol
+    /// keeps a port it has; move it off with --dlt-port etc.
+    #[arg(long = "protocol-port", global = true, value_name = "NAME=PORT")]
+    protocol_port: Vec<String>,
     /// Folder compressed MF4 data is unpacked into (default: the per-user
     /// cache folder); unpacked once, reused when the file is opened again.
     #[arg(long = "unpack-dir", global = true, value_name = "DIR")]
@@ -759,6 +769,33 @@ static SIGNALS: std::sync::OnceLock<Signals> = std::sync::OnceLock::new();
 /// How files are opened (`--dlt-port`, `--someip-port`, …), set once in `main`.
 static OPEN_OPTIONS: std::sync::OnceLock<nerka_core::OpenOptions> = std::sync::OnceLock::new();
 
+/// The `--protocol` definitions with the ports `--protocol-port` gives them.
+fn loaded_protocols(files: &[PathBuf], ports: &[String]) -> Result<Vec<nerka_core::input::proto::LoadedProtocol>> {
+    use nerka_core::input::proto::{LoadedProtocol, Protocol, ksy::KsyProtocol};
+    let mut out: Vec<LoadedProtocol> = Vec::new();
+    for f in files {
+        let p = KsyProtocol::load(f)?;
+        if out.iter().any(|o| o.protocol.name().eq_ignore_ascii_case(p.name())) {
+            anyhow::bail!("{}: a protocol named {} is loaded already", f.display(), p.name());
+        }
+        out.push(LoadedProtocol { protocol: std::sync::Arc::new(p), udp_ports: Vec::new() });
+    }
+    for spec in ports {
+        let (name, port) =
+            spec.split_once('=').ok_or_else(|| anyhow::anyhow!("--protocol-port {spec}: write NAME=PORT"))?;
+        let port: u16 =
+            port.trim().parse().map_err(|_| anyhow::anyhow!("--protocol-port {spec}: `{port}` isn't a port"))?;
+        let Some(p) = out.iter_mut().find(|o| o.protocol.name().eq_ignore_ascii_case(name.trim())) else {
+            anyhow::bail!("--protocol-port {spec}: no --protocol is named {name}");
+        };
+        p.udp_ports.push(port);
+    }
+    if let Some(p) = out.iter().find(|p| p.udp_ports.is_empty()) {
+        eprintln!("nerka: protocol {} has no port (--protocol-port {}=PORT)", p.protocol.name(), p.protocol.name());
+    }
+    Ok(out)
+}
+
 fn open(path: &PathBuf) -> Result<(Box<dyn LogSource>, std::time::Duration)> {
     let t = Instant::now();
     let options = OPEN_OPTIONS.get_or_init(Default::default);
@@ -801,6 +838,7 @@ fn run() -> Result<()> {
     if !cli.syslog_port.is_empty() {
         options.capture.syslog_udp_ports = cli.syslog_port.clone();
     }
+    options.capture.protocols = loaded_protocols(&cli.protocol, &cli.protocol_port)?;
     options.capture.unpack.dir = cli.unpack_dir.clone().or_else(nerka_core::cache_dir);
     options.capture.mf4_local_time = !cli.mf4_utc;
     if let Some(spec) = &cli.records {

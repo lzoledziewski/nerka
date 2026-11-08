@@ -36,14 +36,14 @@ use std::sync::Arc;
 pub type DltFile = Records;
 
 /// Columns of a rendered line, separated by tabs: `time`, then [`Dlt`]'s.
-pub const COLUMNS: [ColumnDef; 7] = [
-    ColumnDef { name: "time", width: 26 },
-    ColumnDef { name: "tmsp", width: 11 },
-    ColumnDef { name: "ecu", width: 4 },
-    ColumnDef { name: "apid", width: 4 },
-    ColumnDef { name: "ctid", width: 4 },
-    ColumnDef { name: "type", width: 9 },
-    ColumnDef { name: "payload", width: 0 },
+pub static COLUMNS: [ColumnDef; 7] = [
+    ColumnDef::new("time", 26),
+    ColumnDef::new("tmsp", 11),
+    ColumnDef::new("ecu", 4),
+    ColumnDef::new("apid", 4),
+    ColumnDef::new("ctid", 4),
+    ColumnDef::new("type", 9),
+    ColumnDef::new("payload", 0),
 ];
 
 const ECU: FieldId = 0;
@@ -112,15 +112,15 @@ impl Dlt {
 }
 
 impl Protocol for Dlt {
-    fn name(&self) -> &'static str {
+    fn name(&self) -> &str {
         "DLT"
     }
 
-    fn columns(&self) -> &'static [ColumnDef] {
+    fn columns(&self) -> &[ColumnDef] {
         &COLUMNS[1..]
     }
 
-    fn schema(&self) -> &'static [FieldDef] {
+    fn schema(&self) -> &[FieldDef] {
         SCHEMA
     }
 
@@ -236,10 +236,14 @@ impl Records {
 
     /// Decode DLT non-verbose messages with `fibex`: their payload as text,
     /// and the APID, CTID, type and level they don't carry themselves.
+    ///
+    /// Native DLT is protocol 0 of every source that has it (a `.dlt` file,
+    /// a capture); a loaded definition is never replaced, whatever its name.
     pub fn with_fibex(self, fibex: Option<Arc<Fibex>>) -> Records {
-        match (0..crate::input::proto::MAX_PROTOCOLS).find(|&i| self.protocol(i).is_some_and(|p| p.name() == "DLT")) {
-            Some(i) => self.with_protocol(i, Arc::new(Dlt::new(fibex))),
-            None => self,
+        if self.protocol(0).is_some_and(|p| p.name() == "DLT") {
+            self.with_protocol(0, Arc::new(Dlt::new(fibex)))
+        } else {
+            self
         }
     }
 }

@@ -657,7 +657,7 @@ struct LineDetail {
     line: LineNo,
     cells: Vec<String>,
     /// Column names of a table source; empty for plain text.
-    names: Vec<&'static str>,
+    names: Vec<String>,
     /// Every field the source supplies for the line: name, value (`None`:
     /// the line has none), kind. Shown with the Fields checkbox.
     fields: Vec<(String, Option<String>, &'static str)>,
@@ -809,7 +809,7 @@ const DETAIL_MAX_BYTES: usize = 1 << 20;
 impl LineDetail {
     fn of(file: &dyn LogSource, line: LineNo) -> Option<Self> {
         let cells = file.line_detail(line)?;
-        let names = file.columns().iter().map(|c| c.name).collect();
+        let names = file.columns().iter().map(|c| c.name.to_string()).collect();
         let fields = field_values(file, line);
         Some(LineDetail {
             line,
@@ -865,7 +865,10 @@ impl LineDetail {
                 let msg = self.cells.last().map_or("", String::as_str);
                 ui.horizontal(|ui| {
                     if table {
-                        let tip = format!("The {} column, with its own line breaks", self.names.last().unwrap_or(&""));
+                        let tip = format!(
+                            "The {} column, with its own line breaks",
+                            self.names.last().map_or("", String::as_str)
+                        );
                         if ui.button("Copy message").on_hover_text(tip).clicked() {
                             copied = Some(msg.to_owned());
                         }
@@ -896,7 +899,7 @@ impl LineDetail {
                     if table {
                         egui::Grid::new("line-detail-cells").num_columns(2).spacing([12.0, 2.0]).show(ui, |ui| {
                             for (name, value) in self.names.iter().zip(&self.cells[..self.cells.len() - 1]) {
-                                ui.label(RichText::new(*name).strong());
+                                ui.label(RichText::new(name.as_str()).strong());
                                 ui.monospace(value);
                                 ui.end_row();
                             }

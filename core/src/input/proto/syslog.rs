@@ -14,13 +14,13 @@ use super::{Origin, Protocol};
 use crate::event::{FieldDef, FieldId, FieldKind, FieldValue, Level};
 use crate::input::ColumnDef;
 
-const COLUMNS: [ColumnDef; 6] = [
-    ColumnDef { name: "facility", width: 8 },
-    ColumnDef { name: "severity", width: 8 },
-    ColumnDef { name: "host", width: 14 },
-    ColumnDef { name: "app", width: 12 },
-    ColumnDef { name: "pid", width: 6 },
-    ColumnDef { name: "payload", width: 0 },
+static COLUMNS: [ColumnDef; 6] = [
+    ColumnDef::new("facility", 8),
+    ColumnDef::new("severity", 8),
+    ColumnDef::new("host", 14),
+    ColumnDef::new("app", 12),
+    ColumnDef::new("pid", 6),
+    ColumnDef::new("payload", 0),
 ];
 
 const FACILITY: FieldId = 0;
@@ -194,15 +194,15 @@ fn cells(p: &Parts<'_>, keep: bool) -> [String; 6] {
 }
 
 impl Protocol for Syslog {
-    fn name(&self) -> &'static str {
+    fn name(&self) -> &str {
         "syslog"
     }
 
-    fn columns(&self) -> &'static [ColumnDef] {
+    fn columns(&self) -> &[ColumnDef] {
         &COLUMNS
     }
 
-    fn schema(&self) -> &'static [FieldDef] {
+    fn schema(&self) -> &[FieldDef] {
         SCHEMA
     }
 

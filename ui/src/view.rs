@@ -30,6 +30,7 @@ use eframe::egui::{
     vec2,
 };
 use nerka_core::{Bookmarks, ColumnDef, Highlighter, LineNo, LogSource, SearchHits};
+use std::borrow::Cow;
 use std::ops::Range;
 
 /// Lines longer than this are cut for display (search still sees them).
@@ -96,7 +97,7 @@ pub struct ViewState {
 /// aligned. Empty for plain text.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Columns {
-    pub names: Vec<&'static str>,
+    pub names: Vec<Cow<'static, str>>,
     /// Cell widths in characters, including a one-character gap. The last
     /// column is unbounded; its entry is unused.
     pub widths: Vec<usize>,
@@ -168,12 +169,12 @@ impl Columns {
     /// Add or remove the last column for bookmark notes (tables only). The
     /// column before it, unbounded until then, gets a width of its own.
     pub fn note_column(&mut self, on: bool) {
-        let has = self.names.last() == Some(&NOTE_COLUMN);
+        let has = self.names.last().is_some_and(|n| n == NOTE_COLUMN);
         if on && !has && !self.names.is_empty() {
             if let Some(w) = self.widths.last_mut() {
                 *w = (*w).max(60);
             }
-            self.names.push(NOTE_COLUMN);
+            self.names.push(Cow::Borrowed(NOTE_COLUMN));
             self.widths.push(NOTE_COLUMN.chars().count() + 1);
         } else if !on && has {
             self.names.pop();
@@ -183,7 +184,7 @@ impl Columns {
 
     pub fn from_defs(defs: &[ColumnDef]) -> Self {
         Columns {
-            names: defs.iter().map(|d| d.name).collect(),
+            names: defs.iter().map(|d| d.name.clone()).collect(),
             widths: defs.iter().map(|d| (d.width as usize).max(d.name.len()) + 1).collect(),
         }
     }
@@ -352,7 +353,7 @@ pub fn log_view(
     // Column too) take a slot above their line. `slots(top, until)`: the
     // rows (and note slots) that fit from `top`, with their y; a note slot
     // belongs to the row after it, so a click there picks that line.
-    let note_column = table && columns.names.last() == Some(&NOTE_COLUMN);
+    let note_column = table && columns.names.last().is_some_and(|n| n == NOTE_COLUMN);
     let note_rows = match hl.notes {
         NoteMode::LineBefore => hl.bookmarks,
         NoteMode::Column if !note_column => hl.bookmarks,
@@ -1106,7 +1107,7 @@ pub fn log_view(
             head.text(
                 pos2(x0 + starts[k] as f32 * char_w, header_rect.center().y),
                 Align2::LEFT_CENTER,
-                *name,
+                name.as_ref(),
                 header_font.clone(),
                 vis.strong_text_color(),
             );
@@ -1583,8 +1584,10 @@ mod tests {
     fn dragging_a_header_divider_resizes_its_column() {
         let file = nerka_core::TextFile::from_bytes("t", b"ab\tc\tpayload\n".to_vec());
         let ctx = egui::Context::default();
-        let (mut state, mut columns) =
-            (ViewState::default(), Columns { names: vec!["a", "b", "rest"], widths: vec![4, 3, 0] });
+        let (mut state, mut columns) = (
+            ViewState::default(),
+            Columns { names: vec!["a".into(), "b".into(), "rest".into()], widths: vec![4, 3, 0] },
+        );
         let hl = Highlight {
             highlighter: None,
             bookmarks: None,

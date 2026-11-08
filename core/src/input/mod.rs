@@ -98,10 +98,18 @@ impl Bytes {
 /// A column of a source whose lines are tab-separated cells (DLT).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ColumnDef {
-    pub name: &'static str,
+    /// Owned for columns a protocol definition names (`input::proto::ksy`).
+    pub name: Cow<'static, str>,
     /// Typical content width in characters; 0 for the last column, which
     /// takes the rest of the line.
     pub width: u16,
+}
+
+impl ColumnDef {
+    /// A column with a fixed name.
+    pub const fn new(name: &'static str, width: u16) -> ColumnDef {
+        ColumnDef { name: Cow::Borrowed(name), width }
+    }
 }
 
 pub trait LogSource: Send + Sync {

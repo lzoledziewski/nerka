@@ -23,7 +23,9 @@ pub mod unpack;
 
 use super::Bytes;
 use super::dlt::Dlt;
-use super::proto::{Framed, MAX_CHANNELS, ProtoId, Protocol, Records, someip::SomeIp, syslog::Syslog};
+use super::proto::{
+    Framed, LoadedProtocol, MAX_CHANNELS, MAX_PROTOCOLS, ProtoId, Protocol, Records, someip::SomeIp, syslog::Syslog,
+};
 use crate::{Error, Progress, Result};
 use net::{Net, NetStats, Payload};
 use std::borrow::Cow;
@@ -44,13 +46,24 @@ pub const DEFAULT_SOMEIP_PORTS: [u16; 1] = [30490];
 /// UDP destination ports that carry syslog by default: 514 (RFC 5426).
 pub const DEFAULT_SYSLOG_PORTS: [u16; 1] = [514];
 
-/// The protocols of a capture, by [`ProtoId`]: DLT, SOME/IP, syslog.
+/// The protocols of a capture, by [`ProtoId`]: DLT, SOME/IP, syslog, then
+/// the loaded ones ([`CaptureOptions::protocols`]) in their order.
 pub const DLT: ProtoId = 0;
 pub const SOMEIP: ProtoId = 1;
 pub const SYSLOG: ProtoId = 2;
+const NATIVE: usize = 3;
 
-fn protocols() -> Vec<Arc<dyn Protocol>> {
-    vec![Arc::new(Dlt::default()), Arc::new(SomeIp), Arc::new(Syslog)]
+fn protocols(options: &CaptureOptions) -> Result<Vec<Arc<dyn Protocol>>> {
+    let mut all: Vec<Arc<dyn Protocol>> = vec![Arc::new(Dlt::default()), Arc::new(SomeIp), Arc::new(Syslog)];
+    all.extend(options.protocols.iter().map(|p| p.protocol.clone()));
+    if all.len() > MAX_PROTOCOLS {
+        return Err(Error::Format(format!(
+            "too many protocols: {} loaded, at most {}",
+            all.len() - NATIVE,
+            MAX_PROTOCOLS - NATIVE
+        )));
+    }
+    Ok(all)
 }
 
 /// How messages are found in a capture.
@@ -62,6 +75,9 @@ pub struct CaptureOptions {
     pub someip_udp_ports: Vec<u16>,
     /// UDP destination ports whose payloads are syslog messages.
     pub syslog_udp_ports: Vec<u16>,
+    /// Protocols given at runtime (definitions), each with its ports. A
+    /// port goes to the first protocol that lists it, the native ones first.
+    pub protocols: Vec<LoadedProtocol>,
     /// Where compressed MF4 data is unpacked.
     pub unpack: UnpackOptions,
     /// An MF4 file whose header says its start time is local time (the
@@ -75,6 +91,7 @@ impl Default for CaptureOptions {
             dlt_udp_ports: DEFAULT_DLT_PORTS.to_vec(),
             someip_udp_ports: DEFAULT_SOMEIP_PORTS.to_vec(),
             syslog_udp_ports: DEFAULT_SYSLOG_PORTS.to_vec(),
+            protocols: Vec::new(),
             unpack: UnpackOptions::default(),
             mf4_local_time: true,
         }
@@ -135,12 +152,13 @@ fn read(
         Some((b, l)) => (b.bytes(), Some(l)),
         None => (file, None),
     };
+    let protos = protocols(options)?;
     let mut sink = Sink {
         net: Net::default(),
         c: Collector {
             base: bytes,
-            delimited: protocols().iter().map(|p| p.delimited()).collect(),
-            protos: protocols(),
+            delimited: protos.iter().map(|p| p.delimited()).collect(),
+            protos,
             msgs: Vec::new(),
             side: Vec::new(),
             stats: CaptureStats::default(),
@@ -248,6 +266,7 @@ fn route(options: &CaptureOptions, port: u16) -> Option<ProtoId> {
         .into_iter()
         .find(|(ports, _)| ports.contains(&port))
         .map(|(_, p)| p)
+        .or_else(|| options.protocols.iter().position(|p| p.udp_ports.contains(&port)).map(|i| NATIVE + i))
 }
 
 /// The protocols' side: indexes the messages of each routed datagram.

@@ -4,6 +4,12 @@
 //! be split into IP fragments. For testing and benchmarking capture import.
 //!
 //!     cargo run --release -p nerka-core --example dlt_to_pcap -- big.dlt big.pcap
+//!
+//! `--ports 3490,3491` sends the datagrams to those ports in turn; with
+//! `--copy` each datagram goes to every port (the file grows that many
+//! times): the same messages for two readers in one capture, e.g. native
+//! DLT on one port and a protocol definition on the other
+//! (doc/protocol-definitions.md).
 
 use std::io::{BufWriter, Write};
 
@@ -14,14 +20,26 @@ const BIG_DATAGRAM: usize = 4000;
 const FRAGMENT: usize = 1480;
 
 fn main() -> std::io::Result<()> {
+    let usage = || -> ! {
+        eprintln!("usage: dlt_to_pcap IN.dlt OUT.pcap [--ports P1,P2,...] [--copy]");
+        std::process::exit(2);
+    };
     let mut args = std::env::args().skip(1);
     let (src, dst) = match (args.next(), args.next()) {
         (Some(s), Some(d)) => (s, d),
-        _ => {
-            eprintln!("usage: dlt_to_pcap IN.dlt OUT.pcap");
-            std::process::exit(2);
-        }
+        _ => usage(),
     };
+    let (mut ports, mut copy) = (vec![3490u16], false);
+    while let Some(a) = args.next() {
+        match a.as_str() {
+            "--ports" => {
+                let list = args.next().unwrap_or_else(|| usage());
+                ports = list.split(',').map(|p| p.trim().parse().unwrap_or_else(|_| usage())).collect();
+            }
+            "--copy" => copy = true,
+            _ => usage(),
+        }
+    }
     let data = std::fs::read(&src)?;
     let mut out = BufWriter::with_capacity(1 << 20, std::fs::File::create(&dst)?);
     out.write_all(&0xA1B2_C3D4u32.to_le_bytes())?;
@@ -55,22 +73,32 @@ fn main() -> std::io::Result<()> {
         pos += 16 + len;
         let limit = if datagrams % 400 == 399 { BIG_DATAGRAM } else { DATAGRAM };
         if payload.len() >= limit || pos + 20 > data.len() {
-            id = id.wrapping_add(1);
-            frames += datagram(&mut out, &payload, id, time)?;
+            let to: Vec<u16> = if copy { ports.clone() } else { vec![ports[datagrams as usize % ports.len()]] };
+            for port in to {
+                id = id.wrapping_add(1);
+                frames += datagram(&mut out, &payload, id, time, port)?;
+            }
             datagrams += 1;
             payload.clear();
         }
     }
     out.flush()?;
-    eprintln!("{msgs} messages in {datagrams} datagrams, {frames} frames");
+    let copies = if copy { ports.len() } else { 1 };
+    eprintln!("{msgs} messages in {datagrams} datagrams (x{copies}), {frames} frames");
     Ok(())
 }
 
 /// Write one UDP datagram (fragmented if needed); returns the frames written.
-fn datagram(out: &mut impl Write, payload: &[u8], id: u16, (secs, usecs): (u32, u32)) -> std::io::Result<u64> {
+fn datagram(
+    out: &mut impl Write,
+    payload: &[u8],
+    id: u16,
+    (secs, usecs): (u32, u32),
+    port: u16,
+) -> std::io::Result<u64> {
     let mut udp = Vec::with_capacity(8 + payload.len());
     udp.extend_from_slice(&50000u16.to_be_bytes());
-    udp.extend_from_slice(&3490u16.to_be_bytes());
+    udp.extend_from_slice(&port.to_be_bytes());
     udp.extend_from_slice(&((8 + payload.len()) as u16).to_be_bytes());
     udp.extend_from_slice(&[0, 0]);
     udp.extend_from_slice(payload);

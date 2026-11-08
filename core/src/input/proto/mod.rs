@@ -17,6 +17,7 @@
 //! every protocol's fields; a field a message's protocol doesn't have has
 //! no value there (it only satisfies `!=` and `!~`).
 
+pub mod ksy;
 pub mod someip;
 pub mod syslog;
 
@@ -46,14 +47,14 @@ pub const NO_CHANNEL: &[u8; 4] = &[0; 4];
 /// place, so filters on header fields never decode a payload.
 pub trait Protocol: Send + Sync {
     /// Short name: the `proto` field and column (`DLT`, `SOMEIP`, `syslog`).
-    fn name(&self) -> &'static str;
+    fn name(&self) -> &str;
 
     /// Columns after `time`, as [`Self::render`] writes them; the last one
     /// is the payload.
-    fn columns(&self) -> &'static [ColumnDef];
+    fn columns(&self) -> &[ColumnDef];
 
     /// The fields [`Self::field`] answers, by index.
-    fn schema(&self) -> &'static [FieldDef];
+    fn schema(&self) -> &[FieldDef];
 
     /// The messages in one datagram (several back to back are fine): adds
     /// the offset of each to `found` and returns the bytes that weren't one.
@@ -94,6 +95,33 @@ pub trait Protocol: Send + Sync {
         None
     }
 }
+
+/// A protocol given at runtime (a definition, [`ksy`]) and the UDP
+/// destination ports whose payloads are its messages.
+#[derive(Clone)]
+pub struct LoadedProtocol {
+    pub protocol: Arc<dyn Protocol>,
+    pub udp_ports: Vec<u16>,
+}
+
+impl std::fmt::Debug for LoadedProtocol {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LoadedProtocol")
+            .field("name", &self.protocol.name())
+            .field("udp_ports", &self.udp_ports)
+            .finish()
+    }
+}
+
+/// The same reader (not an equal one) on the same ports.
+impl PartialEq for LoadedProtocol {
+    fn eq(&self, other: &Self) -> bool {
+        std::ptr::addr_eq(Arc::as_ptr(&self.protocol), Arc::as_ptr(&other.protocol))
+            && self.udp_ports == other.udp_ports
+    }
+}
+
+impl Eq for LoadedProtocol {}
 
 /// Index of a protocol in a [`Records`] source.
 pub type ProtoId = usize;
@@ -180,14 +208,10 @@ struct View {
 }
 
 /// The shared columns of a source with several protocols.
-pub const MIXED_COLUMNS: [ColumnDef; 4] = [
-    ColumnDef { name: "time", width: 26 },
-    ColumnDef { name: "proto", width: 6 },
-    ColumnDef { name: "info", width: 46 },
-    ColumnDef { name: "payload", width: 0 },
-];
+pub const MIXED_COLUMNS: [ColumnDef; 4] =
+    [ColumnDef::new("time", 26), ColumnDef::new("proto", 6), ColumnDef::new("info", 46), ColumnDef::new("payload", 0)];
 
-const TIME: ColumnDef = ColumnDef { name: "time", width: 26 };
+const TIME: ColumnDef = ColumnDef::new("time", 26);
 /// The protocol's name; compared without case (`proto == syslog`, `SYSLOG`).
 const PROTO_FIELD: FieldDef = FieldDef::new("proto", FieldKind::Name, false);
 
@@ -313,7 +337,7 @@ impl Records {
     }
 
     /// The protocols of the messages, by name, each once.
-    pub fn protocols(&self) -> Vec<&'static str> {
+    pub fn protocols(&self) -> Vec<&str> {
         match &self.index {
             Index::Stored { .. } => vec![self.protos[0].name()],
             Index::Framed { msgs, .. } => {

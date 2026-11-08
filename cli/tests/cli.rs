@@ -173,6 +173,64 @@ fn dlt_fields_are_listed_and_filtered() {
     assert!(rows[0].contains("link down") && rows[1].contains("link up"), "{rows:?}");
 }
 
+/// The DLT file's messages (storage headers dropped) as UDP datagrams to
+/// `port` in a pcap.
+fn dlt_pcap(d: &Path, port: u16) -> PathBuf {
+    let dlt = std::fs::read(dlt_file(d)).unwrap();
+    let mut out = Vec::new();
+    out.extend_from_slice(&0xa1b2_c3d4u32.to_le_bytes());
+    out.extend_from_slice(&2u16.to_le_bytes());
+    out.extend_from_slice(&4u16.to_le_bytes());
+    for x in [0u32, 0, 262_144, 1] {
+        out.extend_from_slice(&x.to_le_bytes());
+    }
+    let mut pos = 0;
+    while pos + 20 <= dlt.len() {
+        let len = u16::from_be_bytes([dlt[pos + 18], dlt[pos + 19]]) as usize;
+        let payload = &dlt[pos + 16..pos + 16 + len];
+        pos += 16 + len;
+        let mut f = vec![2; 12];
+        f.extend_from_slice(&[0x08, 0x00, 0x45, 0]);
+        f.extend_from_slice(&((28 + payload.len()) as u16).to_be_bytes());
+        f.extend_from_slice(&[0, 1, 0, 0, 64, 17, 0, 0, 10, 0, 0, 1, 10, 0, 0, 2]);
+        f.extend_from_slice(&50000u16.to_be_bytes());
+        f.extend_from_slice(&port.to_be_bytes());
+        f.extend_from_slice(&((8 + payload.len()) as u16).to_be_bytes());
+        f.extend_from_slice(&[0, 0]);
+        f.extend_from_slice(payload);
+        for x in [0u32, 0, f.len() as u32, f.len() as u32] {
+            out.extend_from_slice(&x.to_le_bytes());
+        }
+        out.extend_from_slice(&f);
+    }
+    let p = d.join("trace.pcap");
+    std::fs::write(&p, out).unwrap();
+    p
+}
+
+#[test]
+fn a_protocol_definition_reads_a_capture() {
+    let d = dir("ksy");
+    let pcap = dlt_pcap(&d, 40000);
+    let ksy = Path::new(env!("CARGO_MANIFEST_DIR")).join("../core/tests/data/dlt.ksy");
+    let def = ["--protocol", s(&ksy), "--protocol-port", "DLTK=40000"];
+    let o = nerka(&[&def[..], &["filter", "-c", "proto == DLTK AND apid == NAV AND level >= WARN", s(&pcap)]].concat());
+    assert!(o.status.success(), "{}", err(&o));
+    assert_eq!(out(&o), "2\n");
+    // Without the definition the port carries nothing Nerka reads.
+    let o = nerka(&["filter", "-c", "level >= WARN", s(&pcap)]);
+    assert_eq!(out(&o), "0\n", "{}", err(&o));
+    // A port for a name no --protocol has, and a broken definition: exit 1 with why.
+    let o = nerka(&["--protocol", s(&ksy), "--protocol-port", "OTHER=1", "open", s(&pcap)]);
+    assert_eq!(o.status.code(), Some(1));
+    assert!(err(&o).contains("no --protocol is named OTHER"), "{}", err(&o));
+    let broken = d.join("broken.ksy");
+    std::fs::write(&broken, "meta: { id: x }\nseq:\n  - { id: a, type: u3 }\n").unwrap();
+    let o = nerka(&["--protocol", s(&broken), "open", s(&pcap)]);
+    assert_eq!(o.status.code(), Some(1));
+    assert!(err(&o).contains("broken.ksy: line 3, column 5: there is no type `u3` here"), "{}", err(&o));
+}
+
 #[test]
 fn checks_report_issues_and_strict_fails() {
     let d = dir("check");
