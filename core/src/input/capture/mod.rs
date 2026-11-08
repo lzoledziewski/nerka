@@ -26,12 +26,14 @@ pub mod unpack;
 use super::Bytes;
 use super::dlt::Dlt;
 use super::proto::{
-    Framed, LoadedProtocol, MAX_CHANNELS, MAX_PROTOCOLS, ProtoId, Protocol, Records, someip::SomeIp, syslog::Syslog,
+    Framed, LoadedProtocol, MAX_CHANNELS, MAX_ORIGINS, MAX_PROTOCOLS, MAX_SENDERS, Origins, ProtoId, Protocol, Records,
+    someip::SomeIp, syslog::Syslog,
 };
 use crate::{Error, Progress, Result};
 use net::{Net, NetStats, Payload};
 use route::{Datagram, Match, Route};
 use std::borrow::Cow;
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 pub use unpack::{UnpackOptions, cache_usage, clear_cache};
@@ -121,6 +123,9 @@ pub struct CaptureStats {
     pub msg_skipped: u64,
     /// Bytes of the file that couldn't be read as records.
     pub file_skipped: u64,
+    /// Messages whose datagram's sender wasn't kept (more than
+    /// [`MAX_SENDERS`] senders): they have no `net.*` fields.
+    pub senders_not_kept: u64,
 }
 
 /// Does `head` (the first bytes of a file) look like a capture this module
@@ -175,6 +180,7 @@ fn read(
             side: Vec::new(),
             stats: CaptureStats::default(),
             found: Vec::new(),
+            origins: OriginTable::default(),
         },
         options,
         rules: &rules,
@@ -191,7 +197,7 @@ fn read(
         pcap::frames(buf, progress, &mut |fr| sink.link_frame(fr.link, fr.data, fr.secs, fr.usecs, fr.channel))?
     };
     if sink.too_far {
-        return Err(Error::Format("capture too large to index (offsets over 256 TiB)".into()));
+        return Err(Error::Format("capture too large to index (offsets over 1 TiB)".into()));
     }
     sink.net.finish();
     let Sink { net, c, channel_ecus, .. } = sink;
@@ -203,11 +209,12 @@ fn read(
     msgs.shrink_to_fit();
     side.shrink_to_fit();
     let skipped = stats.msg_skipped;
+    let origins = Origins::new(channel_ecus, c.origins.pairs, c.origins.senders);
     let data = match unpacked {
         Some((b, _)) => b,
         None => data,
     };
-    Ok((Records::framed(name, path, data, msgs, side, channel_ecus, protos, skipped), stats))
+    Ok((Records::framed(name, path, data, msgs, side, origins, protos, skipped), stats))
 }
 
 /// Where containers deliver frames: transport, router and protocols.
@@ -227,7 +234,7 @@ impl<'a> Sink<'a, '_> {
         let (c, rules, too_far) = (&mut self.c, self.rules, &mut self.too_far);
         self.net.frame(link, data, secs, &mut |dg, payload| {
             if let Some(proto) = route(rules, dg) {
-                *too_far |= !c.datagram(&payload, proto, channel, secs, usecs);
+                *too_far |= !c.datagram(&payload, proto, channel, Some(dg), secs, usecs);
             }
         });
     }
@@ -238,14 +245,14 @@ impl<'a> Sink<'a, '_> {
         match data {
             Cow::Borrowed(d) => self.net.ether_frame(ethertype, d, secs, &mut |dg, payload| {
                 if let Some(proto) = route(rules, dg) {
-                    *too_far |= !c.datagram(&payload, proto, channel, secs, usecs);
+                    *too_far |= !c.datagram(&payload, proto, channel, Some(dg), secs, usecs);
                 }
             }),
             // Not in the file: whatever comes out of it is copied.
             Cow::Owned(v) => self.net.ether_frame(ethertype, &v, secs, &mut |dg, payload| {
                 if let Some(proto) = route(rules, dg) {
                     let p = Payload::Assembled(payload.bytes().to_vec());
-                    *too_far |= !c.datagram(&p, proto, channel, secs, usecs);
+                    *too_far |= !c.datagram(&p, proto, channel, Some(dg), secs, usecs);
                 }
             }),
         }
@@ -257,7 +264,7 @@ impl<'a> Sink<'a, '_> {
             Cow::Borrowed(d) => Payload::InFrame(d),
             Cow::Owned(v) => Payload::Assembled(v),
         };
-        self.too_far |= !self.c.datagram(&p, DLT, channel, secs, usecs);
+        self.too_far |= !self.c.datagram(&p, DLT, channel, None, secs, usecs);
     }
 
     /// The channel whose fallback ECU id is `ecu` (made on first use).
@@ -323,24 +330,93 @@ struct Collector<'a> {
     /// Where `split` found the messages of the datagram at hand: one list
     /// for all datagrams (an MF4 log has one per message).
     found: Vec<usize>,
+    origins: OriginTable,
+}
+
+/// Builds a capture's [`Origins`]: each sender and each (channel, sender)
+/// once. The table is keyed with std's randomly seeded hash, so a crafted
+/// capture can't make its lookups collide; at [`MAX_SENDERS`] senders (or
+/// [`MAX_ORIGINS`] pairs) new ones aren't kept and their messages carry
+/// their channel alone.
+#[derive(Default)]
+struct OriginTable {
+    pairs: Vec<(u16, u32)>,
+    senders: Vec<Datagram>,
+    sender_ids: HashMap<Datagram, u32>,
+    pair_ids: HashMap<(u16, u32), usize>,
+    /// The last datagram's channel, sender and origin: consecutive
+    /// datagrams mostly come from the same sender.
+    last: Option<(usize, Datagram, usize)>,
+}
+
+impl OriginTable {
+    /// The origin of a datagram from `sender` on `channel`; the channel
+    /// alone if it has no sender or the table is full.
+    fn get(&mut self, channel: usize, sender: Option<&Datagram>) -> usize {
+        let Some(dg) = sender else { return channel };
+        if let Some((c, d, o)) = &self.last
+            && *c == channel
+            && d == dg
+        {
+            return *o;
+        }
+        let o = self.find(channel, dg);
+        self.last = Some((channel, *dg, o));
+        o
+    }
+
+    fn find(&mut self, channel: usize, dg: &Datagram) -> usize {
+        let s = match self.sender_ids.get(dg) {
+            Some(&s) => s,
+            None if self.senders.len() >= MAX_SENDERS => return channel,
+            None => {
+                let s = self.senders.len() as u32;
+                self.senders.push(*dg);
+                self.sender_ids.insert(*dg, s);
+                s
+            }
+        };
+        let key = (channel as u16, s);
+        if let Some(&o) = self.pair_ids.get(&key) {
+            return o;
+        }
+        let o = MAX_CHANNELS + self.pairs.len();
+        if o >= MAX_ORIGINS {
+            return channel;
+        }
+        self.pairs.push(key);
+        self.pair_ids.insert(key, o);
+        o
+    }
 }
 
 impl Collector<'_> {
-    /// Index the messages of one datagram of protocol `proto`. Returns
-    /// false if an offset doesn't fit the index.
-    fn datagram(&mut self, payload: &Payload<'_>, proto: ProtoId, channel: usize, secs: u32, usecs: i32) -> bool {
+    /// Index the messages of one datagram of protocol `proto`, from
+    /// `sender` (`None`: not a UDP datagram). Returns false if an offset
+    /// doesn't fit the index.
+    fn datagram(
+        &mut self,
+        payload: &Payload<'_>,
+        proto: ProtoId,
+        channel: usize,
+        sender: Option<&Datagram>,
+        secs: u32,
+        usecs: i32,
+    ) -> bool {
         let mut found = std::mem::take(&mut self.found);
         found.clear();
-        let ok = self.index(payload, proto, channel, secs, usecs, &mut found);
+        let ok = self.index(payload, proto, channel, sender, secs, usecs, &mut found);
         self.found = found;
         ok
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn index(
         &mut self,
         payload: &Payload<'_>,
         proto: ProtoId,
         channel: usize,
+        sender: Option<&Datagram>,
         secs: u32,
         usecs: i32,
         found: &mut Vec<usize>,
@@ -352,12 +428,17 @@ impl Collector<'_> {
         if found.is_empty() {
             return true;
         }
+        // Only datagrams that hold messages get an origin of their own.
         let channel = channel.min(MAX_CHANNELS - 1);
+        let origin = self.origins.get(channel, sender);
+        if sender.is_some() && origin < MAX_CHANNELS {
+            self.stats.senders_not_kept += found.len() as u64;
+        }
         if !self.delimited[proto] {
             // Each message behind its length, in the side buffer.
             let ends: Vec<usize> = found.iter().skip(1).copied().chain([bytes.len() - skipped]).collect();
             for (&at, end) in found.iter().zip(ends) {
-                let Some(f) = Framed::new(self.side.len() as u64, true, proto, channel, secs, usecs) else {
+                let Some(f) = Framed::new(self.side.len() as u64, true, proto, origin, secs, usecs) else {
                     return false;
                 };
                 self.side.extend_from_slice(&((end - at) as u32).to_le_bytes());
@@ -385,7 +466,7 @@ impl Collector<'_> {
             }
         };
         for &at in found.iter() {
-            let Some(f) = Framed::new((base + at) as u64, in_side, proto, channel, secs, usecs) else { return false };
+            let Some(f) = Framed::new((base + at) as u64, in_side, proto, origin, secs, usecs) else { return false };
             self.msgs.push(f);
             self.stats.messages += 1;
         }

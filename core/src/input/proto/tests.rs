@@ -37,7 +37,7 @@ fn someip_messages_back_to_back() {
 #[test]
 fn framed_entries_keep_every_part() {
     let f = Framed::new(12345, true, 2, 77, 9, -1).unwrap();
-    assert_eq!((f.offset(), f.in_side(), f.proto(), f.channel(), f.secs, f.usecs), (12345, true, 2, 77, 9, -1));
+    assert_eq!((f.offset(), f.in_side(), f.proto(), f.origin(), f.secs, f.usecs), (12345, true, 2, 77, 9, -1));
     assert_eq!(size_of::<Framed>(), 16);
 }
 
@@ -47,7 +47,7 @@ fn framed_entries_keep_every_part() {
 fn a_view_of_several_protocols_unites_their_fields() {
     let protos: Vec<Arc<dyn Protocol>> =
         vec![Arc::new(crate::input::dlt::Dlt::default()), Arc::new(SomeIp), Arc::new(syslog::Syslog)];
-    let v = View::new(&protos, &[0, 1]);
+    let v = View::new(&protos, &[0, 1], false);
     assert!(v.mixed);
     let names: Vec<&str> = v.schema.iter().map(|d| d.name.as_ref()).collect();
     assert_eq!(&names[..3], ["proto", "ecu", "apid"]);
@@ -59,8 +59,13 @@ fn a_view_of_several_protocols_unites_their_fields() {
     let service = names.iter().position(|n| *n == "service").unwrap();
     assert!(v.fields[0][service].is_none() && v.fields[1][service].is_some());
     // One protocol: its own columns, `proto` last (DLT's field ids stay).
-    let one = View::new(&protos, &[0]);
+    let one = View::new(&protos, &[0], false);
     assert!(!one.mixed);
     assert_eq!(one.proto_field, one.schema.len() - 1);
     assert_eq!(one.columns, crate::input::dlt::COLUMNS);
+    // A capture's `net.*` fields come after them: DLT's ids still stay.
+    let net = View::new(&protos, &[0], true);
+    assert_eq!(net.proto_field, one.proto_field);
+    assert_eq!(net.net, Some(one.schema.len()));
+    assert_eq!(net.schema[one.schema.len()..], NET_FIELDS);
 }

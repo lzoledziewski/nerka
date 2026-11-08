@@ -243,7 +243,7 @@ fn ethernet_frames_in_vlsd_groups() {
     // record or fragments.
     let file = x2e(true, &frames[..2], false, usize::MAX);
     let (f, _) = from_bytes("t.mf4", file, &CaptureOptions::default()).unwrap();
-    assert_eq!(f.index_memory_bytes(), 2 * 16);
+    assert_eq!((f.line_count(), f.side_bytes()), (2, 0));
 }
 
 /// A sorted data group of DLT frames whose bytes are in an SD block (the

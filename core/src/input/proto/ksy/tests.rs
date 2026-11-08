@@ -196,6 +196,7 @@ fn errors_say_where() {
     assert_eq!(error(&base.replace("x: x", "x: y")).2, "`y` isn't an attribute or instance of `root`");
     assert_eq!(error(&base.replace("name: T", "name: SomeIP")).2, "`SomeIP` is a native protocol's name");
     assert_eq!(error(&base.replace("    x: x", "    raw: x")).2, "`raw` is a name NFD has already");
+    assert_eq!(error(&base.replace("    x: x", "    net.src: x")).2, "`net.src`: `net.` fields are the capture's own");
     assert_eq!(error(&base.replace("columns: [x]", "columns: [y]")).2, "there is no field `y`; give `from:`");
     assert_eq!(error(&base.replace("seq:", "params: []\nseq:")).2, "params aren't read yet");
     assert_eq!(error(&base.replace("type: u1 }", "type: u1, enum: nope }")).2, "there is no enum `nope` here");

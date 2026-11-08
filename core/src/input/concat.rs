@@ -2,8 +2,9 @@
 //! view of several files; [`super::merged`] interleaves them by time).
 //!
 //! Line `n` of the whole is line `n - start` of the part it falls in. Parts
-//! with the same columns and fields keep them (plain text with plain text,
-//! DLT with DLT, captures included). Messages of different protocols
+//! with the same columns keep them, with every part's fields (plain text
+//! with plain text, DLT with DLT, captures included: those add `net.*`
+//! fields a `.dlt` file doesn't have). Messages of different protocols
 //! (owner, 2026-11-08: DLT from one capture, a protocol definition's
 //! messages from another) share the **mixed layout** of a capture holding
 //! several protocols: columns `time`, `proto`, `info`, `payload`, and every
@@ -35,6 +36,8 @@ pub struct Concat {
     schema: Vec<FieldDef>,
     /// Parts of different protocols, in the mixed layout.
     mixed: bool,
+    /// Parts whose fields differ: [`Concat::fields`] maps them.
+    mapped: bool,
     columns: Vec<ColumnDef>,
     /// Per part, its field for each of the whole's (`None`: it has none;
     /// the `file` field is the whole's own).
@@ -77,11 +80,11 @@ impl Concat {
     pub fn new(parts: Vec<Box<dyn LogSource>>) -> Result<Concat> {
         let Some(first) = parts.first() else { return Err(Error::Format("no files to open".into())) };
         let k = kind(first.as_ref());
-        let mixed = parts.iter().any(|p| kind(p.as_ref()) != k);
+        let differ = parts.iter().any(|p| kind(p.as_ref()) != k);
         // Only messages of protocols mix; plain text or JSON with anything
         // of another kind doesn't.
         let lone = parts.iter().position(|p| !has_proto(p.as_ref()));
-        if let (true, Some(i)) = (mixed, lone) {
+        if let (true, Some(i)) = (differ, lone) {
             let (first, k) = (&parts[i], kind(parts[i].as_ref()));
             let other = parts.iter().find(|p| kind(p.as_ref()) != k).expect("they differ");
             return Err(Error::MixedKinds(format!(
@@ -92,21 +95,21 @@ impl Concat {
                 kind_name(other.as_ref())
             )));
         }
-        let mut schema: Vec<FieldDef> = Vec::new();
-        if mixed {
-            // As a capture of several protocols: `proto` first, then each
-            // part's fields; one of a name already there is the same field
-            // when its kind is the same, and left out when it isn't.
-            schema.push(PROTO_FIELD);
-            for p in &parts {
-                for def in p.schema() {
-                    if !schema.iter().any(|d| d.name == def.name) {
-                        schema.push(def.clone());
-                    }
+        // Columns differ: the mixed layout. Only fields differ (a `.dlt`
+        // file and a capture of DLT): the columns stay.
+        let mixed = parts.iter().any(|p| p.columns() != first.columns());
+        let mapped = parts.iter().any(|p| p.schema() != first.schema());
+        // As a capture of several protocols, `proto` first when mixed; then
+        // each part's fields (the first part's keep their ids). One of a
+        // name already there is the same field when its kind is the same,
+        // and left out when it isn't.
+        let mut schema: Vec<FieldDef> = if mixed { vec![PROTO_FIELD] } else { Vec::new() };
+        for p in &parts {
+            for def in p.schema() {
+                if !schema.iter().any(|d| d.name == def.name) {
+                    schema.push(def.clone());
                 }
             }
-        } else {
-            schema = first.schema().to_vec();
         }
         let fields = parts
             .iter()
@@ -124,7 +127,7 @@ impl Concat {
         }
         let files = parts.iter().map(|p| file_name(p.name())).collect();
         let name = parts.iter().map(|p| p.name()).collect::<Vec<_>>().join(" + ");
-        Ok(Concat { name, parts, starts, files, total, schema, mixed, columns, fields, convert })
+        Ok(Concat { name, parts, starts, files, total, schema, mixed, mapped, columns, fields, convert })
     }
 
     /// Whether parts of different protocols share the mixed layout.
@@ -180,7 +183,7 @@ impl Concat {
         if id == self.file_id() {
             return Some(FieldValue::Str(self.files[k].as_bytes().into()));
         }
-        if !self.mixed {
+        if !self.mapped {
             // One kind: the parts' fields are the whole's.
             return self.parts[k].field(l, id);
         }

@@ -15,7 +15,8 @@
 //! (plus `proto`). Several: shared columns `time`, `proto`, `info` (the
 //! protocol's columns before its payload, in one cell) and `payload`, and
 //! every protocol's fields; a field a message's protocol doesn't have has
-//! no value there (it only satisfies `!=` and `!~`).
+//! no value there (it only satisfies `!=` and `!~`). A capture adds
+//! [`NET_FIELDS`], where each message's datagram came from ([`Origins`]).
 
 pub mod ksy;
 pub mod someip;
@@ -134,54 +135,134 @@ pub type ProtoId = usize;
 /// Protocols a source can hold (4 bits of [`Framed`]).
 pub const MAX_PROTOCOLS: usize = 16;
 
-/// Channels a capture can name (11 bits of [`Framed`]).
+/// Channels a capture can name: the first origins ([`Origins`]).
 pub const MAX_CHANNELS: usize = 1 << 11;
 
-/// A message inside a container: where it starts, its protocol, the channel
-/// it came from and the time the container gives it. 16 bytes.
+/// Origins a capture can name (19 bits of [`Framed`]).
+pub const MAX_ORIGINS: usize = 1 << 19;
+
+/// Senders of UDP datagrams a capture keeps ([`Origins`]); messages from
+/// more get no `net.*` fields. A capture with spoofed or garbled addresses
+/// can't grow the table further (owner, 2026-11-08).
+pub const MAX_SENDERS: usize = 1 << 16;
+
+/// Largest offset of a message in a file or the side buffer (1 TiB).
+pub const MAX_OFFSET: u64 = (1 << 40) - 1;
+
+/// A message inside a container: where it starts, its protocol, where it
+/// came from (an [`Origins`] id: the channel, and the sender of its
+/// datagram) and the time the container gives it. 16 bytes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Framed {
-    /// Bits 0–47: offset of the message, in the file or (bit 63) in the
-    /// side buffer; bits 48–58: channel; bits 59–62: protocol.
+    /// Bits 0–39: offset of the message, in the file or (bit 63) in the
+    /// side buffer; bits 40–58: origin; bits 59–62: protocol.
     at: u64,
     secs: u32,
     usecs: i32,
 }
 
-const OFFSET_MASK: u64 = (1 << 48) - 1;
 const IN_SIDE: u64 = 1 << 63;
-const CHANNEL_SHIFT: u32 = 48;
+const ORIGIN_SHIFT: u32 = 40;
 const PROTO_SHIFT: u32 = 59;
 
 impl Framed {
     /// A message of protocol `proto` at `offset` (in the side buffer if
-    /// `side`), from channel `channel` (an index into the source's channel
-    /// ids), stored at `secs` + `usecs`. `None` if something doesn't fit.
-    pub fn new(offset: u64, side: bool, proto: ProtoId, channel: usize, secs: u32, usecs: i32) -> Option<Framed> {
-        if offset > OFFSET_MASK || channel >= MAX_CHANNELS || proto >= MAX_PROTOCOLS {
+    /// `side`), from `origin` (an [`Origins`] id; a channel alone is its
+    /// index into the source's channel ids), stored at `secs` + `usecs`.
+    /// `None` if something doesn't fit.
+    pub fn new(offset: u64, side: bool, proto: ProtoId, origin: usize, secs: u32, usecs: i32) -> Option<Framed> {
+        if offset > MAX_OFFSET || origin >= MAX_ORIGINS || proto >= MAX_PROTOCOLS {
             return None;
         }
         let at = offset
-            | ((channel as u64) << CHANNEL_SHIFT)
+            | ((origin as u64) << ORIGIN_SHIFT)
             | ((proto as u64) << PROTO_SHIFT)
             | if side { IN_SIDE } else { 0 };
         Some(Framed { at, secs, usecs })
     }
 
     pub(crate) fn offset(&self) -> usize {
-        (self.at & OFFSET_MASK) as usize
+        (self.at & MAX_OFFSET) as usize
     }
 
     pub(crate) fn in_side(&self) -> bool {
         self.at & IN_SIDE != 0
     }
 
-    pub(crate) fn channel(&self) -> usize {
-        ((self.at >> CHANNEL_SHIFT) as usize) & (MAX_CHANNELS - 1)
+    pub(crate) fn origin(&self) -> usize {
+        ((self.at >> ORIGIN_SHIFT) as usize) & (MAX_ORIGINS - 1)
     }
 
     pub(crate) fn proto(&self) -> ProtoId {
         ((self.at >> PROTO_SHIFT) as usize) & (MAX_PROTOCOLS - 1)
+    }
+}
+
+/// The fields a capture adds: where each message's UDP datagram came from
+/// and went to (no value for messages without one: MF4 `DLT_Frame`, or a
+/// sender past [`MAX_SENDERS`]). Not columns, and not in `raw`.
+pub const NET_FIELDS: [FieldDef; 5] = [
+    FieldDef::new("net.src", FieldKind::Str, false),
+    FieldDef::new("net.dst", FieldKind::Str, false),
+    FieldDef::new("net.sport", FieldKind::U64, false),
+    FieldDef::new("net.port", FieldKind::U64, false),
+    FieldDef::new("net.vlan", FieldKind::U64, false),
+];
+
+/// Where a capture's messages came from, by [`Framed::origin`]: an id below
+/// [`MAX_CHANNELS`] is a channel alone (MF4 `DLT_Frame`, or a sender not
+/// kept); the others are a channel and the sender of a UDP datagram (its
+/// addresses, ports and VLAN), each pair and each sender kept once.
+#[derive(Default)]
+pub struct Origins {
+    /// ECU id per channel, for messages that don't carry one.
+    channels: Vec<[u8; 4]>,
+    /// Origins from `MAX_CHANNELS` on: a channel and an index into `senders`.
+    pairs: Vec<(u16, u32)>,
+    senders: Vec<crate::input::capture::route::Datagram>,
+    /// Each sender's source and destination address as text.
+    texts: Vec<[String; 2]>,
+}
+
+impl Origins {
+    pub(crate) fn new(
+        channels: Vec<[u8; 4]>,
+        pairs: Vec<(u16, u32)>,
+        senders: Vec<crate::input::capture::route::Datagram>,
+    ) -> Origins {
+        let texts = senders.iter().map(|d| [addr_text(&d.src, d.v6), addr_text(&d.dst, d.v6)]).collect();
+        Origins { channels, pairs, senders, texts }
+    }
+
+    /// The ECU id of `origin`'s channel.
+    fn channel(&self, origin: usize) -> &[u8; 4] {
+        let channel = match origin.checked_sub(MAX_CHANNELS) {
+            None => Some(origin),
+            Some(i) => self.pairs.get(i).map(|p| usize::from(p.0)),
+        };
+        channel.and_then(|c| self.channels.get(c)).unwrap_or(NO_CHANNEL)
+    }
+
+    /// `origin`'s sender, if one was kept.
+    fn sender(&self, origin: usize) -> Option<usize> {
+        let i = origin.checked_sub(MAX_CHANNELS)?;
+        self.pairs.get(i).map(|p| p.1 as usize)
+    }
+
+    fn memory_bytes(&self) -> usize {
+        self.channels.capacity() * 4
+            + self.pairs.capacity() * 8
+            + self.senders.capacity() * size_of::<crate::input::capture::route::Datagram>()
+            + self.texts.iter().map(|t| t[0].capacity() + t[1].capacity() + 48).sum::<usize>()
+    }
+}
+
+/// An IPv4 address (in the first 4 bytes) or an IPv6 one, as text.
+fn addr_text(a: &[u8; 16], v6: bool) -> String {
+    if v6 {
+        std::net::Ipv6Addr::from(*a).to_string()
+    } else {
+        std::net::Ipv4Addr::new(a[0], a[1], a[2], a[3]).to_string()
     }
 }
 
@@ -208,6 +289,8 @@ struct View {
     schema: Vec<FieldDef>,
     /// The `proto` field's id.
     proto_field: FieldId,
+    /// The id of the first of [`NET_FIELDS`], when the source has them.
+    net: Option<FieldId>,
     /// Per protocol, per field of the source: the protocol's own field id.
     fields: Vec<Vec<Option<FieldId>>>,
 }
@@ -222,7 +305,7 @@ pub(crate) const PROTO_FIELD: FieldDef = FieldDef::new("proto", FieldKind::Name,
 
 impl View {
     /// The view for the protocols `present` (indexes into `protos`).
-    fn new(protos: &[Arc<dyn Protocol>], present: &[ProtoId]) -> View {
+    fn new(protos: &[Arc<dyn Protocol>], present: &[ProtoId], net: bool) -> View {
         let present: &[ProtoId] = if present.is_empty() { &[0] } else { present };
         let mut schema: Vec<FieldDef> = Vec::new();
         let mixed = present.len() > 1;
@@ -241,6 +324,11 @@ impl View {
         if !mixed {
             schema.push(PROTO_FIELD);
         }
+        let net = net.then(|| {
+            let first = schema.len();
+            schema.extend(NET_FIELDS);
+            first
+        });
         let fields = protos
             .iter()
             .map(|p| {
@@ -253,7 +341,7 @@ impl View {
             std::iter::once(TIME).chain(protos[present[0]].columns().iter().cloned()).collect()
         };
         let proto_field = schema.iter().position(|d| d.name == PROTO_FIELD.name).expect("added above");
-        View { mixed, columns, schema, proto_field, fields }
+        View { mixed, columns, schema, proto_field, net, fields }
     }
 }
 
@@ -264,8 +352,8 @@ pub struct Records {
     path: Option<PathBuf>,
     data: Bytes,
     index: Index,
-    /// Channel ids, by [`Framed::channel`].
-    channels: Vec<[u8; 4]>,
+    /// Channels and senders, by [`Framed::origin`].
+    origins: Origins,
     protos: Vec<Arc<dyn Protocol>>,
     view: View,
     skipped: u64,
@@ -284,14 +372,14 @@ impl Records {
         skipped: u64,
     ) -> Records {
         let protos = vec![proto];
-        let view = View::new(&protos, &[0]);
+        let view = View::new(&protos, &[0], false);
         let index = Index::Stored { offsets, header };
-        Records { name, path, data, index, channels: Vec::new(), protos, view, skipped, data_id: new_data_id() }
+        Records { name, path, data, index, origins: Origins::default(), protos, view, skipped, data_id: new_data_id() }
     }
 
     /// Messages found inside a container (`data`, e.g. a mapped pcap):
     /// `msgs` in display order, `side` holding those placed there,
-    /// `channels` the channel ids by [`Framed::channel`], `protos` by
+    /// `origins` the channels and senders by [`Framed::origin`], `protos` by
     /// [`Framed::proto`]. `skipped` counts bytes of routed datagrams that
     /// weren't messages.
     #[allow(clippy::too_many_arguments)]
@@ -301,16 +389,16 @@ impl Records {
         data: Bytes,
         msgs: Vec<Framed>,
         side: Vec<u8>,
-        channels: Vec<[u8; 4]>,
+        origins: Origins,
         protos: Vec<Arc<dyn Protocol>>,
         skipped: u64,
     ) -> Records {
         let mut seen = [false; MAX_PROTOCOLS];
         msgs.iter().for_each(|m| seen[m.proto()] = true);
         let present: Vec<ProtoId> = (0..protos.len()).filter(|&p| seen[p]).collect();
-        let view = View::new(&protos, &present);
+        let view = View::new(&protos, &present, !origins.senders.is_empty());
         let index = Index::Framed { msgs, side };
-        Records { name, path, data, index, channels, protos, view, skipped, data_id: new_data_id() }
+        Records { name, path, data, index, origins, protos, view, skipped, data_id: new_data_id() }
     }
 
     /// The same messages with protocol `id`'s reader replaced (DLT with
@@ -336,6 +424,15 @@ impl Records {
         self.data.bytes()
     }
 
+    /// Bytes copied out of the file (reassembled or split messages).
+    #[cfg(test)]
+    pub(crate) fn side_bytes(&self) -> usize {
+        match &self.index {
+            Index::Framed { side, .. } => side.len(),
+            Index::Stored { .. } => 0,
+        }
+    }
+
     /// Bytes that were not part of any well-formed message.
     pub fn skipped_bytes(&self) -> u64 {
         self.skipped
@@ -353,6 +450,21 @@ impl Records {
         }
     }
 
+    /// Field `k` of [`NET_FIELDS`] for message `line`.
+    fn net_field(&self, line: LineNo, k: usize) -> Option<FieldValue<'_>> {
+        let Index::Framed { msgs, .. } = &self.index else { return None };
+        let s = self.origins.sender(msgs.get(usize::try_from(line).ok()?)?.origin())?;
+        let d = self.origins.senders.get(s)?;
+        Some(match k {
+            0 => FieldValue::Str(self.origins.texts[s][0].as_bytes().into()),
+            1 => FieldValue::Str(self.origins.texts[s][1].as_bytes().into()),
+            2 => FieldValue::U64(d.src_port.into()),
+            3 => FieldValue::U64(d.dst_port.into()),
+            _ if d.vlan[0] != 0 => FieldValue::U64(d.vlan[0].into()),
+            _ => return None,
+        })
+    }
+
     /// Message `line`: its protocol, bytes (to the end of its buffer) and
     /// origin.
     fn msg(&self, line: LineNo) -> Option<(ProtoId, &[u8], Origin<'_>)> {
@@ -366,7 +478,7 @@ impl Records {
             Index::Framed { msgs, side } => {
                 let f = msgs.get(i)?;
                 let buf = if f.in_side() { side.as_slice() } else { self.data.bytes() };
-                let channel = self.channels.get(f.channel()).unwrap_or(NO_CHANNEL);
+                let channel = self.origins.channel(f.origin());
                 let mut msg = buf.get(f.offset()..)?;
                 if !self.protos.get(f.proto())?.delimited() {
                     let (len, rest) = msg.split_first_chunk::<4>()?;
@@ -494,7 +606,7 @@ impl LogSource for Records {
         match &self.index {
             Index::Stored { offsets, .. } => offsets.capacity() * size_of::<u64>(),
             Index::Framed { msgs, side } => {
-                msgs.capacity() * size_of::<Framed>() + side.capacity() + self.channels.capacity() * 4
+                msgs.capacity() * size_of::<Framed>() + side.capacity() + self.origins.memory_bytes()
             }
         }
     }
@@ -512,6 +624,11 @@ impl LogSource for Records {
         let proto = &self.protos[p];
         if id == self.view.proto_field {
             return Some(FieldValue::Str(proto.name().as_bytes().into()));
+        }
+        if let Some(first) = self.view.net
+            && (first..first + NET_FIELDS.len()).contains(&id)
+        {
+            return self.net_field(line, id - first);
         }
         let own = (*self.view.fields.get(p)?.get(id)?)?;
         proto.field(msg, &at, own)
