@@ -31,6 +31,7 @@
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod bundles;
 mod checks;
 mod icon;
 mod icon_art;
@@ -238,6 +239,8 @@ fn main() -> eframe::Result {
                 App { pack_paths: packs, show_library, show_signals, window_name, plot_window, ..Default::default() };
             let ctx = cc.egui_ctx.clone();
             app.server = instance::Server::start(move || ctx.request_repaint());
+            // A config folder written by an earlier nerka: to this one's formats.
+            let upgraded = nerka_core::bundle::Store::user().and_then(|s| s.upgrade().message());
             app.load_history();
             app.load_prefs();
             app.load_saved_signals();
@@ -255,6 +258,9 @@ fn main() -> eframe::Result {
             app.load_library();
             app.presets.load();
             app.plots.load();
+            if let Some(m) = upgraded {
+                app.status = m;
+            }
             let mut picks = Picks::default();
             picks.params = params;
             for (role, id) in &startup {
@@ -2824,6 +2830,9 @@ struct App {
     session_signals: SessionOnly<nerka_core::SignalDef>,
     checks_gen: u64,
     saved_gen: u64,
+    /// The settings bundle's Export and Import windows, when open.
+    bundle_export: Option<bundles::ExportView>,
+    bundle_import: Option<bundles::ImportView>,
     /// FIBEX files for DLT non-verbose messages (this session), read into
     /// one catalog that every DLT tab is opened with.
     fibex: Option<Arc<nerka_core::Fibex>>,
@@ -2848,6 +2857,9 @@ struct SettingsChange {
     clear: bool,
     /// Local time or UTC, or how MF4 local times are read, changed.
     times: bool,
+    /// Export… or Import… of a settings bundle clicked.
+    export: bool,
+    import: bool,
 }
 
 /// What the Settings window shows: this window's name, the UDP ports of
@@ -2952,6 +2964,19 @@ fn settings_ui(ui: &mut egui::Ui, f: SettingsFields<'_>) -> SettingsChange {
                     ui.colored_label(ui.visuals().error_fg_color, "1–1024");
                 }
             }
+        });
+        ui.end_row();
+        ui.label(RichText::new("Settings bundle").strong()).on_hover_text(
+            "Packs, presets, plots, checks and signals as one .nerka-bundle file: to share them or move them              to another computer",
+        );
+        ui.end_row();
+        ui.label("");
+        ui.horizontal(|ui| {
+            save.export = ui.button("Export…").on_hover_text("Pick what to put into a bundle, then save it").clicked();
+            save.import = ui
+                .button("Import…")
+                .on_hover_text("Open a bundle and see what it would change before anything is written")
+                .clicked();
         });
         ui.end_row();
     });
@@ -3273,6 +3298,47 @@ impl App {
     /// The Settings window (⚙, Ctrl+,): this window's name and the DLT
     /// ports of captures. A window, not a menu: a menu closes on any click,
     /// so its text fields couldn't be typed in.
+    /// The settings bundle's Export and Import windows.
+    fn bundle_windows(&mut self, ctx: &egui::Context) {
+        if let Some(v) = &mut self.bundle_export {
+            match bundles::export_window(ctx, v) {
+                bundles::Outcome::Open => {}
+                bundles::Outcome::Close => self.bundle_export = None,
+                bundles::Outcome::Go => {
+                    if let Some(msg) = bundles::save_export(v) {
+                        self.status = msg;
+                        self.bundle_export = None;
+                    }
+                }
+            }
+        }
+        if let Some(v) = &mut self.bundle_import {
+            match bundles::import_window(ctx, v) {
+                bundles::Outcome::Open => {}
+                bundles::Outcome::Close => self.bundle_import = None,
+                bundles::Outcome::Go => {
+                    let Some(store) = nerka_core::bundle::Store::user() else { return };
+                    let done = store.apply(&v.plan);
+                    self.bundle_import = None;
+                    self.reload_settings();
+                    self.status = format!("Import: {}", done.summary());
+                }
+            }
+        }
+    }
+
+    /// Load the packs, presets, plots, checks and signals again (an import
+    /// changed them).
+    fn reload_settings(&mut self) {
+        self.load_library();
+        self.presets.load();
+        self.plots.load();
+        self.load_checks();
+        self.checks_gen += 1;
+        self.load_saved_signals();
+        self.saved_gen += 1;
+    }
+
     fn settings_window(&mut self, ctx: &egui::Context) {
         if !self.settings_open {
             return;
@@ -3305,6 +3371,22 @@ impl App {
             self.settings_open = false;
             self.ports_text = None;
             self.limit_text = None;
+        }
+        if save.export {
+            match nerka_core::bundle::Store::user() {
+                Some(store) => self.bundle_export = Some(bundles::ExportView::of(&store)),
+                None => self.status = "No config folder to export from".into(),
+            }
+        }
+        if save.import {
+            match nerka_core::bundle::Store::user() {
+                Some(store) => match bundles::ImportView::pick(&store) {
+                    Some(Ok(v)) => self.bundle_import = Some(v),
+                    Some(Err(e)) => self.status = format!("Could not import: {e}"),
+                    None => {}
+                },
+                None => self.status = "No config folder to import into".into(),
+            }
         }
         if save.clear
             && let Some(dir) = nerka_core::cache_dir()
@@ -3993,6 +4075,7 @@ impl App {
         self.records_window(&ctx);
         self.about_dialog(&ctx);
         self.settings_window(&ctx);
+        self.bundle_windows(&ctx);
         if let Some(t) = self.tabs.get_mut(self.active)
             && let Some(d) = &mut t.detail
         {

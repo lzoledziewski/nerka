@@ -25,9 +25,12 @@
 //! * [`pack`] — query packs (the search manager's library) and their
 //!   expansion into plain NFD.
 //! * [`atomic`] — [`write_atomic`] for every file nerka saves.
+//! * [`bundle`] — settings bundles: export, import and upgrades of the
+//!   analysis setup (packs, presets, plots, checks, signals).
 
 pub mod atomic;
 pub mod bookmarks;
+pub mod bundle;
 pub mod check;
 pub mod dsl;
 pub mod engine;

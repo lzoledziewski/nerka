@@ -27,6 +27,8 @@ cargo run -p nerka-cli -- --check 'storm: lines level >= ERROR; rate 25 per 1s' 
 cargo run -p nerka-cli -- --check 'lost: lines /timeout/; missing /connected/ within 200ms' --check 'bursts: lines @lost.event; rate 2 per 60s' check trace.dlt   # a check feeds a check (@name)
 cargo run -p nerka-cli -- --pack packs/ expand -l ota -p cam=CAM1 --parts   # pack picks -> NFD
 cargo run -p nerka-cli -- --pack packs/ search --in 'level >= WARN' -l ota app.log
+cargo run -p nerka-cli -- export -o mine.nerka-bundle --only packs   # settings bundle (doc/bundles.md)
+cargo run -p nerka-cli -- import --dry-run mine.nerka-bundle         # its plan; --conflicts both|theirs|mine
 cargo run --release -p nerka-core --example gen_log -- big.log 1024   # 1 GiB test log
 cargo run --release -p nerka-cli -- search -c --stats ERROR big.log  # benchmark
 cargo run --release -p nerka-core --example gen_dlt -- big.dlt 1024   # 1 GiB DLT test file
@@ -64,3 +66,6 @@ before changing the UI, and update it when the state changes.
   including error positions.
 - Performance-sensitive changes: report before/after numbers from the `--stats` benchmark above.
 - Keep dependencies few and justified in the PR description (spec §3.1).
+- A breaking change to a saved file's format (packs, presets, plots, checks,
+  signals) adds a migration step to `bundle::STEPS` and a test on a sample
+  of the old format (`doc/bundles.md`); never change a format silently.
