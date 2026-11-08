@@ -151,10 +151,15 @@ grep -qiE 'sha256|checksum|attest' .github/workflows/release.yml && pass SUP-3 "
 
 if [ "$BENCH" = 1 ]; then
   echo "== performance"
-  cargo build --release -p nerka-cli -p nerka-core --examples >"$OUT/build-bench.log" 2>&1
-  tools/bench.sh "${BENCH_DIR:-target/bench}" "${BENCH_MIB:-1024}" "${BENCH_RUNS:-5}" >"$OUT/bench.tsv" 2>"$OUT/bench.log"
-  pass PERF-1 "benchmark written to $OUT/bench.tsv"
-  if [ -n "${BENCH_BASE:-}" ]; then
+  cargo build --release -p nerka-cli -p nerka-core --bins --examples >"$OUT/build-bench.log" 2>&1
+  # An empty table must not pass: every case has to have run.
+  if tools/bench.sh "${BENCH_DIR:-target/bench}" "${BENCH_MIB:-1024}" "${BENCH_RUNS:-5}" >"$OUT/bench.tsv" 2>"$OUT/bench.log" &&
+    [ "$(wc -l <"$OUT/bench.tsv")" -gt 1 ]; then
+    pass PERF-1 "benchmark written to $OUT/bench.tsv"
+  else
+    fail PERF-1 "benchmark did not run (see $OUT/bench.log)"
+  fi
+  if [ -n "${BENCH_BASE:-}" ] && [ "$(wc -l <"$OUT/bench.tsv")" -gt 1 ]; then
     tools/bench.sh compare "$BENCH_BASE" "$OUT/bench.tsv" | tee "$OUT/bench-compare.tsv"
     if grep -q "MATCHES DIFFER" "$OUT/bench-compare.tsv"; then fail PERF-2 "match counts changed against $BENCH_BASE"
     elif grep -q SLOWER "$OUT/bench-compare.tsv"; then warn PERF-2 "slower than $BENCH_BASE by over 15 % (rerun on an idle machine before trusting it)"

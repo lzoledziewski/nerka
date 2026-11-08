@@ -488,3 +488,113 @@ fn rules_share_one_port_by_address_and_vlan() {
     // Turned off: its datagrams go to the next rule that matches.
     assert_eq!(per(&open(&["DLTK:3490"], &["DLT"])), (0, all.0));
 }
+
+// --- review 2026-11-08 probes ---------------------------------------------
+
+/// Mutates numbers and type names of the DLT definition (sizes, counts,
+/// enum values, kinds) and reads well-formed DLT messages with whatever
+/// still parses: nothing may panic, hang or allocate without bound.
+#[test]
+fn mutated_definitions_read_real_messages_without_panic() {
+    let mut rng = Rng(0x5eed_2026_1108);
+    let words: Vec<&str> = DEFINITION.split_inclusive(|c: char| !c.is_ascii_alphanumeric() && c != '_').collect();
+    let nums = [
+        "0",
+        "1",
+        "-1",
+        "2",
+        "7",
+        "8",
+        "63",
+        "64",
+        "255",
+        "65535",
+        "4294967295",
+        "9223372036854775807",
+        "18446744073709551615",
+        "9223372036854775808",
+        "1000000",
+    ];
+    let kinds =
+        ["u1", "u2", "u4", "u8", "s1", "s2", "s4", "s8", "f4", "f8", "b1", "b3", "b7", "b12", "b64", "str", "strz"];
+    let msgs: Vec<Vec<u8>> = (0..64).map(|_| message(&mut rng, None)).collect();
+    let rounds: u64 = std::env::var("PROBE_ROUNDS").ok().and_then(|s| s.parse().ok()).unwrap_or(300);
+    let (mut parsed, mut tried) = (0, 0);
+    for _ in 0..rounds {
+        let mut w: Vec<String> = words.iter().map(|s| s.to_string()).collect();
+        for _ in 0..1 + rng.below(3) {
+            let i = rng.below(w.len() as u64) as usize;
+            let tail: String = w[i].chars().filter(|c| !c.is_ascii_alphanumeric() && *c != '_').collect();
+            let head = &w[i][..w[i].len() - tail.len()];
+            let new = if head.chars().all(|c| c.is_ascii_digit()) && !head.is_empty() {
+                rng.pick(&nums).to_string()
+            } else if kinds.contains(&head) {
+                rng.pick(&kinds).to_string()
+            } else {
+                continue;
+            };
+            w[i] = new + &tail;
+        }
+        let text: String = w.concat();
+        tried += 1;
+        let Ok(p) = KsyProtocol::parse(&text) else { continue };
+        parsed += 1;
+        for m in &msgs {
+            let at = Origin { secs: 1, usecs: 2, channel: b"\0\0\0\0" };
+            let mut found = Vec::new();
+            p.split(m, &mut found);
+            let mut out = Vec::new();
+            p.render(m, &at, &mut out);
+            for id in 0..p.schema().len() {
+                p.field(m, &at, id);
+            }
+            p.level(m, &at);
+            p.detail(m, &at);
+        }
+    }
+    eprintln!("mutated definitions: {parsed} of {tried} parsed");
+    assert!(parsed > tried / 4, "too few mutations parse to test reading: {parsed} of {tried}");
+}
+
+/// Deep nesting allowed by the limits (a chain of types, a chain of
+/// instances) read on a thread with the 1 MiB stack of a Windows main thread.
+#[test]
+fn deep_definitions_fit_a_small_stack() {
+    let mut types = String::new();
+    let n: usize = std::env::var("DEEP_N").ok().and_then(|s| s.parse().ok()).unwrap_or(180);
+    for i in 0..n {
+        let next = if i + 1 < n { format!("\n      - {{ id: c, type: t{} }}", i + 1) } else { String::new() };
+        types.push_str(&format!("  t{i}:\n    seq:\n      - {{ id: x, type: u1 }}{next}\n"));
+    }
+    let mut insts = String::new();
+    for i in 0..120 {
+        let v = if i == 0 { "a.x".to_string() } else { format!("v{} + 1", i - 1) };
+        insts.push_str(&format!("  v{i}: {{ value: '{v}' }}\n"));
+    }
+    let text = format!(
+        "meta: {{ id: deep, endian: be }}\nseq:\n  - {{ id: a, type: t0 }}\ninstances:\n{insts}types:\n{types}-nerka:\n  name: DEEP\n  framing: datagram\n  columns:\n    - {{ name: last, from: v119 }}\n    - {{ name: all, from: a }}\n"
+    );
+    let p = match KsyProtocol::parse(&text) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("deep definition refused: {e}");
+            return;
+        }
+    };
+    let msg: Vec<u8> = (0..n).map(|i| i as u8).collect();
+    std::thread::Builder::new()
+        .stack_size(1 << 20)
+        .spawn(move || {
+            let at = Origin { secs: 1, usecs: 2, channel: b"\0\0\0\0" };
+            let mut out = Vec::new();
+            p.render(&msg, &at, &mut out);
+            for id in 0..p.schema().len() {
+                p.field(&msg, &at, id);
+            }
+            p.detail(&msg, &at);
+            eprintln!("deep: {}", String::from_utf8_lossy(&out[..out.len().min(80)]));
+        })
+        .unwrap()
+        .join()
+        .expect("reading a deep definition overflowed a 1 MiB stack");
+}

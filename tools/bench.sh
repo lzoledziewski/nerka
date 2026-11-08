@@ -10,7 +10,7 @@
 #
 # Run on an idle machine with a warm page cache (the first run of each file
 # warms it and is dropped). Needs a release build: cargo build --release
-# -p nerka-cli -p nerka-core --examples (NERKA_BIN: another folder of it).
+# -p nerka-cli -p nerka-core --bins --examples (NERKA_BIN: another folder of it).
 #
 # KSY=1 adds the protocol definition cases (doc/protocol-definitions.md):
 # big2.pcap has every datagram on ports 3490 and 3491; native DLT reads one,
@@ -35,6 +35,9 @@ RUNS=${3:-5}
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 BIN=${NERKA_BIN:-$ROOT/target/release}
 EX=$BIN/examples
+for b in "$BIN/nerka" "$EX/gen_log" "$EX/gen_dlt" "$EX/dlt_to_pcap"; do
+  [ -x "$b" ] || [ -x "$b.exe" ] || { echo "bench: no $b (cargo build --release -p nerka-cli -p nerka-core --bins --examples)" >&2; exit 1; }
+done
 mkdir -p "$DIR"
 
 [ -f "$DIR/big.log" ] || "$EX/gen_log" "$DIR/big.log" "$MIB" >&2
@@ -74,7 +77,7 @@ one() {
     filter) err=$("$BIN/nerka" filter -c --stats "$q" "$DIR/$file" 2>&1 >/dev/null) ;;
     filter-ksy) err=$("$BIN/nerka" --protocol "$ROOT/core/tests/data/dlt.ksy" --protocol-port DLTK=3491 \
       filter -c --stats "$q" "$DIR/$file" 2>&1 >/dev/null) ;;
-  esac
+  esac || { echo "bench: $kind '$q' on $file failed: $err" >&2; exit 1; }
   # "N matches in M lines | index X | search 12.3ms (...)"
   local matches t
   matches=$(sed -E 's/^([0-9]+) matches.*/\1/' <<<"$err")
