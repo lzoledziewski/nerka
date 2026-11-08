@@ -1,0 +1,23 @@
+query	median_ms	matches
+big.log search: ERROR	34.1	2002175
+big.log search-v: ERROR	94.0	10011703
+big.log filter: level >= ERROR	31.8	2002175
+big.log filter: level >= WARN AND raw ~ /timeout/	33.6	656099
+big.log filter: level == INFO OR raw ~ /disk/	70.8	6006428
+big.dlt filter: apid == NAV AND level >= WARN	30.7	684022
+big.dlt filter: ecu == ECU1	39.3	4170364
+big.dlt filter: level >= ERROR AND raw ~ /timeout/	62.1	348433
+big.dlt filter: raw ~ /timeout/	292.1	1982576
+big.pcap filter: apid == NAV AND level >= WARN	29.8	684022
+big2.pcap filter-ksy: proto == DLT AND apid == NAV AND level >= WARN	100.3	684022
+big2.pcap filter-ksy: proto == DLT AND ecu == ECU1	107.0	4170364
+big2.pcap filter-ksy: proto == DLT AND level >= ERROR	96.6	2084544
+big2.pcap filter-ksy: proto == DLT AND mcnt < 10	93.6	488610
+big2.pcap filter-ksy: proto == DLT AND raw ~ /ECU1 NAV/	768.4	783082
+big2.pcap filter-ksy: proto == DLT AND payload ~ /timeout/	294.8	1982576
+big2.pcap filter-ksy: proto == DLTK AND apid == NAV AND level >= WARN	167.9	684022
+big2.pcap filter-ksy: proto == DLTK AND ecu == ECU1	150.5	4170364
+big2.pcap filter-ksy: proto == DLTK AND level >= ERROR	200.3	2084544
+big2.pcap filter-ksy: proto == DLTK AND mcnt < 10	124.7	488610
+big2.pcap filter-ksy: proto == DLTK AND raw ~ /ECU1 NAV/	3640.0	783082
+big2.pcap filter-ksy: proto == DLTK AND payload ~ /timeout/	2360.0	1982576

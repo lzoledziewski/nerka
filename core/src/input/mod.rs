@@ -30,6 +30,23 @@ pub struct OpenOptions {
     /// How a text file is split into rows: lines, multi-line records or
     /// JSON; `None`: JSON if the file looks like JSON, else lines.
     pub records: Option<records::RecordSplit>,
+    /// Protocols turned off for single captures (by path), instead of
+    /// [`capture::CaptureOptions::disabled`]: a choice made when opening
+    /// several files.
+    pub disabled_for: Vec<(std::path::PathBuf, Vec<String>)>,
+}
+
+impl OpenOptions {
+    /// The capture options for `path`: its own protocol choice, if it has
+    /// one.
+    pub fn capture_for(&self, path: &Path) -> std::borrow::Cow<'_, capture::CaptureOptions> {
+        match self.disabled_for.iter().find(|(p, _)| p == path) {
+            Some((_, off)) => {
+                std::borrow::Cow::Owned(capture::CaptureOptions { disabled: off.clone(), ..self.capture.clone() })
+            }
+            None => std::borrow::Cow::Borrowed(&self.capture),
+        }
+    }
 }
 
 /// Open `path` with the reader its content calls for (default
@@ -49,7 +66,7 @@ pub fn open_with(path: impl AsRef<Path>, options: &OpenOptions, progress: &Progr
     Ok(if dlt::is_dlt(head) {
         Box::new(dlt::DltFile::open(path, progress)?.with_fibex(options.fibex.clone()))
     } else if capture::is_capture(head) {
-        Box::new(capture::open(path, &options.capture, progress)?.0.with_fibex(options.fibex.clone()))
+        Box::new(capture::open(path, &options.capture_for(path), progress)?.0.with_fibex(options.fibex.clone()))
     } else {
         // JSON is told from the start of the file (a first value whole).
         let mut start = vec![0u8; 64 * 1024];
@@ -98,10 +115,18 @@ impl Bytes {
 /// A column of a source whose lines are tab-separated cells (DLT).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ColumnDef {
-    pub name: &'static str,
+    /// Owned for columns a protocol definition names (`input::proto::ksy`).
+    pub name: Cow<'static, str>,
     /// Typical content width in characters; 0 for the last column, which
     /// takes the rest of the line.
     pub width: u16,
+}
+
+impl ColumnDef {
+    /// A column with a fixed name.
+    pub const fn new(name: &'static str, width: u16) -> ColumnDef {
+        ColumnDef { name: Cow::Borrowed(name), width }
+    }
 }
 
 pub trait LogSource: Send + Sync {

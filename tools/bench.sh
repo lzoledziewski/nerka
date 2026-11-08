@@ -10,7 +10,13 @@
 #
 # Run on an idle machine with a warm page cache (the first run of each file
 # warms it and is dropped). Needs a release build: cargo build --release
-# -p nerka-cli -p nerka-core --examples.
+# -p nerka-cli -p nerka-core --bins --examples (NERKA_BIN: another folder of it).
+#
+# KSY=1 adds the protocol definition cases (doc/protocol-definitions.md):
+# big2.pcap has every datagram on ports 3490 and 3491; native DLT reads one,
+# examples/protocols/dlt.ksy (DLTK) the other. Each query runs per protocol
+# (`proto == DLT AND …`, `proto == DLTK AND …`), so both readers read the
+# same messages in the same file.
 set -euo pipefail
 
 if [ "${1:-}" = compare ]; then
@@ -27,8 +33,11 @@ DIR=${1:-target/bench}
 MIB=${2:-1024}
 RUNS=${3:-5}
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
-BIN=$ROOT/target/release
+BIN=${NERKA_BIN:-$ROOT/target/release}
 EX=$BIN/examples
+for b in "$BIN/nerka" "$EX/gen_log" "$EX/gen_dlt" "$EX/dlt_to_pcap"; do
+  [ -x "$b" ] || [ -x "$b.exe" ] || { echo "bench: no $b (cargo build --release -p nerka-cli -p nerka-core --bins --examples)" >&2; exit 1; }
+done
 mkdir -p "$DIR"
 
 [ -f "$DIR/big.log" ] || "$EX/gen_log" "$DIR/big.log" "$MIB" >&2
@@ -50,6 +59,15 @@ big.pcap	filter	apid == NAV AND level >= WARN
 EOF
 )
 
+if [ "${KSY:-0}" = 1 ]; then
+  [ -f "$DIR/big2.pcap" ] || "$EX/dlt_to_pcap" "$DIR/big.dlt" "$DIR/big2.pcap" --ports 3490,3491 --copy >&2
+  for p in DLT DLTK; do
+    for q in 'apid == NAV AND level >= WARN' 'ecu == ECU1' 'level >= ERROR' 'mcnt < 10' 'raw ~ /ECU1 NAV/' 'payload ~ /timeout/'; do
+      CASES+=$'\n'"big2.pcap"$'\t'"filter-ksy"$'\t'"proto == $p AND $q"
+    done
+  done
+fi
+
 # One run: "<ms> <matches>" from the --stats line on stderr.
 one() {
   local file=$1 kind=$2 q=$3 err
@@ -57,7 +75,9 @@ one() {
     search) err=$("$BIN/nerka" search -c --stats "$q" "$DIR/$file" 2>&1 >/dev/null) ;;
     search-v) err=$("$BIN/nerka" search -v -c --stats "$q" "$DIR/$file" 2>&1 >/dev/null) ;;
     filter) err=$("$BIN/nerka" filter -c --stats "$q" "$DIR/$file" 2>&1 >/dev/null) ;;
-  esac
+    filter-ksy) err=$("$BIN/nerka" --protocol "$ROOT/examples/protocols/dlt.ksy" --protocol-port DLTK=3491 \
+      filter -c --stats "$q" "$DIR/$file" 2>&1 >/dev/null) ;;
+  esac || { echo "bench: $kind '$q' on $file failed: $err" >&2; exit 1; }
   # "N matches in M lines | index X | search 12.3ms (...)"
   local matches t
   matches=$(sed -E 's/^([0-9]+) matches.*/\1/' <<<"$err")

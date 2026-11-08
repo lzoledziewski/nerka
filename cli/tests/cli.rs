@@ -173,6 +173,118 @@ fn dlt_fields_are_listed_and_filtered() {
     assert!(rows[0].contains("link down") && rows[1].contains("link up"), "{rows:?}");
 }
 
+/// The DLT file's messages (storage headers dropped) as UDP datagrams to
+/// `port` in a pcap.
+fn dlt_pcap(d: &Path, port: u16) -> PathBuf {
+    let dlt = std::fs::read(dlt_file(d)).unwrap();
+    let mut payloads = Vec::new();
+    let mut pos = 0;
+    while pos + 20 <= dlt.len() {
+        let len = u16::from_be_bytes([dlt[pos + 18], dlt[pos + 19]]) as usize;
+        payloads.push(dlt[pos + 16..pos + 16 + len].to_vec());
+        pos += 16 + len;
+    }
+    udp_pcap(&d.join("trace.pcap"), port, &payloads)
+}
+
+/// A pcap of IPv4 / UDP datagrams to `port`, one per payload.
+fn udp_pcap(p: &Path, port: u16, payloads: &[Vec<u8>]) -> PathBuf {
+    let mut out = Vec::new();
+    out.extend_from_slice(&0xa1b2_c3d4u32.to_le_bytes());
+    out.extend_from_slice(&2u16.to_le_bytes());
+    out.extend_from_slice(&4u16.to_le_bytes());
+    for x in [0u32, 0, 262_144, 1] {
+        out.extend_from_slice(&x.to_le_bytes());
+    }
+    for payload in payloads {
+        let mut f = vec![2; 12];
+        f.extend_from_slice(&[0x08, 0x00, 0x45, 0]);
+        f.extend_from_slice(&((28 + payload.len()) as u16).to_be_bytes());
+        f.extend_from_slice(&[0, 1, 0, 0, 64, 17, 0, 0, 10, 0, 0, 1, 10, 0, 0, 2]);
+        f.extend_from_slice(&50000u16.to_be_bytes());
+        f.extend_from_slice(&port.to_be_bytes());
+        f.extend_from_slice(&((8 + payload.len()) as u16).to_be_bytes());
+        f.extend_from_slice(&[0, 0]);
+        f.extend_from_slice(payload);
+        for x in [0u32, 0, f.len() as u32, f.len() as u32] {
+            out.extend_from_slice(&x.to_le_bytes());
+        }
+        out.extend_from_slice(&f);
+    }
+    std::fs::write(p, out).unwrap();
+    p.to_path_buf()
+}
+
+/// The example definitions in `examples/protocols` stay valid: the sensor
+/// one as README shows it, the DLT one in the test above.
+#[test]
+fn the_example_sensor_definition_reads_as_documented() {
+    let d = dir("sensor");
+    // sensor u2, seq u4, kind u1, value s2 (tenths), a note: little-endian.
+    let reading = |sensor: u16, seq: u32, kind: u8, value: i16, note: &str| {
+        let mut m = sensor.to_le_bytes().to_vec();
+        m.extend_from_slice(&seq.to_le_bytes());
+        m.push(kind);
+        m.extend_from_slice(&value.to_le_bytes());
+        m.extend_from_slice(note.as_bytes());
+        m
+    };
+    let payloads = [
+        reading(7, 1, 1, 215, "ok"),
+        reading(7, 2, 2, 953, "ciśnienie"),
+        reading(8, 3, 2, 412, ""),
+        reading(8, 4, 1, -40, "cold"),
+        reading(9, 5, 1, 921, "fan on"),
+    ];
+    let pcap = udp_pcap(&d.join("sensor.pcap"), 41000, &payloads);
+    let ksy = Path::new(env!("CARGO_MANIFEST_DIR")).join("../examples/protocols/sensor.ksy");
+    let o = nerka(&["--protocol", s(&ksy), "filter", "kind == pressure AND value > 90", s(&pcap)]);
+    assert!(o.status.success(), "{}", err(&o));
+    let text = out(&o);
+    let lines: Vec<&str> = text.lines().collect();
+    assert_eq!(lines.len(), 1, "{text}");
+    assert!(lines[0].starts_with("2:") && lines[0].ends_with("\t7\tpressure\t95.3\tciśnienie"), "{}", lines[0]);
+    // Only a temperature over 90.0 is an error, not a pressure (95.3).
+    let o = nerka(&["--protocol", s(&ksy), "filter", "level >= ERROR", s(&pcap)]);
+    assert!(out(&o).starts_with("5:") && out(&o).lines().count() == 1, "{}{}", out(&o), err(&o));
+    let o = nerka(&["--protocol", s(&ksy), "filter", "-c", "value < 0 AND note == cold", s(&pcap)]);
+    assert_eq!(out(&o), "1\n", "{}", err(&o));
+}
+
+#[test]
+fn a_protocol_definition_reads_a_capture() {
+    let d = dir("ksy");
+    let pcap = dlt_pcap(&d, 40000);
+    let ksy = Path::new(env!("CARGO_MANIFEST_DIR")).join("../examples/protocols/dlt.ksy");
+    let def = ["--protocol", s(&ksy), "--protocol-port", "DLTK=40000"];
+    let o = nerka(&[&def[..], &["filter", "-c", "proto == DLTK AND apid == NAV AND level >= WARN", s(&pcap)]].concat());
+    assert!(o.status.success(), "{}", err(&o));
+    assert_eq!(out(&o), "2\n");
+    // Without the definition the port carries nothing Nerka reads.
+    let o = nerka(&["filter", "-c", "level >= WARN", s(&pcap)]);
+    assert_eq!(out(&o), "0\n", "{}", err(&o));
+    // Rules for native DLT too: the same datagrams, its reader.
+    let o = nerka(&["--route", "dlt:port=40000,dst=10.0.0.0/8", "filter", "-c", "proto == DLT", s(&pcap)]);
+    assert_eq!(out(&o), "6\n", "{}", err(&o));
+    let o = nerka(&["--route", "DLT:port=40000,src=192.168.0.0/16", "filter", "-c", "level >= WARN", s(&pcap)]);
+    assert_eq!(out(&o), "0\n", "a rule on another source matches nothing: {}", err(&o));
+    let o = nerka(&[&def[..], &["--disable-protocol", "DLTK", "filter", "-c", "level >= WARN", s(&pcap)]].concat());
+    assert_eq!(out(&o), "0\n", "{}", err(&o));
+    // A rule for a name no protocol has, a bad rule, a broken definition:
+    // exit 1 with why.
+    let o = nerka(&["--protocol", s(&ksy), "--protocol-port", "OTHER=1", "open", s(&pcap)]);
+    assert_eq!(o.status.code(), Some(1));
+    assert!(err(&o).contains("no protocol is named OTHER"), "{}", err(&o));
+    let o = nerka(&["--route", "DLT:port=1,vlan=9999", "open", s(&pcap)]);
+    assert_eq!(o.status.code(), Some(1));
+    assert!(err(&o).contains("--route DLT:port=1,vlan=9999: VLAN id 9999 isn't 1 to 4094"), "{}", err(&o));
+    let broken = d.join("broken.ksy");
+    std::fs::write(&broken, "meta: { id: x }\nseq:\n  - { id: a, type: u3 }\n").unwrap();
+    let o = nerka(&["--protocol", s(&broken), "open", s(&pcap)]);
+    assert_eq!(o.status.code(), Some(1));
+    assert!(err(&o).contains("broken.ksy: line 3, column 5: there is no type `u3` here"), "{}", err(&o));
+}
+
 #[test]
 fn checks_report_issues_and_strict_fails() {
     let d = dir("check");

@@ -23,14 +23,14 @@ use std::io::Write;
 const HEADER_LEN: usize = 16;
 const PROTOCOL_VERSION: u8 = 1;
 
-const COLUMNS: [ColumnDef; 7] = [
-    ColumnDef { name: "service", width: 6 },
-    ColumnDef { name: "method", width: 6 },
-    ColumnDef { name: "client", width: 6 },
-    ColumnDef { name: "session", width: 7 },
-    ColumnDef { name: "type", width: 17 },
-    ColumnDef { name: "rc", width: 10 },
-    ColumnDef { name: "payload", width: 0 },
+static COLUMNS: [ColumnDef; 7] = [
+    ColumnDef::new("service", 6),
+    ColumnDef::new("method", 6),
+    ColumnDef::new("client", 6),
+    ColumnDef::new("session", 7),
+    ColumnDef::new("type", 17),
+    ColumnDef::new("rc", 10),
+    ColumnDef::new("payload", 0),
 ];
 
 const SERVICE: FieldId = 0;
@@ -184,15 +184,15 @@ fn render_payload(h: &Header<'_>, out: &mut Vec<u8>) {
 }
 
 impl Protocol for SomeIp {
-    fn name(&self) -> &'static str {
+    fn name(&self) -> &str {
         "SOMEIP"
     }
 
-    fn columns(&self) -> &'static [ColumnDef] {
+    fn columns(&self) -> &[ColumnDef] {
         &COLUMNS
     }
 
-    fn schema(&self) -> &'static [FieldDef] {
+    fn schema(&self) -> &[FieldDef] {
         SCHEMA
     }
 

@@ -53,7 +53,7 @@ regression over 15 %; **S3** debt that makes the next change harder;
 
 | ID | Check | How |
 |---|---|---|
-| PERF-1 🤖 | The `--stats` benchmark runs and is recorded | `tools/bench.sh DIR 1024 5 > bench.tsv` (`--bench`) |
+| PERF-1 🤖 | The `--stats` benchmark runs and is recorded, a row per case (an empty table fails) | `tools/bench.sh DIR 1024 5 > bench.tsv` (`--bench`); `KSY=1` adds the protocol definition cases |
 | PERF-2 🤖 | No query more than 15 % slower than the baseline, match counts identical | `tools/bench.sh compare doc/review/baseline/bench-….tsv bench.tsv` |
 | PERF-3 | Index memory per line stays as documented (8 B text, 8 / 16 B DLT, +16 B merged) | `nerka open FILE` → `index mem` |
 | PERF-4 | New per-line work in the hot path (allocation, `to_string`, rendering) is avoided or measured | read `scan_*`, `Event`, `field` implementations |
@@ -69,6 +69,7 @@ regression over 15 %; **S3** debt that makes the next change harder;
 | HUX-4 | GUI change checked on screen | `tools/screenshot.ps1` |
 | HUX-5 | Messages use the same words as the docs (filter / search / query / pack / signal / lifecycle / check) | read new strings |
 | HUX-6 | README's quick start works from a fresh clone | follow it |
+| HUX-7 | A setting the user made never loses silently to a default (rules, ports, protocols turned off) | try a user rule on a port a default rule has |
 
 ## AIX — usability for AI agents and scripts (cycle)
 
@@ -90,6 +91,7 @@ regression over 15 %; **S3** debt that makes the next change harder;
 | SEC-2 | The single-instance listener: loopback only, token compared in constant time, bounded request, no command but `open` | `ui/src/instance.rs` |
 | SEC-3 | Unpack cache: names derived by hashing, written to a temp name, never outside the cache folder | `core/src/input/capture/unpack.rs` |
 | SEC-4 | No secrets, real logs or captures committed | `git log -p` for new binaries; `.gitignore` |
+| SEC-5 | Protocol definitions are untrusted input too: bounded file size, nesting, nodes, list items; no panic on any definition over any message | `core/src/input/proto/ksy` limits; `PROBE_ROUNDS=20000 cargo test --release -p nerka-core --test ksy_dlt mutated` |
 
 ## SUP — CI, release, supply chain (cycle)
 

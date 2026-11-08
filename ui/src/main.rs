@@ -42,6 +42,7 @@ mod plot;
 mod plots;
 mod prefs;
 mod presets;
+mod protocols;
 mod recall;
 mod records;
 mod shot;
@@ -625,10 +626,13 @@ struct Tab {
     views: signals::Views,
     /// Read again: the line to show once it is loaded.
     reopen_at: Option<LineNo>,
+    /// Protocols turned off per capture (its Files window); kept when the
+    /// files are read again.
+    disabled_for: Vec<(PathBuf, Vec<String>)>,
     /// FIBEX arguments used as signals (picked in the Signals panel).
     arg_picks: Vec<nerka_core::Argument>,
     /// The Files window: the tab's files as they are being edited.
-    files_edit: Option<Vec<PathBuf>>,
+    files_edit: Option<FilesEdit>,
     /// How the tab's text files are split into rows (remembered per file;
     /// `None`: automatic, JSON if a file looks like JSON).
     records: Option<nerka_core::input::records::RecordSplit>,
@@ -657,7 +661,7 @@ struct LineDetail {
     line: LineNo,
     cells: Vec<String>,
     /// Column names of a table source; empty for plain text.
-    names: Vec<&'static str>,
+    names: Vec<String>,
     /// Every field the source supplies for the line: name, value (`None`:
     /// the line has none), kind. Shown with the Fields checkbox.
     fields: Vec<(String, Option<String>, &'static str)>,
@@ -809,7 +813,7 @@ const DETAIL_MAX_BYTES: usize = 1 << 20;
 impl LineDetail {
     fn of(file: &dyn LogSource, line: LineNo) -> Option<Self> {
         let cells = file.line_detail(line)?;
-        let names = file.columns().iter().map(|c| c.name).collect();
+        let names = file.columns().iter().map(|c| c.name.to_string()).collect();
         let fields = field_values(file, line);
         Some(LineDetail {
             line,
@@ -865,7 +869,10 @@ impl LineDetail {
                 let msg = self.cells.last().map_or("", String::as_str);
                 ui.horizontal(|ui| {
                     if table {
-                        let tip = format!("The {} column, with its own line breaks", self.names.last().unwrap_or(&""));
+                        let tip = format!(
+                            "The {} column, with its own line breaks",
+                            self.names.last().map_or("", String::as_str)
+                        );
                         if ui.button("Copy message").on_hover_text(tip).clicked() {
                             copied = Some(msg.to_owned());
                         }
@@ -896,7 +903,7 @@ impl LineDetail {
                     if table {
                         egui::Grid::new("line-detail-cells").num_columns(2).spacing([12.0, 2.0]).show(ui, |ui| {
                             for (name, value) in self.names.iter().zip(&self.cells[..self.cells.len() - 1]) {
-                                ui.label(RichText::new(*name).strong());
+                                ui.label(RichText::new(name.as_str()).strong());
                                 ui.monospace(value);
                                 ui.end_row();
                             }
@@ -1043,6 +1050,40 @@ impl SearchBox {
     }
 }
 
+/// A tab's Files window while it is open: the files as edited, which are
+/// captures, and the protocols turned off in each capture.
+struct FilesEdit {
+    paths: Vec<PathBuf>,
+    captures: Vec<PathBuf>,
+    off: Vec<(PathBuf, Vec<String>)>,
+}
+
+impl FilesEdit {
+    fn of(paths: &[PathBuf], disabled_for: &[(PathBuf, Vec<String>)]) -> FilesEdit {
+        FilesEdit {
+            paths: paths.to_vec(),
+            captures: paths.iter().filter(|p| protocols::is_capture(p)).cloned().collect(),
+            off: disabled_for.to_vec(),
+        }
+    }
+
+    fn off_for(&mut self, path: &Path) -> &mut Vec<String> {
+        let i = match self.off.iter().position(|(p, _)| p == path) {
+            Some(i) => i,
+            None => {
+                self.off.push((path.to_path_buf(), Vec::new()));
+                self.off.len() - 1
+            }
+        };
+        &mut self.off[i].1
+    }
+
+    /// The choice as a tab keeps it: files of the tab with something off.
+    fn disabled_for(&self) -> Vec<(PathBuf, Vec<String>)> {
+        self.off.iter().filter(|(p, off)| !off.is_empty() && self.paths.contains(p)).cloned().collect()
+    }
+}
+
 impl Tab {
     #[cfg(test)]
     fn open(ctx: &egui::Context, path: PathBuf, prefs: &SearchPrefs) -> Self {
@@ -1128,6 +1169,7 @@ impl Tab {
             choices_gen: 0,
             views: signals::Views::default(),
             reopen_at: None,
+            disabled_for: Vec::new(),
             arg_picks: Vec::new(),
             files_edit: None,
             records: split,
@@ -1292,6 +1334,7 @@ impl Tab {
         let mut options = prefs.open_options();
         options.fibex = fibex;
         options.records = self.records.clone();
+        options.disabled_for = self.disabled_for.clone();
         self.file = None;
         self.reopen_at = Some(line);
         self.loading = Some(self.open_job(ctx, ps, options));
@@ -1329,6 +1372,7 @@ impl Tab {
         let mut options = prefs.open_options();
         options.fibex = fibex;
         options.records = self.records.clone();
+        options.disabled_for = self.disabled_for.clone();
         self.loading = Some(self.open_job(ctx, ps, options));
     }
 
@@ -2803,9 +2847,10 @@ struct App {
     pack_paths: Vec<PathBuf>,
     show_library: bool,
     library_view: LibraryView,
-    /// The ⚙ menu's ports field while it is edited.
-    /// The Settings window's UDP port fields as typed: DLT, SOME/IP, syslog.
-    ports_text: Option<[String; 3]>,
+    /// The Settings window's protocol rules as typed, while it is open.
+    protocols_edit: Option<protocols::Edit>,
+    /// The definition files of the protocols folder, read or not.
+    definitions: Vec<protocols::DefFile>,
     /// The unpack cache's limit as typed, while Settings is open.
     limit_text: Option<String>,
     /// This window's name (title, Alt+Tab).
@@ -2849,8 +2894,6 @@ struct App {
 /// What the Settings window changed.
 #[derive(Default)]
 struct SettingsChange {
-    /// The UDP ports of DLT, SOME/IP and syslog, each changed to a valid list.
-    ports: [Option<Vec<u16>>; 3],
     /// The unpack cache's limit, changed to a valid number of GiB.
     limit_gib: Option<u64>,
     /// Empty the unpack cache.
@@ -2862,12 +2905,11 @@ struct SettingsChange {
     import: bool,
 }
 
-/// What the Settings window shows: this window's name, the UDP ports of
-/// each protocol in captures (`ports` as typed: DLT, SOME/IP, syslog), the unpack cache (`limit` as typed, in GiB) and the
-/// time settings.
+/// What the Settings window shows: this window's name, the unpack cache
+/// (`limit` as typed, in GiB) and the time settings (protocols:
+/// [`protocols::settings_section`]).
 struct SettingsFields<'a> {
     name: &'a mut String,
-    ports: &'a mut [String; 3],
     limit: &'a mut String,
     local_time: &'a mut bool,
     mf4_local_time: &'a mut bool,
@@ -2875,7 +2917,7 @@ struct SettingsFields<'a> {
 
 /// The Settings window's fields ([`SettingsFields`]).
 fn settings_ui(ui: &mut egui::Ui, f: SettingsFields<'_>) -> SettingsChange {
-    let SettingsFields { name, ports, limit, local_time, mf4_local_time } = f;
+    let SettingsFields { name, limit, local_time, mf4_local_time } = f;
     let mut save = SettingsChange::default();
     egui::Grid::new("settings-grid").num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| {
         ui.label(RichText::new("Times").strong());
@@ -2903,33 +2945,6 @@ fn settings_ui(ui: &mut egui::Ui, f: SettingsFields<'_>) -> SettingsChange {
         ui.add(egui::TextEdit::singleline(name).hint_text("e.g. OTA crash").desired_width(200.0))
             .on_hover_text("Shown first in the title, so Alt+Tab tells windows apart");
         ui.end_row();
-        ui.label(RichText::new("Captures: UDP ports").strong()).on_hover_text(
-            "Destination ports whose UDP payloads are read as each protocol (pcap, pcapng, MF4), separated by \
-             spaces. A port listed for two protocols goes to the first. Used for captures opened from now on.",
-        );
-        ui.end_row();
-        let rows = [
-            ("DLT", "Default: 3490"),
-            ("SOME/IP", "Default: 30490 (service discovery); add your services' ports"),
-            ("syslog", "Default: 514"),
-        ];
-        for (k, (name, tip)) in rows.into_iter().enumerate() {
-            ui.label(name);
-            ui.horizontal(|ui| {
-                let r = ui.add(egui::TextEdit::singleline(&mut ports[k]).desired_width(200.0)).on_hover_text(tip);
-                match prefs::parse_ports(&ports[k]) {
-                    Some(p) => {
-                        if r.changed() {
-                            save.ports[k] = Some(p);
-                        }
-                    }
-                    None => {
-                        ui.colored_label(ui.visuals().error_fg_color, "Port numbers 1–65535, separated by spaces");
-                    }
-                }
-            });
-            ui.end_row();
-        }
         ui.label(RichText::new("Compressed MF4").strong()).on_hover_text(
             "Compressed data is unpacked once into the unpack cache and read from there, as fast as an \
              uncompressed file. Opening the file again uses it.",
@@ -3291,6 +3306,13 @@ impl App {
             }
         }
         nerka_core::time::set_local(self.prefs.local_time);
+        self.load_definitions();
+    }
+
+    /// Read the protocols folder: the definitions captures are opened with.
+    fn load_definitions(&mut self) {
+        self.definitions = protocols::folder().map(|d| protocols::load(&d)).unwrap_or_default();
+        self.prefs.protocols = self.definitions.iter().filter_map(|d| d.loaded.as_ref().ok().cloned()).collect();
     }
 
     /// Remember the active tab's mode and options if the user changed them.
@@ -3345,31 +3367,30 @@ impl App {
         }
         let mut open = true;
         let mut save = SettingsChange::default();
+        let mut proto_change = protocols::Change::default();
         egui::Window::new("Settings")
             .id(egui::Id::unique("settings"))
             .open(&mut open)
             .resizable(false)
             .collapsible(false)
             .show(ctx, |ui| {
-                let p = &self.prefs;
-                let ports = self.ports_text.get_or_insert_with(|| {
-                    [&p.dlt_ports, &p.someip_ports, &p.syslog_ports].map(|v| prefs::ports_text(v))
-                });
                 let limit = self.limit_text.get_or_insert_with(|| self.prefs.unpack_limit_gib.to_string());
                 save = settings_ui(
                     ui,
                     SettingsFields {
                         name: self.window_name.get_or_insert_with(String::new),
-                        ports,
                         limit,
                         local_time: &mut self.prefs.local_time,
                         mf4_local_time: &mut self.prefs.mf4_local_time,
                     },
                 );
+                ui.separator();
+                let edit = self.protocols_edit.get_or_insert_with(Default::default);
+                proto_change = protocols::settings_section(ui, edit, &self.prefs, &self.definitions);
             });
         if !open {
             self.settings_open = false;
-            self.ports_text = None;
+            self.protocols_edit = None;
             self.limit_text = None;
         }
         if save.export {
@@ -3397,15 +3418,33 @@ impl App {
                 n => format!("Removed {removed} unpacked files; {n} in use stay"),
             };
         }
-        let mut changed = false;
-        let p = &mut self.prefs;
-        for (new, ports) in save.ports.into_iter().zip([&mut p.dlt_ports, &mut p.someip_ports, &mut p.syslog_ports]) {
-            if let Some(new) = new
-                && new != *ports
-            {
-                *ports = new;
-                changed = true;
+        let mut changed = protocols::apply(&mut self.prefs, &proto_change);
+        let mut reload = proto_change.reload;
+        if proto_change.add
+            && let Some(dir) = protocols::folder()
+            && let Some(src) = rfd::FileDialog::new()
+                .add_filter("Protocol definitions", &["ksy"])
+                .add_filter("All files", &["*"])
+                .pick_file()
+        {
+            match protocols::add(&src, &dir, &self.definitions) {
+                Ok(dest) => {
+                    self.status = format!("Added {} (captures opened from now on)", dest.display());
+                    reload = true;
+                }
+                Err(e) => self.status = format!("Could not add {}: {e}", src.display()),
             }
+        }
+        if let Some(path) = &proto_change.remove {
+            match std::fs::remove_file(path) {
+                Ok(()) => self.status = format!("Removed {}", path.display()),
+                Err(e) => self.status = format!("Could not remove {}: {e}", path.display()),
+            }
+            reload = true;
+        }
+        if reload {
+            self.load_definitions();
+            self.protocols_edit = None;
         }
         if let Some(n) = save.limit_gib
             && n != self.prefs.unpack_limit_gib
@@ -3444,6 +3483,9 @@ impl App {
             mf4_local_time: self.prefs.mf4_local_time,
             bookmark_notes: self.prefs.bookmark_notes,
             merge_by_time: self.prefs.merge_by_time,
+            routes: self.prefs.routes.clone(),
+            disabled_protocols: self.prefs.disabled_protocols.clone(),
+            protocols: self.prefs.protocols.clone(),
             ..prefs
         };
         if prefs == self.prefs {
@@ -3773,7 +3815,12 @@ impl App {
                                 ui.close();
                             }
                         }
-                        if ui.button("Files…").on_hover_text("Reorder, add or remove the files of this tab").clicked()
+                        if ui
+                            .button("Files…")
+                            .on_hover_text(
+                                "Reorder, add or remove the files of this tab; the protocols read in each capture",
+                            )
+                            .clicked()
                         {
                             files = Some(i);
                         }
@@ -3807,7 +3854,7 @@ impl App {
         if let Some(i) = files {
             self.active = i;
             let t = &mut self.tabs[i];
-            t.files_edit = Some(t.paths.clone());
+            t.files_edit = Some(FilesEdit::of(&t.paths, &t.disabled_for));
         }
         if let Some(i) = merge {
             self.active = i;
@@ -3848,32 +3895,35 @@ impl App {
     }
 
     /// The active tab's Files window (its menu → Files…): the files of the
-    /// view in order, to move up and down, remove and add to. Apply reads
-    /// them again as one view (`Tab::set_files`). Sorting the files by
-    /// their time is not done yet.
+    /// view in order, to move up and down, remove and add to, and for each
+    /// capture the protocols read in it. Apply reads them again as one view
+    /// (`Tab::set_files`). Sorting the files by their time is not done yet.
     fn files_window(&mut self, ctx: &egui::Context) {
+        let names = protocols::names(&self.prefs);
         let Some(t) = self.tabs.get_mut(self.active) else { return };
         if t.files_edit.is_none() {
             return;
         }
         let title = t.title();
-        let Some(list) = &mut t.files_edit else { return };
+        let Some(edit) = &mut t.files_edit else { return };
         let (mut open, mut apply, mut add, mut cancel) = (true, false, false, false);
         egui::Window::new(format!("Files of {title}"))
             .id(egui::Id::unique("files-window"))
             .open(&mut open)
             .collapsible(false)
-            .default_width(560.0)
+            .default_width(640.0)
             .show(ctx, |ui| {
                 ui.weak(
                     "The tab shows these files as one view, one after another in this order. They must be of one \
-                     kind: plain text with plain text, DLT with DLT and captures.",
+                     kind: plain text with plain text, DLT with DLT and captures. In a capture, only the \
+                     highlighted protocols are read (Settings → Captures: protocols says which datagrams are whose).",
                 );
                 ui.separator();
-                let (n, mut moved, mut removed) = (list.len(), None, None);
-                egui::ScrollArea::vertical().max_height(320.0).show(ui, |ui| {
-                    egui::Grid::new("files-grid").num_columns(5).striped(true).show(ui, |ui| {
-                        for (i, p) in list.iter().enumerate() {
+                let (n, mut moved, mut removed) = (edit.paths.len(), None, None);
+                egui::ScrollArea::vertical().max_height(360.0).show(ui, |ui| {
+                    egui::Grid::new("files-grid").num_columns(6).striped(true).show(ui, |ui| {
+                        let paths = edit.paths.clone();
+                        for (i, p) in paths.iter().enumerate() {
                             ui.weak(format!("{}", i + 1));
                             let name =
                                 p.file_name().map_or_else(|| p.display().to_string(), |f| f.to_string_lossy().into());
@@ -3897,38 +3947,53 @@ impl App {
                             {
                                 removed = Some(i);
                             }
+                            if edit.captures.contains(p) {
+                                let off = edit.off_for(p);
+                                protocols::file_toggles(ui, &names, off);
+                            } else {
+                                ui.weak("");
+                            }
                             ui.end_row();
                         }
                     });
                 });
                 if let Some((a, b)) = moved {
-                    list.swap(a, b);
+                    edit.paths.swap(a, b);
                 }
                 if let Some(i) = removed {
-                    list.remove(i);
+                    edit.paths.remove(i);
                 }
                 ui.separator();
                 ui.horizontal(|ui| {
                     add = ui.button("+ Add files…").clicked();
                     ui.separator();
-                    let changed = *list != t.paths;
+                    let changed = edit.paths != t.paths || edit.disabled_for() != t.disabled_for;
                     apply = ui
                         .add_enabled(changed, egui::Button::new("Apply"))
-                        .on_hover_text("Read the files again in this order; filter, search and selection stay")
+                        .on_hover_text("Read the files again: in this order, with these protocols; filter, search and selection stay")
                         .clicked();
                     cancel = ui.button("Cancel").clicked();
                 });
             });
         if add && let Some(paths) = rfd::FileDialog::new().pick_files() {
             for p in paths {
-                if !list.iter().any(|q| same_file(q, &p)) {
-                    list.push(p);
+                if !edit.paths.iter().any(|q| same_file(q, &p)) {
+                    if protocols::is_capture(&p) {
+                        edit.captures.push(p.clone());
+                    }
+                    edit.paths.push(p);
                 }
             }
         }
         if apply {
-            let paths = list.clone();
-            t.set_files(ctx, paths, &self.prefs, self.fibex.clone());
+            let (paths, off) = (edit.paths.clone(), edit.disabled_for());
+            let reread = off != t.disabled_for && paths == t.paths;
+            t.disabled_for = off;
+            if reread {
+                t.reopen(ctx, &self.prefs, self.fibex.clone());
+            } else {
+                t.set_files(ctx, paths, &self.prefs, self.fibex.clone());
+            }
         }
         if apply || cancel || !open {
             t.files_edit = None;
@@ -5521,33 +5586,35 @@ gear=D
     fn the_settings_window_takes_typing() {
         let ctx = egui::Context::default();
         let mut name = String::new();
-        let mut ports = ["3490", "30490", "514"].map(str::to_owned);
+        let prefs = SearchPrefs::default();
+        let mut edit = protocols::Edit::default();
         let mut saved = None;
         let mut rects = Vec::new();
         let mut frame =
-            |events: Vec<egui::Event>, name: &mut String, ports: &mut [String; 3], rects: &mut Vec<egui::Rect>| {
-                let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0));
+            |events: Vec<egui::Event>, name: &mut String, edit: &mut protocols::Edit, rects: &mut Vec<egui::Rect>| {
+                let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(900.0, 700.0));
                 let input = egui::RawInput { screen_rect: Some(screen), events, ..Default::default() };
                 let mut out = ctx.run_ui(input, |ui| {
                     egui::Window::new("Settings").show(ui.ctx(), |ui| {
                         let fields = SettingsFields {
                             name,
-                            ports,
                             limit: &mut "8".to_owned(),
                             local_time: &mut true,
                             mf4_local_time: &mut true,
                         };
-                        let [dlt, someip, syslog] = settings_ui(ui, fields).ports;
-                        assert!(someip.is_none() && syslog.is_none(), "only the DLT ports were typed in");
-                        if let Some(p) = dlt {
-                            saved = Some(p);
+                        settings_ui(ui, fields);
+                        let change = protocols::settings_section(ui, edit, &prefs, &[]);
+                        for (proto, rules) in change.rules {
+                            assert_eq!(proto, "DLT", "only DLT's rules were typed in");
+                            saved = Some(rules);
                         }
                     });
                 });
                 out.textures_delta.clear();
-                // Where the fields' texts are: the name's hint, the ports.
+                // Where the texts are: the name's hint, DLT's "Rules ▸", its
+                // rules (the summary, then the port field once shown).
                 rects.clear();
-                for want in ["e.g. OTA crash", "3490"] {
+                for want in ["e.g. OTA crash", "Rules ▸", "3490"] {
                     for s in &out.shapes {
                         if let egui::Shape::Text(t) = &s.shape
                             && t.galley.text() == want
@@ -5575,17 +5642,23 @@ gear=D
             ]
         };
         for _ in 0..3 {
-            frame(vec![], &mut name, &mut ports, &mut rects);
+            frame(vec![], &mut name, &mut edit, &mut rects);
         }
-        assert!(rects.len() >= 2, "two text fields: {rects:?}");
-        let (name_at, ports_at) = (rects[0].center(), rects[1].right_center() + egui::vec2(2.0, 0.0));
-        frame(click(name_at), &mut name, &mut ports, &mut rects);
-        frame(vec![egui::Event::Text("OTA crash".into())], &mut name, &mut ports, &mut rects);
+        assert!(rects.len() >= 3, "name, DLT's Rules ▸ and its rules: {rects:?}");
+        let (name_at, open_at) = (rects[0].center(), rects[1].center());
+        frame(click(name_at), &mut name, &mut edit, &mut rects);
+        frame(vec![egui::Event::Text("OTA crash".into())], &mut name, &mut edit, &mut rects);
         assert_eq!(name, "OTA crash");
-        frame(click(ports_at), &mut name, &mut ports, &mut rects);
-        frame(vec![egui::Event::Text(" 3489".into())], &mut name, &mut ports, &mut rects);
-        assert_eq!(ports[0], "3490 3489");
-        assert_eq!(saved, Some(vec![3490, 3489]));
+        // Rules ▸ shows DLT's rules: a row with its port in a field.
+        frame(click(open_at), &mut name, &mut edit, &mut rects);
+        frame(vec![], &mut name, &mut edit, &mut rects);
+        // The field is in the rules table, left of the summary.
+        let field = rects.iter().min_by(|a, b| a.left().total_cmp(&b.left())).copied();
+        let field = field.expect("the port field").right_center() + egui::vec2(2.0, 0.0);
+        frame(click(field), &mut name, &mut edit, &mut rects);
+        frame(vec![egui::Event::Text("-3499".into())], &mut name, &mut edit, &mut rects);
+        let saved: Vec<String> = saved.unwrap_or_default().iter().map(ToString::to_string).collect();
+        assert_eq!(saved, ["3490-3499"]);
     }
 
     #[test]

@@ -3,8 +3,9 @@
 //! The layers of `doc/sources-and-signals.md`: a **container** turns the file
 //! into frames ([`pcap`], [`mf4`]), the **transport** turns frames into UDP
 //! payloads ([`net`]: VLAN, IPv4 / IPv6 with reassembly), a **router**
-//! picks each payload's protocol by its UDP destination port
-//! ([`CaptureOptions`]: DLT, SOME/IP, syslog), and the protocol
+//! picks each payload's protocol by rules over its ports, addresses and
+//! VLAN tags ([`route`], [`CaptureOptions`]: DLT, SOME/IP, syslog and
+//! loaded definitions), and the protocol
 //! ([`super::proto::Protocol`]) splits it into messages, indexed where they
 //! are: in the mapped file, or, for bytes that aren't contiguous there
 //! (reassembled datagrams, MF4 records spanning data blocks), in a side
@@ -19,13 +20,17 @@
 pub mod mf4;
 pub mod net;
 pub mod pcap;
+pub mod route;
 pub mod unpack;
 
 use super::Bytes;
 use super::dlt::Dlt;
-use super::proto::{Framed, MAX_CHANNELS, ProtoId, Protocol, Records, someip::SomeIp, syslog::Syslog};
+use super::proto::{
+    Framed, LoadedProtocol, MAX_CHANNELS, MAX_PROTOCOLS, ProtoId, Protocol, Records, someip::SomeIp, syslog::Syslog,
+};
 use crate::{Error, Progress, Result};
 use net::{Net, NetStats, Payload};
+use route::{Datagram, Match, Route};
 use std::borrow::Cow;
 use std::path::Path;
 use std::sync::Arc;
@@ -44,13 +49,24 @@ pub const DEFAULT_SOMEIP_PORTS: [u16; 1] = [30490];
 /// UDP destination ports that carry syslog by default: 514 (RFC 5426).
 pub const DEFAULT_SYSLOG_PORTS: [u16; 1] = [514];
 
-/// The protocols of a capture, by [`ProtoId`]: DLT, SOME/IP, syslog.
+/// The protocols of a capture, by [`ProtoId`]: DLT, SOME/IP, syslog, then
+/// the loaded ones ([`CaptureOptions::protocols`]) in their order.
 pub const DLT: ProtoId = 0;
 pub const SOMEIP: ProtoId = 1;
 pub const SYSLOG: ProtoId = 2;
+const NATIVE: usize = 3;
 
-fn protocols() -> Vec<Arc<dyn Protocol>> {
-    vec![Arc::new(Dlt::default()), Arc::new(SomeIp), Arc::new(Syslog)]
+fn protocols(options: &CaptureOptions) -> Result<Vec<Arc<dyn Protocol>>> {
+    let mut all: Vec<Arc<dyn Protocol>> = vec![Arc::new(Dlt::default()), Arc::new(SomeIp), Arc::new(Syslog)];
+    all.extend(options.protocols.iter().map(|p| p.protocol.clone()));
+    if all.len() > MAX_PROTOCOLS {
+        return Err(Error::Format(format!(
+            "too many protocols: {} loaded, at most {}",
+            all.len() - NATIVE,
+            MAX_PROTOCOLS - NATIVE
+        )));
+    }
+    Ok(all)
 }
 
 /// How messages are found in a capture.
@@ -62,6 +78,15 @@ pub struct CaptureOptions {
     pub someip_udp_ports: Vec<u16>,
     /// UDP destination ports whose payloads are syslog messages.
     pub syslog_udp_ports: Vec<u16>,
+    /// Protocols given at runtime (definitions), each with its default
+    /// rules (its own `-nerka: match:`).
+    pub protocols: Vec<LoadedProtocol>,
+    /// Rules by protocol name. A protocol named here is matched by these
+    /// rules instead of its defaults (the port lists above for the native
+    /// ones, a definition's own).
+    pub routes: Vec<Route>,
+    /// Protocols turned off, by name: their datagrams are not read.
+    pub disabled: Vec<String>,
     /// Where compressed MF4 data is unpacked.
     pub unpack: UnpackOptions,
     /// An MF4 file whose header says its start time is local time (the
@@ -75,6 +100,9 @@ impl Default for CaptureOptions {
             dlt_udp_ports: DEFAULT_DLT_PORTS.to_vec(),
             someip_udp_ports: DEFAULT_SOMEIP_PORTS.to_vec(),
             syslog_udp_ports: DEFAULT_SYSLOG_PORTS.to_vec(),
+            protocols: Vec::new(),
+            routes: Vec::new(),
+            disabled: Vec::new(),
             unpack: UnpackOptions::default(),
             mf4_local_time: true,
         }
@@ -135,18 +163,21 @@ fn read(
         Some((b, l)) => (b.bytes(), Some(l)),
         None => (file, None),
     };
+    let protos = protocols(options)?;
+    let rules = rules(options, &protos);
     let mut sink = Sink {
         net: Net::default(),
         c: Collector {
             base: bytes,
-            delimited: protocols().iter().map(|p| p.delimited()).collect(),
-            protos: protocols(),
+            delimited: protos.iter().map(|p| p.delimited()).collect(),
+            protos,
             msgs: Vec::new(),
             side: Vec::new(),
             stats: CaptureStats::default(),
             found: Vec::new(),
         },
         options,
+        rules: &rules,
         channel_ecus: Vec::new(),
         too_far: false,
     };
@@ -184,6 +215,7 @@ pub(crate) struct Sink<'a, 'o> {
     net: Net,
     c: Collector<'a>,
     options: &'o CaptureOptions,
+    rules: &'o [(ProtoId, Match)],
     /// ECU id per channel, for messages that don't carry one.
     channel_ecus: Vec<[u8; 4]>,
     too_far: bool,
@@ -192,9 +224,9 @@ pub(crate) struct Sink<'a, 'o> {
 impl<'a> Sink<'a, '_> {
     /// A link-layer frame (pcap): transport, then the router.
     fn link_frame(&mut self, link: u32, data: &'a [u8], secs: u32, usecs: i32, channel: usize) {
-        let (c, options, too_far) = (&mut self.c, self.options, &mut self.too_far);
-        self.net.frame(link, data, secs, &mut |port, payload| {
-            if let Some(proto) = route(options, port) {
+        let (c, rules, too_far) = (&mut self.c, self.rules, &mut self.too_far);
+        self.net.frame(link, data, secs, &mut |dg, payload| {
+            if let Some(proto) = route(rules, dg) {
                 *too_far |= !c.datagram(&payload, proto, channel, secs, usecs);
             }
         });
@@ -202,16 +234,16 @@ impl<'a> Sink<'a, '_> {
 
     /// An Ethernet frame's payload with its EtherType (MF4 `ETH_Frame`).
     fn ether(&mut self, ethertype: u16, data: Cow<'a, [u8]>, secs: u32, usecs: i32, channel: usize) {
-        let (c, options, too_far) = (&mut self.c, self.options, &mut self.too_far);
+        let (c, rules, too_far) = (&mut self.c, self.rules, &mut self.too_far);
         match data {
-            Cow::Borrowed(d) => self.net.ether_frame(ethertype, d, secs, &mut |port, payload| {
-                if let Some(proto) = route(options, port) {
+            Cow::Borrowed(d) => self.net.ether_frame(ethertype, d, secs, &mut |dg, payload| {
+                if let Some(proto) = route(rules, dg) {
                     *too_far |= !c.datagram(&payload, proto, channel, secs, usecs);
                 }
             }),
             // Not in the file: whatever comes out of it is copied.
-            Cow::Owned(v) => self.net.ether_frame(ethertype, &v, secs, &mut |port, payload| {
-                if let Some(proto) = route(options, port) {
+            Cow::Owned(v) => self.net.ether_frame(ethertype, &v, secs, &mut |dg, payload| {
+                if let Some(proto) = route(rules, dg) {
                     let p = Payload::Assembled(payload.bytes().to_vec());
                     *too_far |= !c.datagram(&p, proto, channel, secs, usecs);
                 }
@@ -241,13 +273,41 @@ impl<'a> Sink<'a, '_> {
     }
 }
 
-/// The protocol of a UDP payload by its destination port, if one is
-/// configured for it (the first protocol that lists the port).
-fn route(options: &CaptureOptions, port: u16) -> Option<ProtoId> {
-    [(&options.dlt_udp_ports, DLT), (&options.someip_udp_ports, SOMEIP), (&options.syslog_udp_ports, SYSLOG)]
-        .into_iter()
-        .find(|(ports, _)| ports.contains(&port))
-        .map(|(_, p)| p)
+/// Every enabled protocol's rules, most specific first (ties: the
+/// protocol listed first). A protocol's rules are the ones
+/// [`CaptureOptions::routes`] gives it, else its defaults.
+fn rules(options: &CaptureOptions, protos: &[Arc<dyn Protocol>]) -> Vec<(ProtoId, Match)> {
+    let mut out = Vec::new();
+    for (id, p) in protos.iter().enumerate() {
+        let name = p.name();
+        if options.disabled.iter().any(|d| d.eq_ignore_ascii_case(name)) {
+            continue;
+        }
+        let user: Vec<Match> =
+            options.routes.iter().filter(|r| r.protocol.eq_ignore_ascii_case(name)).map(|r| r.rule.clone()).collect();
+        let given = !user.is_empty();
+        let rules = if given {
+            user
+        } else {
+            match id {
+                DLT => options.dlt_udp_ports.iter().map(|&p| Match::port(p)).collect(),
+                SOMEIP => options.someip_udp_ports.iter().map(|&p| Match::port(p)).collect(),
+                SYSLOG => options.syslog_udp_ports.iter().map(|&p| Match::port(p)).collect(),
+                _ => options.protocols.get(id - NATIVE).map(|l| l.routes.clone()).unwrap_or_default(),
+            }
+        };
+        out.extend(rules.into_iter().map(|r| (r.specificity(), given, id, r)));
+    }
+    // More specific first; of equally specific rules, the user's before
+    // defaults (a rule someone wrote never loses silently to a default
+    // one), then the protocols' order (the sort is stable).
+    out.sort_by_key(|(spec, given, _, _)| std::cmp::Reverse((*spec, *given)));
+    out.into_iter().map(|(_, _, id, r)| (id, r)).collect()
+}
+
+/// The protocol of a UDP datagram: the first rule that matches it.
+fn route(rules: &[(ProtoId, Match)], dg: &Datagram) -> Option<ProtoId> {
+    rules.iter().find(|(_, r)| r.matches(dg)).map(|(p, _)| *p)
 }
 
 /// The protocols' side: indexes the messages of each routed datagram.

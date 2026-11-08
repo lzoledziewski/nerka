@@ -31,8 +31,11 @@ pub struct Concat {
 }
 
 /// What kind of source this is, for "same kind": columns and fields.
-fn kind(s: &dyn LogSource) -> (Vec<&'static str>, Vec<(&str, FieldKind)>) {
-    (s.columns().iter().map(|c| c.name).collect(), s.schema().iter().map(|f| (f.name.as_ref(), f.kind)).collect())
+fn kind(s: &dyn LogSource) -> (Vec<&str>, Vec<(&str, FieldKind)>) {
+    (
+        s.columns().iter().map(|c| c.name.as_ref()).collect(),
+        s.schema().iter().map(|f| (f.name.as_ref(), f.kind)).collect(),
+    )
 }
 
 /// A readable kind for messages: plain text, DLT, or another table.

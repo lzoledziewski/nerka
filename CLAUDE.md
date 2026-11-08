@@ -20,6 +20,7 @@ cargo run -p nerka-gui -- app.log --query 'level >= ERROR'
 cargo run -p nerka-cli -- --signal 'v=/v=(?<v>\d+)/' filter '@v > 100' app.log   # signals (@name)
 cargo run -p nerka-cli -- --fibex ecu1.xml filter 'apid == NAV' trace.dlt        # DLT non-verbose via FIBEX
 cargo run -p nerka-cli -- --someip-port 30501 filter 'proto == SOMEIP AND type == ERROR' trace.pcap   # protocols by UDP port
+cargo run -p nerka-cli -- --protocol examples/protocols/dlt.ksy --protocol-port DLTK=3491 filter 'proto == DLTK AND apid == NAV' trace.pcap   # a protocol definition (.ksy, doc/protocol-definitions.md)
 cargo run -p nerka-cli -- --records 'start=/\d{4}-\d\d-\d\d/' filter 'level >= ERROR' app.log   # multi-line records
 cargo run -p nerka-cli -- --lifecycle 'ecu1: lines ecu == ECU1; reset uptime; planned payload ~ /shutdown/' lifecycles trace.dlt   # ECU1's boots
 cargo run -p nerka-cli -- --pack packs/ --lifecycle 'ecu1: lines ecu == ECU1; reset uptime; planned {sys.shutdown}' --signal 'ota(s):enum:per(ecu1):default(idle)=ecu == ECU1 AND /OTA (?<s>\w+)/' filter '@ota == idle' trace.dlt
@@ -34,6 +35,7 @@ cargo run --release -p nerka-cli -- search -c --stats ERROR big.log  # benchmark
 cargo run --release -p nerka-core --example gen_dlt -- big.dlt 1024   # 1 GiB DLT test file
 cargo run --release -p nerka-cli -- filter -c --stats 'apid == NAV AND level >= WARN' big.dlt
 cargo run --release -p nerka-core --example dlt_to_pcap -- big.dlt big.pcap   # the same DLT as a pcap (VLAN, UDP, fragments)
+cargo run --release -p nerka-core --example dlt_to_pcap -- big.dlt big2.pcap --ports 3490,3491 --copy   # every datagram on both ports
 cargo run --release -p nerka-cli -- filter -c --stats 'apid == NAV AND level >= WARN' big.pcap
 cargo run --release -p nerka-core --example dlt_to_mf4 -- big.dlt big_z.mf4 --deflate   # the same DLT as an MF4 (DZ blocks; --one-block, or no --deflate)
 cargo run --release -p nerka-cli -- --unpack-dir cache filter -c --stats 'apid == NAV AND level >= WARN' big_z.mf4  # 1st run unpacks, then cached
@@ -41,6 +43,7 @@ cargo run --release -p nerka-core --example probe_capture -- trace.pcapng log.mf
 powershell -ExecutionPolicy Bypass -File tools/screenshot.ps1 -Out shot.png -AppArgs app.log  # GUI screenshot (Windows)
 bash tools/review-gate.sh --full                      # review gate: build gates, fuzz, metrics (doc/review/)
 bash tools/bench.sh target/bench 1024 5 > bench.tsv   # the benchmark above as TSV; `tools/bench.sh compare a.tsv b.tsv`
+KSY=1 bash tools/bench.sh target/bench 1024 5 > bench.tsv   # + the DLT definition against native DLT (NERKA_BIN: binaries elsewhere)
 ```
 
 Reviews (a gate before a merge or release, a deep review each cycle): `doc/review/README.md`,
@@ -58,6 +61,9 @@ before changing the UI, and update it when the state changes.
 - New input formats implement `input::LogSource`; the engine must not care about formats.
   A new protocol inside captures implements `input::proto::Protocol` and gets
   a UDP port list in `CaptureOptions`; DLT is one of them.
+- Protocol definitions (`input/proto/ksy`): `core/tests/ksy_dlt.rs` checks the
+  DLT definition (`examples/protocols/dlt.ksy`) against native DLT; keep it
+  passing, and keep the language subset in `doc/protocol-definitions.md` current.
 - Long operations take `&Progress` and check `is_cancelled()` per chunk.
 - Search changes: every engine test runs the fast path against the naive
   per-line path (`run_filter` in `engine/search.rs`). Keep that invariant and

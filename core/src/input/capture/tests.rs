@@ -313,8 +313,8 @@ fn several_protocols_share_one_view() {
     let (f, s) = from_bytes("t.pcap", pcap_file(1, &frames), &o).unwrap();
     assert_eq!(f.protocols(), ["DLT", "SOMEIP", "syslog"]);
     assert_eq!((s.datagrams, s.messages, s.msg_skipped), (6, 6, 10));
-    let names: Vec<&str> = f.columns().iter().map(|c| c.name).collect();
-    assert_eq!(names, MIXED_COLUMNS.iter().map(|c| c.name).collect::<Vec<_>>());
+    let names: Vec<&str> = f.columns().iter().map(|c| c.name.as_ref()).collect();
+    assert_eq!(names, MIXED_COLUMNS.iter().map(|c| c.name.as_ref()).collect::<Vec<_>>());
     let cells = |l| f.line_text(l).unwrap().split('\t').skip(1).map(str::to_owned).collect::<Vec<_>>();
     assert_eq!(cells(0), ["DLT", "0.0000 ECU1 NAV CTX info", "position ok"]);
     assert_eq!(cells(1), ["SOMEIP", "0xffff 0x8100 0x0000 0x0001 NOTIFICATION E_OK", "SD [4] c0 00 00 00"]);
@@ -347,7 +347,7 @@ fn one_protocol_shows_its_own_columns() {
     use crate::input::proto::someip;
     let frames = vec![(100, eth(0x0800, &ipv4(17, 1, 0, &udp(30490, &someip::encode(0x10, 0x20, 1, 2, 0, 0, &[9])))))];
     let (f, _) = from_bytes("t.pcap", pcap_file(1, &frames), &CaptureOptions::default()).unwrap();
-    let names: Vec<&str> = f.columns().iter().map(|c| c.name).collect();
+    let names: Vec<&str> = f.columns().iter().map(|c| c.name.as_ref()).collect();
     assert_eq!(names, ["time", "service", "method", "client", "session", "type", "rc", "payload"]);
     assert_eq!(
         f.line_text(0).unwrap().split_once('\t').unwrap().1,
