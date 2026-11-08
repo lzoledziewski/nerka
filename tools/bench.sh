@@ -59,7 +59,7 @@ EOF
 if [ "${KSY:-0}" = 1 ]; then
   [ -f "$DIR/big2.pcap" ] || "$EX/dlt_to_pcap" "$DIR/big.dlt" "$DIR/big2.pcap" --ports 3490,3491 --copy >&2
   for p in DLT DLTK; do
-    for q in 'apid == NAV AND level >= WARN' 'ecu == ECU1' 'level >= ERROR' 'mcnt < 10' 'raw ~ /ECU1 NAV/'; do
+    for q in 'apid == NAV AND level >= WARN' 'ecu == ECU1' 'level >= ERROR' 'mcnt < 10' 'raw ~ /ECU1 NAV/' 'payload ~ /timeout/'; do
       CASES+=$'\n'"big2.pcap"$'\t'"filter-ksy"$'\t'"proto == $p AND $q"
     done
   done

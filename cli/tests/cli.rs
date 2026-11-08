@@ -220,10 +220,21 @@ fn a_protocol_definition_reads_a_capture() {
     // Without the definition the port carries nothing Nerka reads.
     let o = nerka(&["filter", "-c", "level >= WARN", s(&pcap)]);
     assert_eq!(out(&o), "0\n", "{}", err(&o));
-    // A port for a name no --protocol has, and a broken definition: exit 1 with why.
+    // Rules for native DLT too: the same datagrams, its reader.
+    let o = nerka(&["--route", "dlt:port=40000,dst=10.0.0.0/8", "filter", "-c", "proto == DLT", s(&pcap)]);
+    assert_eq!(out(&o), "6\n", "{}", err(&o));
+    let o = nerka(&["--route", "DLT:port=40000,src=192.168.0.0/16", "filter", "-c", "level >= WARN", s(&pcap)]);
+    assert_eq!(out(&o), "0\n", "a rule on another source matches nothing: {}", err(&o));
+    let o = nerka(&[&def[..], &["--disable-protocol", "DLTK", "filter", "-c", "level >= WARN", s(&pcap)]].concat());
+    assert_eq!(out(&o), "0\n", "{}", err(&o));
+    // A rule for a name no protocol has, a bad rule, a broken definition:
+    // exit 1 with why.
     let o = nerka(&["--protocol", s(&ksy), "--protocol-port", "OTHER=1", "open", s(&pcap)]);
     assert_eq!(o.status.code(), Some(1));
-    assert!(err(&o).contains("no --protocol is named OTHER"), "{}", err(&o));
+    assert!(err(&o).contains("no protocol is named OTHER"), "{}", err(&o));
+    let o = nerka(&["--route", "DLT:port=1,vlan=9999", "open", s(&pcap)]);
+    assert_eq!(o.status.code(), Some(1));
+    assert!(err(&o).contains("--route DLT:port=1,vlan=9999: VLAN id 9999 isn't 1 to 4094"), "{}", err(&o));
     let broken = d.join("broken.ksy");
     std::fs::write(&broken, "meta: { id: x }\nseq:\n  - { id: a, type: u3 }\n").unwrap();
     let o = nerka(&["--protocol", s(&broken), "open", s(&pcap)]);

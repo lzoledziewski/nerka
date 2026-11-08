@@ -8,17 +8,21 @@
 
 pub mod expr;
 mod model;
+mod plan;
 mod run;
+pub mod template;
 pub mod yaml;
 
 use super::{NO_CHANNEL, Origin, Protocol};
 use crate::event::{FieldDef, FieldId, FieldKind, FieldValue, Level};
 use crate::input::ColumnDef;
+use crate::input::capture::route::Match;
 use model::{CExpr, Def, Lit, Src, Ty, as_expr, as_map, as_seq, as_text, err, intern, parse_int};
 use run::{Eval, Val};
 use std::borrow::Cow;
 use std::fmt;
 use std::path::Path;
+use template::Fmt;
 use yaml::{Node, Value};
 
 /// What is wrong with a definition, and where (1-based).
@@ -54,6 +58,8 @@ pub struct KsyProtocol {
     uptime: Option<Spec>,
     columns: Vec<ColumnDef>,
     cells: Vec<Cell>,
+    /// Which UDP datagrams are its messages, by default (`match:`).
+    routes: Vec<Match>,
 }
 
 enum Framing {
@@ -98,7 +104,7 @@ impl KsyProtocol {
         let mut bind = |src: &Src| binder.bind_root(&mut def, src);
         let n = as_map(nerka, "-nerka")?;
         for (k, _) in n {
-            if !["name", "framing", "fields", "level", "uptime", "columns", "doc"].contains(&k.text.as_str()) {
+            if !["name", "framing", "fields", "level", "uptime", "columns", "match", "doc"].contains(&k.text.as_str()) {
                 return Err(err(k.line, k.col, format!("`{}` isn't read in -nerka", k.text)));
             }
         }
@@ -158,7 +164,7 @@ impl KsyProtocol {
                     None => match spec.ty {
                         Ty::Int | Ty::Bool => FieldKind::U64,
                         Ty::Float => FieldKind::F64,
-                        Ty::Bytes | Ty::Any => FieldKind::Str,
+                        Ty::Bytes | Ty::Any | Ty::Obj | Ty::List(_) => FieldKind::Str,
                     },
                 };
                 schema.push(FieldDef::owned(name.clone(), kind, extra.costly || spec.hex));
@@ -245,7 +251,23 @@ impl KsyProtocol {
             columns.push(ColumnDef { name: Cow::Owned(col_name), width });
             cells.push(cell);
         }
-        Ok(KsyProtocol { name, def, framing, schema, fields, level, level_names, uptime, columns, cells })
+        let mut routes = Vec::new();
+        if let Some(m) = get("match") {
+            for r in as_seq(m, "match")? {
+                let rule = match &r.value {
+                    Value::Map(entries) => {
+                        let mut rule = Match::default();
+                        for (k, v) in entries {
+                            rule.set(&k.text, as_text(v, "a rule's value")?).map_err(|e| err(v.line, v.col, e))?;
+                        }
+                        rule
+                    }
+                    _ => as_text(r, "a rule")?.parse().map_err(|e: String| err(r.line, r.col, e))?,
+                };
+                routes.push(rule);
+            }
+        }
+        Ok(KsyProtocol { name, def, framing, schema, fields, level, level_names, uptime, columns, cells, routes })
     }
 
     /// Read a definition file.
@@ -257,6 +279,11 @@ impl KsyProtocol {
         }
         let text = std::fs::read_to_string(path)?;
         KsyProtocol::parse(&text).map_err(|e| crate::Error::Format(format!("{}: {e}", path.display())))
+    }
+
+    /// The rules it gives itself: which UDP datagrams are its messages.
+    pub fn routes(&self) -> &[Match] {
+        &self.routes
     }
 
     fn length(&self) -> Option<&CExpr> {
@@ -271,14 +298,13 @@ impl KsyProtocol {
     }
 
     fn cell_text(&self, e: &Eval<'_, '_>, cell: &Cell, one_line: bool, out: &mut Vec<u8>) {
-        let (v, decimals, hex) = match cell {
-            Cell::Field(id) => {
-                let s = &self.fields[*id];
-                (eval_spec(e, s), s.decimals, s.hex)
-            }
-            Cell::Own(s) => (eval_spec(e, s), s.decimals, s.hex),
+        let spec = match cell {
+            Cell::Field(id) => &self.fields[*id],
+            Cell::Own(s) => s,
         };
-        write_val(&v, decimals, hex, one_line, out);
+        let start = out.len();
+        write_spec(e, spec, out);
+        clean(out, start, one_line);
     }
 
     fn cells(&self, msg: &[u8], at: &Origin<'_>, one_line: bool) -> Vec<Vec<u8>> {
@@ -292,6 +318,40 @@ impl KsyProtocol {
             })
             .collect()
     }
+}
+
+/// Control characters in a cell: on one line, all of them as spaces; in a
+/// detailed view, line breaks (`\r\n` and a lone `\r` as `\n`) and tabs
+/// kept. As native DLT shows payloads.
+fn clean(out: &mut Vec<u8>, start: usize, one_line: bool) {
+    if one_line {
+        for b in &mut out[start..] {
+            if *b < 0x20 || *b == 0x7F {
+                *b = b' ';
+            }
+        }
+        return;
+    }
+    let text = out.split_off(start);
+    let mut it = text.iter().copied().peekable();
+    while let Some(b) = it.next() {
+        match b {
+            b'\r' => {
+                it.next_if_eq(&b'\n');
+                out.push(b'\n');
+            }
+            b'\n' | b'\t' => out.push(b),
+            b if b < 0x20 || b == 0x7F => out.push(b' '),
+            b => out.push(b),
+        }
+    }
+}
+
+/// A section value as text: numbers with its `decimals`, bytes as hex if
+/// it says `render: hex`, objects by their templates.
+fn write_spec(e: &Eval<'_, '_>, spec: &Spec, out: &mut Vec<u8>) {
+    let v = eval_spec(e, spec);
+    write_spec_val(e, spec, &v, out);
 }
 
 /// What a value of the section says besides its value.
@@ -415,51 +475,25 @@ fn eval_spec<'m>(e: &Eval<'_, 'm>, s: &Spec) -> Val<'m> {
     }
 }
 
+/// [`write_spec`] for a value already evaluated.
+fn write_spec_val<'m>(e: &Eval<'_, 'm>, spec: &Spec, v: &Val<'m>, out: &mut Vec<u8>) {
+    use std::io::Write;
+    if let Some(d) = spec.decimals
+        && let Some(x) = v.as_f64()
+        && !matches!(v, Val::Enum(..))
+    {
+        let _ = write!(out, "{x:.d$}");
+        return;
+    }
+    e.text(v, if spec.hex { &Fmt::Hex } else { &Fmt::Plain }, None, out);
+}
+
 fn lit_val(l: &Lit) -> Val<'static> {
     match l {
         Lit::Int(v) => Val::Int(*v),
         Lit::Float(v) => Val::Float(*v),
         Lit::Bool(v) => Val::Bool(*v),
         Lit::Bytes(b) => Val::Lit(b),
-    }
-}
-
-fn write_val(v: &Val<'_>, decimals: Option<usize>, hex: bool, one_line: bool, out: &mut Vec<u8>) {
-    use std::io::Write;
-    match v {
-        Val::Null => {}
-        Val::Int(x) => match decimals {
-            Some(d) => {
-                let _ = write!(out, "{:.*}", d, *x as f64);
-            }
-            None => {
-                let _ = write!(out, "{x}");
-            }
-        },
-        Val::Float(x) => {
-            let _ = match decimals {
-                Some(d) => write!(out, "{x:.d$}"),
-                None => write!(out, "{x}"),
-            };
-        }
-        Val::Bool(b) => out.extend_from_slice(if *b { b"true" } else { b"false" }),
-        v => {
-            let b = v.bytes().unwrap_or_default();
-            if hex {
-                for (i, x) in b.iter().enumerate() {
-                    if i > 0 && !one_line && i % 16 == 0 {
-                        out.push(b'\n');
-                    } else if i > 0 && !one_line {
-                        out.push(b' ');
-                    }
-                    let _ = write!(out, "{x:02x}");
-                }
-            } else if one_line {
-                out.extend(b.iter().map(|&c| if matches!(c, b'\t' | b'\n' | b'\r') { b' ' } else { c }));
-            } else {
-                out.extend_from_slice(b);
-            }
-        }
     }
 }
 
@@ -527,26 +561,27 @@ impl Protocol for KsyProtocol {
     fn field<'m>(&self, msg: &'m [u8], at: &Origin<'m>, id: FieldId) -> Option<FieldValue<'m>> {
         let spec = self.fields.get(id)?;
         let kind = self.schema[id].kind;
-        let v = eval_spec(&self.reader(msg, at), spec);
-        if spec.hex {
+        let e = self.reader(msg, at);
+        let v = eval_spec(&e, spec);
+        let as_text = |v: &Val<'m>| {
             let mut out = Vec::new();
-            write_val(&v, None, true, true, &mut out);
-            return Some(FieldValue::Str(out.into()));
+            write_spec_val(&e, spec, v, &mut out);
+            clean(&mut out, 0, true);
+            FieldValue::Str(out.into())
+        };
+        if spec.hex || spec.decimals.is_some() {
+            return (v != Val::Null).then(|| as_text(&v));
         }
         Some(match (kind, v) {
             (_, Val::Null) => return None,
-            (FieldKind::U64, Val::Int(x)) => FieldValue::U64(x as u64),
-            (FieldKind::U64, Val::Bool(b)) => FieldValue::U64(u64::from(b)),
-            (FieldKind::U64, Val::Float(x)) => FieldValue::U64(x as u64),
+            (FieldKind::U64, Val::U64(x)) => FieldValue::U64(x),
+            (FieldKind::U64, v) if v.as_i64().is_some() => FieldValue::U64(v.as_i64()? as u64),
+            (FieldKind::U64, v) => FieldValue::U64(v.as_f64()? as u64),
             (FieldKind::F64, v) => FieldValue::F64(v.as_f64()?),
-            (_, Val::Msg(b)) => FieldValue::Str(Cow::Borrowed(b)),
+            // As they are: only cells show control characters as spaces.
+            (_, Val::Msg(b) | Val::Text(b)) => FieldValue::Str(Cow::Borrowed(b)),
             (_, Val::Lit(b)) => FieldValue::Str(Cow::Borrowed(b)),
-            (_, Val::Own(b)) => FieldValue::Str(Cow::Owned(b)),
-            (_, v) => {
-                let mut out = Vec::new();
-                write_val(&v, spec.decimals, false, true, &mut out);
-                FieldValue::Str(out.into())
-            }
+            (_, v) => as_text(&v),
         })
     }
 

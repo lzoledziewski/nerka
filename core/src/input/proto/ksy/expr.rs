@@ -15,7 +15,7 @@
 //! term    := unary (('*' | '/' | '%') unary)*
 //! unary   := ('-' | '~') unary | postfix
 //! postfix := atom ('.' NAME | '[' expr ']')*
-//! atom    := INT | FLOAT | STRING | 'true' | 'false' | NAME | '(' expr ')'
+//! atom    := INT | FLOAT | STRING | 'true' | 'false' | NAME | NAME '::' NAME | '(' expr ')'
 //! ```
 //!
 //! As in Kaitai (and Python), comparisons bind more loosely than bit
@@ -40,6 +40,8 @@ pub enum Expr {
     Binary(BinOp, Box<Expr>, Box<Expr>),
     /// `c ? a : b`
     Cond(Box<Expr>, Box<Expr>, Box<Expr>),
+    /// `enum::label`
+    EnumLit(String, String),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -157,9 +159,6 @@ fn lex(text: &str) -> Result<Vec<Token>, ExprError> {
             out.push(Token { tok: Tok::Str(s), at });
             i += n;
         } else if let Some(op) = OPS.iter().find(|o| b[i..].starts_with(o.as_bytes())) {
-            if *op == "::" {
-                return Err(ExprError { at, message: "enums (`::`) aren't read yet".into() });
-            }
             out.push(Token { tok: Tok::Op(op), at });
             i += op.len();
         } else {
@@ -414,6 +413,20 @@ impl Parser<'_> {
             Tok::Name(n) if matches!(n.as_str(), "and" | "or" | "not") => {
                 self.at -= 1;
                 return Err(self.error_here(format!("expected a value, found `{n}`")));
+            }
+            // `enum::label`
+            Tok::Name(n) if matches!(self.tokens.get(self.at), Some(Token { tok: Tok::Op("::"), .. })) => {
+                self.at += 1;
+                match self.tokens.get(self.at) {
+                    Some(Token { tok: Tok::Name(label), .. }) => {
+                        self.at += 1;
+                        if matches!(self.tokens.get(self.at), Some(Token { tok: Tok::Op("::"), .. })) {
+                            return Err(self.error_here("enums of other types (`a::b::c`) aren't read yet"));
+                        }
+                        Expr::EnumLit(n.clone(), label.clone())
+                    }
+                    _ => return Err(self.error_here("expected an enum label after `::`")),
+                }
             }
             Tok::Name(n) => Expr::Name(n.clone()),
             Tok::Op("(") => {

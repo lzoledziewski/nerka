@@ -59,10 +59,11 @@ fn the_dlt_definition_reads_a_message() {
     assert_eq!(field(&p, &m, "seid"), None);
     assert_eq!(field(&p, &m, "mid"), None);
     assert_eq!(field(&p, &m, "mode").as_deref(), Some("verbose"));
-    assert_eq!(field(&p, &m, "payload").as_deref(), Some("dead"));
+    assert_eq!(field(&p, &m, "payload").as_deref(), Some("<undecoded> de ad"));
     assert_eq!(p.level(&m, &AT), Some(Level::Warn));
     assert_eq!(p.uptime(&m, &AT), Some(12.3456));
-    assert_eq!(render(&p, &m), "12.3456\tECU1\tNAV\tCTX1\twarn\tdead");
+    // One argument announced, two bytes: native DLT shows the same.
+    assert_eq!(render(&p, &m), "12.3456\tECU1\tNAV\tCTX1\twarn\t<undecoded> de ad");
     let mut found = Vec::new();
     let two = [m.clone(), m.clone(), vec![1, 2]].concat();
     assert_eq!(p.split(&two, &mut found), 2);
@@ -80,7 +81,7 @@ fn missing_fields_and_the_containers_ecu() {
     assert_eq!(field(&p, &m, "mid").as_deref(), Some("258"));
     assert_eq!(field(&p, &m, "mode").as_deref(), Some("non-verbose"));
     assert_eq!(p.level(&m, &AT), None);
-    assert_eq!(render(&p, &m), "\tCH\t\t\t\t00000102aabb");
+    assert_eq!(render(&p, &m), "\tCH\t\t\t\t[258] aa bb");
     // Little-endian payload: the id the other way round.
     let le = [0x20, 0, 0, 8, 0x02, 0x01, 0, 0];
     assert_eq!(field(&p, &le, "mid").as_deref(), Some("258"));
@@ -185,7 +186,7 @@ fn contents_valid_and_instances() {
 fn errors_say_where() {
     assert_eq!(error("meta: { id: x }\nseq: []\n").2, "a definition needs a `-nerka:` section");
     let base = small("  - { id: x, type: u1 }", "    x: x");
-    assert_eq!(error(&base.replace("type: u1 }", "type: u1, repeat: eos }")).2, "repeat isn't read yet");
+    assert_eq!(error(&base.replace("type: u1 }", "type: u1, process: zlib }")).2, "process isn't read yet");
     assert_eq!(error(&base.replace("type: u1", "type: nope")), (5, 5, "there is no type `nope` here".into()));
     assert_eq!(
         error(&base.replace("type: u1", "type: u2").replace("  endian: le\n", "")).2.as_str(),
@@ -196,7 +197,8 @@ fn errors_say_where() {
     assert_eq!(error(&base.replace("name: T", "name: SomeIP")).2, "`SomeIP` is a native protocol's name");
     assert_eq!(error(&base.replace("    x: x", "    raw: x")).2, "`raw` is a name NFD has already");
     assert_eq!(error(&base.replace("columns: [x]", "columns: [y]")).2, "there is no field `y`; give `from:`");
-    assert_eq!(error(&base.replace("seq:", "enums: {}\nseq:")).2, "enums aren't read yet");
+    assert_eq!(error(&base.replace("seq:", "params: []\nseq:")).2, "params aren't read yet");
+    assert_eq!(error(&base.replace("type: u1 }", "type: u1, enum: nope }")).2, "there is no enum `nope` here");
     let recursive = "meta: { id: r }\nseq:\n  - { id: a, type: n }\ntypes:\n  n:\n    seq:\n      - { id: b, type: n }\n-nerka: { name: R, framing: datagram, columns: [{ name: c, from: a }] }\n";
     assert!(error(recursive).2.contains("contains itself"));
 }
@@ -246,4 +248,18 @@ fn broken_definitions_and_messages_never_panic() {
             p.detail(&msg, &AT);
         }
     }
+}
+
+#[test]
+fn a_definition_names_its_datagrams() {
+    let text = small("  - { id: x, type: u1 }", "    x: x")
+        .replace("  framing: datagram", "  framing: datagram\n  match:\n    - 40000\n    - { port: 40001, src: 10.0.0.0/8 }\n    - port=40002-40009,vlan=3");
+    let p = load(&text);
+    let rules: Vec<String> = p.routes().iter().map(ToString::to_string).collect();
+    assert_eq!(rules, ["40000", "port=40001,src=10.0.0.0/8", "port=40002-40009,vlan=3"]);
+    let loaded = crate::input::proto::LoadedProtocol::new(std::sync::Arc::new(p));
+    assert_eq!(loaded.routes.len(), 3);
+    let bad = small("  - { id: x, type: u1 }", "    x: x")
+        .replace("  framing: datagram", "  framing: datagram\n  match: [ { port: 1, vlan: 0 } ]");
+    assert_eq!(error(&bad).2, "VLAN id 0 isn't 1 to 4094");
 }

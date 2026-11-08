@@ -13,6 +13,7 @@ fn show(e: &Expr) -> String {
         Expr::Unary(op, a) => format!("({op:?} {})", show(a)),
         Expr::Binary(op, a, b) => format!("({} {op:?} {})", show(a), show(b)),
         Expr::Cond(c, a, b) => format!("({} ? {} : {})", show(c), show(a), show(b)),
+        Expr::EnumLit(e, l) => format!("{e}::{l}"),
     }
 }
 
@@ -70,7 +71,9 @@ fn errors_at_their_place() {
     assert_eq!(err("(a"), (2, "expected `)`, found the end".into()));
     assert_eq!(err("a b"), (2, "unexpected `b`".into()));
     assert_eq!(err("a == b == c"), (7, "comparisons don't chain; use `and`".into()));
-    assert_eq!(err("x::y"), (1, "enums (`::`) aren't read yet".into()));
+    assert_eq!(p("sid == service::marker"), "(sid Eq service::marker)");
+    assert_eq!(err("a::b::c"), (4, "enums of other types (`a::b::c`) aren't read yet".into()));
+    assert_eq!(err("a:: 1"), (4, "expected an enum label after `::`".into()));
     assert_eq!(err("0xZZ"), (0, "`0xZZ` isn't a number".into()));
     assert_eq!(err("'open"), (0, "the string isn't closed".into()));
     assert_eq!(err("a $ b"), (2, "unexpected `$`".into()));

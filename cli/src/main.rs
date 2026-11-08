@@ -56,11 +56,21 @@ struct Cli {
     /// ports with --protocol-port. See doc/protocol-definitions.md.
     #[arg(long, global = true, value_name = "FILE")]
     protocol: Vec<PathBuf>,
-    /// UDP destination port of a --protocol definition, by its name
-    /// (repeatable): NAME=PORT, e.g. 'MYPROTO=40000'. A native protocol
-    /// keeps a port it has; move it off with --dlt-port etc.
+    /// UDP destination port of a protocol, by its name (repeatable):
+    /// NAME=PORT, e.g. 'MYPROTO=40000'; short for --route NAME:PORT.
     #[arg(long = "protocol-port", global = true, value_name = "NAME=PORT")]
     protocol_port: Vec<String>,
+    /// Which datagrams in captures are a protocol's (repeatable): NAME:RULE,
+    /// a rule being a port or range, or conditions on what matters, e.g.
+    /// 'DLT:port=3490,src=10.0.0.0/8' or 'MYPROTO:port=40000,vlan=5' (keys
+    /// port, sport, src, dst, vlan; `*`: every datagram). A protocol given
+    /// rules here uses only these; the most specific rule wins.
+    #[arg(long, global = true, value_name = "NAME:RULE")]
+    route: Vec<String>,
+    /// Don't read this protocol in captures (repeatable): DLT, SOMEIP,
+    /// syslog or a --protocol's name.
+    #[arg(long = "disable-protocol", global = true, value_name = "NAME")]
+    disable_protocol: Vec<String>,
     /// Folder compressed MF4 data is unpacked into (default: the per-user
     /// cache folder); unpacked once, reused when the file is opened again.
     #[arg(long = "unpack-dir", global = true, value_name = "DIR")]
@@ -769,31 +779,52 @@ static SIGNALS: std::sync::OnceLock<Signals> = std::sync::OnceLock::new();
 /// How files are opened (`--dlt-port`, `--someip-port`, …), set once in `main`.
 static OPEN_OPTIONS: std::sync::OnceLock<nerka_core::OpenOptions> = std::sync::OnceLock::new();
 
-/// The `--protocol` definitions with the ports `--protocol-port` gives them.
-fn loaded_protocols(files: &[PathBuf], ports: &[String]) -> Result<Vec<nerka_core::input::proto::LoadedProtocol>> {
+/// The `--protocol` definitions, and the rules `--route`, `--protocol-port`
+/// and `--disable-protocol` give (by protocol name: native or loaded).
+fn capture_protocols(cli: &Cli, capture: &mut nerka_core::input::capture::CaptureOptions) -> Result<()> {
+    use nerka_core::input::capture::route::{Match, Route};
     use nerka_core::input::proto::{LoadedProtocol, Protocol, ksy::KsyProtocol};
-    let mut out: Vec<LoadedProtocol> = Vec::new();
-    for f in files {
+    for f in &cli.protocol {
         let p = KsyProtocol::load(f)?;
-        if out.iter().any(|o| o.protocol.name().eq_ignore_ascii_case(p.name())) {
+        if capture.protocols.iter().any(|o| o.protocol.name().eq_ignore_ascii_case(p.name())) {
             anyhow::bail!("{}: a protocol named {} is loaded already", f.display(), p.name());
         }
-        out.push(LoadedProtocol { protocol: std::sync::Arc::new(p), udp_ports: Vec::new() });
+        capture.protocols.push(LoadedProtocol::new(std::sync::Arc::new(p)));
     }
-    for spec in ports {
+    let known = |name: &str| {
+        ["DLT", "SOMEIP", "syslog"].iter().any(|n| n.eq_ignore_ascii_case(name))
+            || capture.protocols.iter().any(|p| p.protocol.name().eq_ignore_ascii_case(name))
+    };
+    let mut routes = Vec::new();
+    for spec in &cli.protocol_port {
         let (name, port) =
             spec.split_once('=').ok_or_else(|| anyhow::anyhow!("--protocol-port {spec}: write NAME=PORT"))?;
         let port: u16 =
             port.trim().parse().map_err(|_| anyhow::anyhow!("--protocol-port {spec}: `{port}` isn't a port"))?;
-        let Some(p) = out.iter_mut().find(|o| o.protocol.name().eq_ignore_ascii_case(name.trim())) else {
-            anyhow::bail!("--protocol-port {spec}: no --protocol is named {name}");
-        };
-        p.udp_ports.push(port);
+        routes.push(Route { protocol: name.trim().to_owned(), rule: Match::port(port) });
     }
-    if let Some(p) = out.iter().find(|p| p.udp_ports.is_empty()) {
-        eprintln!("nerka: protocol {} has no port (--protocol-port {}=PORT)", p.protocol.name(), p.protocol.name());
+    for spec in &cli.route {
+        routes.push(spec.parse::<Route>().map_err(|e| anyhow::anyhow!("--route {spec}: {e}"))?);
     }
-    Ok(out)
+    for r in &routes {
+        if !known(&r.protocol) {
+            anyhow::bail!("no protocol is named {} (DLT, SOMEIP, syslog or a --protocol's name)", r.protocol);
+        }
+    }
+    for name in &cli.disable_protocol {
+        if !known(name) {
+            anyhow::bail!("--disable-protocol {name}: no protocol is named so");
+        }
+    }
+    capture.routes = routes;
+    capture.disabled = cli.disable_protocol.clone();
+    for p in &capture.protocols {
+        let name = p.protocol.name();
+        if p.routes.is_empty() && !capture.routes.iter().any(|r| r.protocol.eq_ignore_ascii_case(name)) {
+            eprintln!("nerka: protocol {name} matches no datagrams (--route {name}:PORT, or `match:` in its file)");
+        }
+    }
+    Ok(())
 }
 
 fn open(path: &PathBuf) -> Result<(Box<dyn LogSource>, std::time::Duration)> {
@@ -838,7 +869,7 @@ fn run() -> Result<()> {
     if !cli.syslog_port.is_empty() {
         options.capture.syslog_udp_ports = cli.syslog_port.clone();
     }
-    options.capture.protocols = loaded_protocols(&cli.protocol, &cli.protocol_port)?;
+    capture_protocols(&cli, &mut options.capture)?;
     options.capture.unpack.dir = cli.unpack_dir.clone().or_else(nerka_core::cache_dir);
     options.capture.mf4_local_time = !cli.mf4_utc;
     if let Some(spec) = &cli.records {

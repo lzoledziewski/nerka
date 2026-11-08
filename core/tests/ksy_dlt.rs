@@ -1,12 +1,13 @@
 //! The DLT definition (`data/dlt.ksy`) against Nerka's native DLT reader:
 //! the same messages, split the same way, with the same fields, levels,
-//! uptimes and columns (all but the payload, which the definition shows as
-//! hex). Then both in one capture, on two UDP ports: every query gives the
+//! uptimes, lines and payload text (verbose arguments of every kind,
+//! control messages, non-verbose ids; no FIBEX). Then both in one capture, on two UDP ports: every query gives the
 //! same lines for `proto == DLT` and `proto == DLTK`.
 //!
 //! A test of the protocol definitions, not a feature: it uses the public
 //! API only (doc/protocol-definitions.md).
 
+use nerka_core::input::capture::route::Match;
 use nerka_core::input::capture::{self, CaptureOptions};
 use nerka_core::input::dlt::Dlt;
 use nerka_core::input::proto::ksy::KsyProtocol;
@@ -38,9 +39,16 @@ impl Rng {
 const IDS: [&[u8; 4]; 6] = [b"NAV\0", b"ECU1", b"\0\0\0\0", b"A\0\0\0", b"CTX1", b"SYS "];
 
 /// A well-formed DLT message (standard header on) with flags, ids and
-/// payload from `rng`.
+/// payload from `rng`: verbose arguments of every kind, control messages,
+/// non-verbose ids or random bytes, sometimes cut short or with more after.
 fn message(rng: &mut Rng, htyp_flags: Option<u8>) -> Vec<u8> {
-    let flags = htyp_flags.unwrap_or_else(|| rng.next() as u8 & 0x1f);
+    let mut flags = htyp_flags.unwrap_or_else(|| rng.next() as u8 & 0x1f);
+    // What the payload is: 0 random, 1 verbose, 2 control, 3 non-verbose.
+    let kind = if htyp_flags.is_some() { 0 } else { rng.below(4) };
+    if kind == 1 || kind == 2 {
+        flags |= 0x01;
+    }
+    let be = flags & 0x02 != 0;
     let mut m = vec![0x20 | flags, rng.next() as u8, 0, 0];
     if flags & 0x04 != 0 {
         m.extend_from_slice(*rng.pick(&IDS));
@@ -51,19 +59,139 @@ fn message(rng: &mut Rng, htyp_flags: Option<u8>) -> Vec<u8> {
     if flags & 0x10 != 0 {
         m.extend_from_slice(&(rng.next() as u32).to_be_bytes());
     }
+    let mut payload = Vec::new();
+    let mut noar = rng.below(4) as u8;
     if flags & 0x01 != 0 {
         // Every message type and type info, verbose or not.
-        m.push(rng.next() as u8);
-        m.push(rng.below(4) as u8);
+        let msin = match kind {
+            1 => (rng.next() as u8 & 0xf0) | 0x01,
+            2 => ((rng.below(4) as u8 + 1) << 4) | (3 << 1),
+            3 => rng.next() as u8 & 0xf0,
+            _ => rng.next() as u8,
+        };
+        match kind {
+            1 => {
+                noar = rng.below(5) as u8;
+                for _ in 0..noar {
+                    verbose_arg(rng, be, &mut payload);
+                }
+                // NOAR a little off now and then.
+                if rng.below(8) == 0 {
+                    noar = noar.wrapping_add(1);
+                }
+            }
+            2 => control(rng, be, msin >> 4, &mut payload),
+            _ => {}
+        }
+        m.push(msin);
+        m.push(noar);
         m.extend_from_slice(*rng.pick(&IDS));
         m.extend_from_slice(*rng.pick(&IDS));
     }
-    for _ in 0..rng.below(24) {
-        m.push(rng.next() as u8);
+    if kind == 3 {
+        let id = rng.next() as u32;
+        payload.extend_from_slice(&if be { id.to_be_bytes() } else { id.to_le_bytes() });
     }
+    if kind == 0 || rng.below(6) == 0 {
+        payload.extend((0..rng.below(24)).map(|_| rng.next() as u8));
+    }
+    if !payload.is_empty() && rng.below(8) == 0 {
+        payload.truncate(rng.below(payload.len() as u64) as usize);
+    }
+    m.extend_from_slice(&payload);
     let len = m.len() as u16;
     m[2..4].copy_from_slice(&len.to_be_bytes());
     m
+}
+
+fn put16(be: bool, v: u16, out: &mut Vec<u8>) {
+    out.extend_from_slice(&if be { v.to_be_bytes() } else { v.to_le_bytes() });
+}
+
+fn put32(be: bool, v: u32, out: &mut Vec<u8>) {
+    out.extend_from_slice(&if be { v.to_be_bytes() } else { v.to_le_bytes() });
+}
+
+/// Text for names, units and strings: plain, empty, with a NUL at the
+/// end, control characters, bytes that aren't UTF-8.
+fn text(rng: &mut Rng) -> Vec<u8> {
+    const WORDS: [&[u8]; 8] = [b"speed", b"", b"km/h\0", b"a\tb\nc", b"\xff\xfeoops", b"\0", b"temp\0\0", b"x y"];
+    rng.pick(&WORDS).to_vec()
+}
+
+/// One verbose argument: type info, then what it says.
+fn verbose_arg(rng: &mut Rng, be: bool, out: &mut Vec<u8>) {
+    let vari = if rng.below(2) == 0 { 0x800 } else { 0 };
+    match rng.below(9) {
+        // Strings, trace info and raw data.
+        0..=2 => {
+            let ty = *rng.pick(&[0x200u32, 0x200, 0x2000, 0x400]);
+            let data = text(rng);
+            put32(be, ty | vari | (rng.below(8) as u32) << 15, out);
+            put16(be, data.len() as u16, out);
+            if vari != 0 && ty != 0x2000 {
+                let name = text(rng);
+                put16(be, name.len() as u16, out);
+                out.extend_from_slice(&name);
+            }
+            out.extend_from_slice(&data);
+        }
+        3 => {
+            put32(be, 0x10 | 1 | vari, out);
+            if vari != 0 {
+                let name = text(rng);
+                put16(be, name.len() as u16, out);
+                out.extend_from_slice(&name);
+            }
+            out.push(rng.below(3) as u8);
+        }
+        // Integers and floats, every length (some not readable).
+        4..=7 => {
+            let base = *rng.pick(&[0x20u32, 0x40, 0x80, 0x20 | 0x1000]);
+            let tyle = rng.below(7) as u32;
+            put32(be, base | tyle | vari, out);
+            if vari != 0 {
+                let (name, unit) = (text(rng), text(rng));
+                put16(be, name.len() as u16, out);
+                put16(be, unit.len() as u16, out);
+                out.extend_from_slice(&name);
+                out.extend_from_slice(&unit);
+            }
+            let size = if (1..=5).contains(&tyle) { 1usize << (tyle - 1) } else { 4 };
+            if base == 0x80 && rng.below(2) == 0 {
+                // A float people log.
+                let v = *rng.pick(&[0.1f64, -2.5, 1e30, f64::NAN, 0.0]);
+                match size {
+                    4 => out.extend_from_slice(&if be { (v as f32).to_be_bytes() } else { (v as f32).to_le_bytes() }),
+                    8 => out.extend_from_slice(&if be { v.to_be_bytes() } else { v.to_le_bytes() }),
+                    _ => out.extend((0..size).map(|_| rng.next() as u8)),
+                }
+            } else {
+                out.extend((0..size).map(|_| rng.next() as u8));
+            }
+        }
+        // Arrays, structs and anything else.
+        _ => {
+            put32(be, rng.next() as u32, out);
+            out.extend((0..rng.below(8)).map(|_| rng.next() as u8));
+        }
+    }
+}
+
+/// A control message: service id, a response's status, a version string.
+fn control(rng: &mut Rng, be: bool, mtin: u8, out: &mut Vec<u8>) {
+    let sid = *rng.pick(&[0x01u32, 0x03, 0x13, 0x13, 0x1f, 0xf04, 0x77, 0xf02]);
+    put32(be, sid, out);
+    if mtin == 2 && rng.below(6) != 0 {
+        out.push(*rng.pick(&[0u8, 1, 2, 9]));
+        if sid == 0x13 {
+            let v = text(rng);
+            let len = if rng.below(5) == 0 { v.len() as u32 + 3 } else { v.len() as u32 };
+            put32(be, len, out);
+            out.extend_from_slice(&v);
+        }
+    }
+    out.extend((0..rng.below(3)).map(|_| rng.next() as u8));
 }
 
 /// A field's value, comparable across the two readers.
@@ -82,16 +210,6 @@ fn norm(v: Option<FieldValue<'_>>) -> Option<V> {
     })
 }
 
-/// Columns before the payload.
-fn header_cells(p: &dyn Protocol, msg: &[u8], at: &Origin<'_>) -> Vec<String> {
-    let mut out = Vec::new();
-    p.render(msg, at, &mut out);
-    let text = String::from_utf8_lossy(&out).into_owned();
-    let mut cells: Vec<String> = text.split('\t').map(str::to_owned).collect();
-    cells.truncate(p.columns().len() - 1);
-    cells
-}
-
 fn readers() -> (Dlt, KsyProtocol) {
     (Dlt::default(), KsyProtocol::parse(DEFINITION).unwrap_or_else(|e| panic!("dlt.ksy: {e}")))
 }
@@ -100,9 +218,6 @@ fn readers() -> (Dlt, KsyProtocol) {
 fn same_message(native: &Dlt, ksy: &KsyProtocol, msg: &[u8], at: &Origin<'_>) {
     let ctx = || format!("message {msg:02x?}");
     for (kid, def) in ksy.schema().iter().enumerate() {
-        if def.name == "payload" {
-            continue;
-        }
         let nid = native
             .schema()
             .iter()
@@ -113,16 +228,21 @@ fn same_message(native: &Dlt, ksy: &KsyProtocol, msg: &[u8], at: &Origin<'_>) {
     }
     assert_eq!(ksy.level(msg, at), native.level(msg, at), "level of {}", ctx());
     assert_eq!(ksy.uptime(msg, at), native.uptime(msg, at), "uptime of {}", ctx());
-    // Native DLT writes an id's tabs and line breaks into the columns as
+    // Native DLT writes an id's control characters into the columns as
     // they are (a tab shifts the columns); the definition writes spaces, as
     // `Protocol::render` asks. Only the columns of such messages differ.
     let control = ["ecu", "apid", "ctid"].iter().any(|name| {
         let id = native.schema().iter().position(|d| d.name == *name).expect("native field");
-        matches!(native.field(msg, at, id), Some(FieldValue::Str(s)) if s.iter().any(|c| matches!(c, b'\t' | b'\n' | b'\r')))
+        matches!(native.field(msg, at, id), Some(FieldValue::Str(s)) if s.iter().any(|&c| c < 0x20 || c == 0x7F))
     });
     if !control {
-        assert_eq!(header_cells(ksy, msg, at), header_cells(native, msg, at), "columns of {}", ctx());
+        let (mut a, mut b) = (Vec::new(), Vec::new());
+        native.render(msg, at, &mut a);
+        ksy.render(msg, at, &mut b);
+        assert_eq!(String::from_utf8_lossy(&b), String::from_utf8_lossy(&a), "line of {}", ctx());
     }
+    // The detailed view: the payload keeps its line breaks and tabs.
+    assert_eq!(ksy.detail(msg, at).last(), native.detail(msg, at).last(), "detailed payload of {}", ctx());
 }
 
 fn same_split(native: &Dlt, ksy: &KsyProtocol, datagram: &[u8], at: &Origin<'_>) -> usize {
@@ -142,6 +262,7 @@ const CHANNELS: [&[u8; 4]; 2] = [b"\0\0\0\0", b"MF4E"];
 fn the_same_fields_as_native_dlt() {
     let (native, ksy) = readers();
     let mut rng = Rng(0x5eed_0001);
+    let mut payloads = Vec::new();
     for i in 0..20_000 {
         let m = message(&mut rng, None);
         let at = Origin { secs: i, usecs: 0, channel: CHANNELS[rng.below(2) as usize] };
@@ -150,7 +271,28 @@ fn the_same_fields_as_native_dlt() {
         let mut buf = m.clone();
         buf.extend_from_slice(&message(&mut rng, None));
         same_message(&native, &ksy, &buf, &at);
+        let id = native.schema().iter().position(|d| d.name == "payload").expect("payload");
+        if let Some(FieldValue::Str(s)) = native.field(&m, &at, id) {
+            payloads.push(String::from_utf8_lossy(&s).into_owned());
+        }
     }
+    // Every kind of payload was there, read in full and cut short.
+    for (what, needle) in [
+        ("named numbers with a unit", " km/h"),
+        ("booleans", "true"),
+        ("strings with a name", "speed="),
+        ("text that isn't UTF-8", "\u{fffd}"),
+        ("raw data and the undecoded rest", "<undecoded> "),
+        ("control responses", " ok]"),
+        ("versions", "[get_software_version "),
+        ("unknown services", "[service 0x77"),
+        ("non-verbose ids", "] "),
+    ] {
+        let n = payloads.iter().filter(|p| p.contains(needle)).count();
+        assert!(n >= 30, "{what}: {n} payloads with {needle:?}");
+    }
+    let floats = payloads.iter().filter(|p| p.contains("0.1") || p.contains("-2.5") || p.contains("NaN")).count();
+    assert!(floats >= 30, "floats: {floats}");
 }
 
 #[test]
@@ -207,6 +349,20 @@ fn damaged_datagrams_split_the_same() {
 
 /// A pcap of Ethernet / IPv4 / UDP frames: `(port, payload)` each.
 fn pcap(datagrams: &[(u16, Vec<u8>)]) -> Vec<u8> {
+    let all: Vec<Udp> =
+        datagrams.iter().map(|(port, p)| Udp { src: 1, port: *port, vlan: None, payload: p.clone() }).collect();
+    pcap_of(&all)
+}
+
+/// A UDP datagram from 10.0.0.`src` to 10.0.0.2, VLAN-tagged or not.
+struct Udp {
+    src: u8,
+    port: u16,
+    vlan: Option<u16>,
+    payload: Vec<u8>,
+}
+
+fn pcap_of(datagrams: &[Udp]) -> Vec<u8> {
     let mut out = Vec::new();
     out.extend_from_slice(&0xa1b2_c3d4u32.to_le_bytes());
     out.extend_from_slice(&2u16.to_le_bytes());
@@ -214,12 +370,16 @@ fn pcap(datagrams: &[(u16, Vec<u8>)]) -> Vec<u8> {
     for x in [0u32, 0, 262_144, 1] {
         out.extend_from_slice(&x.to_le_bytes());
     }
-    for (i, (port, payload)) in datagrams.iter().enumerate() {
+    for (i, Udp { src, port, vlan, payload }) in datagrams.iter().enumerate() {
         let mut f = vec![2; 12];
+        if let Some(v) = vlan {
+            f.extend_from_slice(&[0x81, 0x00]);
+            f.extend_from_slice(&v.to_be_bytes());
+        }
         f.extend_from_slice(&[0x08, 0x00, 0x45, 0]);
         f.extend_from_slice(&((20 + 8 + payload.len()) as u16).to_be_bytes());
         f.extend_from_slice(&(i as u16).to_be_bytes());
-        f.extend_from_slice(&[0, 0, 64, 17, 0, 0, 10, 0, 0, 1, 10, 0, 0, 2]);
+        f.extend_from_slice(&[0, 0, 64, 17, 0, 0, 10, 0, 0, *src, 10, 0, 0, 2]);
         f.extend_from_slice(&50000u16.to_be_bytes());
         f.extend_from_slice(&port.to_be_bytes());
         f.extend_from_slice(&((8 + payload.len()) as u16).to_be_bytes());
@@ -250,7 +410,7 @@ fn both_readers_in_one_capture_find_the_same_lines() {
     }
     let ksy = KsyProtocol::parse(DEFINITION).expect("dlt.ksy");
     let options = CaptureOptions {
-        protocols: vec![LoadedProtocol { protocol: Arc::new(ksy), udp_ports: vec![3491] }],
+        protocols: vec![LoadedProtocol { protocol: Arc::new(ksy), routes: vec![Match::port(3491)] }],
         ..Default::default()
     };
     let (source, stats) = capture::from_bytes("two-ports.pcap", pcap(&datagrams), &options).expect("capture");
@@ -285,4 +445,46 @@ fn both_readers_in_one_capture_find_the_same_lines() {
         assert!(!native.is_empty(), "{q}: no lines");
         assert_eq!(native.iter().map(|l| twin[l]).collect::<Vec<_>>(), ksy, "{q}");
     }
+}
+
+#[test]
+fn rules_share_one_port_by_address_and_vlan() {
+    let mut rng = Rng(0x5eed_0005);
+    let mut datagrams = Vec::new();
+    // On port 3490: from 10.0.0.1 untagged, from 10.0.0.7, and on VLAN 5.
+    for i in 0..300u32 {
+        let (src, vlan) = match i % 3 {
+            0 => (1, None),
+            1 => (7, None),
+            _ => (1, Some(5)),
+        };
+        datagrams.push(Udp { src, port: 3490, vlan, payload: message(&mut rng, Some(0x05)) });
+    }
+    let ksy = Arc::new(KsyProtocol::parse(DEFINITION).expect("dlt.ksy"));
+    let open = |routes: &[&str], disabled: &[&str]| {
+        let options = CaptureOptions {
+            protocols: vec![LoadedProtocol { protocol: ksy.clone(), routes: Vec::new() }],
+            routes: routes.iter().map(|r| r.parse().expect("rule")).collect(),
+            disabled: disabled.iter().map(|d| d.to_string()).collect(),
+            ..Default::default()
+        };
+        capture::from_bytes("rules.pcap", pcap_of(&datagrams), &options).expect("capture").0
+    };
+    let per = |source: &dyn LogSource| (count(source, "proto == DLT").len(), count(source, "proto == DLTK").len());
+    // Native DLT's default port takes them all.
+    let all = per(&open(&[], &[]));
+    assert!(all.0 > 200 && all.1 == 0, "{all:?}");
+    // The more specific rule wins: one source, one VLAN.
+    let by_src = per(&open(&["DLTK:port=3490,src=10.0.0.7"], &[]));
+    let by_vlan = per(&open(&["DLTK:3490,vlan=5"], &[]));
+    assert!(by_src.1 > 50 && by_vlan.1 > 50, "{by_src:?} {by_vlan:?}");
+    assert_eq!(by_src.0 + by_src.1, all.0);
+    assert_eq!(by_vlan.0 + by_vlan.1, all.0);
+    // A rule for DLT replaces its default port: here only VLAN 5 is DLT.
+    let only = per(&open(&["DLT:vlan=5"], &[]));
+    assert_eq!(only, (by_vlan.1, 0));
+    // Equally specific rules: the protocol listed first (native DLT).
+    assert_eq!(per(&open(&["DLTK:3490"], &[])), all);
+    // Turned off: its datagrams go to the next rule that matches.
+    assert_eq!(per(&open(&["DLTK:3490"], &["DLT"])), (0, all.0));
 }

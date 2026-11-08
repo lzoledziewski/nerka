@@ -96,28 +96,33 @@ pub trait Protocol: Send + Sync {
     }
 }
 
-/// A protocol given at runtime (a definition, [`ksy`]) and the UDP
-/// destination ports whose payloads are its messages.
+/// A protocol given at runtime (a definition, [`ksy`]) and its default
+/// rules: which UDP datagrams are its messages
+/// ([`crate::input::capture::route`]).
 #[derive(Clone)]
 pub struct LoadedProtocol {
     pub protocol: Arc<dyn Protocol>,
-    pub udp_ports: Vec<u16>,
+    pub routes: Vec<crate::input::capture::route::Match>,
+}
+
+impl LoadedProtocol {
+    /// A definition with the rules it gives itself (`-nerka: match:`).
+    pub fn new(protocol: Arc<ksy::KsyProtocol>) -> LoadedProtocol {
+        let routes = protocol.routes().to_vec();
+        LoadedProtocol { protocol, routes }
+    }
 }
 
 impl std::fmt::Debug for LoadedProtocol {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("LoadedProtocol")
-            .field("name", &self.protocol.name())
-            .field("udp_ports", &self.udp_ports)
-            .finish()
+        f.debug_struct("LoadedProtocol").field("name", &self.protocol.name()).field("routes", &self.routes).finish()
     }
 }
 
-/// The same reader (not an equal one) on the same ports.
+/// The same reader (not an equal one) with the same rules.
 impl PartialEq for LoadedProtocol {
     fn eq(&self, other: &Self) -> bool {
-        std::ptr::addr_eq(Arc::as_ptr(&self.protocol), Arc::as_ptr(&other.protocol))
-            && self.udp_ports == other.udp_ports
+        std::ptr::addr_eq(Arc::as_ptr(&self.protocol), Arc::as_ptr(&other.protocol)) && self.routes == other.routes
     }
 }
 

@@ -1,7 +1,8 @@
 //! Options remembered between runs: the last search mode and checkboxes
-//! the user picked become the default for new tabs; the UDP ports that
-//! carry DLT in captures; the unpack cache's size limit; local time or UTC;
-//! whether tabs of several files are merged by time.
+//! the user picked become the default for new tabs; which protocols are
+//! read in captures and the rules saying which datagrams are theirs; the
+//! unpack cache's size limit; local time or UTC; whether tabs of several
+//! files are merged by time.
 //!
 //! Stored as `key=value` lines in `<config>/nerka/prefs`. Unknown keys and
 //! bad values are ignored, so an old or hand-edited file never fails.
@@ -38,6 +39,14 @@ pub struct SearchPrefs {
     /// Tabs of several files that know their times interleave their lines
     /// by time (the last choice in a tab's menu).
     pub merge_by_time: bool,
+    /// Rules for protocols in captures (`NAME:RULE`, as `--route` takes
+    /// them): a protocol given rules uses these instead of its defaults.
+    pub routes: Vec<String>,
+    /// Protocols not read in captures, by name.
+    pub disabled_protocols: Vec<String>,
+    /// The protocol definitions in `<config>/nerka/protocols` (not saved
+    /// here: read from their files at startup).
+    pub protocols: Vec<nerka_core::input::proto::LoadedProtocol>,
 }
 
 impl Default for SearchPrefs {
@@ -58,6 +67,9 @@ impl Default for SearchPrefs {
             mf4_local_time: true,
             bookmark_notes: NoteMode::default(),
             merge_by_time: false,
+            routes: Vec::new(),
+            disabled_protocols: Vec::new(),
+            protocols: Vec::new(),
         }
     }
 }
@@ -66,6 +78,19 @@ impl SearchPrefs {
     pub fn parse(s: &str) -> Self {
         let mut p = Self::default();
         for (key, value) in s.lines().filter_map(|l| l.split_once('=')) {
+            match key.trim() {
+                "route" => {
+                    if value.trim().parse::<nerka_core::input::capture::route::Route>().is_ok() {
+                        p.routes.push(value.trim().to_owned());
+                    }
+                    continue;
+                }
+                "disabled_protocols" => {
+                    p.disabled_protocols = value.split_whitespace().map(str::to_owned).collect();
+                    continue;
+                }
+                _ => {}
+            }
             let flag = match value.trim() {
                 "true" => true,
                 "false" => false,
@@ -123,7 +148,7 @@ impl SearchPrefs {
             Mode::Text => "text",
             Mode::Query => "query",
         };
-        format!(
+        let mut out = format!(
             "mode={}\nregex={}\nignore_case={}\ninvert={}\nsearch_mode={}\nsearch_regex={}\nsearch_ignore_case={}\ndlt_ports={}\nsomeip_ports={}\nsyslog_ports={}\nunpack_limit_gib={}\nlocal_time={}\nmf4_local_time={}\nbookmark_notes={}\nmerge_by_time={}\n",
             name(self.mode),
             !self.options.fixed_string,
@@ -140,7 +165,12 @@ impl SearchPrefs {
             self.mf4_local_time,
             self.bookmark_notes.key(),
             self.merge_by_time
-        )
+        );
+        for r in &self.routes {
+            out.push_str(&format!("route={r}\n"));
+        }
+        out.push_str(&format!("disabled_protocols={}\n", self.disabled_protocols.join(" ")));
+        out
     }
 
     /// How captures are opened with these prefs.
@@ -152,6 +182,9 @@ impl SearchPrefs {
         o.capture.unpack.dir = nerka_core::cache_dir();
         o.capture.unpack.limit = self.unpack_limit_gib << 30;
         o.capture.mf4_local_time = self.mf4_local_time;
+        o.capture.protocols = self.protocols.clone();
+        o.capture.routes = self.routes.iter().filter_map(|r| r.parse().ok()).collect();
+        o.capture.disabled = self.disabled_protocols.clone();
         o
     }
 
@@ -218,6 +251,9 @@ mod tests {
             mf4_local_time: false,
             bookmark_notes: NoteMode::Column,
             merge_by_time: true,
+            routes: vec!["DLT:port=3490,vlan=5".into()],
+            disabled_protocols: vec!["syslog".into()],
+            protocols: Vec::new(),
         };
         assert_eq!(SearchPrefs::parse(&p.serialize()), p);
         assert_eq!(SearchPrefs::parse(&SearchPrefs::default().serialize()), SearchPrefs::default());
@@ -241,5 +277,26 @@ mod tests {
         assert_eq!(parse_ports("70000"), None);
         assert_eq!(SearchPrefs::parse("unpack_limit_gib=0\n").unpack_limit_gib, 8);
         assert_eq!(SearchPrefs::parse("unpack_limit_gib= 2\n").unpack_limit_gib, 2);
+    }
+}
+
+#[cfg(test)]
+mod protocol_tests {
+    use super::*;
+
+    #[test]
+    fn protocol_settings_are_saved_and_read_back() {
+        let p = SearchPrefs {
+            routes: vec!["DLTK:port=3491,src=10.0.0.0/8".into(), "DLT:vlan=5".into()],
+            disabled_protocols: vec!["syslog".into(), "SOMEIP".into()],
+            ..SearchPrefs::default()
+        };
+        let back = SearchPrefs::parse(&p.serialize());
+        assert_eq!((back.routes, back.disabled_protocols), (p.routes, p.disabled_protocols));
+        // A bad rule in the file is left out; the rest is read.
+        let back = SearchPrefs::parse("route=DLT:3490\nroute=DLT:port=x\nroute=nothing\n");
+        assert_eq!(back.routes, ["DLT:3490"]);
+        let o = SearchPrefs::parse("route=DLT:3490,vlan=5\ndisabled_protocols=syslog\n").open_options();
+        assert_eq!((o.capture.routes.len(), o.capture.disabled.as_slice()), (1, ["syslog".to_owned()].as_slice()));
     }
 }

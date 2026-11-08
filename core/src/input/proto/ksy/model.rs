@@ -1,14 +1,19 @@
 //! A definition compiled: the static tree of nodes with every name bound.
 //!
-//! There are no arrays (`repeat`) yet, so every attribute of every nested
-//! type has one place: the root type is node 0, an attribute (or a
-//! positional instance) of a user type is a child node. Expressions are
-//! bound per node, so `_parent`, `body.ext.apid` and the like become node
-//! and attribute numbers when the file loads.
+//! The root type is node 0; an attribute (or a positional instance, or a
+//! case of a `switch-on` type) of a user type is a child node. Expressions
+//! and templates are bound per node, so `_parent`, `body.ext.apid` and the
+//! like become node and attribute numbers when the file loads.
+//!
+//! A node under a `repeat` is **dynamic**: it has a place per element, so
+//! where it is comes from the element being read (a frame, see
+//! [`super::run`]), never from the memo tables. Outside its list it can only
+//! be reached through the list (`args[2].value`).
 
 use super::KsyError;
 use super::expr::{self, BinOp, Expr, UnOp};
 use super::run::Memo;
+use super::template::{self, Piece};
 use super::yaml::{Key, Node, Value};
 use std::collections::HashSet;
 use std::sync::{Mutex, OnceLock};
@@ -44,19 +49,28 @@ pub enum OriginField {
 #[derive(Debug, Clone, PartialEq)]
 pub enum CExpr {
     Lit(Lit),
-    /// Seq attribute `i` of node `n`.
+    /// Seq attribute `i` of node `n` (a list if it repeats, an object if it
+    /// is a user type).
     Attr(NodeId, usize),
     /// Instance `k` of node `n`.
     Inst(NodeId, usize),
     /// `_io.size` of node `n`'s stream, in bytes.
     IoSize(NodeId),
+    /// `.length` / `.size`: of bytes, text or a list.
     Length(Box<CExpr>),
     Index(Box<CExpr>, Box<CExpr>),
     Unary(UnOp, Box<CExpr>),
     Binary(BinOp, Box<CExpr>, Box<CExpr>),
     Cond(Box<CExpr>, Box<CExpr>, Box<CExpr>),
-    /// `_`: the value a `valid` check is about.
+    /// `obj.member`, where `obj` is an object known only when read (an
+    /// element of a list): the member is evaluated in that object.
+    In(Box<CExpr>, Box<CExpr>),
+    /// `.to_i`: an enum value as its number.
+    ToInt(Box<CExpr>),
+    /// `_`: the value a `valid` check or `repeat-until` is about.
     Underscore,
+    /// `_rest` in a `-nerka-partial` template: the bytes not decoded.
+    Rest,
     /// What the container knows (`-nerka:` only).
     Origin(OriginField),
 }
@@ -68,6 +82,10 @@ pub enum Ty {
     Float,
     Bool,
     Bytes,
+    /// An object of a user type.
+    Obj,
+    /// A list; its elements are objects of this node, if they are.
+    List(Option<NodeId>),
     Any,
 }
 
@@ -78,11 +96,24 @@ pub enum Kind {
         signed: bool,
         endian: Option<Endian>,
     },
+    Float {
+        bytes: u8,
+        endian: Option<Endian>,
+    },
     Bits(u8),
     Bytes,
     Str,
     /// A user type: the node it is.
     User(NodeId),
+    /// The type chosen by a value when read.
+    Switch(Box<Switch>),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Switch {
+    pub on: CExpr,
+    pub cases: Vec<(Lit, Kind)>,
+    pub default: Option<Kind>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -96,8 +127,18 @@ pub enum Size {
     Eos,
     /// Up to and including the first `terminator` byte.
     Terminated(u8),
-    /// An unsized user type: as long as its attributes.
+    /// As long as its type: an unsized user type's attributes, a switch's
+    /// chosen case.
     Child,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum Repeat {
+    No,
+    Expr(CExpr),
+    Eos,
+    /// Until this is true of the element just read (`_`).
+    Until(CExpr),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -109,15 +150,25 @@ pub enum Check {
     Expr(CExpr),
 }
 
+pub type Template = Vec<Piece<CExpr>>;
+
 pub struct Attr {
     pub id: String,
     pub kind: Kind,
+    /// Of one element when it repeats.
     pub size: Size,
+    pub repeat: Repeat,
     pub cond: Option<CExpr>,
     pub checks: Vec<Check>,
     pub contents: Option<&'static [u8]>,
     /// For bytes and strings with a size: cut at the first such byte.
     pub terminator: Option<u8>,
+    /// Its numbers name values of this enum ([`Def::enums`]).
+    pub enum_id: Option<usize>,
+    /// `-nerka-partial`: it never makes its message invalid. A list keeps
+    /// the elements read before one that can't be; anything else that
+    /// can't be read reads as this template (`_rest`: its bytes).
+    pub partial: Option<Template>,
     /// Where it starts in its node, in bits (`None`: not there).
     pub pos: Memo,
     /// Whether it is there (its `if`): 1 or 0.
@@ -127,6 +178,23 @@ pub struct Attr {
 impl Attr {
     pub fn is_bits(&self) -> bool {
         matches!(self.kind, Kind::Bits(_))
+    }
+
+    fn new(id: String, kind: Kind) -> Attr {
+        Attr {
+            id,
+            kind,
+            size: Size::Fixed(0),
+            repeat: Repeat::No,
+            cond: None,
+            checks: Vec::new(),
+            contents: None,
+            terminator: None,
+            enum_id: None,
+            partial: None,
+            pos: Memo::new(),
+            there: Memo::new(),
+        }
     }
 }
 
@@ -160,6 +228,8 @@ pub enum EndianRule {
 pub enum Place {
     Root,
     Attr(NodeId, usize),
+    /// Case `c` of a `switch-on` attribute.
+    Case(NodeId, usize, usize),
     Inst(NodeId, usize),
 }
 
@@ -173,12 +243,27 @@ pub struct NodeDef {
     pub endian: Option<EndianRule>,
     /// It has a stream of its own (a size, or an instance with one).
     pub sized: bool,
+    /// It is, or is inside, an element of a list.
+    pub dynamic: bool,
+    /// The list element it is in (itself, or the nearest node above it
+    /// placed directly in a list): where it is depends on that element.
+    pub anchor: Option<NodeId>,
+    /// `-nerka-text`: how it reads as text.
+    pub text: Option<Template>,
     /// Where it starts, in bits from the message's start.
     pub start: Memo,
 }
 
+pub struct EnumDef {
+    pub values: Vec<(i64, &'static [u8])>,
+}
+
 pub struct Def {
     pub nodes: Vec<NodeDef>,
+    pub enums: Vec<EnumDef>,
+    /// Per node, its straight decoder if it is read inside a list
+    /// ([`super::plan`]).
+    pub plans: Vec<Option<super::plan::Plan>>,
 }
 
 /// Byte strings that live as long as the process: names a definition maps
@@ -202,9 +287,12 @@ struct TypeSpec {
     name: String,
     parent: Option<usize>,
     children: Vec<(String, usize)>,
+    /// Its enums: name and index into the enum list.
+    enums: Vec<(String, usize)>,
     endian: Option<EndianSpec>,
     attrs: Vec<AttrSpec>,
     insts: Vec<InstSpec>,
+    text: Option<TemplateSrc>,
 }
 
 enum EndianSpec {
@@ -220,13 +308,30 @@ pub struct Src {
     pub col: usize,
 }
 
+/// A template with where its text is.
+#[derive(Clone)]
+struct TemplateSrc {
+    parsed: template::Parsed,
+    line: usize,
+    col: usize,
+}
+
 enum TypeRef {
     Int { bytes: u8, signed: bool, endian: Option<Endian> },
+    Float { bytes: u8, endian: Option<Endian> },
     Bits(u8),
     Str,
     Strz,
     Bytes,
     User(String),
+    Switch { on: Src, cases: Vec<(Node, TypeRef)>, default: Option<Box<TypeRef>> },
+}
+
+enum RepeatSpec {
+    No,
+    Expr(Src),
+    Eos,
+    Until(Src),
 }
 
 struct AttrSpec {
@@ -236,10 +341,13 @@ struct AttrSpec {
     ty: TypeRef,
     size: Option<Src>,
     size_eos: bool,
+    repeat: RepeatSpec,
     cond: Option<Src>,
     valid: Vec<(String, Vec<Src>)>,
     contents: Option<Vec<u8>>,
     terminator: Option<u8>,
+    enum_name: Option<(String, usize, usize)>,
+    partial: Option<TemplateSrc>,
 }
 
 struct InstSpec {
@@ -288,18 +396,21 @@ pub fn as_text<'n>(n: &'n Node, what: &str) -> Result<&'n str, KsyError> {
 }
 
 /// A value that is an expression: a number or `true` written as YAML is
-/// one too.
+/// one too; quotes are YAML's.
 pub fn as_expr(n: &Node, what: &str) -> Result<Src, KsyError> {
-    let text = match &n.value {
-        Value::Scalar { text, quoted: false } => text.clone(),
-        // A quoted YAML value is still an expression in Kaitai; the quotes
-        // are YAML's.
-        Value::Scalar { text, quoted: true } => text.clone(),
-        _ => return Err(node_err(n, format!("{what} must be an expression"))),
+    let Value::Scalar { text, quoted } = &n.value else {
+        return Err(node_err(n, format!("{what} must be an expression")));
     };
-    let quoted = matches!(n.value, Value::Scalar { quoted: true, .. });
-    let expr = expr::parse(&text).map_err(|e| err(n.line, n.col + e.at + usize::from(quoted), e.message))?;
+    let expr = expr::parse(text).map_err(|e| err(n.line, n.col + e.at + usize::from(*quoted), e.message))?;
     Ok(Src { expr, line: n.line, col: n.col })
+}
+
+fn as_template(n: &Node, what: &str) -> Result<TemplateSrc, KsyError> {
+    let Value::Scalar { text, quoted } = &n.value else {
+        return Err(node_err(n, format!("{what} must be a template (text)")));
+    };
+    let parsed = template::parse(text).map_err(|e| err(n.line, n.col + e.at + usize::from(*quoted), e.message))?;
+    Ok(TemplateSrc { parsed, line: n.line, col: n.col + usize::from(*quoted) })
 }
 
 /// The keys of `entries` must be among `known` (or start with `-`).
@@ -331,79 +442,108 @@ const META_KEYS: [&str; 12] = [
     "tags",
 ];
 
-fn read_types(root: &Node) -> Result<Vec<TypeSpec>, KsyError> {
-    let mut types = Vec::new();
-    read_type(root, "root".into(), None, &mut types, 0)?;
-    Ok(types)
+struct Reader {
+    types: Vec<TypeSpec>,
+    enums: Vec<EnumDef>,
 }
 
-fn read_type(
-    n: &Node,
-    name: String,
-    parent: Option<usize>,
-    types: &mut Vec<TypeSpec>,
-    depth: usize,
-) -> Result<usize, KsyError> {
-    if depth > 32 || types.len() > 256 {
-        return Err(node_err(n, "too many nested types"));
-    }
-    let entries = as_map(n, "a type")?;
-    let top = parent.is_none();
-    let known: &[&str] = &["meta", "seq", "instances", "types", "doc", "doc-ref"];
-    for (k, _) in entries {
-        if matches!(k.text.as_str(), "enums") {
-            return Err(key_err(k, "enums aren't read yet"));
+fn read_types(root: &Node) -> Result<Reader, KsyError> {
+    let mut r = Reader { types: Vec::new(), enums: Vec::new() };
+    r.read_type(root, "root".into(), None, 0)?;
+    Ok(r)
+}
+
+impl Reader {
+    fn read_type(&mut self, n: &Node, name: String, parent: Option<usize>, depth: usize) -> Result<usize, KsyError> {
+        if depth > 32 || self.types.len() > 256 {
+            return Err(node_err(n, "too many nested types"));
         }
-        if matches!(k.text.as_str(), "params") {
+        let entries = as_map(n, "a type")?;
+        let top = parent.is_none();
+        if let Some((k, _)) = entries.iter().find(|(k, _)| k.text == "params") {
             return Err(key_err(k, "params aren't read yet"));
         }
-    }
-    known_keys(entries, known, if top { "a definition" } else { "a type" })?;
-    let id = types.len();
-    types.push(TypeSpec { name, parent, children: Vec::new(), endian: None, attrs: Vec::new(), insts: Vec::new() });
-    if let Some(meta) = get(entries, "meta") {
-        let m = as_map(meta, "meta")?;
-        known_keys(m, &META_KEYS, "meta")?;
-        if let Some((k, _)) = m.iter().find(|(k, _)| k.text == "imports") {
-            return Err(key_err(k, "imports aren't read yet"));
+        known_keys(
+            entries,
+            &["meta", "seq", "instances", "types", "enums", "doc", "doc-ref"],
+            if top { "a definition" } else { "a type" },
+        )?;
+        let id = self.types.len();
+        self.types.push(TypeSpec {
+            name,
+            parent,
+            children: Vec::new(),
+            enums: Vec::new(),
+            endian: None,
+            attrs: Vec::new(),
+            insts: Vec::new(),
+            text: None,
+        });
+        if let Some(t) = get(entries, "-nerka-text") {
+            self.types[id].text = Some(as_template(t, "-nerka-text")?);
         }
-        if let Some(e) = get(m, "endian") {
-            types[id].endian = Some(read_endian(e)?);
-        }
-        if let Some(b) = get(m, "bit-endian")
-            && as_text(b, "bit-endian")? != "be"
-        {
-            return Err(node_err(b, "only `bit-endian: be` is read yet"));
-        }
-    }
-    if let Some(seq) = get(entries, "seq") {
-        let mut attrs = Vec::new();
-        for a in as_seq(seq, "seq")? {
-            let attr = read_attr(a, false)?;
-            if attrs.iter().any(|x: &AttrSpec| x.id == attr.id) {
-                return Err(err(attr.line, attr.col, format!("`{}` is given twice", attr.id)));
+        if let Some(meta) = get(entries, "meta") {
+            let m = as_map(meta, "meta")?;
+            if let Some((k, _)) = m.iter().find(|(k, _)| k.text == "imports") {
+                return Err(key_err(k, "imports aren't read yet"));
             }
-            attrs.push(attr);
-        }
-        types[id].attrs = attrs;
-    }
-    if let Some(insts) = get(entries, "instances") {
-        let mut out: Vec<InstSpec> = Vec::new();
-        for (k, v) in as_map(insts, "instances")? {
-            if types[id].attrs.iter().any(|a| a.id == k.text) {
-                return Err(key_err(k, format!("`{}` is an attribute already", k.text)));
+            known_keys(m, &META_KEYS, "meta")?;
+            if let Some(e) = get(m, "endian") {
+                self.types[id].endian = Some(read_endian(e)?);
             }
-            out.push(read_inst(k, v)?);
+            if let Some(b) = get(m, "bit-endian")
+                && as_text(b, "bit-endian")? != "be"
+            {
+                return Err(node_err(b, "only `bit-endian: be` is read yet"));
+            }
         }
-        types[id].insts = out;
-    }
-    if let Some(ts) = get(entries, "types") {
-        for (k, v) in as_map(ts, "types")? {
-            let child = read_type(v, k.text.clone(), Some(id), types, depth + 1)?;
-            types[id].children.push((k.text.clone(), child));
+        if let Some(es) = get(entries, "enums") {
+            for (k, v) in as_map(es, "enums")? {
+                let mut values = Vec::new();
+                for (vk, vv) in as_map(v, "an enum")? {
+                    let num =
+                        parse_int(&vk.text).ok_or_else(|| key_err(vk, format!("`{}` isn't a number", vk.text)))?;
+                    let label = match &vv.value {
+                        Value::Map(m) => {
+                            as_text(get(m, "id").ok_or_else(|| node_err(vv, "an enum value needs an `id`"))?, "id")?
+                        }
+                        _ => as_text(vv, "an enum label")?,
+                    };
+                    values.push((num, intern(label.as_bytes())));
+                }
+                self.types[id].enums.push((k.text.clone(), self.enums.len()));
+                self.enums.push(EnumDef { values });
+            }
         }
+        if let Some(seq) = get(entries, "seq") {
+            let mut attrs = Vec::new();
+            for a in as_seq(seq, "seq")? {
+                let attr = read_attr(a, false)?;
+                if attrs.iter().any(|x: &AttrSpec| x.id == attr.id) {
+                    return Err(err(attr.line, attr.col, format!("`{}` is given twice", attr.id)));
+                }
+                attrs.push(attr);
+            }
+            self.types[id].attrs = attrs;
+        }
+        if let Some(insts) = get(entries, "instances") {
+            let mut out: Vec<InstSpec> = Vec::new();
+            for (k, v) in as_map(insts, "instances")? {
+                if self.types[id].attrs.iter().any(|a| a.id == k.text) {
+                    return Err(key_err(k, format!("`{}` is an attribute already", k.text)));
+                }
+                out.push(read_inst(k, v)?);
+            }
+            self.types[id].insts = out;
+        }
+        if let Some(ts) = get(entries, "types") {
+            for (k, v) in as_map(ts, "types")? {
+                let child = self.read_type(v, k.text.clone(), Some(id), depth + 1)?;
+                self.types[id].children.push((k.text.clone(), child));
+            }
+        }
+        Ok(id)
     }
-    Ok(id)
 }
 
 fn endian_name(n: &Node) -> Result<Endian, KsyError> {
@@ -412,6 +552,11 @@ fn endian_name(n: &Node) -> Result<Endian, KsyError> {
         "le" => Ok(Endian::Le),
         other => Err(node_err(n, format!("endian is `be` or `le`, not `{other}`"))),
     }
+}
+
+/// Case keys are expressions written as YAML keys.
+fn key_node(k: &Key) -> Node {
+    Node { value: Value::Scalar { text: k.text.clone(), quoted: false }, line: k.line, col: k.col }
 }
 
 fn read_endian(n: &Node) -> Result<EndianSpec, KsyError> {
@@ -428,14 +573,13 @@ fn read_endian(n: &Node) -> Result<EndianSpec, KsyError> {
         if k.text == "_" {
             default = Some(e);
         } else {
-            let key = Node { value: Value::Scalar { text: k.text.clone(), quoted: false }, line: k.line, col: k.col };
-            cases.push((key, e));
+            cases.push((key_node(k), e));
         }
     }
     Ok(EndianSpec::Switch { on, cases, default })
 }
 
-const ATTR_KEYS: [&str; 14] = [
+const ATTR_KEYS: [&str; 16] = [
     "id",
     "type",
     "size",
@@ -447,8 +591,10 @@ const ATTR_KEYS: [&str; 14] = [
     "encoding",
     "doc",
     "doc-ref",
-    "pad-right",
-    "include",
+    "repeat",
+    "repeat-expr",
+    "repeat-until",
+    "enum",
     "consume",
 ];
 
@@ -456,14 +602,14 @@ fn read_attr(n: &Node, instance: bool) -> Result<AttrSpec, KsyError> {
     let m = as_map(n, "an attribute")?;
     for (k, _) in m {
         let not_yet = match k.text.as_str() {
-            "repeat" | "repeat-expr" | "repeat-until" => Some("repeat"),
-            "process" => Some("process"),
-            "enum" => Some("enum"),
-            "eos-error" => Some("eos-error"),
+            "process" => Some("process isn't read yet"),
+            "eos-error" => Some("eos-error isn't read yet"),
+            "pad-right" => Some("pad-right isn't read yet"),
+            "include" => Some("include isn't read yet"),
             _ => None,
         };
         if let Some(what) = not_yet {
-            return Err(key_err(k, format!("{what} isn't read yet")));
+            return Err(key_err(k, what));
         }
     }
     let mut keys: Vec<&str> = ATTR_KEYS.to_vec();
@@ -472,10 +618,10 @@ fn read_attr(n: &Node, instance: bool) -> Result<AttrSpec, KsyError> {
         keys.extend(["pos", "value"]);
     }
     known_keys(m, &keys, "an attribute")?;
-    for (k, v) in m {
-        if matches!(k.text.as_str(), "pad-right" | "include" | "consume") {
-            return Err(node_err(v, format!("{} isn't read yet", k.text)));
-        }
+    if let Some(c) = get(m, "consume")
+        && as_text(c, "consume")? != "true"
+    {
+        return Err(node_err(c, "only `consume: true` is read yet"));
     }
     let id = if instance {
         String::new()
@@ -493,22 +639,43 @@ fn read_attr(n: &Node, instance: bool) -> Result<AttrSpec, KsyError> {
     };
     let size = get(m, "size").map(|s| as_expr(s, "size")).transpose()?;
     let size_eos = match get(m, "size-eos") {
-        Some(v) => match as_text(v, "size-eos")? {
-            "true" => true,
-            "false" => false,
-            _ => return Err(node_err(v, "size-eos is `true` or `false`")),
-        },
+        Some(v) => bool_value(v, "size-eos")?,
         None => false,
     };
     if size.is_some() && size_eos {
         return Err(node_err(n, "give `size` or `size-eos`, not both"));
     }
+    let repeat = match get(m, "repeat") {
+        None => {
+            if let Some((k, _)) = m.iter().find(|(k, _)| k.text == "repeat-expr" || k.text == "repeat-until") {
+                return Err(key_err(k, format!("`{}` needs `repeat`", k.text)));
+            }
+            RepeatSpec::No
+        }
+        Some(r) => match as_text(r, "repeat")? {
+            "eos" => RepeatSpec::Eos,
+            "expr" => RepeatSpec::Expr(as_expr(
+                get(m, "repeat-expr").ok_or_else(|| node_err(r, "`repeat: expr` needs `repeat-expr`"))?,
+                "repeat-expr",
+            )?),
+            "until" => RepeatSpec::Until(as_expr(
+                get(m, "repeat-until").ok_or_else(|| node_err(r, "`repeat: until` needs `repeat-until`"))?,
+                "repeat-until",
+            )?),
+            other => return Err(node_err(r, format!("repeat is eos, expr or until, not `{other}`"))),
+        },
+    };
     let cond = get(m, "if").map(|c| as_expr(c, "if")).transpose()?;
     let contents = get(m, "contents").map(read_contents).transpose()?;
     let terminator = match get(m, "terminator") {
         Some(t) => Some(byte_value(t)?),
         None => None,
     };
+    let enum_name = match get(m, "enum") {
+        Some(e) => Some((as_text(e, "enum")?.to_owned(), e.line, e.col)),
+        None => None,
+    };
+    let partial = get(m, "-nerka-partial").map(|t| as_template(t, "-nerka-partial")).transpose()?;
     let mut valid = Vec::new();
     if let Some(v) = get(m, "valid") {
         match &v.value {
@@ -530,8 +697,13 @@ fn read_attr(n: &Node, instance: bool) -> Result<AttrSpec, KsyError> {
     if contents.is_some() && !matches!(ty, TypeRef::Bytes) {
         return Err(node_err(n, "`contents` takes no `type`"));
     }
+    if enum_name.is_some() && !matches!(ty, TypeRef::Int { .. } | TypeRef::Bits(_)) {
+        return Err(node_err(n, "`enum` is for numbers"));
+    }
     match &ty {
-        TypeRef::Int { .. } | TypeRef::Bits(_) if size.is_some() || size_eos || terminator.is_some() => {
+        TypeRef::Int { .. } | TypeRef::Bits(_) | TypeRef::Float { .. }
+            if size.is_some() || size_eos || terminator.is_some() =>
+        {
             return Err(node_err(n, "a number takes no `size`, `size-eos` or `terminator`"));
         }
         TypeRef::Str if size.is_none() && !size_eos && terminator.is_none() => {
@@ -542,7 +714,15 @@ fn read_attr(n: &Node, instance: bool) -> Result<AttrSpec, KsyError> {
         }
         _ => {}
     }
-    Ok(AttrSpec { id, line, col, ty, size, size_eos, cond, valid, contents, terminator })
+    Ok(AttrSpec { id, line, col, ty, size, size_eos, repeat, cond, valid, contents, terminator, enum_name, partial })
+}
+
+fn bool_value(v: &Node, what: &str) -> Result<bool, KsyError> {
+    match as_text(v, what)? {
+        "true" => Ok(true),
+        "false" => Ok(false),
+        _ => Err(node_err(v, format!("{what} is `true` or `false`"))),
+    }
 }
 
 fn read_inst(k: &Key, v: &Node) -> Result<InstSpec, KsyError> {
@@ -552,7 +732,7 @@ fn read_inst(k: &Key, v: &Node) -> Result<InstSpec, KsyError> {
     let m = as_map(v, "an instance")?;
     let cond = get(m, "if").map(|c| as_expr(c, "if")).transpose()?;
     if let Some(value) = get(m, "value") {
-        known_keys(m, &["value", "if", "doc", "doc-ref"], "a value instance")?;
+        known_keys(m, &["value", "if", "doc", "doc-ref", "enum"], "a value instance")?;
         return Ok(InstSpec {
             id: k.text.clone(),
             line: k.line,
@@ -567,6 +747,9 @@ fn read_inst(k: &Key, v: &Node) -> Result<InstSpec, KsyError> {
     let pos = as_expr(pos, "pos")?;
     let mut read = read_attr(v, true)?;
     read.cond = None;
+    if !matches!(read.repeat, RepeatSpec::No) {
+        return Err(key_err(k, "repeated instances aren't read yet"));
+    }
     Ok(InstSpec { id: k.text.clone(), line: k.line, col: k.col, cond, value: None, pos: Some(pos), read: Some(read) })
 }
 
@@ -577,10 +760,25 @@ fn is_name(s: &str) -> bool {
 }
 
 fn type_ref(n: &Node) -> Result<TypeRef, KsyError> {
-    let t = as_text(n, "type")?;
-    if let Value::Map(_) = n.value {
-        return Err(node_err(n, "switch-on types aren't read yet"));
+    if let Value::Map(m) = &n.value {
+        known_keys(m, &["switch-on", "cases"], "a switch-on type")?;
+        let on = as_expr(get(m, "switch-on").ok_or_else(|| node_err(n, "a type map needs `switch-on`"))?, "switch-on")?;
+        let mut cases = Vec::new();
+        let mut default = None;
+        for (k, v) in as_map(get(m, "cases").ok_or_else(|| node_err(n, "`switch-on` needs `cases`"))?, "cases")? {
+            let t = type_ref(v)?;
+            if matches!(t, TypeRef::Switch { .. }) {
+                return Err(node_err(v, "a switch-on type inside another isn't read"));
+            }
+            if k.text == "_" {
+                default = Some(Box::new(t));
+            } else {
+                cases.push((key_node(k), t));
+            }
+        }
+        return Ok(TypeRef::Switch { on, cases, default });
     }
+    let t = as_text(n, "type")?;
     let suffix = |rest: &str| -> Option<Option<Endian>> {
         match rest {
             "" => Some(None),
@@ -597,6 +795,13 @@ fn type_ref(n: &Node) -> Result<TypeRef, KsyError> {
     {
         return Ok(TypeRef::Int { bytes: d - b'0', signed: b[0] == b's', endian });
     }
+    if b.first() == Some(&b'f')
+        && let Some(&d) = b.get(1)
+        && matches!(d, b'4' | b'8')
+        && let Some(endian) = suffix(&t[2..])
+    {
+        return Ok(TypeRef::Float { bytes: d - b'0', endian });
+    }
     if let Some(rest) = t.strip_prefix('b') {
         let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
         if !digits.is_empty() {
@@ -612,7 +817,6 @@ fn type_ref(n: &Node) -> Result<TypeRef, KsyError> {
     match t {
         "str" => Ok(TypeRef::Str),
         "strz" => Ok(TypeRef::Strz),
-        "f4" | "f8" | "f4be" | "f4le" | "f8be" | "f8le" => Err(node_err(n, "floats aren't read yet")),
         _ if t.contains('(') => Err(node_err(n, "types with parameters aren't read yet")),
         _ if t.contains("::") => Err(node_err(n, "types of other files aren't read yet")),
         _ if is_name(t) => Ok(TypeRef::User(t.to_owned())),
@@ -657,12 +861,13 @@ fn read_contents(n: &Node) -> Result<Vec<u8>, KsyError> {
 
 struct Builder<'t> {
     types: &'t [TypeSpec],
+    enums: &'t [EnumDef],
     nodes: Vec<NodeDef>,
     /// Per node, its type.
     node_types: Vec<usize>,
 }
 
-impl<'t> Builder<'t> {
+impl Builder<'_> {
     /// The type `name` as seen from type `from` (its own types, then its
     /// parents').
     fn lookup(&self, from: usize, name: &str) -> Option<usize> {
@@ -676,8 +881,27 @@ impl<'t> Builder<'t> {
         None
     }
 
+    /// The enum `name` as seen from type `from`.
+    fn lookup_enum(&self, from: usize, name: &str) -> Option<usize> {
+        let mut t = Some(from);
+        while let Some(i) = t {
+            if let Some((_, e)) = self.types[i].enums.iter().find(|(n, _)| n == name) {
+                return Some(*e);
+            }
+            t = self.types[i].parent;
+        }
+        None
+    }
+
     /// Make the node of type `ty`, and its children.
-    fn make(&mut self, ty: usize, place: Place, parent: Option<NodeId>, sized: bool) -> Result<NodeId, KsyError> {
+    fn make(
+        &mut self,
+        ty: usize,
+        place: Place,
+        parent: Option<NodeId>,
+        sized: bool,
+        dynamic: bool,
+    ) -> Result<NodeId, KsyError> {
         if self.nodes.len() >= MAX_NODES {
             return Err(err(1, 1, format!("more than {MAX_NODES} nodes (types used inside types)")));
         }
@@ -701,44 +925,31 @@ impl<'t> Builder<'t> {
             insts: Vec::new(),
             endian: None,
             sized,
+            dynamic,
+            anchor: None,
+            text: None,
             start: Memo::new(),
         });
         self.node_types.push(ty);
         // Children first (their numbers), expressions later.
         let mut attrs = Vec::new();
         for (i, a) in spec.attrs.iter().enumerate() {
-            let kind = self.kind(ty, a, Place::Attr(id, i), id)?;
-            attrs.push(Attr {
-                id: a.id.clone(),
-                kind,
-                size: Size::Fixed(0),
-                cond: None,
-                checks: Vec::new(),
-                contents: a.contents.as_deref().map(intern),
-                terminator: terminator(a),
-                pos: Memo::new(),
-                there: Memo::new(),
-            });
+            let element = dynamic || !matches!(a.repeat, RepeatSpec::No);
+            let kind = self.kind(ty, a, &a.ty, id, i, element, false)?;
+            let mut attr = Attr::new(a.id.clone(), kind);
+            attr.contents = a.contents.as_deref().map(intern);
+            attr.terminator = terminator(a);
+            attrs.push(attr);
         }
         let mut insts = Vec::new();
         for (k, s) in spec.insts.iter().enumerate() {
             let kind = match &s.read {
                 Some(r) => {
-                    let kind = self.kind(ty, r, Place::Inst(id, k), id)?;
-                    InstKind::Read {
-                        pos: CExpr::Lit(Lit::Int(0)),
-                        read: Box::new(Attr {
-                            id: s.id.clone(),
-                            kind,
-                            size: Size::Fixed(0),
-                            cond: None,
-                            checks: Vec::new(),
-                            contents: r.contents.as_deref().map(intern),
-                            terminator: terminator(r),
-                            pos: Memo::new(),
-                            there: Memo::new(),
-                        }),
-                    }
+                    let kind = self.kind(ty, r, &r.ty, id, k, dynamic, true)?;
+                    let mut read = Attr::new(s.id.clone(), kind);
+                    read.contents = r.contents.as_deref().map(intern);
+                    read.terminator = terminator(r);
+                    InstKind::Read { pos: CExpr::Lit(Lit::Int(0)), read: Box::new(read) }
                 }
                 None => InstKind::Value(CExpr::Lit(Lit::Int(0))),
             };
@@ -749,9 +960,22 @@ impl<'t> Builder<'t> {
         Ok(id)
     }
 
-    fn kind(&mut self, ty: usize, a: &AttrSpec, place: Place, node: NodeId) -> Result<Kind, KsyError> {
-        Ok(match &a.ty {
+    /// The kind of attribute `i` (or instance, `inst`) of node `node`.
+    #[allow(clippy::too_many_arguments)]
+    fn kind(
+        &mut self,
+        ty: usize,
+        a: &AttrSpec,
+        t: &TypeRef,
+        node: NodeId,
+        i: usize,
+        dynamic: bool,
+        inst: bool,
+    ) -> Result<Kind, KsyError> {
+        let sized = a.size.is_some() || a.size_eos;
+        Ok(match t {
             TypeRef::Int { bytes, signed, endian } => Kind::Int { bytes: *bytes, signed: *signed, endian: *endian },
+            TypeRef::Float { bytes, endian } => Kind::Float { bytes: *bytes, endian: *endian },
             TypeRef::Bits(n) => Kind::Bits(*n),
             TypeRef::Str | TypeRef::Strz => Kind::Str,
             TypeRef::Bytes => Kind::Bytes,
@@ -759,13 +983,42 @@ impl<'t> Builder<'t> {
                 let t = self
                     .lookup(ty, name)
                     .ok_or_else(|| err(a.line, a.col, format!("there is no type `{name}` here")))?;
-                let sized = a.size.is_some() || a.size_eos;
-                Kind::User(self.make(t, place, Some(node), sized)?)
+                let place = if inst { Place::Inst(node, i) } else { Place::Attr(node, i) };
+                Kind::User(self.make(t, place, Some(node), sized, dynamic)?)
+            }
+            TypeRef::Switch { cases, default, .. } => {
+                if inst {
+                    return Err(err(a.line, a.col, "switch-on types on instances aren't read yet"));
+                }
+                let mut out = Vec::new();
+                let case_kind = |b: &mut Self, t: &TypeRef, c: usize| -> Result<Kind, KsyError> {
+                    Ok(match t {
+                        TypeRef::User(name) => {
+                            let ct = b
+                                .lookup(ty, name)
+                                .ok_or_else(|| err(a.line, a.col, format!("there is no type `{name}` here")))?;
+                            Kind::User(b.make(ct, Place::Case(node, i, c), Some(node), sized, dynamic)?)
+                        }
+                        TypeRef::Str | TypeRef::Strz | TypeRef::Bytes if !sized && a.terminator.is_none() => {
+                            return Err(err(a.line, a.col, "a text or bytes case needs a `size`"));
+                        }
+                        other => b.kind(ty, a, other, node, i, dynamic, false)?,
+                    })
+                };
+                for (c, (_, t)) in cases.iter().enumerate() {
+                    out.push((Lit::Int(0), case_kind(self, t, c)?));
+                }
+                let default = match default {
+                    Some(t) => Some(case_kind(self, t, cases.len())?),
+                    None => None,
+                };
+                // Keys and the switch value are bound later.
+                Kind::Switch(Box::new(Switch { on: CExpr::Lit(Lit::Int(0)), cases: out, default }))
             }
         })
     }
 
-    /// Bind every expression of every node.
+    /// Bind every expression and template of every node.
     fn bind_all(&mut self) -> Result<(), KsyError> {
         let types = self.types;
         for id in 0..self.nodes.len() {
@@ -774,29 +1027,68 @@ impl<'t> Builder<'t> {
                 None => None,
                 Some(EndianSpec::Fixed(e)) => Some(EndianRule::Fixed(*e)),
                 Some(EndianSpec::Switch { on, cases, default }) => {
-                    let on = self.bind(on, id, false)?.0;
+                    let on = self.bind(on, id, Under::No)?.0;
                     let mut out = Vec::new();
                     for (k, e) in cases {
-                        out.push((self.lit_key(k)?, *e));
+                        out.push((self.lit_key(k, id)?, *e));
                     }
                     Some(EndianRule::Switch { on, cases: out, default: *default })
                 }
             };
             self.nodes[id].endian = endian;
             for (i, a) in spec.attrs.iter().enumerate() {
-                let (size, cond, checks) = self.bind_attr(a, id)?;
+                let elem = match &self.nodes[id].attrs[i].kind {
+                    Kind::User(c) => Under::Obj(*c),
+                    _ => Under::Value,
+                };
+                let (size, cond, checks) = self.bind_attr(a, id, elem)?;
+                let repeat = match &a.repeat {
+                    RepeatSpec::No => Repeat::No,
+                    RepeatSpec::Eos => Repeat::Eos,
+                    RepeatSpec::Expr(e) => Repeat::Expr(self.bind(e, id, Under::No)?.0),
+                    RepeatSpec::Until(e) => Repeat::Until(self.bind(e, id, elem)?.0),
+                };
+                let enum_id = match &a.enum_name {
+                    Some((name, line, col)) => Some(
+                        self.lookup_enum(self.node_types[id], name)
+                            .ok_or_else(|| err(*line, *col, format!("there is no enum `{name}` here")))?,
+                    ),
+                    None => None,
+                };
+                let partial = match &a.partial {
+                    Some(t) => Some(self.bind_template(t, id, true)?),
+                    None => None,
+                };
+                let switch = match (&a.ty, &self.nodes[id].attrs[i].kind) {
+                    (TypeRef::Switch { on, cases, .. }, Kind::Switch(_)) => {
+                        let on = self.bind(on, id, Under::No)?.0;
+                        let keys: Vec<Lit> =
+                            cases.iter().map(|(k, _)| self.lit_key(k, id)).collect::<Result<_, _>>()?;
+                        Some((on, keys))
+                    }
+                    _ => None,
+                };
                 let attr = &mut self.nodes[id].attrs[i];
                 attr.size = size;
                 attr.cond = cond;
                 attr.checks = checks;
+                attr.repeat = repeat;
+                attr.enum_id = enum_id;
+                attr.partial = partial;
+                if let (Some((on, keys)), Kind::Switch(sw)) = (switch, &mut attr.kind) {
+                    sw.on = on;
+                    for (case, key) in sw.cases.iter_mut().zip(keys) {
+                        case.0 = key;
+                    }
+                }
             }
             for (k, s) in spec.insts.iter().enumerate() {
-                let cond = s.cond.as_ref().map(|c| self.bind(c, id, false)).transpose()?.map(|b| b.0);
+                let cond = s.cond.as_ref().map(|c| self.bind(c, id, Under::No)).transpose()?.map(|b| b.0);
                 let kind = match (&s.value, &s.pos, &s.read) {
-                    (Some(v), _, _) => InstKind::Value(self.bind(v, id, false)?.0),
+                    (Some(v), _, _) => InstKind::Value(self.bind(v, id, Under::No)?.0),
                     (None, Some(pos), Some(r)) => {
-                        let pos = self.bind(pos, id, false)?.0;
-                        let (size, _, checks) = self.bind_attr(r, id)?;
+                        let pos = self.bind(pos, id, Under::No)?.0;
+                        let (size, _, checks) = self.bind_attr(r, id, Under::Value)?;
                         let made = std::mem::replace(
                             &mut self.nodes[id].insts[k].kind,
                             InstKind::Value(CExpr::Lit(Lit::Int(0))),
@@ -806,6 +1098,12 @@ impl<'t> Builder<'t> {
                         };
                         read.size = size;
                         read.checks = checks;
+                        if let Some((name, line, col)) = &r.enum_name {
+                            read.enum_id = Some(
+                                self.lookup_enum(self.node_types[id], name)
+                                    .ok_or_else(|| err(*line, *col, format!("there is no enum `{name}` here")))?,
+                            );
+                        }
                         if let Kind::User(c) = read.kind {
                             self.nodes[c].sized = !matches!(read.size, Size::Child);
                         }
@@ -814,7 +1112,7 @@ impl<'t> Builder<'t> {
                     _ => return Err(err(s.line, s.col, "an instance needs `value` or `pos`")),
                 };
                 let small = match (&kind, &s.value) {
-                    (InstKind::Value(_), Some(v)) => match self.bind(v, id, false)?.1 {
+                    (InstKind::Value(_), Some(v)) => match self.bind(v, id, Under::No)?.1 {
                         t @ (Ty::Int | Ty::Bool) => Some(t),
                         _ => None,
                     },
@@ -825,15 +1123,64 @@ impl<'t> Builder<'t> {
                 inst.kind = kind;
                 inst.small = small;
             }
+            if let Some(t) = &spec.text {
+                let text = self.bind_template(t, id, false)?;
+                self.nodes[id].text = Some(text);
+            }
+        }
+        // Each node's list element, now that the lists are known.
+        for id in 0..self.nodes.len() {
+            let mut n = id;
+            self.nodes[id].anchor = loop {
+                let (p, i) = match self.nodes[n].place {
+                    Place::Root => break None,
+                    Place::Attr(p, i) | Place::Case(p, i, _) => (p, i),
+                    Place::Inst(p, _) => {
+                        n = p;
+                        continue;
+                    }
+                };
+                if self.nodes[p].attrs[i].repeat != Repeat::No {
+                    break Some(n);
+                }
+                n = p;
+            };
         }
         self.check_endians()
     }
 
-    fn bind_attr(&self, a: &AttrSpec, id: NodeId) -> Result<(Size, Option<CExpr>, Vec<Check>), KsyError> {
+    fn bind_template(&self, t: &TemplateSrc, id: NodeId, rest: bool) -> Result<Template, KsyError> {
+        fn go(
+            b: &Builder<'_>,
+            ps: &template::Parsed,
+            t: &TemplateSrc,
+            id: NodeId,
+            rest: bool,
+        ) -> Result<Template, KsyError> {
+            ps.iter()
+                .map(|p| {
+                    Ok(match p {
+                        Piece::Text(s) => Piece::Text(s.clone()),
+                        Piece::Value((e, at), f) => {
+                            let scope = Scope { b, under: Under::No, origin: false, rest };
+                            let e = scope.bind(e, id).map_err(|m| err(t.line, t.col + at, m))?.0;
+                            Piece::Value(e, f.clone())
+                        }
+                        Piece::Group(alts) => {
+                            Piece::Group(alts.iter().map(|a| go(b, a, t, id, rest)).collect::<Result<_, _>>()?)
+                        }
+                    })
+                })
+                .collect()
+        }
+        go(self, &t.parsed, t, id, rest)
+    }
+
+    fn bind_attr(&self, a: &AttrSpec, id: NodeId, elem: Under) -> Result<(Size, Option<CExpr>, Vec<Check>), KsyError> {
         let size = match (&a.ty, &a.size, a.size_eos) {
-            (TypeRef::Int { bytes, .. }, _, _) => Size::Fixed(u64::from(*bytes)),
+            (TypeRef::Int { bytes, .. }, _, _) | (TypeRef::Float { bytes, .. }, _, _) => Size::Fixed(u64::from(*bytes)),
             (TypeRef::Bits(n), _, _) => Size::Bits(*n),
-            (_, Some(s), _) => match self.bind(s, id, false)?.0 {
+            (_, Some(s), _) => match self.bind(s, id, Under::No)?.0 {
                 CExpr::Lit(Lit::Int(v)) if v >= 0 => Size::Fixed(v as u64),
                 CExpr::Lit(_) => return Err(err(s.line, s.col, "a size must be a whole number, 0 or more")),
                 e => Size::Expr(e),
@@ -844,13 +1191,13 @@ impl<'t> Builder<'t> {
                 Size::Fixed(a.contents.as_ref().map_or(0, |c| c.len() as u64))
             }
             (TypeRef::Str | TypeRef::Bytes, None, false) => Size::Terminated(a.terminator.unwrap_or(0)),
-            (TypeRef::User(_), None, false) => Size::Child,
+            (TypeRef::User(_) | TypeRef::Switch { .. }, None, false) => Size::Child,
         };
-        let cond = a.cond.as_ref().map(|c| self.bind(c, id, false)).transpose()?.map(|b| b.0);
+        let cond = a.cond.as_ref().map(|c| self.bind(c, id, Under::No)).transpose()?.map(|b| b.0);
         let mut checks = Vec::new();
         for (key, list) in &a.valid {
             let bound: Vec<CExpr> =
-                list.iter().map(|e| self.bind(e, id, true).map(|b| b.0)).collect::<Result<_, _>>()?;
+                list.iter().map(|e| self.bind(e, id, elem).map(|b| b.0)).collect::<Result<_, _>>()?;
             checks.push(match key.as_str() {
                 "eq" => Check::Eq(bound.into_iter().next().unwrap_or(CExpr::Lit(Lit::Bool(true)))),
                 "min" => Check::Min(bound.into_iter().next().unwrap_or(CExpr::Lit(Lit::Int(0)))),
@@ -862,10 +1209,11 @@ impl<'t> Builder<'t> {
         Ok((size, cond, checks))
     }
 
-    /// A case key of `switch-on`: a number, `true` / `false`, or a string.
-    fn lit_key(&self, k: &Node) -> Result<Lit, KsyError> {
+    /// A case key of `switch-on`: a number, `true` / `false`, a string or an
+    /// enum value.
+    fn lit_key(&self, k: &Node, id: NodeId) -> Result<Lit, KsyError> {
         let src = as_expr(k, "a case")?;
-        match self.bind(&src, 0, false)?.0 {
+        match self.bind(&src, id, Under::No)?.0 {
             CExpr::Lit(l) => Ok(l),
             _ => Err(node_err(k, "a case must be a constant")),
         }
@@ -874,16 +1222,21 @@ impl<'t> Builder<'t> {
     /// Every multi-byte number without `be` / `le` has an endianness from
     /// its node or a node above it.
     fn check_endians(&self) -> Result<(), KsyError> {
+        fn needs(k: &Kind) -> bool {
+            match k {
+                Kind::Int { bytes, endian: None, .. } => *bytes > 1,
+                Kind::Float { endian: None, .. } => true,
+                Kind::Switch(sw) => sw.cases.iter().map(|c| &c.1).chain(&sw.default).any(needs),
+                _ => false,
+            }
+        }
         for (id, n) in self.nodes.iter().enumerate() {
             let reads = n.attrs.iter().chain(n.insts.iter().filter_map(|i| match &i.kind {
                 InstKind::Read { read, .. } => Some(&**read),
                 InstKind::Value(_) => None,
             }));
             for a in reads {
-                if let Kind::Int { bytes, endian: None, .. } = a.kind
-                    && bytes > 1
-                    && !self.has_endian(id)
-                {
+                if needs(&a.kind) && !self.has_endian(id) {
                     let spec = &self.types[self.node_types[id]];
                     let at = spec.attrs.iter().find(|s| s.id == a.id).map_or((1, 1), |s| (s.line, s.col));
                     return Err(err(
@@ -909,11 +1262,57 @@ impl<'t> Builder<'t> {
         }
     }
 
-    /// Bind `src` in node `at`. `underscore`: `_` is allowed (`valid`).
-    pub fn bind(&self, src: &Src, at: NodeId, underscore: bool) -> Result<(CExpr, Ty), KsyError> {
-        let scope = Scope { b: self, underscore, origin: false };
+    /// Bind `src` in node `at`.
+    fn bind(&self, src: &Src, at: NodeId, under: Under) -> Result<(CExpr, Ty), KsyError> {
+        let scope = Scope { b: self, under, origin: false, rest: false };
         scope.bind(&src.expr, at).map_err(|m| err(src.line, src.col, m))
     }
+
+    fn element_of(&self, mut n: NodeId) -> Option<NodeId> {
+        loop {
+            let (p, i) = match self.nodes[n].place {
+                Place::Root => return None,
+                Place::Attr(p, i) | Place::Case(p, i, _) => (p, i),
+                Place::Inst(p, _) => {
+                    n = p;
+                    continue;
+                }
+            };
+            if self.nodes[p].attrs[i].repeat != Repeat::No || self.types[self.node_types[p]].attrs[i].is_repeated() {
+                return Some(n);
+            }
+            n = p;
+        }
+    }
+
+    fn is_within(&self, n: NodeId, mut of: NodeId) -> bool {
+        loop {
+            if of == n {
+                return true;
+            }
+            match self.nodes[of].parent {
+                Some(p) => of = p,
+                None => return false,
+            }
+        }
+    }
+}
+
+impl AttrSpec {
+    fn is_repeated(&self) -> bool {
+        !matches!(self.repeat, RepeatSpec::No)
+    }
+}
+
+/// What `_` is while binding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Under {
+    /// Not allowed.
+    No,
+    /// A value (a `valid` check).
+    Value,
+    /// An object of this node (`repeat-until` of a user type).
+    Obj(NodeId),
 }
 
 /// What a name is while binding.
@@ -921,48 +1320,47 @@ impl<'t> Builder<'t> {
 enum Bound {
     Value(CExpr, Ty),
     Obj(NodeId),
+    /// An object known only when read: the expression giving it, its node.
+    DynObj(CExpr, NodeId),
     Io(NodeId),
     Origin,
 }
 
-pub struct Scope<'b, 't> {
+struct Scope<'b, 't> {
     b: &'b Builder<'t>,
-    underscore: bool,
+    under: Under,
     /// `origin` may be used (`-nerka:`).
     origin: bool,
+    /// `_rest` may be used (`-nerka-partial`).
+    rest: bool,
 }
 
 impl Scope<'_, '_> {
     fn bind(&self, e: &Expr, at: NodeId) -> Result<(CExpr, Ty), String> {
-        match self.bound(e, at, 0)? {
-            Bound::Value(c, t) => Ok((fold(c), t)),
-            Bound::Obj(n) => {
-                // A user type as a value: its bytes (Kaitai's `_raw_…`).
-                match self.b.nodes[n].place {
-                    Place::Attr(p, i) => Ok((CExpr::Attr(p, i), Ty::Bytes)),
-                    Place::Inst(p, k) => Ok((CExpr::Inst(p, k), Ty::Bytes)),
-                    Place::Root => Err("`_root` isn't a value".into()),
-                }
-            }
-            Bound::Io(_) => Err("`_io` isn't a value; `_io.size` is".into()),
-            Bound::Origin => Err("`origin` isn't a value; `origin.channel` is".into()),
-        }
+        let (c, t) = self.value(e, at, 0)?;
+        Ok((fold(c), t))
     }
 
     fn value(&self, e: &Expr, at: NodeId, depth: usize) -> Result<(CExpr, Ty), String> {
         match self.bound(e, at, depth)? {
             Bound::Value(c, t) => Ok((c, t)),
-            Bound::Obj(n) => match self.b.nodes[n].place {
-                Place::Attr(p, i) => Ok((CExpr::Attr(p, i), Ty::Bytes)),
-                Place::Inst(p, k) => Ok((CExpr::Inst(p, k), Ty::Bytes)),
-                Place::Root => Err("`_root` isn't a value".into()),
-            },
+            Bound::Obj(n) => self.obj_value(n),
+            Bound::DynObj(c, _) => Ok((c, Ty::Obj)),
             Bound::Io(_) => Err("`_io` isn't a value; `_io.size` is".into()),
             Bound::Origin => Err("`origin` isn't a value; `origin.channel` is".into()),
         }
     }
 
-    fn member(&self, n: NodeId, name: &str) -> Result<Bound, String> {
+    /// A user-type node as a value: the object (its text, its bytes).
+    fn obj_value(&self, n: NodeId) -> Result<(CExpr, Ty), String> {
+        match self.b.nodes[n].place {
+            Place::Attr(p, i) | Place::Case(p, i, _) => Ok((CExpr::Attr(p, i), Ty::Obj)),
+            Place::Inst(p, k) => Ok((CExpr::Inst(p, k), Ty::Obj)),
+            Place::Root => Err("`_root` isn't a value".into()),
+        }
+    }
+
+    fn member(&self, n: NodeId, name: &str, at: NodeId) -> Result<Bound, String> {
         let node = &self.b.nodes[n];
         match name {
             "_root" => return Ok(Bound::Obj(0)),
@@ -970,9 +1368,25 @@ impl Scope<'_, '_> {
             "_io" => return Ok(Bound::Io(n)),
             _ => {}
         }
+        // A node inside a list is reached through the list.
+        if let Some(e) = self.b.element_of(n)
+            && !self.b.is_within(e, at)
+        {
+            return Err(format!("`{}` is inside a list; reach it through the list (`list[i].{name}`)", node.type_name));
+        }
         if let Some(i) = node.attrs.iter().position(|a| a.id == name) {
-            return Ok(match &node.attrs[i].kind {
+            let spec = &self.b.types[self.b.node_types[n]].attrs[i];
+            let a = &node.attrs[i];
+            if spec.is_repeated() {
+                let elem = match a.kind {
+                    Kind::User(c) => Some(c),
+                    _ => None,
+                };
+                return Ok(Bound::Value(CExpr::Attr(n, i), Ty::List(elem)));
+            }
+            return Ok(match &a.kind {
                 Kind::User(c) => Bound::Obj(*c),
+                Kind::Switch(_) => Bound::Value(CExpr::Attr(n, i), Ty::Any),
                 k => Bound::Value(CExpr::Attr(n, i), kind_ty(k)),
             });
         }
@@ -1009,6 +1423,24 @@ impl Scope<'_, '_> {
         }
     }
 
+    /// `.name` of an object known only when read.
+    fn dyn_member(&self, obj: CExpr, c: NodeId, name: &str) -> Result<Bound, String> {
+        let inner = match name {
+            "_root" => return Ok(Bound::Obj(0)),
+            "_parent" | "_io" => return Err(format!("`{name}` of a list element isn't read yet")),
+            _ => self.member(c, name, c)?,
+        };
+        Ok(match inner {
+            Bound::Value(x, t) => Bound::Value(CExpr::In(Box::new(obj), Box::new(x)), t),
+            Bound::Obj(c2) => {
+                let (x, _) = self.obj_value(c2)?;
+                Bound::DynObj(CExpr::In(Box::new(obj), Box::new(x)), c2)
+            }
+            Bound::DynObj(x, c2) => Bound::DynObj(CExpr::In(Box::new(obj), Box::new(x)), c2),
+            other => other,
+        })
+    }
+
     fn bound(&self, e: &Expr, at: NodeId, depth: usize) -> Result<Bound, String> {
         if depth > 128 {
             return Err("nested too deeply".into());
@@ -1019,16 +1451,30 @@ impl Scope<'_, '_> {
             Expr::Float(v) => Bound::Value(CExpr::Lit(Lit::Float(*v)), Ty::Float),
             Expr::Bool(v) => Bound::Value(CExpr::Lit(Lit::Bool(*v)), Ty::Bool),
             Expr::Str(s) => Bound::Value(CExpr::Lit(Lit::Bytes(intern(s))), Ty::Bytes),
-            Expr::Name(n) if n == "_" => {
-                if !self.underscore {
-                    return Err("`_` is only for `valid`".into());
-                }
-                Bound::Value(CExpr::Underscore, Ty::Any)
+            Expr::EnumLit(name, label) => {
+                let id = self
+                    .b
+                    .lookup_enum(self.b.node_types[at], name)
+                    .ok_or_else(|| format!("there is no enum `{name}` here"))?;
+                let v = self.b.enums[id]
+                    .values
+                    .iter()
+                    .find(|(_, l)| *l == label.as_bytes())
+                    .ok_or_else(|| format!("enum `{name}` has no `{label}`"))?
+                    .0;
+                Bound::Value(CExpr::Lit(Lit::Int(v)), Ty::Int)
             }
+            Expr::Name(n) if n == "_" => match self.under {
+                Under::No => return Err("`_` is only for `valid` and `repeat-until`".into()),
+                Under::Value => Bound::Value(CExpr::Underscore, Ty::Any),
+                Under::Obj(c) => Bound::DynObj(CExpr::Underscore, c),
+            },
+            Expr::Name(n) if n == "_rest" && self.rest => Bound::Value(CExpr::Rest, Ty::Bytes),
             Expr::Name(n) if n == "origin" && self.origin => Bound::Origin,
-            Expr::Name(n) => self.member(at, n)?,
+            Expr::Name(n) => self.member(at, n, at)?,
             Expr::Attr(base, name) => match self.bound(base, at, d)? {
-                Bound::Obj(n) => self.member(n, name)?,
+                Bound::Obj(n) => self.member(n, name, at)?,
+                Bound::DynObj(x, c) => self.dyn_member(x, c, name)?,
                 Bound::Io(n) => match name.as_str() {
                     "size" => Bound::Value(CExpr::IoSize(n), Ty::Int),
                     _ => return Err(format!("`_io.{name}` isn't read yet (only `_io.size`)")),
@@ -1043,16 +1489,22 @@ impl Scope<'_, '_> {
                     if name == "channel" { Ty::Bytes } else { Ty::Int },
                 ),
                 Bound::Value(c, t) => match name.as_str() {
-                    "length" | "size" if matches!(t, Ty::Bytes | Ty::Any) => {
+                    "length" | "size" if matches!(t, Ty::Bytes | Ty::Any | Ty::List(_)) => {
                         Bound::Value(CExpr::Length(Box::new(c)), Ty::Int)
                     }
+                    "to_i" => Bound::Value(CExpr::ToInt(Box::new(c)), Ty::Int),
                     _ => return Err(format!("`.{name}` isn't read yet on a value")),
                 },
             },
             Expr::Index(a, i) => {
-                let (a, _) = self.value(a, at, d)?;
+                let (a, ta) = self.value(a, at, d)?;
                 let (i, _) = self.value(i, at, d)?;
-                Bound::Value(CExpr::Index(Box::new(a), Box::new(i)), Ty::Int)
+                let x = CExpr::Index(Box::new(a), Box::new(i));
+                match ta {
+                    Ty::List(Some(c)) => Bound::DynObj(x, c),
+                    Ty::List(None) => Bound::Value(x, Ty::Any),
+                    _ => Bound::Value(x, Ty::Int),
+                }
             }
             Expr::Unary(op, a) => {
                 let (a, t) = self.value(a, at, d)?;
@@ -1102,9 +1554,12 @@ fn terminator(a: &AttrSpec) -> Option<u8> {
 fn kind_ty(k: &Kind) -> Ty {
     match k {
         Kind::Int { .. } => Ty::Int,
+        Kind::Float { .. } => Ty::Float,
         Kind::Bits(1) => Ty::Bool,
         Kind::Bits(_) => Ty::Int,
-        Kind::Bytes | Kind::Str | Kind::User(_) => Ty::Bytes,
+        Kind::Bytes | Kind::Str => Ty::Bytes,
+        Kind::User(_) => Ty::Obj,
+        Kind::Switch(_) => Ty::Any,
     }
 }
 
@@ -1130,12 +1585,14 @@ fn fold(e: CExpr) -> CExpr {
 
 /// The definition's structure, from its YAML.
 pub fn build(root: &Node) -> Result<(Def, Binder), KsyError> {
-    let types = read_types(root)?;
-    let mut b = Builder { types: &types, nodes: Vec::new(), node_types: Vec::new() };
-    b.make(0, Place::Root, None, false)?;
+    let Reader { types, enums } = read_types(root)?;
+    let mut b = Builder { types: &types, enums: &enums, nodes: Vec::new(), node_types: Vec::new() };
+    b.make(0, Place::Root, None, false, false)?;
     b.bind_all()?;
     let Builder { nodes, node_types, .. } = b;
-    Ok((Def { nodes }, Binder { types, node_types }))
+    let mut def = Def { nodes, enums, plans: Vec::new() };
+    def.plans = super::plan::compile(&def);
+    Ok((def, Binder { types, node_types }))
 }
 
 /// Binds the `-nerka:` section's expressions after [`build`].
@@ -1148,10 +1605,12 @@ impl Binder {
     /// Bind `src` at the root, where `origin` is known too.
     pub fn bind_root(&self, def: &mut Def, src: &Src) -> Result<(CExpr, Ty), KsyError> {
         let nodes = std::mem::take(&mut def.nodes);
-        let b = Builder { types: &self.types, nodes, node_types: self.node_types.clone() };
-        let scope = Scope { b: &b, underscore: false, origin: true };
+        let enums = std::mem::take(&mut def.enums);
+        let b = Builder { types: &self.types, enums: &enums, nodes, node_types: self.node_types.clone() };
+        let scope = Scope { b: &b, under: Under::No, origin: true, rest: false };
         let r = scope.bind(&src.expr, 0).map_err(|m| err(src.line, src.col, m));
         def.nodes = b.nodes;
+        def.enums = enums;
         r
     }
 }
