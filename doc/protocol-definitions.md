@@ -1,6 +1,6 @@
 # Protocol definitions — design
 
-_Status: built (2026-11-08, branch `claude/ksy-protocols`): the language subset with lists, switch-on types, floats, enums, text templates and partial decoding; the `-nerka:` section; rules over ports, addresses and VLANs saying which datagrams are whose, for every protocol; CLI `--protocol`, `--route`, `--disable-protocol`; GUI Settings → Captures: protocols, and per capture in a tab's Files window. DLT as a definition (`core/tests/data/dlt.ksy`), payload included, gives the same results as the native reader on every test; numbers below. Not yet: packs and bundles carrying definitions, containers (binary log files). Current state: `status.md` → "Protocol definitions"._
+_Status: built (2026-11-08, in 0.2.0-alpha.1): the language subset with lists, switch-on types, floats, enums, text templates and partial decoding; the `-nerka:` section; rules over ports, addresses and VLANs saying which datagrams are whose, for every protocol; CLI `--protocol`, `--route`, `--disable-protocol`; GUI Settings → Captures: protocols, and per capture in a tab's Files window. DLT as a definition (`examples/protocols/dlt.ksy`), payload included, gives the same results as the native reader on every test; numbers below. Not yet: packs and bundles carrying definitions, containers (binary log files). Current state: `status.md` → "Protocol definitions"._
 
 ## Goal
 
@@ -152,7 +152,7 @@ Loading a definition (`core/src/input/proto/ksy/`):
 
 ## Checking against native DLT
 
-`core/tests/ksy_dlt.rs` with `core/tests/data/dlt.ksy` (public API only):
+`core/tests/ksy_dlt.rs` with `examples/protocols/dlt.ksy` (public API only):
 
 - 20,000 random messages, alone and with more bytes behind them: every flag combination, message type and type info; verbose arguments of every kind (strings, trace info, raw data, booleans, integers of every length including 128-bit, floats, names and units, text that isn't UTF-8, arrays and structs native can't read either), control messages (known and unknown services, responses with and without status, version strings), non-verbose ids; NOAR off by one, payloads cut short, junk behind. Every field (the payload's text included), the level, the uptime, the whole line and the detailed view's payload are the same as native DLT's; the test checks each kind of payload was there.
 - Every `htyp` value (other versions too) with `LEN` a little off, and 20,000 damaged datagrams (bytes changed, cut, junk added): both readers split them the same way, and the messages found agree.

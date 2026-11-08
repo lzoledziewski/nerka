@@ -2,7 +2,7 @@
 //! thread: each field, the whole line, splitting; and the allocations of
 //! each. For work on the definition reader (doc/protocol-definitions.md).
 //!
-//!     cargo run --release -p nerka-core --example ksy_cells -- trace.dlt core/tests/data/dlt.ksy
+//!     cargo run --release -p nerka-core --example ksy_cells -- trace.dlt examples/protocols/dlt.ksy
 use nerka_core::input::proto::ksy::KsyProtocol;
 use nerka_core::input::proto::{Origin, Protocol};
 use std::sync::atomic::{AtomicU64, Ordering};

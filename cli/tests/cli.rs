@@ -177,6 +177,18 @@ fn dlt_fields_are_listed_and_filtered() {
 /// `port` in a pcap.
 fn dlt_pcap(d: &Path, port: u16) -> PathBuf {
     let dlt = std::fs::read(dlt_file(d)).unwrap();
+    let mut payloads = Vec::new();
+    let mut pos = 0;
+    while pos + 20 <= dlt.len() {
+        let len = u16::from_be_bytes([dlt[pos + 18], dlt[pos + 19]]) as usize;
+        payloads.push(dlt[pos + 16..pos + 16 + len].to_vec());
+        pos += 16 + len;
+    }
+    udp_pcap(&d.join("trace.pcap"), port, &payloads)
+}
+
+/// A pcap of IPv4 / UDP datagrams to `port`, one per payload.
+fn udp_pcap(p: &Path, port: u16, payloads: &[Vec<u8>]) -> PathBuf {
     let mut out = Vec::new();
     out.extend_from_slice(&0xa1b2_c3d4u32.to_le_bytes());
     out.extend_from_slice(&2u16.to_le_bytes());
@@ -184,11 +196,7 @@ fn dlt_pcap(d: &Path, port: u16) -> PathBuf {
     for x in [0u32, 0, 262_144, 1] {
         out.extend_from_slice(&x.to_le_bytes());
     }
-    let mut pos = 0;
-    while pos + 20 <= dlt.len() {
-        let len = u16::from_be_bytes([dlt[pos + 18], dlt[pos + 19]]) as usize;
-        let payload = &dlt[pos + 16..pos + 16 + len];
-        pos += 16 + len;
+    for payload in payloads {
         let mut f = vec![2; 12];
         f.extend_from_slice(&[0x08, 0x00, 0x45, 0]);
         f.extend_from_slice(&((28 + payload.len()) as u16).to_be_bytes());
@@ -203,16 +211,49 @@ fn dlt_pcap(d: &Path, port: u16) -> PathBuf {
         }
         out.extend_from_slice(&f);
     }
-    let p = d.join("trace.pcap");
-    std::fs::write(&p, out).unwrap();
-    p
+    std::fs::write(p, out).unwrap();
+    p.to_path_buf()
+}
+
+/// The example definitions in `examples/protocols` stay valid: the sensor
+/// one as README shows it, the DLT one in the test above.
+#[test]
+fn the_example_sensor_definition_reads_as_documented() {
+    let d = dir("sensor");
+    // sensor u2, seq u4, kind u1, value s2 (tenths), a note: little-endian.
+    let reading = |sensor: u16, seq: u32, kind: u8, value: i16, note: &str| {
+        let mut m = sensor.to_le_bytes().to_vec();
+        m.extend_from_slice(&seq.to_le_bytes());
+        m.push(kind);
+        m.extend_from_slice(&value.to_le_bytes());
+        m.extend_from_slice(note.as_bytes());
+        m
+    };
+    let payloads = [
+        reading(7, 1, 1, 215, "ok"),
+        reading(7, 2, 2, 953, "ciśnienie"),
+        reading(8, 3, 2, 412, ""),
+        reading(8, 4, 1, -40, "cold"),
+    ];
+    let pcap = udp_pcap(&d.join("sensor.pcap"), 41000, &payloads);
+    let ksy = Path::new(env!("CARGO_MANIFEST_DIR")).join("../examples/protocols/sensor.ksy");
+    let o = nerka(&["--protocol", s(&ksy), "filter", "kind == pressure AND value > 90", s(&pcap)]);
+    assert!(o.status.success(), "{}", err(&o));
+    let text = out(&o);
+    let lines: Vec<&str> = text.lines().collect();
+    assert_eq!(lines.len(), 1, "{text}");
+    assert!(lines[0].starts_with("2:") && lines[0].ends_with("\t7\tpressure\t95.3\tciśnienie"), "{}", lines[0]);
+    let o = nerka(&["--protocol", s(&ksy), "filter", "-c", "level >= ERROR", s(&pcap)]);
+    assert_eq!(out(&o), "1\n", "{}", err(&o));
+    let o = nerka(&["--protocol", s(&ksy), "filter", "-c", "value < 0 AND note == cold", s(&pcap)]);
+    assert_eq!(out(&o), "1\n", "{}", err(&o));
 }
 
 #[test]
 fn a_protocol_definition_reads_a_capture() {
     let d = dir("ksy");
     let pcap = dlt_pcap(&d, 40000);
-    let ksy = Path::new(env!("CARGO_MANIFEST_DIR")).join("../core/tests/data/dlt.ksy");
+    let ksy = Path::new(env!("CARGO_MANIFEST_DIR")).join("../examples/protocols/dlt.ksy");
     let def = ["--protocol", s(&ksy), "--protocol-port", "DLTK=40000"];
     let o = nerka(&[&def[..], &["filter", "-c", "proto == DLTK AND apid == NAV AND level >= WARN", s(&pcap)]].concat());
     assert!(o.status.success(), "{}", err(&o));

@@ -1,9 +1,12 @@
 # DLT (AUTOSAR PRS_Dlt) messages as a protocol definition: the standard and
 # extended headers and the payload (verbose arguments, control messages,
-# non-verbose ids; no FIBEX). A test fixture: it is compared with
-# Nerka's native DLT reader (core/tests/ksy_dlt.rs) and benchmarked against
-# it (doc/protocol-definitions.md). Messages start at their standard header
-# (DLT over UDP has no storage header).
+# non-verbose ids; no FIBEX). An example of a full definition, and a test:
+# core/tests/ksy_dlt.rs compares it with nerka's native DLT reader, and
+# tools/bench.sh (KSY=1) benchmarks the two (doc/protocol-definitions.md).
+# Messages start at their standard header (DLT over UDP has no storage
+# header). Its name is DLTK, so it can run next to native DLT:
+#
+#   nerka --protocol examples/protocols/dlt.ksy --protocol-port DLTK=3491 filter 'proto == DLTK AND apid == NAV' trace.pcap
 meta:
   id: dlt_message
   title: AUTOSAR DLT message, from its standard header on

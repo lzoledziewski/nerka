@@ -1,6 +1,6 @@
 use super::*;
 
-const DLT: &str = include_str!("../../../../tests/data/dlt.ksy");
+const DLT: &str = include_str!("../../../../../examples/protocols/dlt.ksy");
 
 fn load(text: &str) -> KsyProtocol {
     KsyProtocol::parse(text).unwrap_or_else(|e| panic!("{e}"))

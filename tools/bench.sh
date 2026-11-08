@@ -14,7 +14,7 @@
 #
 # KSY=1 adds the protocol definition cases (doc/protocol-definitions.md):
 # big2.pcap has every datagram on ports 3490 and 3491; native DLT reads one,
-# core/tests/data/dlt.ksy (DLTK) the other. Each query runs per protocol
+# examples/protocols/dlt.ksy (DLTK) the other. Each query runs per protocol
 # (`proto == DLT AND …`, `proto == DLTK AND …`), so both readers read the
 # same messages in the same file.
 set -euo pipefail
@@ -75,7 +75,7 @@ one() {
     search) err=$("$BIN/nerka" search -c --stats "$q" "$DIR/$file" 2>&1 >/dev/null) ;;
     search-v) err=$("$BIN/nerka" search -v -c --stats "$q" "$DIR/$file" 2>&1 >/dev/null) ;;
     filter) err=$("$BIN/nerka" filter -c --stats "$q" "$DIR/$file" 2>&1 >/dev/null) ;;
-    filter-ksy) err=$("$BIN/nerka" --protocol "$ROOT/core/tests/data/dlt.ksy" --protocol-port DLTK=3491 \
+    filter-ksy) err=$("$BIN/nerka" --protocol "$ROOT/examples/protocols/dlt.ksy" --protocol-port DLTK=3491 \
       filter -c --stats "$q" "$DIR/$file" 2>&1 >/dev/null) ;;
   esac || { echo "bench: $kind '$q' on $file failed: $err" >&2; exit 1; }
   # "N matches in M lines | index X | search 12.3ms (...)"

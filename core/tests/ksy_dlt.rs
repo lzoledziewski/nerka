@@ -15,7 +15,7 @@ use nerka_core::input::proto::{LoadedProtocol, Origin, Protocol};
 use nerka_core::{FieldValue, Filter, LogSource, Progress, Query, search};
 use std::sync::Arc;
 
-const DEFINITION: &str = include_str!("data/dlt.ksy");
+const DEFINITION: &str = include_str!("../../examples/protocols/dlt.ksy");
 
 struct Rng(u64);
 

@@ -413,7 +413,7 @@ mod tests {
         d
     }
 
-    const DLT_KSY: &str = include_str!("../../core/tests/data/dlt.ksy");
+    const DLT_KSY: &str = include_str!("../../examples/protocols/dlt.ksy");
 
     #[test]
     fn the_folder_reads_definitions_and_says_what_is_wrong() {
