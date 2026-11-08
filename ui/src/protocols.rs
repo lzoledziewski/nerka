@@ -273,7 +273,10 @@ pub fn settings_section(ui: &mut egui::Ui, edit: &mut Edit, prefs: &SearchPrefs,
                         if bad {
                             te = te.text_color(ui.visuals().error_fg_color);
                         }
-                        changed |= ui.add(te).on_hover_text(tip).changed();
+                        // Sized, not desired: a grid cell would squeeze it
+                        // (a port of five digits showed as `410(`).
+                        let size = egui::vec2(width, ui.spacing().interact_size.y);
+                        changed |= ui.add_sized(size, te).on_hover_text(tip).changed();
                     }
                     if ui.small_button("✖").on_hover_text("Remove this rule").clicked() {
                         removed = Some(r);

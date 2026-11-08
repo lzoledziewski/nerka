@@ -5,8 +5,10 @@
 //! Written as text (CLI, settings): `3490`, `30000-30100`, or
 //! `port=3490,src=10.0.0.0/8,dst=fe80::1,sport=50000,vlan=5`; `*` matches
 //! every datagram. A datagram goes to the protocol of the most specific rule
-//! that matches it (more conditions, then longer address prefixes), ties to
-//! the protocol listed first (DLT, SOME/IP, syslog, then loaded ones).
+//! that matches it (more conditions, then longer address prefixes); of
+//! equally specific rules, the user's win over defaults, then the protocol
+//! listed first (DLT, SOME/IP, syslog, then loaded ones). A port range
+//! counts as one condition, as a single port does.
 
 use std::fmt;
 use std::net::{Ipv4Addr, Ipv6Addr};

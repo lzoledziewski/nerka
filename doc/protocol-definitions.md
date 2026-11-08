@@ -119,8 +119,10 @@ A **rule** names what it cares about; the rest matches anything. As text
 datagram. Keys: `port` (destination), `sport`, `src`, `dst` (IPv4 / IPv6
 address or network), `vlan` (any of the datagram's tags). A datagram goes to
 the protocol of the **most specific** matching rule (more conditions, then
-longer address prefixes); ties go to the protocol listed first (DLT, SOME/IP,
-syslog, then loaded definitions).
+longer address prefixes; a port range counts as one condition, as a single
+port does). Of equally specific rules, a user's rule wins over a default one
+(`--route DLTK:3490` takes port 3490 from native DLT's default), then the
+protocol listed first (DLT, SOME/IP, syslog, then loaded definitions).
 
 A protocol's rules are the user's (`--route NAME:RULE`, Settings) if any, else
 its defaults: a native protocol's port list (`--dlt-port`, …), a definition's

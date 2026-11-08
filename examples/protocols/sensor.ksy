@@ -29,7 +29,7 @@ enums:
     value: value / 10.0
     note: note
   level:
-    from: "value > 900 ? 2 : 4"       # above 90.0: an error, else info
+    from: "kind == kind::temperature and value > 900 ? 2 : 4"   # over 90.0 degrees: an error
     map: { 2: error, 4: info }
   columns:
     - { name: sensor, width: 6 }

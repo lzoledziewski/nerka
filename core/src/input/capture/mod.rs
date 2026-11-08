@@ -285,7 +285,8 @@ fn rules(options: &CaptureOptions, protos: &[Arc<dyn Protocol>]) -> Vec<(ProtoId
         }
         let user: Vec<Match> =
             options.routes.iter().filter(|r| r.protocol.eq_ignore_ascii_case(name)).map(|r| r.rule.clone()).collect();
-        let rules = if !user.is_empty() {
+        let given = !user.is_empty();
+        let rules = if given {
             user
         } else {
             match id {
@@ -295,11 +296,13 @@ fn rules(options: &CaptureOptions, protos: &[Arc<dyn Protocol>]) -> Vec<(ProtoId
                 _ => options.protocols.get(id - NATIVE).map(|l| l.routes.clone()).unwrap_or_default(),
             }
         };
-        out.extend(rules.into_iter().map(|r| (id, r)));
+        out.extend(rules.into_iter().map(|r| (r.specificity(), given, id, r)));
     }
-    // Stable: equally specific rules keep the protocols' order.
-    out.sort_by_key(|(_, r)| std::cmp::Reverse(r.specificity()));
-    out
+    // More specific first; of equally specific rules, the user's before
+    // defaults (a rule someone wrote never loses silently to a default
+    // one), then the protocols' order (the sort is stable).
+    out.sort_by_key(|(spec, given, _, _)| std::cmp::Reverse((*spec, *given)));
+    out.into_iter().map(|(_, _, id, r)| (id, r)).collect()
 }
 
 /// The protocol of a UDP datagram: the first rule that matches it.

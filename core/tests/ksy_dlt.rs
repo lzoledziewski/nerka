@@ -483,8 +483,12 @@ fn rules_share_one_port_by_address_and_vlan() {
     // A rule for DLT replaces its default port: here only VLAN 5 is DLT.
     let only = per(&open(&["DLT:vlan=5"], &[]));
     assert_eq!(only, (by_vlan.1, 0));
-    // Equally specific rules: the protocol listed first (native DLT).
-    assert_eq!(per(&open(&["DLTK:3490"], &[])), all);
+    // Equally specific rules: the user's rule wins over DLT's default port
+    // (review 2026-11-08, R2: it lost silently)...
+    assert_eq!(per(&open(&["DLTK:3490"], &[])), (0, all.0));
+    // ...and of two rules the user wrote, the protocol listed first.
+    assert_eq!(per(&open(&["DLTK:3490", "DLT:3490"], &[])), all);
+    assert_eq!(per(&open(&["DLT:3490", "DLTK:3490"], &[])), all);
     // Turned off: its datagrams go to the next rule that matches.
     assert_eq!(per(&open(&["DLTK:3490"], &["DLT"])), (0, all.0));
 }

@@ -234,6 +234,7 @@ fn the_example_sensor_definition_reads_as_documented() {
         reading(7, 2, 2, 953, "ciśnienie"),
         reading(8, 3, 2, 412, ""),
         reading(8, 4, 1, -40, "cold"),
+        reading(9, 5, 1, 921, "fan on"),
     ];
     let pcap = udp_pcap(&d.join("sensor.pcap"), 41000, &payloads);
     let ksy = Path::new(env!("CARGO_MANIFEST_DIR")).join("../examples/protocols/sensor.ksy");
@@ -243,8 +244,9 @@ fn the_example_sensor_definition_reads_as_documented() {
     let lines: Vec<&str> = text.lines().collect();
     assert_eq!(lines.len(), 1, "{text}");
     assert!(lines[0].starts_with("2:") && lines[0].ends_with("\t7\tpressure\t95.3\tciśnienie"), "{}", lines[0]);
-    let o = nerka(&["--protocol", s(&ksy), "filter", "-c", "level >= ERROR", s(&pcap)]);
-    assert_eq!(out(&o), "1\n", "{}", err(&o));
+    // Only a temperature over 90.0 is an error, not a pressure (95.3).
+    let o = nerka(&["--protocol", s(&ksy), "filter", "level >= ERROR", s(&pcap)]);
+    assert!(out(&o).starts_with("5:") && out(&o).lines().count() == 1, "{}{}", out(&o), err(&o));
     let o = nerka(&["--protocol", s(&ksy), "filter", "-c", "value < 0 AND note == cold", s(&pcap)]);
     assert_eq!(out(&o), "1\n", "{}", err(&o));
 }

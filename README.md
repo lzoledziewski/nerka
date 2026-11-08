@@ -17,10 +17,13 @@ one UI-free engine (`nerka-core`).
 > Linux builds come from CI; macOS isn't built yet. While nerka is at 0.x,
 > file formats, the filter language and the GUI can still change.
 
-## A quick tour
+## Features
 
-**Open big files fast.** Files are memory-mapped, never modified or copied.
-On a 1 GiB file (release build, Windows):
+### Big files, opened fast
+
+Files are memory-mapped, never modified or copied, and indexed once. A
+filter or a search then runs over the whole file in tens of milliseconds
+(1 GiB, release build, Windows):
 
 | 1 GiB of | Query | Time |
 |---|---|---|
@@ -30,10 +33,15 @@ On a 1 GiB file (release build, Windows):
 | DLT in a pcap | `filter 'apid == NAV AND level >= WARN'` | 30 ms |
 | DLT | `filter 'raw ~ /timeout/'` (every message rendered) | 0.29 s |
 
-**Filter, then search inside.** The Filter decides which lines the view
-shows; the Search finds lines among those, lists them in a bottom pane and
-colours them. Both take plain words, a regex, or NFD, nerka's filter
-language:
+### Filter, then search inside
+
+Two boxes do two jobs. The **Filter** decides which lines the view shows.
+The **Search** finds lines among those, lists them in a bottom pane and
+colours them per query. Both take plain words, a regex, or a query in
+**NFD**, nerka's filter language (see [NFD at a glance](#nfd-at-a-glance)).
+Each box has an **Auto** mode (plain words are a phrase, filter syntax is a
+query, they mix), a **Text** mode (literal or regex) and a strict **NFD**
+mode, with history on ↑ / ↓.
 
 ```
 nerka filter 'level >= ERROR AND raw ~ /SSL|CERT/i AND NOT /healthcheck/' app.log
@@ -41,21 +49,37 @@ nerka filter 'apid == NAV AND level >= WARN AND payload ~ "timeout"' trace.dlt
 nerka search --in 'level >= WARN' -c timeout app.log
 ```
 
-**Every format by its content.** Plain text (UTF-8), JSON Lines and pretty
-JSON (each key a field: `ctx.user == bob AND latency > 2.5`), DLT files,
-and captures: pcap / pcapng (VLAN, IPv4 / IPv6 fragments) and MF4 (Ethernet
-bus events, compressed data too) carrying **DLT**, **SOME/IP** or **syslog**
-over UDP. Several protocols in one capture share one table
-(`proto == SOMEIP AND service == 0x1234`). A text log can be read as
-multi-line records, so a stack trace stays with its message
-(`--records 'start=/\d{4}-\d\d-\d\d/'`). DLT non-verbose messages decode
-from FIBEX files (`--fibex ecu1.xml`).
+### Every format by its content
 
-**Your own protocols.** A protocol inside captures can be described in a
-`.ksy` file (Kaitai Struct, plus a `-nerka:` section that says which fields,
-level and columns nerka shows) and is read like a built-in one: no code, no
-rebuild. Rules say which datagrams are whose, by port, address and VLAN, and
-each capture of a tab can turn protocols on or off.
+nerka recognises a file by its content, not its name:
+
+- **Text** (UTF-8). Multi-line records keep a stack trace with its message
+  (a tab's menu → Records…; `--records 'start=/\d{4}-\d\d-\d\d/'`).
+- **JSON Lines** and **pretty JSON**: each value is a row, its keys are
+  fields (`ctx.user == bob AND latency > 2.5`).
+- **DLT** files. Non-verbose messages are decoded from FIBEX files, and
+  their arguments can be plotted.
+- **Captures**: pcap / pcapng (VLAN, IPv4 / IPv6 fragments) and MF4
+  (Ethernet bus events, compressed data too). They can carry **DLT**,
+  **SOME/IP** or **syslog** over UDP, or a protocol of your own (below).
+  Several protocols in one capture share one table
+  (`proto == SOMEIP AND service == 0x1234`).
+
+Several files of one kind open as one view, one after another, in an order
+you choose.
+
+### Your own protocols
+
+![a capture holding DLT and a custom SENSOR protocol, filtered by level, "fan on" found in the sensor notes, and Settings showing the SENSOR protocol's rule](doc/img/protocols.png)
+
+A protocol inside captures can be described in a `.ksy` file:
+[Kaitai Struct](https://kaitai.io), plus a `-nerka:` section that says
+which fields, level and columns nerka shows. It is then read like a
+built-in protocol: no code, no rebuild. **Rules** say which datagrams
+belong to which protocol, by port, source or destination address, source
+port and VLAN. They exist for the built-in protocols too. In the GUI,
+definitions and rules live in ⚙ Settings → Captures: protocols, and a tab's
+**Files…** window turns protocols on or off for each capture in it.
 
 ```yaml
 # examples/protocols/sensor.ksy (excerpt)
@@ -76,69 +100,77 @@ seq:
 ```
 nerka --protocol examples/protocols/sensor.ksy filter 'kind == pressure AND value > 90' capture.pcap
 nerka --protocol examples/protocols/dlt.ksy --route 'DLTK:port=3491,src=10.0.0.0/8' filter 'proto == DLTK AND level >= WARN' trace.pcap
+nerka --route 'DLT:port=3490,vlan=5' --disable-protocol syslog filter 'level >= WARN' trace.pcapng
 ```
 
 [`examples/protocols/dlt.ksy`](examples/protocols/dlt.ksy) describes all of
-DLT, payloads included, and gives the same results as the built-in reader
-(it is tested against it). See
+DLT, payloads included. It gives the same results as the built-in reader,
+and a test checks that. Language and rules:
 [doc/protocol-definitions.md](doc/protocol-definitions.md).
 
-**Query packs.** Queries you use again live in plain-text `.nerka-pack`
-files, with parent → child refinement, labels, parameters (`$cam`) and
-colours. Pick them in the library pane; they expand into plain NFD, and each
-pick can colour the lines it keeps. A selection can be saved as a preset.
+### Lifecycles and checks
 
-```
-nerka --pack packs/ expand -l ota -p cam=CAM1
-```
+![a DLT trace of a drive: ECU1's three boots listed with their outcomes (planned, crash, open) and what checks found in each; the Checks pane with issues and facts, the crash's evidence; speed, temperature and an OTA state plotted with the boots' boundaries](doc/img/lifecycles-checks.png)
 
-**Signals and plots.** A value captured by a named regex group is a signal:
-`@speed > 100`, `@gear.changed`. Plot signals over time in lanes, with time
-cursors (Δt), value markers and bookmarks; keep plots by name for other
-files. FIBEX arguments can be plotted from a searchable tree.
+A trace of several devices holds many boots. A **lifecycle** says which
+lines belong to one device and what starts and ends its boots. Each boot
+then becomes its own span, with an outcome (planned, crash, lost), and
+signals can reset with it ([doc/lifecycles.md](doc/lifecycles.md)).
 
-```
-nerka-gui app.log --signal 't:time=/^(?<t>\S+ \S+)/' --signal 'lat=/latency_us=(?<lat>\d+)/' --plot lat
-```
+**Checks** are known problems written as small rules:
+- a line that shows up, or a count;
+- a burst (`rate 25 per 1s`) or a gap;
+- an event without its answer (`missing /connected/ within 200ms`);
+- a value (`value max`).
 
-**Lifecycles.** A trace of several devices holds many boots. A lifecycle
-says which lines belong to one device and what starts and ends its boots, so
-each boot is its own span, with its outcome (planned, crash, lost) and
-signals that reset with it ([doc/lifecycles.md](doc/lifecycles.md)).
-
-```
-nerka --lifecycle 'ecu1: lines ecu == ECU1; reset uptime; planned payload ~ /shutdown/' lifecycles trace.dlt
-```
-
-**Checks.** Known problems as small rules: a line that shows up, a count,
-a burst (`rate 25 per 1s`), a gap, one event without its answer
-(`missing /connected/ within 200ms`), a value; overall or per lifecycle.
-Results are issues or facts with their evidence lines, in a pane of their
-own or on the command line, and a check can feed another
+A check runs over the whole trace or per lifecycle. Its results are issues
+or facts with their evidence lines, shown in a pane of their own, next to
+each boot and on the command line. A check can feed another
 ([doc/checks.md](doc/checks.md)).
 
 ```
+nerka --lifecycle 'ecu1: lines ecu == ECU1; reset uptime; planned payload ~ /shutdown/' lifecycles trace.dlt
 nerka --check 'storm: lines level >= ERROR; rate 25 per 1s' check -e 2 trace.dlt
 nerka --check 'lost: lines /timeout/; missing /connected/ within 200ms' check --json trace.dlt
 ```
 
-**Bookmarks with notes** (`m`, `b` / `B`), kept next to the log as
-`<log>.nerka-marks` and anchored to their lines' content, so they survive a
-changed file. `bookmark` is a field: `level >= ERROR OR bookmark`.
+### Query packs, signals and plots
 
-**Settings bundles.** Packs, presets, plots, checks and signals travel as
-one readable `.nerka-bundle` file, with a preview of what an import would
-change; later versions of nerka upgrade what earlier ones wrote
-([doc/bundles.md](doc/bundles.md)).
+The screenshot at the top shows these.
+
+**Query packs:** queries you use again live in plain-text `.nerka-pack`
+files, with parent → child refinement, labels, parameters (`$cam`) and
+colours. Pick them in the library pane: they expand into plain NFD, and
+each pick can colour the lines it keeps. A selection can be saved as a
+preset.
+
+**Signals and plots:** a value captured by a named regex group is a
+**signal** (`@speed > 100`, `@gear.changed`). Signals are plotted over
+time in lanes, with time cursors (Δt), value markers and bookmarks. A plot
+can be kept by name for use on other files.
+
+```
+nerka --pack packs/ expand -l ota -p cam=CAM1
+nerka-gui app.log --signal 't:time=/^(?<t>\S+ \S+)/' --signal 'lat=/latency_us=(?<lat>\d+)/' --plot lat
+```
+
+### Bookmarks, bundles, windows
+
+- **Bookmarks with notes** (`m`, `b` / `B`) are kept next to the log as
+  `<log>.nerka-marks`. They are anchored to their lines' content, so they
+  survive a changed file. `bookmark` is a field: `level >= ERROR OR bookmark`.
+- **Settings bundles:** packs, presets, plots, checks and signals travel as
+  one readable `.nerka-bundle` file. An import shows a preview of what it
+  would change, and later versions of nerka upgrade what earlier ones wrote
+  ([doc/bundles.md](doc/bundles.md)).
+- **Tabs and windows:** there is one tab per file or set of files. A file
+  opened from the shell goes to the nerka window focused last, and windows
+  can be named.
 
 ```
 nerka export -o mine.nerka-bundle --only packs --only check:storm
 nerka import --dry-run theirs.nerka-bundle
 ```
-
-**Tabs and windows.** One tab per file or set of files (several files of
-one kind are one view, in an order you choose); opening a file from the
-shell hands it to the nerka window focused last; windows can be named.
 
 ## Install
 
@@ -182,10 +214,6 @@ nerka-gui app.log --signal 'lat=/latency_us=(?<lat>\d+)/' --query '@lat > 9000' 
 | `Ctrl+Tab`, `Ctrl+W` | next tab, close tab |
 | `Ctrl+,`, `F1` | settings, about |
 
-Protocol definitions go in ⚙ Settings → Captures: protocols (Add
-definition…), with each protocol's rules under **Rules ▸**; a tab's
-**Files…** window turns protocols on or off for each capture in it.
-
 ### Command line
 
 ```
@@ -195,7 +223,6 @@ nerka filter 'apid == NAV AND level >= WARN' trace.dlt
 nerka lines app.log 100 120
 nerka open trace.pcap                                     # its lines and fields
 nerka --someip-port 30501 filter 'proto == SOMEIP AND type == ERROR' trace.pcap
-nerka --route 'DLT:port=3490,vlan=5' --disable-protocol syslog filter 'level >= WARN' trace.pcapng
 nerka --signal 'gear:enum=/gear=(?<gear>\w+)/' filter '@gear == D' app.log
 nerka --fibex ecu1.xml filter 'apid == NAV' trace.dlt
 nerka --local-time lines trace.dlt 1 20                  # local time (CLI: UTC by default; GUI: local)
