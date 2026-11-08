@@ -65,8 +65,11 @@ nerka recognises a file by its content, not its name:
   Several protocols in one capture share one table
   (`proto == SOMEIP AND service == 0x1234`).
 
-Several files of one kind open as one view, one after another, in an order
-you choose.
+Several files open as one view, one after another in an order you choose,
+or interleaved by time. Messages of different protocols share one table:
+a DLT file next to a capture of your own protocol, or captures where
+different protocols are turned on. Text and JSON files join files of their
+own kind.
 
 ### Your own protocols
 
@@ -263,8 +266,9 @@ DCO sign-off (`git commit -s`). Security problems: please report them privately,
 
 ## License
 
-nerka (the engine, the command-line tool and the desktop viewer) is
-licensed under either of [Apache License 2.0](LICENSE-APACHE) or
-[MIT license](LICENSE-MIT), at your option. The fonts it ships with keep
-their own licences ([licenses/](licenses)). Unless you state otherwise, any contribution you submit is dual-licensed the same way,
-without additional terms.
+Everything in this repository (the engine, the command-line tool, the
+desktop viewer, the examples and the documentation) is licensed under
+either of [Apache License 2.0](LICENSE-APACHE) or [MIT license](LICENSE-MIT),
+at your option. The fonts it ships with keep their own licences
+([licenses/](licenses)). Unless you state otherwise, any contribution you
+submit is dual-licensed the same way, without additional terms.

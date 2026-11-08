@@ -10,6 +10,7 @@
 meta:
   id: dlt_message
   title: AUTOSAR DLT message, from its standard header on
+  license: MIT OR Apache-2.0
   endian: be                     # LEN, session id and timestamp are always big-endian
   bit-endian: be
 seq:
