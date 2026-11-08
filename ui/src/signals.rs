@@ -122,19 +122,19 @@ impl LifeForm {
 
     /// The definition the fields describe; an error names the field.
     fn build(&self, name: &str) -> Result<LifecycleDef, String> {
-        let q = |what: &str, e: nerka_core::DslError| format!("{what}: {} (at column {})", e.msg, e.pos + 1);
+        let q = |what: &str, src: &str, e: nerka_core::DslError| format!("{what}: {}", e.at(src));
         let dur = |what: &str, t: &str| {
             lifecycle::parse_duration(t).ok_or_else(|| format!("{what}: '{t}' isn't a duration (30s, 500ms, 2m)"))
         };
         let mut d = LifecycleDef::new(name)?
             .with_lines(&self.lines)
-            .map_err(|e| q("Its lines", e))?
+            .map_err(|e| q("Its lines", &self.lines, e))?
             .with_start(if self.on_start { &self.start } else { "" })
-            .map_err(|e| q("Starts on a line", e))?
+            .map_err(|e| q("Starts on a line", if self.on_start { &self.start } else { "" }, e))?
             .with_planned(&self.planned)
-            .map_err(|e| q("Planned", e))?
+            .map_err(|e| q("Planned", &self.planned, e))?
             .with_crash(&self.crash)
-            .map_err(|e| q("Crash", e))?
+            .map_err(|e| q("Crash", &self.crash, e))?
             .with_late(dur("Late start above", &self.late)?);
         if self.on_start && self.start.trim().is_empty() {
             return Err("Starts on a line: which line? Give a query".into());

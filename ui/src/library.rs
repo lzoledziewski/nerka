@@ -1399,10 +1399,10 @@ pub fn selection_panel(ui: &mut egui::Ui, lib: &mut Library, picks: &mut Picks) 
     if let Some(key) = remove {
         picks.remove(key);
     }
-    if let Some(key) = save {
-        if let Some(renamed) = save_node(lib, picks, key) {
-            action = Action::Edited { renamed, removed: None };
-        }
+    if let Some(key) = save
+        && let Some(renamed) = save_node(lib, picks, key)
+    {
+        action = Action::Edited { renamed, removed: None };
     }
     if create_pack {
         let name = picks.new_pack.trim().to_owned();

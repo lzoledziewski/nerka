@@ -144,11 +144,13 @@ pub fn create_pack_file(dir: &Path, name: &str) -> Result<PathBuf, PackError> {
     if !is_query_name(name) || name.contains(['/', '\\', '*', '?', '<', '>', '|']) {
         return Err(err(format!("invalid pack name '{name}' (no . \" # : / \\ * ? < > | and no spaces at the ends)")));
     }
-    if path.exists() {
-        return Err(err("the file already exists".into()));
-    }
     std::fs::create_dir_all(dir).map_err(|e| err(e.to_string()))?;
-    std::fs::write(&path, format!("pack {}\n", quoted(name))).map_err(|e| err(e.to_string()))?;
+    // `create_new` fails if the file exists: no window between a check and the write.
+    let mut f = std::fs::OpenOptions::new().write(true).create_new(true).open(&path).map_err(|e| match e.kind() {
+        std::io::ErrorKind::AlreadyExists => err("the file already exists".into()),
+        _ => err(e.to_string()),
+    })?;
+    std::io::Write::write_all(&mut f, format!("pack {}\n", quoted(name)).as_bytes()).map_err(|e| err(e.to_string()))?;
     Ok(path)
 }
 

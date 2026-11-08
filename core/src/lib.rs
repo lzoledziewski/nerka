@@ -4,19 +4,29 @@
 //! all sit on top of the same building blocks (layout follows
 //! `doc/nerka_architecture_implementation_spec_v_0.md` §10):
 //!
-//! * [`input`] — [`LogSource`]: random access to lines whatever the on-disk
-//!   format (plain text and DLT today; PCAP, stdin later); [`open`] picks
-//!   the reader from the file's content.
+//! * [`input`] — [`LogSource`]: random access to rows whatever the on-disk
+//!   format: plain text, text records and JSON, DLT files, and DLT / SOME/IP
+//!   / syslog inside pcap, pcapng and MF4 captures (`input::proto`);
+//!   several files one after another or merged by time ([`open_many`],
+//!   [`open_merged_by_time`]). [`open`] picks the reader from the content.
 //! * [`engine`] — [`LineIndex`] (parallel line indexing) and [`search`]:
 //!   filtering that yields the set of matching lines; [`search_within`]:
 //!   search inside a filter result, per query.
 //! * [`dsl`] — NFD, the filter language (`level >= ERROR AND raw ~ /SSL/`).
 //! * [`event`] — lazily normalized fields (level, …) per line.
+//! * [`signal`] — signals (`@name`): values captured from lines, their
+//!   events and states; [`time`] — reading and showing times.
+//! * [`lifecycle`] — an entity's lifecycles (boots), found from its lines.
+//! * [`check`] — checks: issues and facts, overall and per lifecycle.
+//! * [`session`] — a view's filter, search and colours, and what to rerun.
 //! * [`bookmarks`] — bookmarks/notes persisted in a sidecar file.
-//! * [`history`] — recently used filters.
+//! * [`history`] — recently used filters; [`preset`], [`plot`] — saved
+//!   presets and plots.
 //! * [`pack`] — query packs (the search manager's library) and their
 //!   expansion into plain NFD.
+//! * [`atomic`] — [`write_atomic`] for every file nerka saves.
 
+pub mod atomic;
 pub mod bookmarks;
 pub mod check;
 pub mod dsl;
@@ -32,6 +42,7 @@ pub mod session;
 pub mod signal;
 pub mod time;
 
+pub use atomic::write_atomic;
 pub use bookmarks::Bookmarks;
 pub use dsl::{DslError, Query};
 pub use engine::index::LineIndex;
@@ -66,6 +77,9 @@ pub enum Error {
     Cancelled,
     #[error("{0}")]
     Format(String),
+    /// Files of different kinds (columns, fields) asked to open as one view.
+    #[error("{0}")]
+    MixedKinds(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

@@ -810,7 +810,7 @@ impl SignalDef {
         if let Some(rest) = spec.trim_start().strip_prefix("lifecycle ") {
             return LifecycleDef::parse_spec(rest)
                 .map(SignalDef::lifecycle)
-                .map_err(|e| SignalError::Spec(format!("lifecycle: {} (at column {})", e.msg, e.pos + 1)));
+                .map_err(|e| SignalError::Spec(format!("lifecycle: {}", e.at(rest))));
         }
         let bad = || SignalError::Spec(format!("'{spec}' isn't NAME[(GROUP)][:KIND][:SCOPE]=QUERY"));
         let (head, query) = spec.split_once('=').ok_or_else(bad)?;
