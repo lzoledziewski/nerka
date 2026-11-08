@@ -4,7 +4,7 @@ members = ["core", "cli", "ui"]
 default-members = ["core", "cli"]
 
 [workspace.package]
-version = "0.2.0-alpha.1"
+version = "0.3.0"
 edition = "2024"
 # The engine and the CLI: let-chains need 1.88 (no dependency needs more).
 # The GUI sets its own (egui 0.37 needs 1.95).
