@@ -1,16 +1,21 @@
-//! Several sources of the same kind as one, one after another (the owner,
-//! 2026-10-20: one view of several files; merging by time waits until
-//! "time" is defined).
+//! Several sources as one, one after another (the owner, 2026-10-20: one
+//! view of several files; [`super::merged`] interleaves them by time).
 //!
-//! Line `n` of the whole is line `n - start` of the part it falls in. The
-//! parts must have the same columns and fields (plain text with plain
-//! text, DLT with DLT, captures included). A `file` field (the part's file
+//! Line `n` of the whole is line `n - start` of the part it falls in. Parts
+//! with the same columns and fields keep them (plain text with plain text,
+//! DLT with DLT, captures included). Messages of different protocols
+//! (owner, 2026-11-08: DLT from one capture, a protocol definition's
+//! messages from another) share the **mixed layout** of a capture holding
+//! several protocols: columns `time`, `proto`, `info`, `payload`, and every
+//! part's fields, a field a part doesn't have having no value there. Plain
+//! text and JSON mix with nothing else. A `file` field (the part's file
 //! name) is added, so `file == b.dlt` filters by file.
 //!
 //! The engine searches part by part ([`LogSource::parts`]), so each part
 //! keeps its own fast path; a part's [`View`] answers with the whole's
-//! fields, so `file` works there too.
+//! fields, columns and line text, so `file` and `raw` read the same there.
 
+use super::proto::{MIXED_COLUMNS, PROTO_FIELD, Records};
 use super::{ColumnDef, LogSource};
 use crate::event::{FieldDef, FieldId, FieldKind, FieldValue, Level};
 use crate::{Error, LineNo, Result};
@@ -28,6 +33,15 @@ pub struct Concat {
     files: Vec<String>,
     total: LineNo,
     schema: Vec<FieldDef>,
+    /// Parts of different protocols, in the mixed layout.
+    mixed: bool,
+    columns: Vec<ColumnDef>,
+    /// Per part, its field for each of the whole's (`None`: it has none;
+    /// the `file` field is the whole's own).
+    fields: Vec<Vec<Option<FieldId>>>,
+    /// Per part, whether its lines are rendered into the mixed layout
+    /// (they have columns of their own).
+    convert: Vec<bool>,
 }
 
 /// What kind of source this is, for "same kind": columns and fields.
@@ -36,6 +50,12 @@ fn kind(s: &dyn LogSource) -> (Vec<&str>, Vec<(&str, FieldKind)>) {
         s.columns().iter().map(|c| c.name.as_ref()).collect(),
         s.schema().iter().map(|f| (f.name.as_ref(), f.kind)).collect(),
     )
+}
+
+/// Whether `s` holds messages of protocols (a `.dlt` file, a capture):
+/// those mix in one view.
+fn has_proto(s: &dyn LogSource) -> bool {
+    !s.columns().is_empty() && s.schema().iter().any(|f| f.name == PROTO_FIELD.name)
 }
 
 /// A readable kind for messages: plain text, DLT, or another table.
@@ -57,7 +77,13 @@ impl Concat {
     pub fn new(parts: Vec<Box<dyn LogSource>>) -> Result<Concat> {
         let Some(first) = parts.first() else { return Err(Error::Format("no files to open".into())) };
         let k = kind(first.as_ref());
-        if let Some(other) = parts.iter().find(|p| kind(p.as_ref()) != k) {
+        let mixed = parts.iter().any(|p| kind(p.as_ref()) != k);
+        // Only messages of protocols mix; plain text or JSON with anything
+        // of another kind doesn't.
+        let lone = parts.iter().position(|p| !has_proto(p.as_ref()));
+        if let (true, Some(i)) = (mixed, lone) {
+            let (first, k) = (&parts[i], kind(parts[i].as_ref()));
+            let other = parts.iter().find(|p| kind(p.as_ref()) != k).expect("they differ");
             return Err(Error::MixedKinds(format!(
                 "{} is {} but {} is {}: only files of one kind open as one view",
                 file_name(first.name()),
@@ -66,7 +92,30 @@ impl Concat {
                 kind_name(other.as_ref())
             )));
         }
-        let mut schema = first.schema().to_vec();
+        let mut schema: Vec<FieldDef> = Vec::new();
+        if mixed {
+            // As a capture of several protocols: `proto` first, then each
+            // part's fields; one of a name already there is the same field
+            // when its kind is the same, and left out when it isn't.
+            schema.push(PROTO_FIELD);
+            for p in &parts {
+                for def in p.schema() {
+                    if !schema.iter().any(|d| d.name == def.name) {
+                        schema.push(def.clone());
+                    }
+                }
+            }
+        } else {
+            schema = first.schema().to_vec();
+        }
+        let fields = parts
+            .iter()
+            .map(|p| {
+                schema.iter().map(|d| p.schema().iter().position(|o| o.name == d.name && o.kind == d.kind)).collect()
+            })
+            .collect();
+        let convert = parts.iter().map(|p| mixed && p.columns() != MIXED_COLUMNS).collect();
+        let columns = if mixed { MIXED_COLUMNS.to_vec() } else { first.columns().to_vec() };
         schema.push(FieldDef::new(FILE_FIELD, FieldKind::Str, false));
         let (mut starts, mut total) = (Vec::with_capacity(parts.len()), 0);
         for p in &parts {
@@ -75,7 +124,67 @@ impl Concat {
         }
         let files = parts.iter().map(|p| file_name(p.name())).collect();
         let name = parts.iter().map(|p| p.name()).collect::<Vec<_>>().join(" + ");
-        Ok(Concat { name, parts, starts, files, total, schema })
+        Ok(Concat { name, parts, starts, files, total, schema, mixed, columns, fields, convert })
+    }
+
+    /// Whether parts of different protocols share the mixed layout.
+    pub fn is_mixed(&self) -> bool {
+        self.mixed
+    }
+
+    /// Part `k`'s line `l` as the whole shows it: in the mixed layout, its
+    /// protocol's cells before the payload become `info`, as in a capture
+    /// of several protocols.
+    fn part_bytes(&self, k: usize, l: LineNo) -> Option<Cow<'_, [u8]>> {
+        let own = self.parts[k].line_bytes(l)?;
+        if !self.convert[k] {
+            return Some(own);
+        }
+        let own = String::from_utf8_lossy(&own);
+        let (time, rest) = own.split_once('\t').unwrap_or((&own, ""));
+        let (info, payload) = Records::mixed_cells(rest);
+        let mut out = Vec::with_capacity(own.len() + 8);
+        out.extend_from_slice(time.as_bytes());
+        out.push(b'\t');
+        out.extend_from_slice(&self.proto_of(k, l));
+        out.push(b'\t');
+        out.extend_from_slice(info.as_bytes());
+        out.push(b'\t');
+        out.extend_from_slice(payload.as_bytes());
+        Some(Cow::Owned(out))
+    }
+
+    /// Part `k`'s detailed line, in the mixed layout when it needs one.
+    fn part_detail(&self, k: usize, l: LineNo) -> Option<Vec<String>> {
+        let mut cells = self.parts[k].line_detail(l)?;
+        if !self.convert[k] || cells.is_empty() {
+            return Some(cells);
+        }
+        let time = cells.remove(0);
+        let payload = cells.pop().unwrap_or_default();
+        let info = cells.into_iter().filter(|c| !c.is_empty()).collect::<Vec<_>>().join(" ");
+        Some(vec![time, String::from_utf8_lossy(&self.proto_of(k, l)).into_owned(), info, payload])
+    }
+
+    /// The protocol of part `k`'s line `l` (its `proto` field).
+    fn proto_of(&self, k: usize, l: LineNo) -> Vec<u8> {
+        let p = self.parts[k].schema().iter().position(|d| d.name == PROTO_FIELD.name);
+        match p.and_then(|p| self.parts[k].field(l, p)) {
+            Some(FieldValue::Str(s)) => s.into_owned(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// Part `k`'s value of the whole's field `id`.
+    fn part_field(&self, k: usize, l: LineNo, id: FieldId) -> Option<FieldValue<'_>> {
+        if id == self.file_id() {
+            return Some(FieldValue::Str(self.files[k].as_bytes().into()));
+        }
+        if !self.mixed {
+            // One kind: the parts' fields are the whole's.
+            return self.parts[k].field(l, id);
+        }
+        self.parts[k].field(l, self.fields[k].get(id).copied().flatten()?)
     }
 
     /// The part `line` falls in, and its line there.
@@ -103,12 +212,12 @@ impl LogSource for Concat {
 
     fn line_bytes(&self, line: LineNo) -> Option<Cow<'_, [u8]>> {
         let (k, l) = self.locate(line)?;
-        self.parts[k].line_bytes(l)
+        self.part_bytes(k, l)
     }
 
     fn line_detail(&self, line: LineNo) -> Option<Vec<String>> {
         let (k, l) = self.locate(line)?;
-        self.parts[k].line_detail(l)
+        self.part_detail(k, l)
     }
 
     fn size_bytes(&self) -> u64 {
@@ -130,7 +239,7 @@ impl LogSource for Concat {
     }
 
     fn columns(&self) -> &[ColumnDef] {
-        self.parts[0].columns()
+        &self.columns
     }
 
     fn schema(&self) -> &[FieldDef] {
@@ -139,10 +248,7 @@ impl LogSource for Concat {
 
     fn field(&self, line: LineNo, id: FieldId) -> Option<FieldValue<'_>> {
         let (k, l) = self.locate(line)?;
-        if id == self.file_id() {
-            return Some(FieldValue::Str(self.files[k].as_bytes().into()));
-        }
-        self.parts[k].field(l, id)
+        self.part_field(k, l, id)
     }
 
     fn supplied_level(&self, line: LineNo) -> Option<Option<Level>> {
@@ -209,11 +315,15 @@ impl LogSource for View<'_> {
     }
 
     fn line_bytes(&self, line: LineNo) -> Option<Cow<'_, [u8]>> {
-        self.part().line_bytes(line)
+        self.whole.part_bytes(self.k, line)
+    }
+
+    fn line_detail(&self, line: LineNo) -> Option<Vec<String>> {
+        self.whole.part_detail(self.k, line)
     }
 
     fn columns(&self) -> &[ColumnDef] {
-        self.part().columns()
+        &self.whole.columns
     }
 
     fn schema(&self) -> &[FieldDef] {
@@ -221,10 +331,7 @@ impl LogSource for View<'_> {
     }
 
     fn field(&self, line: LineNo, id: FieldId) -> Option<FieldValue<'_>> {
-        if id == self.whole.file_id() {
-            return Some(FieldValue::Str(self.whole.files[self.k].as_bytes().into()));
-        }
-        self.part().field(line, id)
+        self.whole.part_field(self.k, line, id)
     }
 
     fn supplied_level(&self, line: LineNo) -> Option<Option<Level>> {

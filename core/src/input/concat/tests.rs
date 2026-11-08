@@ -169,3 +169,116 @@ fn files_with_times_open_in_the_order_they_start() {
     assert_eq!(s.line_text(0).unwrap(), "two");
     std::fs::remove_dir_all(&dir).ok();
 }
+
+/// A pcap of IPv4 / UDP datagrams: (seconds, destination port, payload).
+fn pcap_of(datagrams: &[(u32, u16, Vec<u8>)]) -> Vec<u8> {
+    let mut pcap = 0xA1B2_C3D4u32.to_le_bytes().to_vec();
+    pcap.extend_from_slice(&[2, 0, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 0, 0, 1, 0, 0, 0]);
+    for (secs, port, payload) in datagrams {
+        let mut udp = vec![0xc3, 0x50];
+        udp.extend_from_slice(&port.to_be_bytes());
+        udp.extend_from_slice(&((8 + payload.len()) as u16).to_be_bytes());
+        udp.extend_from_slice(&[0, 0]);
+        udp.extend_from_slice(payload);
+        let mut ip = vec![0x45, 0];
+        ip.extend_from_slice(&((20 + udp.len()) as u16).to_be_bytes());
+        ip.extend_from_slice(&[0, 1, 0, 0, 64, 17, 0, 0, 10, 0, 0, 1, 10, 0, 0, 2]);
+        ip.extend_from_slice(&udp);
+        let mut frame = vec![2; 12];
+        frame.extend_from_slice(&[0x08, 0x00]);
+        frame.extend_from_slice(&ip);
+        for x in [*secs, 0, frame.len() as u32, frame.len() as u32] {
+            pcap.extend_from_slice(&x.to_le_bytes());
+        }
+        pcap.extend_from_slice(&frame);
+    }
+    pcap
+}
+
+/// A protocol definition: a value and a note per datagram on port 41000.
+const SENS: &str = "meta: { id: sens, endian: le }
+seq:
+  - { id: v, type: u2 }
+  - { id: note, type: str, size-eos: true, encoding: UTF-8 }
+-nerka:
+  name: SENS
+  framing: datagram
+  match: [ 41000 ]
+  fields:
+    v: v
+    note: note
+  level:
+    from: \"v > 100 ? 2 : 4\"
+    map: { 2: error, 4: info }
+  columns:
+    - { name: v, width: 5 }
+    - note
+";
+
+fn sens(v: u16, note: &str) -> Vec<u8> {
+    let mut m = v.to_le_bytes().to_vec();
+    m.extend_from_slice(note.as_bytes());
+    m
+}
+
+/// Owner, 2026-11-08: DLT from one capture, a definition's messages from
+/// another (DLT turned off there) in one view: the mixed layout.
+#[test]
+fn messages_of_different_protocols_share_the_mixed_layout() {
+    use crate::input::capture::{self, CaptureOptions};
+    use crate::input::proto::{LoadedProtocol, ksy::KsyProtocol};
+    let defs = vec![LoadedProtocol::new(std::sync::Arc::new(KsyProtocol::parse(SENS).unwrap()))];
+    let a: Box<dyn LogSource> = Box::new(DltFile::from_bytes("a.dlt", dlt_bytes(&["NAV", "SYS"])));
+    // A capture with DLT on 3490 and SENS on 41000.
+    let dlt = dlt_bytes(&["GPS"]);
+    let both =
+        pcap_of(&[(200, 3490, dlt[16..].to_vec()), (201, 41000, sens(150, "hot")), (202, 41000, sens(20, "ok"))]);
+    let with = |disabled: &[&str]| CaptureOptions {
+        protocols: defs.clone(),
+        disabled: disabled.iter().map(|d| d.to_string()).collect(),
+        ..Default::default()
+    };
+    // Turned off there, DLT leaves only SENS: a layout of its own.
+    let (b, _) = capture::from_bytes("b.pcap", both.clone(), &with(&["DLT"])).unwrap();
+    assert_eq!(b.columns().iter().map(|c| c.name.as_ref()).collect::<Vec<_>>(), ["time", "v", "note"]);
+    // Both on: the capture is mixed already.
+    let (c, _) = capture::from_bytes("c.pcap", both, &with(&[])).unwrap();
+    assert_eq!(c.columns(), MIXED_COLUMNS);
+
+    let all = Concat::new(vec![a, Box::new(b), Box::new(c)]).unwrap();
+    assert!(all.is_mixed());
+    assert_eq!(all.columns(), MIXED_COLUMNS);
+    assert_eq!(all.line_count(), 2 + 2 + 3);
+    // Each part's line in the shared layout; one already mixed is as it was.
+    let cells = |l| all.line_text(l).unwrap().split('\t').skip(1).map(str::to_owned).collect::<Vec<_>>();
+    assert_eq!(cells(0), ["DLT", "0.0000 ECU1 NAV CTX warn", "msg 0"]);
+    assert_eq!(cells(2), ["SENS", "150", "hot"]);
+    assert_eq!(cells(4), ["DLT", "0.0000 ECU1 GPS CTX warn", "msg 0"]);
+    assert_eq!(cells(5), ["SENS", "150", "hot"]);
+    let detail = all.line_detail(2).unwrap();
+    assert_eq!(detail[1..], ["SENS".to_owned(), "150".to_owned(), "hot".to_owned()]);
+    assert_eq!(detail.len(), 4);
+
+    // Fields of every part; one a line's protocol lacks has no value.
+    let names: Vec<&str> = all.schema().iter().map(|f| f.name.as_ref()).collect();
+    assert_eq!(names[0], "proto");
+    assert!(["apid", "payload", "v", "note", "file"].iter().all(|n| names.contains(n)), "{names:?}");
+    assert_eq!(run_on(&all, &q("proto == SENS")), [2, 3, 5, 6]);
+    assert_eq!(run_on(&all, &q("proto == DLT")), [0, 1, 4]);
+    assert_eq!(run_on(&all, &q("apid == NAV OR v > 100")), [0, 2, 5]);
+    assert_eq!(run_on(&all, &q("apid != NAV")), [1, 2, 3, 4, 5, 6]);
+    assert_eq!(run_on(&all, &q("level >= ERROR")), [2, 5]);
+    assert_eq!(run_on(&all, &q("note ~ /ok/ AND file == b.pcap")), [3]);
+    assert_eq!(run_on(&all, &q("payload ~ /msg/")), [0, 1, 4]);
+    // `raw` is the line as shown, on both paths.
+    assert_eq!(run_on(&all, &re("\tSENS\t150\t")), [2, 5]);
+    assert_eq!(run_on(&all, &q(r#"raw ~ /^\S+ \S+\tDLT\t/"#)), [0, 1, 4]);
+
+    // Interleaved by time, too.
+    let merged = crate::input::merged::Merged::new(all, &crate::Progress::new()).unwrap();
+    assert_eq!(merged.columns(), MIXED_COLUMNS);
+    let order: Vec<String> =
+        (0..7).map(|l| merged.line_text(l).unwrap().split('\t').nth(1).unwrap().to_owned()).collect();
+    assert_eq!(order, ["DLT", "DLT", "DLT", "SENS", "SENS", "SENS", "SENS"]);
+    assert_eq!(run_on(&merged, &q("proto == SENS AND v > 100")).len(), 2);
+}

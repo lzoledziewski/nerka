@@ -218,7 +218,7 @@ pub const MIXED_COLUMNS: [ColumnDef; 4] =
 
 const TIME: ColumnDef = ColumnDef::new("time", 26);
 /// The protocol's name; compared without case (`proto == syslog`, `SYSLOG`).
-const PROTO_FIELD: FieldDef = FieldDef::new("proto", FieldKind::Name, false);
+pub(crate) const PROTO_FIELD: FieldDef = FieldDef::new("proto", FieldKind::Name, false);
 
 impl View {
     /// The view for the protocols `present` (indexes into `protos`).
@@ -379,7 +379,7 @@ impl Records {
 
     /// The `info` and `payload` cells of a mixed view, from the protocol's
     /// own cells: the ones before the payload joined by spaces.
-    fn mixed_cells(own: &str) -> (String, &str) {
+    pub(crate) fn mixed_cells(own: &str) -> (String, &str) {
         match own.rsplit_once('\t') {
             Some((head, payload)) => {
                 (head.split('\t').filter(|c| !c.is_empty()).collect::<Vec<_>>().join(" "), payload)

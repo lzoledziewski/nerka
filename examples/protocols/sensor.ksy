@@ -7,6 +7,7 @@
 #   nerka --protocol examples/protocols/sensor.ksy filter 'kind == pressure AND value > 90' capture.pcap
 meta:
   id: sensor_reading
+  license: MIT OR Apache-2.0
   endian: le
 seq:
   - { id: sensor, type: u2 }
