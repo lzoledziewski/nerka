@@ -1,7 +1,7 @@
 use super::writer::{Arg, Extended, Msg, Payload, Value, id};
 use super::*;
 use crate::engine::search::tests::run_on;
-use crate::input::proto::{Framed, MAX_CHANNELS, MAX_PROTOCOLS};
+use crate::input::proto::{Framed, MAX_OFFSET, MAX_ORIGINS, MAX_PROTOCOLS, Origins};
 use crate::{Filter, LineNo, LogSource, Matcher, Query};
 use fibex::Fibex;
 
@@ -305,7 +305,8 @@ fn framed_copy(f: &DltFile) -> DltFile {
         target.extend_from_slice(bytes);
     }
     let protos: Vec<Arc<dyn Protocol>> = vec![Arc::new(Dlt::default())];
-    Records::framed("t.pcap".into(), None, crate::input::Bytes::Owned(data), msgs, side, channel_ecus, protos, 0)
+    let origins = Origins::new(channel_ecus, Vec::new(), Vec::new());
+    Records::framed("t.pcap".into(), None, crate::input::Bytes::Owned(data), msgs, side, origins, protos, 0)
 }
 
 #[test]
@@ -327,12 +328,12 @@ fn messages_read_in_place_match_the_dlt_file() {
         assert_eq!(run_on(&g, &q(s)), run_on(&f, &q(s)), "{s}");
     }
     // Out-of-range offsets, protocols and channels are refused.
-    assert!(Framed::new(1 << 48, false, 0, 0, 0, 0).is_none());
-    assert!(Framed::new(0, false, 0, MAX_CHANNELS, 0, 0).is_none());
+    assert!(Framed::new(MAX_OFFSET + 1, false, 0, 0, 0, 0).is_none());
+    assert!(Framed::new(0, false, 0, MAX_ORIGINS, 0, 0).is_none());
     assert!(Framed::new(0, false, MAX_PROTOCOLS, 0, 0, 0).is_none());
-    let x = Framed::new((1 << 48) - 1, true, MAX_PROTOCOLS - 1, MAX_CHANNELS - 1, 1, 2).unwrap();
-    let got = (x.offset(), x.in_side(), x.proto(), x.channel());
-    assert_eq!(got, ((1 << 48) - 1, true, MAX_PROTOCOLS - 1, MAX_CHANNELS - 1));
+    let x = Framed::new(MAX_OFFSET, true, MAX_PROTOCOLS - 1, MAX_ORIGINS - 1, 1, 2).unwrap();
+    let got = (x.offset(), x.in_side(), x.proto(), x.origin());
+    assert_eq!(got, (MAX_OFFSET as usize, true, MAX_PROTOCOLS - 1, MAX_ORIGINS - 1));
 }
 
 #[test]

@@ -270,6 +270,9 @@ fn messages_of_different_protocols_share_the_mixed_layout() {
     assert_eq!(run_on(&all, &q("level >= ERROR")), [2, 5]);
     assert_eq!(run_on(&all, &q("note ~ /ok/ AND file == b.pcap")), [3]);
     assert_eq!(run_on(&all, &q("payload ~ /msg/")), [0, 1, 4]);
+    // The captures' `net.*` fields; the `.dlt` file has none.
+    assert_eq!(run_on(&all, &q("net.port == 41000")), [2, 3, 5, 6]);
+    assert_eq!(run_on(&all, &q("net.src == 10.0.0.1")), [2, 3, 4, 5, 6]);
     // `raw` is the line as shown, on both paths.
     assert_eq!(run_on(&all, &re("\tSENS\t150\t")), [2, 5]);
     assert_eq!(run_on(&all, &q(r#"raw ~ /^\S+ \S+\tDLT\t/"#)), [0, 1, 4]);

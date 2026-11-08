@@ -104,7 +104,7 @@ missing field, no entry in `map`), `decimals` (numbers), `render` (`hex` or
 `text`). A field also takes `kind` (`str`, `u64`, `f64`, `name`; else inferred:
 numbers and booleans `u64`, floats `f64`, the rest text) and `costly`. Field
 names are lower case and not NFD's own (`raw`, `level`, `bookmark`, `proto`,
-`file`, `nfd`). `level` maps to level names (checked when the file loads).
+`file`, `nfd`, and `net.` names, which are the capture's own). `level` maps to level names (checked when the file loads).
 `origin.channel`, `origin.secs` and `origin.usecs` are what the container
 knows about the message. A column names a field (with an optional `width`), or
 defines its own value with `name` and `from`. Field values are as read; cells
@@ -131,6 +131,18 @@ for every capture or for one capture of a tab (its Files window). The
 transport (`input/capture/net.rs`) hands the router the addresses, ports and
 VLAN tags of each datagram, reassembled ones included; MF4 `DLT_Frame`
 channels still go straight to native DLT.
+
+The same facts are fields of every message in a capture (owner,
+2026-11-08), in the words of the rules: `net.src`, `net.dst` (addresses as
+text), `net.sport`, `net.port` (destination), `net.vlan` (the outer tag; no
+value when untagged). They aren't columns and aren't in `raw`; the line
+window lists them. Each sender (addresses, ports, VLAN) is kept once, and a
+message stores its number in the bits of its index entry, so they cost no
+memory per message (an offset in a file is now at most 1 TiB). At most
+65,536 senders are kept: a capture of spoofed or garbled addresses can't
+grow the table further, and its later senders' messages have no `net.*`
+values (`CaptureStats::senders_not_kept`). The table's hash is std's
+randomly seeded one, so a crafted capture can't make its lookups collide.
 
 ## Compiled form
 

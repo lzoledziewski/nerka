@@ -1,8 +1,10 @@
 use super::*;
 use crate::DltFile;
+use crate::LineNo;
 use crate::LogSource;
 use crate::engine::search::tests::run_on;
 use crate::input::dlt::writer::{Msg, Value};
+use crate::input::proto::MAX_SENDERS;
 use crate::{Filter, Level, Query};
 use net::FRAGMENT_TIMEOUT_SECS;
 
@@ -172,7 +174,7 @@ fn dlt_over_udp_is_read_in_place() {
     assert_eq!((s.datagrams, s.messages, s.msg_skipped), (3, 4, 5));
     assert_eq!((s.net.frames, s.net.udp, s.net.other, s.file_skipped), (6, 5, 1, 0));
     // Nothing was copied: every message is in the file.
-    assert_eq!(f.index_memory_bytes(), 4 * 16);
+    assert_eq!((f.line_count(), f.side_bytes()), (4, 0));
 
     // Other ports when configured.
     let o = CaptureOptions { dlt_udp_ports: vec![3491, 3489], ..Default::default() };
@@ -363,4 +365,93 @@ fn one_protocol_shows_its_own_columns() {
     assert_eq!(f.supplied_level(0), Some(Some(Level::Warn)));
     // Kept behind its length in the side buffer.
     assert!(f.index_memory_bytes() >= 16 + 4 + 5);
+}
+
+/// A UDP datagram from `sport` to `dport`.
+fn udp_from(sport: u16, dport: u16, data: &[u8]) -> Vec<u8> {
+    let mut v = udp(dport, data);
+    v[..2].copy_from_slice(&sport.to_be_bytes());
+    v
+}
+
+fn field_named<'a>(f: &'a Records, line: LineNo, name: &str) -> Option<crate::FieldValue<'a>> {
+    let id = f.schema().iter().position(|d| d.name == name).unwrap_or_else(|| panic!("no field {name}"));
+    f.field(line, id)
+}
+
+/// Owner, 2026-11-08: where a message's datagram came from, as fields
+/// (`net.src`, `net.dst`, `net.sport`, `net.port`, `net.vlan`) that
+/// queries see but columns and `raw` don't.
+#[test]
+fn network_fields_say_where_datagrams_came_from() {
+    let two = [dlt("TWO", "first"), dlt("TWO", "second")].concat();
+    let frames = vec![
+        (1, eth(0x0800, &ipv4(17, 1, 0, &udp_from(40001, 3490, &dlt("A", "v4"))))),
+        (2, vlan(0x0800, &ipv4(17, 2, 0, &udp(3490, &dlt("V", "tagged"))))),
+        (3, eth(0x86DD, &ipv6_udp(&udp(3490, &dlt("SIX", "v6")), None))),
+        (4, eth(0x0800, &ipv4(17, 3, 0, &udp(3490, &two)))),
+    ];
+    let mut frames = frames;
+    for (i, p) in fragments(9, &udp(3490, &dlt("FRAG", &"f".repeat(600))), 304).into_iter().enumerate() {
+        frames.push((5 + i as u32, eth(0x0800, &p)));
+    }
+    let (f, s) = from_bytes("t", pcap_file(1, &frames), &CaptureOptions::default()).unwrap();
+    assert_eq!(lines(&f).iter().map(|(a, _)| a.as_str()).collect::<Vec<_>>(), ["A", "V", "SIX", "TWO", "TWO", "FRAG"]);
+    assert_eq!(s.senders_not_kept, 0);
+    let s = |l, n| match field_named(&f, l, n) {
+        Some(crate::FieldValue::Str(v)) => String::from_utf8_lossy(&v).into_owned(),
+        Some(crate::FieldValue::U64(v)) => v.to_string(),
+        other => format!("{other:?}"),
+    };
+    assert_eq!(
+        [s(0, "net.src"), s(0, "net.dst"), s(0, "net.sport"), s(0, "net.port")],
+        ["10.0.0.1", "10.0.0.2", "40001", "3490"]
+    );
+    assert_eq!(s(0, "net.vlan"), "None", "untagged: no value");
+    assert_eq!(s(1, "net.vlan"), "5");
+    assert_eq!(s(2, "net.src"), "fefe:fefe:fefe:fefe:fefe:fefe:fefe:fefe");
+    assert_eq!(s(2, "net.dst"), "fdfd:fdfd:fdfd:fdfd:fdfd:fdfd:fdfd:fdfd");
+    assert_eq!([s(3, "net.src"), s(4, "net.src")], ["10.0.0.1", "10.0.0.1"], "every message of a datagram");
+    assert_eq!(s(5, "net.port"), "3490", "a reassembled datagram keeps its sender");
+    // Fields, not columns, and not in the line's text.
+    assert!(f.columns().iter().all(|c| !c.name.starts_with("net.")));
+    assert!((0..6).all(|l| !f.line_text(l).unwrap().contains("10.0.0.1")));
+    // Through the engine: fast path against naive.
+    let q = |s: &str| Filter::Query(Query::compile(s).unwrap_or_else(|e| panic!("{s}: {e}")));
+    assert_eq!(run_on(&f, &q("net.src == 10.0.0.1")), [0, 1, 3, 4, 5]);
+    assert_eq!(run_on(&f, &q("net.vlan == 5")), [1]);
+    assert_eq!(run_on(&f, &q("net.vlan != 5")), [0, 2, 3, 4, 5], "no tag: no value, so it isn't 5");
+    assert_eq!(run_on(&f, &q("net.sport == 40001 AND net.port >= 3490")), [0]);
+    assert_eq!(run_on(&f, &q("net.src ~ /^fefe:/")), [2]);
+    assert_eq!(run_on(&f, &q(r"raw ~ /10\.0\.0\.1/")), Vec::<LineNo>::new());
+    // A `.dlt` file has no network: no such fields.
+    assert!(DltFile::from_bytes("x.dlt", Vec::new()).schema().iter().all(|d| !d.name.starts_with("net.")));
+}
+
+/// A capture with more senders than [`MAX_SENDERS`] (spoofed or garbled
+/// addresses): the table stops growing, later senders' messages have no
+/// `net.*` fields, and nothing else about them changes.
+#[test]
+fn senders_past_the_cap_are_not_kept() {
+    let n = MAX_SENDERS + 5;
+    let mut frames: Vec<(u32, Vec<u8>)> = Vec::with_capacity(n + 1);
+    for i in 0..n {
+        let mut ip = ipv4(17, 1, 0, &udp_from((i % 60_000) as u16, 3490, &dlt("S", "spoofed")));
+        // A different source address per datagram.
+        ip[12..16].copy_from_slice(&(i as u32).to_be_bytes());
+        frames.push((1, eth(0x0800, &ip)));
+    }
+    // A sender seen before is still known once the table is full.
+    let mut again = ipv4(17, 1, 0, &udp_from(0, 3490, &dlt("S", "again")));
+    again[12..16].copy_from_slice(&0u32.to_be_bytes());
+    frames.push((2, eth(0x0800, &again)));
+    let (f, s) = from_bytes("t", pcap_file(1, &frames), &CaptureOptions::default()).unwrap();
+    assert_eq!(f.line_count() as usize, n + 1);
+    assert_eq!(s.senders_not_kept, 5);
+    let src = |l: usize| field_named(&f, l as LineNo, "net.src");
+    assert_eq!(src(0), Some(crate::FieldValue::Str(b"0.0.0.0".as_slice().into())));
+    assert!(src(MAX_SENDERS - 1).is_some());
+    assert!((MAX_SENDERS..n).all(|l| src(l).is_none()));
+    assert!(src(n).is_some(), "a known sender");
+    assert_eq!(field_named(&f, n as LineNo - 1, "apid"), Some(crate::FieldValue::Str(b"S".as_slice().into())));
 }

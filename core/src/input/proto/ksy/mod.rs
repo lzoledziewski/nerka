@@ -157,6 +157,9 @@ impl KsyProtocol {
                 if RESERVED.contains(&name.as_str()) {
                     return Err(err(k.line, k.col, format!("`{name}` is a name NFD has already")));
                 }
+                if name.starts_with("net.") {
+                    return Err(err(k.line, k.col, format!("`{name}`: `net.` fields are the capture's own")));
+                }
                 let (spec, extra) = spec(v, &mut bind, &["kind", "costly"])?;
                 let kind = match extra.kind {
                     Some(k) => k,

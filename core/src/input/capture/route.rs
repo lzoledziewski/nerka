@@ -15,7 +15,7 @@ use std::net::{Ipv4Addr, Ipv6Addr};
 use std::str::FromStr;
 
 /// What the transport knows about a UDP datagram.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub struct Datagram {
     /// IPv4 addresses in the first 4 bytes.
     pub src: [u8; 16],
