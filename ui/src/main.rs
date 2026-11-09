@@ -33,6 +33,7 @@
 
 mod bundles;
 mod checks;
+mod console;
 mod icon;
 mod icon_art;
 mod instance;
@@ -67,6 +68,38 @@ use std::sync::Arc;
 use std::time::Duration;
 use view::{Columns, Highlight, NoteMode, SearchMarks, ViewOutput, ViewState, log_view};
 
+/// `nerka-gui --help`.
+const USAGE: &str = "\
+Usage: nerka-gui [OPTIONS] [FILE]...
+
+Opens log files (several: one view) in a window. With only files given, a
+nerka window already open takes them.
+
+Options:
+  -q, --query NFD          Filter with a query
+  -r, --regex RE           Filter with a regex
+  -t, --text TEXT          Filter with plain text
+      --pack PATH          Load a library pack (file or folder)
+      --pick PACK.QUERY    Select a library query (Include)
+      --exclude PACK.QUERY Select a library query (Exclude)
+      --signal-pick PACK.QUERY  Select a library query (Signal)
+      --search-pick PACK.QUERY  Put a library query in the Search box
+      --highlight NFD      Colour the lines a query matches
+      --param NAME=VALUE   A library parameter's value
+      --library            Show the library
+      --signal SPEC        A signal for this session (as `nerka --signal`)
+      --check SPEC         A check for this session (as `nerka --check`)
+      --plot NAME          Plot a signal
+      --plot-window        The plot in a window of its own
+      --marker NAME=VALUE[:LABEL]  A horizontal line in a plotted lane
+      --cursor TIME        A time cursor in the plot
+      --fibex FILE         FIBEX file for DLT non-verbose messages
+      --new-window         A new window, even if one is open
+      --name NAME          The window's name
+  -h, --help               This text
+  -V, --version            The version
+";
+
 fn main() -> eframe::Result {
     let mut initial: Vec<PathBuf> = Vec::new();
     // (history tag, pattern): the same tags the search history uses.
@@ -93,11 +126,24 @@ fn main() -> eframe::Result {
     let mut markers: Vec<(String, plot::Marker)> = Vec::new();
     // `--plot-window`: the plot starts in a window of its own.
     let mut plot_window = false;
-    let (mut new_window, mut window_name, mut preset_file) = (false, None, None);
+    let (mut window_name, mut preset_file) = (None, None);
+    // Options given (anything but files): with none, a running window opens
+    // the files (review 2026-11-09, R7: an option left out of a list of
+    // them handed the files over and dropped the option).
+    let mut options_given = 0usize;
     let mut args = std::env::args_os().skip(1);
     while let Some(a) = args.next() {
+        options_given += 1;
         let mut value = || args.next().map(|v| v.to_string_lossy().into_owned()).unwrap_or_default();
         let tag = match a.to_str() {
+            Some("--help" | "-h") => {
+                console::print(USAGE);
+                return Ok(());
+            }
+            Some("--version" | "-V") => {
+                console::print(&format!("nerka-gui {}\n", env!("CARGO_PKG_VERSION")));
+                return Ok(());
+            }
             Some("--query" | "-q") => "query",
             Some("--regex" | "-r") => "regex",
             Some("--text" | "-t") => "text",
@@ -184,10 +230,8 @@ fn main() -> eframe::Result {
                 }
                 continue;
             }
-            Some("--new-window") => {
-                new_window = true;
-                continue;
-            }
+            // An option: the files aren't handed to a running window.
+            Some("--new-window") => continue,
             Some("--name") => {
                 window_name = Some(value());
                 continue;
@@ -198,7 +242,19 @@ fn main() -> eframe::Result {
                 preset_file = Some(PathBuf::from(value()));
                 continue;
             }
+            // `--` ends the options: a file named `-x` follows.
+            Some("--") => {
+                options_given -= 1;
+                initial.extend(args.by_ref().map(PathBuf::from));
+                continue;
+            }
+            // Not a file (R7: `--help` was opened as one).
+            Some(o) if o.starts_with('-') && o.len() > 1 && !Path::new(o).exists() => {
+                console::error(&format!("nerka-gui: unknown option {o}\n\n{USAGE}"));
+                std::process::exit(2);
+            }
             _ => {
+                options_given -= 1;
                 initial.push(PathBuf::from(a));
                 continue;
             }
@@ -206,21 +262,7 @@ fn main() -> eframe::Result {
         preset = args.next().map(|v| (tag, v.to_string_lossy().into_owned()));
     }
     // Plain `nerka-gui FILE…`: the window focused last opens them.
-    let plain = preset.is_none()
-        && packs.is_empty()
-        && startup.is_empty()
-        && searches.is_empty()
-        && highlight.is_empty()
-        && params.is_empty()
-        && signals.is_empty()
-        && plotted.is_empty()
-        && fibex.is_empty()
-        && markers.is_empty()
-        && cursors.is_empty()
-        && !show_library
-        && preset_file.is_none()
-        && window_name.is_none();
-    if plain && !new_window && !initial.is_empty() && instance::hand_off(&initial) {
+    if options_given == 0 && !initial.is_empty() && instance::hand_off(&initial) {
         return Ok(());
     }
     let options = eframe::NativeOptions {
@@ -522,8 +564,8 @@ impl PreviewCache {
     }
 }
 
-/// One open file (or several of one kind, one after another) with its own
-/// filter, view positions and bookmarks.
+/// One open file (or several, one after another or merged by time) with
+/// its own filter, view positions and bookmarks.
 /// A tab's files, read: the source and the paths in the order read.
 type Opened = (Box<dyn LogSource>, Vec<PathBuf>);
 
@@ -537,6 +579,9 @@ struct Tab {
     /// The files turned out to be of different kinds: why. The app then
     /// opens them as separate tabs.
     mixed: Option<String>,
+    /// The files couldn't be opened: why. The tab is closed and the app
+    /// shows it (`App::open_errors`).
+    open_error: Option<String>,
     file: Option<Arc<dyn LogSource>>,
     /// The files being read, and their paths in the order read.
     loading: Option<Job<Opened>>,
@@ -1090,8 +1135,9 @@ impl Tab {
         Self::open_many(ctx, vec![path], prefs, None)
     }
 
-    /// One tab for `paths`: one file, or several of one kind one after
-    /// another (nerka_core::open_many checks the kind).
+    /// One tab for `paths`: one file, or several one after another
+    /// (nerka_core::open_many checks they go together: text with text, JSON
+    /// with JSON of the same keys, messages of any protocols mixed).
     /// `fibex` describes DLT non-verbose messages.
     fn open_many(
         ctx: &egui::Context,
@@ -1111,6 +1157,7 @@ impl Tab {
             paths,
             part_files: Vec::new(),
             mixed: None,
+            open_error: None,
             file: None,
             // Files that know their times (DLT, captures) in the order they
             // start, their lines interleaved by time if that was last chosen.
@@ -1337,6 +1384,7 @@ impl Tab {
         options.disabled_for = self.disabled_for.clone();
         self.file = None;
         self.reopen_at = Some(line);
+        self.open_error = None;
         self.loading = Some(self.open_job(ctx, ps, options));
     }
 
@@ -1373,6 +1421,7 @@ impl Tab {
         options.fibex = fibex;
         options.records = self.records.clone();
         options.disabled_for = self.disabled_for.clone();
+        self.open_error = None;
         self.loading = Some(self.open_job(ctx, ps, options));
     }
 
@@ -1652,8 +1701,17 @@ impl Tab {
                             return false;
                         }
                         Err(e) => {
-                            let src = std::error::Error::source(&e).map(|s| format!(" ({s})")).unwrap_or_default();
-                            self.status = format!("Cannot open {}: {e}{src}", self.path.display());
+                            // One of several files names itself (R7).
+                            let why = match &e {
+                                nerka_core::Error::Open { .. } => e.to_string(),
+                                e => {
+                                    let src =
+                                        std::error::Error::source(e).map(|s| format!(" ({s})")).unwrap_or_default();
+                                    format!("{}: {e}{src}", self.path.display())
+                                }
+                            };
+                            self.status = format!("Cannot open {why}");
+                            self.open_error = Some(why);
                             return false;
                         }
                     }
@@ -1667,7 +1725,7 @@ impl Tab {
                 i += 1;
                 continue;
             };
-            let (_, ticket, _) = self.stage_jobs.remove(i);
+            let (stage, ticket, _) = self.stage_jobs.remove(i);
             // Where the view is, before the filter's lines change.
             let cur = self.current_line();
             match self.session.finish(ticket, r) {
@@ -1692,6 +1750,8 @@ impl Tab {
                 }
                 Ok(Finished::Done(Stage::Colors)) => self.colors_shown = self.colors_set.clone(),
                 Ok(Finished::Ignored) => {}
+                // The failed filter's lines aren't the old filter's (R5).
+                Err(e) if stage == Stage::Filter => self.status = format!("Filter failed: {e}; every line is shown"),
                 Err(e) => self.status = format!("Failed: {e}"),
             }
             // A filter result lets the search and the colours run over it.
@@ -2838,6 +2898,9 @@ struct App {
     prefs: SearchPrefs,
     /// Shown when no tab is open (e.g. why the last open failed).
     status: String,
+    /// Why files couldn't be opened, in a window until OK (review
+    /// 2026-11-09, R7: the reason was the cut-off end of the status line).
+    open_errors: Vec<String>,
     focus_search: bool,
     window_title: String,
     /// Query packs (search manager) and where they come from besides the
@@ -3532,7 +3595,8 @@ impl App {
     }
 
     /// Files opened together become one view, one after another (owner,
-    /// 2026-10-20), if they are of one kind; otherwise separate tabs. A view
+    /// 2026-10-20), if they go together (`open_many`); otherwise separate
+    /// tabs. A view
     /// already open with the same files is switched to.
     fn open_files(&mut self, ctx: &egui::Context, paths: Vec<PathBuf>) {
         if paths.is_empty() {
@@ -3604,6 +3668,9 @@ impl App {
                 continue;
             }
             let msg = std::mem::take(&mut self.tabs[i].status);
+            if let Some(why) = self.tabs[i].open_error.take() {
+                self.open_errors.push(why);
+            }
             self.close(i);
             match self.tab() {
                 Some(t) => t.status = msg,
@@ -3914,8 +3981,9 @@ impl App {
             .default_width(640.0)
             .show(ctx, |ui| {
                 ui.weak(
-                    "The tab shows these files as one view, one after another in this order. They must be of one \
-                     kind: plain text with plain text, DLT with DLT and captures. In a capture, only the \
+                    "The tab shows these files as one view, one after another in this order. Plain text opens only \
+                     with plain text, and JSON with JSON of the same keys; DLT files and captures mix, whatever \
+                     their protocols (messages of other protocols share one table). In a capture, only the \
                      highlighted protocols are read (Settings → Captures: protocols says which datagrams are whose).",
                 );
                 ui.separator();
@@ -4049,6 +4117,29 @@ impl App {
     }
 
     /// F1 / the About button: name, version, licence and where to find it.
+    /// Files that couldn't be opened: each with its whole reason, wrapped.
+    fn open_errors_dialog(&mut self, ctx: &egui::Context) {
+        if self.open_errors.is_empty() {
+            return;
+        }
+        let mut ok = false;
+        egui::Window::new("Cannot open")
+            .collapsible(false)
+            .resizable(false)
+            .default_width(520.0)
+            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+            .show(ctx, |ui| {
+                for why in &self.open_errors {
+                    ui.add(egui::Label::new(egui::RichText::new(why).color(ui.visuals().error_fg_color)).wrap());
+                }
+                ui.add_space(4.0);
+                ok = ui.button("OK").clicked() || ui.input(|i| i.key_pressed(Key::Escape) || i.key_pressed(Key::Enter));
+            });
+        if ok {
+            self.open_errors.clear();
+        }
+    }
+
     fn about_dialog(&mut self, ctx: &egui::Context) {
         if !self.about {
             return;
@@ -4139,6 +4230,7 @@ impl App {
         self.files_window(&ctx);
         self.records_window(&ctx);
         self.about_dialog(&ctx);
+        self.open_errors_dialog(&ctx);
         self.settings_window(&ctx);
         self.bundle_windows(&ctx);
         if let Some(t) = self.tabs.get_mut(self.active)
@@ -4586,6 +4678,7 @@ impl App {
                             if p.name.as_deref() == Some(name.as_str()) {
                                 p.name = None;
                             }
+                            p.drafts.remove(&name);
                         }
                     }
                 }

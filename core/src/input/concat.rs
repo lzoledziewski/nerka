@@ -61,9 +61,12 @@ fn has_proto(s: &dyn LogSource) -> bool {
     !s.columns().is_empty() && s.schema().iter().any(|f| f.name == PROTO_FIELD.name)
 }
 
-/// A readable kind for messages: plain text, DLT, or another table.
+/// A readable kind for messages: plain text, text records, JSON, DLT, or
+/// another table.
 fn kind_name(s: &dyn LogSource) -> &'static str {
     match s.columns() {
+        [] if s.format() == "JSON" => "JSON",
+        [] if s.format().starts_with("text records") => "text records",
         [] => "plain text",
         c if c == super::dlt::COLUMNS => "DLT",
         _ => "a table of other columns",
@@ -87,13 +90,18 @@ impl Concat {
         if let (true, Some(i)) = (differ, lone) {
             let (first, k) = (&parts[i], kind(parts[i].as_ref()));
             let other = parts.iter().find(|p| kind(p.as_ref()) != k).expect("they differ");
-            return Err(Error::MixedKinds(format!(
-                "{} is {} but {} is {}: only files of one kind open as one view",
-                file_name(first.name()),
-                kind_name(first.as_ref()),
-                file_name(other.name()),
-                kind_name(other.as_ref())
-            )));
+            let (a, b) = (file_name(first.name()), file_name(other.name()));
+            let (ka, kb) = (kind_name(first.as_ref()), kind_name(other.as_ref()));
+            // Of one kind with other fields (JSON with other keys): say so
+            // (review 2026-11-09, R17: "is JSON but … is JSON").
+            return Err(Error::MixedKinds(if ka == kb {
+                let what = if ka == "JSON" { "keys" } else { "fields" };
+                format!(
+                    "{a} and {b} are both {ka} but with other {what}: only files with the same {what} open as one view"
+                )
+            } else {
+                format!("{a} is {ka} but {b} is {kb}: only files of one kind open as one view")
+            }));
         }
         // Columns differ: the mixed layout. Only fields differ (a `.dlt`
         // file and a capture of DLT): the columns stay.
@@ -381,7 +389,7 @@ pub fn open_many(
 ) -> Result<Box<dyn LogSource>> {
     let mut parts = Vec::with_capacity(paths.len());
     for p in paths {
-        parts.push(super::open_with(p, options, progress)?);
+        parts.push(super::open_with(p, options, progress).map_err(|e| Error::opening(p, e))?);
     }
     if parts.len() == 1 {
         return Ok(parts.pop().expect("one"));
@@ -433,7 +441,7 @@ fn open_sorted(
 ) -> Result<Sorted> {
     let mut parts = Vec::with_capacity(paths.len());
     for p in paths {
-        parts.push((p.clone(), super::open_with(p, options, progress)?));
+        parts.push((p.clone(), super::open_with(p, options, progress).map_err(|e| Error::opening(p, e))?));
     }
     let starts: Option<Vec<f64>> = parts.iter().map(|(_, s)| start_time(s.as_ref())).collect();
     let timed = starts.is_some();

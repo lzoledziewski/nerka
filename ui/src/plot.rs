@@ -111,23 +111,28 @@ pub struct SavedPlot {
     pub name: String,
     /// Kept for this session only (not on disk).
     pub session: bool,
-    /// The tab's plot is this one, changed since it was saved or kept.
+    /// The tab has changes to it that aren't kept (its current plot, or a
+    /// draft it switched away from).
     pub changed: bool,
 }
 
 /// What the plot's list and menu ask for.
 #[derive(Debug, Clone, PartialEq)]
 pub enum PlotAction {
-    /// Switch to the kept plot of this name (the current one is kept as it
-    /// is first).
+    /// Switch to the kept plot of this name, or to this tab's draft of it
+    /// (the current one's changes stay a draft of this tab).
     Use(String),
-    /// Keep this plot by a name; `store` writes it to disk too.
+    /// Keep this plot by a new name; `store` writes it to disk too.
     Keep { name: String, store: bool },
-    /// A blank plot instead: no lanes, no name (a kept one is kept as it
-    /// is first).
+    /// A blank plot instead: no lanes, no name (the current one's changes
+    /// stay a draft of this tab).
     Blank,
-    /// Write the current plot to its kept entry (and its file).
+    /// Write the current plot to its kept entry, for this session only.
+    Update,
+    /// Write the current plot to its kept entry and its file.
     Save,
+    /// Drop this tab's changes to the current plot: back to it as kept.
+    Revert,
     /// Delete the kept plot of this name (and its file).
     Delete(String),
 }
@@ -208,6 +213,10 @@ pub struct PlotState {
     capture: Option<Capture>,
     /// Lanes that show their events.
     pub events: std::collections::HashSet<String>,
+    /// This tab's unkept changes to kept plots, by name, for the session: a
+    /// kept plot changes only on Keep or Save (owner, 2026-11-09: U5), and
+    /// switching back shows the draft (`crate::plots`).
+    pub drafts: HashMap<String, nerka_core::plot::PlotLayout>,
     /// Visible x range; none: everything.
     range: Option<(f64, f64)>,
     /// Lanes' y axes (absent: [`YAxis::All`]).
@@ -1079,11 +1088,18 @@ pub fn plot_panel(ui: &mut egui::Ui, state: &mut PlotState, src: Source<'_>) -> 
 
     // ----- lifecycles: a line where each starts (red after one that ended
     // badly), labelled at the top of the lanes (owner, 2026-11-06); only
-    // those plotted (owner, 2026-11-07) -----
-    // Labels only where they don't run into the one before.
-    let mut label_end = f32::NEG_INFINITY;
-    for def in signals.lifecycles().filter(|d| state.is_plotted(d.name())) {
+    // those plotted (owner, 2026-11-07). Each plotted lifecycle has a row of
+    // labels and a dash of its own, so ECUs that boot together are all
+    // named (owner, 2026-11-09: U1); a label that would run into the one
+    // before in its row is left out, and the hover names every start. -----
+    let plotted: Vec<_> = signals.lifecycles().filter(|d| state.is_plotted(d.name())).collect();
+    let label_font = FontId::monospace(9.0);
+    let label_rows = plotted.len().min(LIFE_ROWS).min(((axis_y - plot.min.y) / LIFE_ROW) as usize).max(1);
+    let mut starts: Vec<(f32, String)> = Vec::new();
+    let mut labels: Vec<(usize, f32, f32, String, Color32)> = Vec::new();
+    for (k, def) in plotted.iter().enumerate() {
         let Some(l) = def.cached(file) else { continue };
+        let dash = 2.0 + 2.0 * (k % LIFE_ROWS) as f32;
         for (i, life) in l.lives.iter().enumerate() {
             let Some(x) = clock.at(file, clock_series.as_ref(), life.first).filter(|x| (x0..=x1).contains(x)) else {
                 continue;
@@ -1092,15 +1108,25 @@ pub fn plot_panel(ui: &mut egui::Ui, state: &mut PlotState, src: Source<'_>) -> 
             let c = if bad { red } else { weak };
             let px = to_px(x, x0, x1);
             let line = [pos2(px, plot.min.y), pos2(px, axis_y)];
-            painter.extend(egui::Shape::dashed_line(&line, Stroke::new(1.0, c), 2.0, 2.0));
-            if px > label_end + 4.0 {
-                let label = format!("{} #{}", def.name(), life.number);
-                let r =
-                    painter.text(pos2(px + 2.0, plot.min.y + 1.0), Align2::LEFT_TOP, label, FontId::monospace(9.0), c);
-                label_end = r.max.x;
-            }
+            painter.extend(egui::Shape::dashed_line(&line, Stroke::new(1.0, c), dash, 2.0));
+            let label = format!("{} #{}", def.name(), life.number);
+            starts.push((px, format!("{label} starts on line {}", life.first + 1)));
+            let w = painter.layout_no_wrap(label.clone(), label_font.clone(), c).size().x;
+            labels.push((k, px, w, label, c));
         }
     }
+    let spans: Vec<(usize, f32, f32)> = labels.iter().map(|(k, px, w, ..)| (*k, *px, *w)).collect();
+    for ((_, px, _, label, c), row) in labels.into_iter().zip(life_label_rows(&spans, label_rows)) {
+        if let Some(row) = row {
+            let at = pos2(px + 2.0, plot.min.y + 1.0 + row as f32 * LIFE_ROW);
+            painter.text(at, Align2::LEFT_TOP, label, label_font.clone(), c);
+        }
+    }
+    let life_tip = response.hover_pos().filter(|p| plot.contains(*p)).and_then(|p| {
+        let near: Vec<&str> =
+            starts.iter().filter(|(px, _)| (px - p.x).abs() <= 3.0).map(|(_, t)| t.as_str()).collect();
+        (!near.is_empty()).then(|| near.join("\n"))
+    });
 
     // ----- cursor -----
     if let Some(cx) = clock.at(file, clock_series.as_ref(), cursor).filter(|x| (x0..=x1).contains(x)) {
@@ -1109,9 +1135,12 @@ pub fn plot_panel(ui: &mut egui::Ui, state: &mut PlotState, src: Source<'_>) -> 
     }
 
     // ----- hover and click: the lane's value at the pointer -----
-    if let (Some(p), Some((k, _))) = (response.hover_pos(), hovered_lane)
-        && plot.contains(p)
+    let lane_at = response.hover_pos().filter(|p| plot.contains(*p)).zip(hovered_lane);
+    if lane_at.is_none()
+        && let Some(tip) = life_tip
     {
+        response.on_hover_text_at_pointer(tip);
+    } else if let Some((p, (k, _))) = lane_at {
         let lane = &data.lanes[k];
         let x = x0 + (p.x - plot.min.x) as f64 / w * (x1 - x0);
         let at = lane.xs.partition_point(|&v| v <= x).checked_sub(1);
@@ -1136,6 +1165,10 @@ pub fn plot_panel(ui: &mut egui::Ui, state: &mut PlotState, src: Source<'_>) -> 
                 }
             }
             None => tip.push_str(&format!("@{}: no event yet", lane.name)),
+        }
+        if let Some(life) = life_tip {
+            tip.push('\n');
+            tip.push_str(&life);
         }
         let clicked = response.clicked();
         response.on_hover_text_at_pointer(tip);
@@ -1196,8 +1229,27 @@ fn plots_list(ui: &mut egui::Ui, state: &mut PlotState, saved: &[SavedPlot]) -> 
             } else {
                 (format!("Save '{name}'"), "Overwrites its file")
             };
+            // A kept plot changes only here (owner, 2026-11-09: U5); until
+            // then the changes are this tab's draft, marked `*`.
+            if c.session
+                && ui
+                    .add_enabled(c.changed, egui::Button::new(format!("Keep changes to '{name}'")))
+                    .on_hover_text("For this session only")
+                    .clicked()
+            {
+                action = Some(PlotAction::Update);
+                ui.close();
+            }
             if ui.add_enabled(c.changed || c.session, egui::Button::new(text)).on_hover_text(tip).clicked() {
                 action = Some(PlotAction::Save);
+                ui.close();
+            }
+            if ui
+                .add_enabled(c.changed, egui::Button::new(format!("Revert '{name}'")))
+                .on_hover_text("Drop this tab's changes: back to the plot as kept")
+                .clicked()
+            {
+                action = Some(PlotAction::Revert);
                 ui.close();
             }
             let sure = state.confirm_delete.as_deref() == Some(&name);
@@ -1427,6 +1479,29 @@ fn stack_tags(spans: &[(f32, f32)], rows: usize) -> Vec<usize> {
             };
             ends[row] = px + w + 1.0;
             row
+        })
+        .collect()
+}
+
+/// Rows of lifecycle labels at most, and the height of one.
+const LIFE_ROWS: usize = 4;
+const LIFE_ROW: f32 = 11.0;
+
+/// The row of each lifecycle label `(lifecycle, px, width)`, or `None` where
+/// it would run into the label before it in that row: lifecycle `k` has row
+/// `k` (the last of `rows` shared by the rest), so two lifecycles starting
+/// at one x are both labelled (U1).
+fn life_label_rows(spans: &[(usize, f32, f32)], rows: usize) -> Vec<Option<usize>> {
+    let rows = rows.max(1);
+    let mut ends = vec![f32::NEG_INFINITY; rows];
+    spans
+        .iter()
+        .map(|&(k, px, w)| {
+            let row = k.min(rows - 1);
+            (px > ends[row] + 4.0).then(|| {
+                ends[row] = px + 2.0 + w;
+                row
+            })
         })
         .collect()
 }
@@ -2231,6 +2306,17 @@ mod tests {
         // More than the rows: the one that frees first.
         assert_eq!(stack_tags(&[(0.0, 20.0), (1.0, 20.0), (2.0, 20.0)], 2), [0, 1, 0]);
         assert_eq!(stack_tags(&[(0.0, 20.0), (1.0, 20.0)], 0), [0, 0]);
+    }
+
+    #[test]
+    fn every_plotted_lifecycle_has_its_labels() {
+        // Two ECUs booting at one x: both named, a row each (U1).
+        assert_eq!(life_label_rows(&[(0, 10.0, 30.0), (1, 10.0, 30.0)], 4), [Some(0), Some(1)]);
+        // In its row, a label that would run into the one before is left out.
+        assert_eq!(life_label_rows(&[(0, 10.0, 30.0), (0, 20.0, 30.0), (0, 60.0, 30.0)], 4), [Some(0), None, Some(0)]);
+        // More lifecycles than rows: the last row is shared.
+        assert_eq!(life_label_rows(&[(0, 0.0, 9.0), (1, 0.0, 9.0), (2, 0.0, 9.0)], 2), [Some(0), Some(1), None]);
+        assert_eq!(life_label_rows(&[(3, 0.0, 9.0)], 0), [Some(0)]);
     }
 
     /// The plot's ✖ closes it; with nothing plotted it says how to plot.

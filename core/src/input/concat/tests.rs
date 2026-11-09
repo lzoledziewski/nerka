@@ -133,7 +133,27 @@ fn open_many_reads_files_in_order() {
     let s = open_many(&[b.clone(), a.clone()], &o, &p).unwrap();
     assert_eq!((0..3).map(|l| s.line_text(l).unwrap().into_owned()).collect::<Vec<_>>(), ["three", "one", "two"]);
     assert_eq!(open_many(std::slice::from_ref(&a), &o, &p).unwrap().part_files(), [(0, 2)]);
-    assert!(open_many(&[a, d], &o, &p).is_err());
+    assert!(open_many(&[a.clone(), d], &o, &p).is_err());
+
+    // A file that can't be opened is named (review 2026-11-09, R7: the
+    // GUI named the first file); its reason is in the text.
+    let missing = dir.join("nope.log");
+    let Err(e) = open_many(&[a.clone(), missing.clone()], &o, &p) else { panic!("a missing file") };
+    assert!(matches!(&e, crate::Error::Open { path, .. } if *path == missing), "{e:?}");
+    assert!(e.to_string().starts_with(&format!("{}: I/O error (", missing.display())), "{e}");
+    let Err(e) = open_many_by_time(&[missing.clone(), a.clone()], &o, &p) else { panic!("a missing file") };
+    assert!(matches!(&e, crate::Error::Open { path, .. } if *path == missing), "{e:?}");
+
+    // JSON files with other keys: said so (R17).
+    let (j1, j2) = (dir.join("a.jsonl"), dir.join("b.jsonl"));
+    std::fs::write(&j1, "{\"level\":\"INFO\",\"msg\":\"one\"}\n").unwrap();
+    std::fs::write(&j2, "{\"sev\":3,\"text\":\"two\"}\n").unwrap();
+    let Err(e) = open_many(&[j1, j2], &o, &p) else { panic!("other keys") };
+    assert_eq!(
+        e.to_string(),
+        "a.jsonl and b.jsonl are both JSON but with other keys: only files with the same keys open as one view"
+    );
+    assert!(matches!(e, crate::Error::MixedKinds(_)));
     std::fs::remove_dir_all(&dir).ok();
 }
 

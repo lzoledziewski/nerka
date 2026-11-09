@@ -1,10 +1,13 @@
 //! Kept plots, shared by the tabs (owner, 2026-10-28: switch between plots
 //! without building them again, save them and use them again). A plot has
 //! no name until it is kept for the session (Keep, `•`) or saved to disk
-//! (Save, (`<config>/nerka/plots`,
-//! format in `nerka_core::plot`). Switching keeps the current plot as it is
-//! in its entry first, so nothing is lost; a saved plot changed since it was
-//! written is marked `*` until it is saved.
+//! (Save, `<config>/nerka/plots`, format in `nerka_core::plot`).
+//!
+//! A kept plot is like a preset (owner, 2026-11-09: U5, reversing
+//! 2026-10-28's "switching keeps the current plot in its entry"): it
+//! changes only on Keep changes or Save. Changes made in a tab are that
+//! tab's draft, marked `*`; switching away keeps the draft in the tab for
+//! the session, switching back shows it, Revert drops it.
 
 use crate::plot::{PlotAction, PlotState, SavedPlot};
 use nerka_core::plot::{self, PlotLayout};
@@ -52,60 +55,75 @@ impl Plots {
         self.entries.iter().position(|e| e.layout.name == name)
     }
 
-    /// The list a tab's plot shows: a saved plot is marked changed when it
-    /// differs from its file (`state`'s own one as `state` shows it).
+    /// The list a tab's plot shows: a plot is marked changed when the tab
+    /// has changes to it that aren't kept (its current plot, or a draft).
     pub fn listed(&self, state: &PlotState) -> Vec<SavedPlot> {
         self.entries
             .iter()
             .map(|e| {
                 let name = &e.layout.name;
-                let changed = e.file.as_ref().is_some_and(|(_, written)| {
-                    if state.name.as_ref() == Some(name) {
-                        *written != state.layout(name)
-                    } else {
-                        *written != e.layout
-                    }
-                });
+                let changed = if state.name.as_ref() == Some(name) {
+                    state.layout(name) != e.layout
+                } else {
+                    state.drafts.contains_key(name)
+                };
                 SavedPlot { name: name.clone(), session: e.file.is_none(), changed }
             })
             .collect()
     }
 
     /// Do what a tab's plot asked, on `state` (that tab's plot). Returns the
-    /// name of a deleted plot (other tabs showing it forget its name).
+    /// name of a deleted plot (other tabs showing it forget its name and
+    /// their drafts of it).
     pub fn act(&mut self, state: &mut PlotState, action: PlotAction) -> Result<Option<String>, String> {
         match action {
             PlotAction::Use(name) => {
-                self.keep_current(state);
                 let i = self.find(&name).ok_or(format!("no kept plot '{name}'"))?;
-                state.apply(&self.entries[i].layout);
+                self.stash_draft(state);
+                let layout = state.drafts.remove(&name).unwrap_or_else(|| self.entries[i].layout.clone());
+                state.apply(&layout);
                 Ok(None)
             }
             PlotAction::Keep { name, store } => {
                 if self.find(&name).is_some() {
                     return Err(format!("a plot '{name}' is kept already"));
                 }
-                // A plot kept by another name before stays as it was.
-                self.keep_current(state);
+                // A plot kept by another name before stays as it was kept;
+                // the changes go to the new one.
                 let layout = state.layout(&name);
                 let file = if store { Some(self.write(&layout, None)?) } else { None };
+                if let Some(old) = state.name.take() {
+                    state.drafts.remove(&old);
+                }
                 self.entries.push(Entry { layout, file });
                 self.sort();
                 state.name = Some(name);
                 Ok(None)
             }
             PlotAction::Blank => {
-                self.keep_current(state);
+                self.stash_draft(state);
                 state.blank();
                 Ok(None)
             }
-            PlotAction::Save => {
+            PlotAction::Update | PlotAction::Save => {
                 let name = state.name.clone().ok_or("this plot isn't kept: ⋮ → Keep this plot as…")?;
                 let i = self.find(&name).ok_or(format!("no kept plot '{name}'"))?;
                 let layout = state.layout(&name);
-                let path = self.entries[i].file.as_ref().map(|(p, _)| p.clone());
-                let file = self.write(&layout, path)?;
-                self.entries[i] = Entry { layout, file: Some(file) };
+                let file = if action == PlotAction::Save {
+                    let path = self.entries[i].file.as_ref().map(|(p, _)| p.clone());
+                    Some(self.write(&layout, path)?)
+                } else {
+                    self.entries[i].file.clone()
+                };
+                self.entries[i] = Entry { layout, file };
+                state.drafts.remove(&name);
+                Ok(None)
+            }
+            PlotAction::Revert => {
+                let name = state.name.clone().ok_or("this plot isn't kept")?;
+                let i = self.find(&name).ok_or(format!("no kept plot '{name}'"))?;
+                state.drafts.remove(&name);
+                state.apply(&self.entries[i].layout);
                 Ok(None)
             }
             PlotAction::Delete(name) => {
@@ -114,15 +132,22 @@ impl Plots {
                     std::fs::remove_file(path).map_err(|e| format!("{}: {e}", path.display()))?;
                 }
                 self.entries.remove(i);
+                state.drafts.remove(&name);
                 Ok(Some(name))
             }
         }
     }
 
-    /// `state` is about to show another plot: keep it in its entry.
-    fn keep_current(&mut self, state: &PlotState) {
-        if let Some(i) = state.name.as_deref().and_then(|n| self.find(n)) {
-            self.entries[i].layout = state.layout(&self.entries[i].layout.name);
+    /// `state` is about to show another plot: its changes to the kept plot
+    /// it shows stay with the tab as a draft, the entry as it was.
+    fn stash_draft(&self, state: &mut PlotState) {
+        let Some(name) = state.name.clone() else { return };
+        let Some(i) = self.find(&name) else { return };
+        let current = state.layout(&name);
+        if current == self.entries[i].layout {
+            state.drafts.remove(&name);
+        } else {
+            state.drafts.insert(name, current);
         }
     }
 
@@ -163,7 +188,7 @@ mod tests {
         assert_eq!(plots.entries.len(), 1, "a blank plot isn't kept by itself");
         s.toggle("temp");
         plots.act(&mut s, PlotAction::Keep { name: "temps".into(), store: false }).unwrap();
-        assert!(plots.listed(&s).iter().all(|p| p.session && !p.changed), "session plots aren't marked changed");
+        assert!(plots.listed(&s).iter().all(|p| p.session && !p.changed), "nothing changed since kept");
 
         // Back to "drive": as it was; "temps" kept with its lane.
         plots.act(&mut s, PlotAction::Use("drive".into())).unwrap();
@@ -175,6 +200,54 @@ mod tests {
         assert_eq!(plots.act(&mut s, PlotAction::Delete("temps".into())), Ok(Some("temps".into())));
         assert_eq!(plots.listed(&s).iter().map(|p| p.name.as_str()).collect::<Vec<_>>(), ["drive"]);
         assert!(plots.act(&mut s, PlotAction::Keep { name: "drive".into(), store: false }).is_err());
+    }
+
+    /// A kept plot is a preset (owner, 2026-11-09: U5): a change without
+    /// Keep changes leaves it as kept; the tab keeps its draft, marked, and
+    /// shows it again; Revert drops it; Keep changes writes it.
+    #[test]
+    fn a_kept_plot_changes_only_on_keep() {
+        let mut plots = Plots::default();
+        let mut a = state_with(&["speed"]);
+        plots.act(&mut a, PlotAction::Keep { name: "drive".into(), store: false }).unwrap();
+        a.toggle("rpm");
+        assert!(plots.listed(&a)[0].changed, "the tab's change is marked");
+        plots.act(&mut a, PlotAction::Blank).unwrap();
+        assert_eq!(plots.entries[0].layout.lanes.len(), 1, "the kept plot is as kept");
+        assert!(plots.listed(&a)[0].changed, "the draft is marked after switching away");
+
+        // Another tab uses the plot as kept, not the first tab's draft.
+        let mut b = PlotState::default();
+        plots.act(&mut b, PlotAction::Use("drive".into())).unwrap();
+        assert_eq!(b.plotted, ["speed"]);
+        assert!(!plots.listed(&b)[0].changed);
+
+        // Back in the first tab: the draft; Revert: as kept.
+        plots.act(&mut a, PlotAction::Use("drive".into())).unwrap();
+        assert_eq!(a.plotted, ["speed", "rpm"]);
+        plots.act(&mut a, PlotAction::Revert).unwrap();
+        assert_eq!(a.plotted, ["speed"]);
+        assert!(a.drafts.is_empty() && !plots.listed(&a)[0].changed);
+
+        // Keep changes: the entry changes, the draft is gone.
+        a.toggle("temp");
+        plots.act(&mut a, PlotAction::Update).unwrap();
+        assert_eq!(plots.entries[0].layout.lanes.len(), 2);
+        assert!(plots.entries[0].file.is_none(), "kept for the session only");
+        assert!(!plots.listed(&a)[0].changed);
+        // A change undone by hand isn't a draft.
+        a.toggle("rpm");
+        a.toggle("rpm");
+        plots.act(&mut a, PlotAction::Blank).unwrap();
+        assert!(a.drafts.is_empty());
+
+        // Kept by a new name: the old one stays as kept, no draft of it.
+        plots.act(&mut a, PlotAction::Use("drive".into())).unwrap();
+        a.toggle("oil");
+        plots.act(&mut a, PlotAction::Keep { name: "drive2".into(), store: false }).unwrap();
+        assert_eq!(plots.entries[0].layout.lanes.len(), 2);
+        assert_eq!(plots.entries[1].layout.lanes.len(), 3);
+        assert!(plots.listed(&a).iter().all(|p| !p.changed));
     }
 
     #[test]

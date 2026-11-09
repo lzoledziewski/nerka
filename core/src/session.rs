@@ -345,7 +345,10 @@ impl Session {
 
     /// Take a task's outcome. A filter result makes the search and the
     /// colours run again over it. An error (not a cancel) is returned so
-    /// the caller can show it; the stage then has no result.
+    /// the caller can show it; the stage then has no result, and a failed
+    /// filter takes the search's and the colours' results along (they were
+    /// found inside the previous filter's lines) without running them again
+    /// over lines nobody chose. It runs again when its query changes.
     pub fn finish(&mut self, ticket: u64, outcome: Result<Output>) -> Result<Finished> {
         let stage = if self.filter.running == Some(ticket) {
             Stage::Filter
@@ -364,6 +367,15 @@ impl Session {
             }
             Err(e) => {
                 self.slot_running(stage, None);
+                match stage {
+                    Stage::Filter => {
+                        self.filter.result = None;
+                        self.search.result = None;
+                        self.colors.result = None;
+                    }
+                    Stage::Search => self.search.result = None,
+                    Stage::Colors => self.colors.result = None,
+                }
                 return Err(e);
             }
         };
