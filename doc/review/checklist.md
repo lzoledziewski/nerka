@@ -33,6 +33,7 @@ regression over 15 %; **S3** debt that makes the next change harder;
 | ARCH-6 | New input formats implement `LogSource` / `Protocol`; the engine has no format `match` | read `engine/`, `input/mod.rs::open_with` |
 | ARCH-7 | Every long operation takes `&Progress` and checks `is_cancelled()` per chunk | read new loops over lines / bytes |
 | ARCH-8 | Public API of `nerka-core` (`lib.rs` re-exports) matches what CLI and GUI need; module docs current | read `core/src/lib.rs` header against the module list |
+| ARCH-10 | A source that wraps others (`Concat`, its parts, `Merged`) answers every field as its parts do, for every layout (same kind, other fields, mixed, mixed with equal fields) | a test that compares each line's fields by name with the part's own; expected values, since both paths share the mapping |
 | ARCH-9 | Decisions recorded: a change against `doc/` decisions links the owner's decision | `doc/status.md`, `doc/architecture-analysis.md` |
 
 ## CODE — correctness and robustness (gate for S1)
@@ -70,6 +71,7 @@ regression over 15 %; **S3** debt that makes the next change harder;
 | HUX-5 | Messages use the same words as the docs (filter / search / query / pack / signal / lifecycle / check) | read new strings |
 | HUX-6 | README's quick start works from a fresh clone | follow it |
 | HUX-7 | A setting the user made never loses silently to a default (rules, ports, protocols turned off) | try a user rule on a port a default rule has |
+| HUX-8 | What a reader drops is reported: bytes skipped, messages not read, fields past a cap (`net.*` senders) | open a file with garbage in it, and a capture past the cap; `nerka open` and the GUI's status must say so |
 
 ## AIX — usability for AI agents and scripts (cycle)
 
@@ -82,6 +84,7 @@ regression over 15 %; **S3** debt that makes the next change harder;
 | AIX-5 | Exit status tells "no match" from "error" (grep: 0 / 1 / 2) where a script needs it | `nerka filter … ; echo $?` |
 | AIX-6 | A file's fields can be discovered without the GUI | `nerka open FILE` lists `fields:`; kinds too? |
 | AIX-7 | Status and decisions are split: current state (short) vs history (append-only) | `doc/status.md` structure |
+| AIX-8 | Each file an agent must read fits one read (under 20k tokens), with what must not be missed (pending decisions) near the top | read `doc/status.md` whole with the agent's file tool |
 
 ## SEC — security (gate for S1)
 

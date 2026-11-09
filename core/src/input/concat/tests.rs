@@ -285,3 +285,35 @@ fn messages_of_different_protocols_share_the_mixed_layout() {
     assert_eq!(order, ["DLT", "DLT", "DLT", "SENS", "SENS", "SENS", "SENS"]);
     assert_eq!(run_on(&merged, &q("proto == SENS AND v > 100")).len(), 2);
 }
+
+/// Review 2026-11-09, R1: two captures of different protocols whose fields
+/// are the same (name and kind) but whose columns differ share the mixed
+/// layout; each part's fields must still be found by name (`proto` moves
+/// to the front of the whole's fields, so the ids differ from a part's).
+#[test]
+fn mixed_parts_with_the_same_fields_keep_their_fields() {
+    use crate::input::capture::{self, CaptureOptions};
+    use crate::input::proto::{LoadedProtocol, ksy::KsyProtocol};
+    // The same fields as SENS, other columns, another name and port.
+    let other = SENS
+        .replace("name: SENS", "name: SENB")
+        .replace("41000", "41001")
+        .replace("    - { name: v, width: 5 }\n    - note\n", "    - note\n");
+    assert_ne!(other, SENS);
+    let open = |name: &str, def: &str, port: u16, v: u16, note: &str| -> Box<dyn LogSource> {
+        let defs = vec![LoadedProtocol::new(std::sync::Arc::new(KsyProtocol::parse(def).unwrap()))];
+        let o = CaptureOptions { protocols: defs, ..Default::default() };
+        Box::new(capture::from_bytes(name, pcap_of(&[(100, port, sens(v, note))]), &o).unwrap().0)
+    };
+    let (a, b) = (open("a.pcap", SENS, 41000, 150, "hot"), open("b.pcap", &other, 41001, 20, "ok"));
+    assert_eq!(a.schema(), b.schema(), "the case: equal fields");
+    assert_ne!(a.columns(), b.columns(), "the case: other columns");
+    let all = Concat::new(vec![a, b]).unwrap();
+    assert!(all.is_mixed());
+    assert_eq!(run_on(&all, &q("proto == SENS")), [0]);
+    assert_eq!(run_on(&all, &q("proto == SENB")), [1]);
+    assert_eq!(run_on(&all, &q("v > 100")), [0]);
+    assert_eq!(run_on(&all, &q("note == ok")), [1]);
+    assert_eq!(run_on(&all, &q("net.port == 41001")), [1]);
+    assert_eq!(run_on(&all, &q("file == b.pcap AND v == 20")), [1]);
+}

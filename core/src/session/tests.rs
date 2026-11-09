@@ -194,3 +194,22 @@ fn a_new_source_runs_everything_again() {
     assert!(empty.tasks().is_empty());
     assert_eq!(empty.rows(), 0);
 }
+
+/// Review 2026-11-09, R5: a filter whose task fails leaves the session
+/// without a filter result, as `finish` documents; today the lines of the
+/// filter before it stay, and the search runs inside them.
+#[test]
+#[ignore = "R5: a failed filter keeps the previous filter's lines (doc/review/2026-11-09-findings.md)"]
+fn a_failed_filter_has_no_result() {
+    let mut s = session();
+    let f = q(&s, "level >= ERROR");
+    s.set_filter(Some(f));
+    run(&mut s);
+    assert_eq!(lines(&s), [1, 3]);
+    // Another filter, whose task fails (an error while it runs).
+    let next = q(&s, "level >= WARN");
+    s.set_filter(Some(next));
+    let t = s.tasks().pop().unwrap();
+    assert!(s.finish(t.ticket, Err(crate::Error::Format("failed".into()))).is_err());
+    assert!(s.result().is_none(), "the lines of `level >= ERROR` are still shown: {:?}", lines(&s));
+}

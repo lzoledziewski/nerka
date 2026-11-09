@@ -98,7 +98,9 @@ impl Concat {
         // Columns differ: the mixed layout. Only fields differ (a `.dlt`
         // file and a capture of DLT): the columns stay.
         let mixed = parts.iter().any(|p| p.columns() != first.columns());
-        let mapped = parts.iter().any(|p| p.schema() != first.schema());
+        // The mixed layout puts `proto` first, so a part's field ids are
+        // never the whole's there, even when every part has the same fields.
+        let mapped = mixed || parts.iter().any(|p| p.schema() != first.schema());
         // As a capture of several protocols, `proto` first when mixed; then
         // each part's fields (the first part's keep their ids). One of a
         // name already there is the same field when its kind is the same,
