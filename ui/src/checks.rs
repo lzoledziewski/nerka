@@ -2,11 +2,15 @@
 //! their results on the tab's file (overall and per lifecycle) and the
 //! evidence, and a form to define one. Core runs them
 //! ([`nerka_core::check`]); the pane shows results and edits definitions
-//! (owner, 2026-11-07: built in small steps with feedback).
+//! (owner, 2026-11-07: built in small steps with feedback). The checks are
+//! the app's; which are on, and whether they run by themselves or on ▶ Run,
+//! is each tab's (owner, 2026-11-09, U2). A check's saved on / off is what
+//! new tabs start with.
 
 use eframe::egui::{self, RichText};
 use nerka_core::check::{CheckDef, CheckResult, Checks, Kind, Op, Part, Test, Verdict, signal_name};
 use nerka_core::{Library, LineNo, LogSource, Signals};
+use std::collections::HashSet;
 
 /// A check's result on the tab's file, or why it couldn't run.
 pub type Outcome = Result<CheckResult, String>;
@@ -34,6 +38,8 @@ struct Form {
     kind: Kind,
     per: String,
     labels: String,
+    /// On in new tabs (its saved flag).
+    default_on: bool,
     error: Option<String>,
     preview: Option<Result<String, String>>,
 }
@@ -209,6 +215,7 @@ impl Default for Form {
             kind: Kind::Issue,
             per: String::new(),
             labels: String::new(),
+            default_on: true,
             error: None,
             preview: None,
         }
@@ -243,6 +250,7 @@ impl Form {
             kind: c.kind(),
             per: c.per().unwrap_or_default().to_owned(),
             labels: c.labels().join(", "),
+            default_on: c.is_on(),
             ..Form::default()
         }
     }
@@ -252,6 +260,14 @@ impl Form {
 pub struct Input<'a> {
     /// The user's checks (every tab has them).
     pub saved: &'a mut Checks,
+    /// The ones on in this tab (lower-case names).
+    pub on: &'a mut HashSet<String>,
+    /// This tab runs them by itself when something changes (else on ▶ Run).
+    pub auto: bool,
+    /// On request: the results are out of date (or there are none yet).
+    pub stale: bool,
+    /// They ran in this tab at least once.
+    pub ran: bool,
     /// Their results on this tab's file (by name), and whether they run.
     pub results: &'a [(String, Outcome)],
     pub running: bool,
@@ -269,7 +285,19 @@ pub struct Output {
     pub changed: bool,
     /// The check the form added or updated (by name).
     pub adopted: Option<String>,
+    /// A check renamed (to the name) or removed (none): every tab's set
+    /// follows.
+    pub renamed: Option<(String, Option<String>)>,
+    /// ▶ Run.
+    pub run: bool,
+    /// Auto switched (this tab, and new tabs from now on).
+    pub auto: Option<bool>,
     pub goto: Option<LineNo>,
+}
+
+/// A check's name as a tab's set holds it.
+fn key(name: &str) -> String {
+    name.to_lowercase()
 }
 
 /// What a check's checkbox, ✎ or − asked for.
@@ -281,7 +309,7 @@ enum Act {
 }
 
 pub fn checks_panel(ui: &mut egui::Ui, st: &mut ChecksUi, input: Input<'_>) -> Output {
-    let Input { saved, results, running, file, signals, library, plot } = input;
+    let Input { saved, on, auto, stale, ran, results, running, file, signals, library, plot } = input;
     let mut out = Output::default();
     // Long names, errors, notes and lines wrap: the pane must fit the room
     // it has (owner, 2026-11-07: with long lines its left part went under
@@ -292,7 +320,7 @@ pub fn checks_panel(ui: &mut egui::Ui, st: &mut ChecksUi, input: Input<'_>) -> O
         ui.weak("ℹ").on_hover_text(
             "Issues (a known problem shows up) and facts (a count, a value) found in the file, overall and per \
              lifecycle. Click a result for the lines that show it. Labels group checks: switch a group on or off \
-             at once.",
+             at once. On / off is this tab's; a new tab starts with each check's \"On in new tabs\" (✎).",
         );
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             out.close = crate::close_button(ui).on_hover_text("Close panel").clicked();
@@ -311,20 +339,41 @@ pub fn checks_panel(ui: &mut egui::Ui, st: &mut ChecksUi, input: Input<'_>) -> O
         .filter(|(_, r)| r.as_ref().is_ok_and(|r| matches!(r.overall().verdict, Verdict::Issue(_))))
         .count();
     let facts = results.iter().filter(|(_, r)| r.as_ref().is_ok_and(|r| r.kind == Kind::Fact)).count();
-    if !saved.is_empty() {
-        ui.label(format!(
-            "{issues} issue{} found · {facts} fact{}",
-            if issues == 1 { "" } else { "s" },
-            if facts == 1 { "" } else { "s" }
-        ));
-    }
+    ui.horizontal_wrapped(|ui| {
+        let mut a = auto;
+        let tip = "Run this tab's checks by themselves when the file, the signals or the checks change. Off: \
+                   only on ▶ Run. New tabs take your last choice";
+        if ui.checkbox(&mut a, "Auto").on_hover_text(tip).changed() {
+            out.auto = Some(a);
+        }
+        if ui.button("▶ Run").on_hover_text("Run this tab's checks now").clicked() {
+            out.run = true;
+        }
+        if !saved.is_empty() && ran {
+            ui.label(format!(
+                "{issues} issue{} found · {facts} fact{}",
+                if issues == 1 { "" } else { "s" },
+                if facts == 1 { "" } else { "s" }
+            ));
+        }
+        if stale && !running {
+            let text = if ran { "Out of date: ▶ Run" } else { "Not run yet: ▶ Run" };
+            ui.colored_label(ui.visuals().warn_fg_color, text).on_hover_text(
+                "The file, the signals or the checks changed since they ran. Signals of checks (@name) come back \
+                 when they run again",
+            );
+        }
+    });
 
     // The form, at the top while open.
     if st.form_open {
         egui::Frame::group(ui.style()).show(ui, |ui| {
             let title = if st.editing.is_some() { "Edit check" } else { "New check" };
             ui.label(RichText::new(title).strong());
-            form_ui(ui, st, saved, &mut out, file, signals, library);
+            // A new check is on in this tab.
+            if let Some(name) = form_ui(ui, st, saved, &mut out, file, signals, library) {
+                on.insert(key(&name));
+            }
         });
     }
 
@@ -354,14 +403,14 @@ pub fn checks_panel(ui: &mut egui::Ui, st: &mut ChecksUi, input: Input<'_>) -> O
                 ui.horizontal(|ui| {
                     match label {
                         Some(l) => {
-                            let mut on = members.iter().all(|c| c.is_on());
-                            let tip = "Switch every check of this label on or off";
+                            let mut all = members.iter().all(|c| on.contains(&key(c.name())));
+                            let tip = "Switch every check of this label on or off in this tab";
                             if ui
-                                .checkbox(&mut on, RichText::new(format!("🏷 {l}")).strong())
+                                .checkbox(&mut all, RichText::new(format!("🏷 {l}")).strong())
                                 .on_hover_text(tip)
                                 .changed()
                             {
-                                act = Some(Act::SwitchLabel(l.clone(), on));
+                                act = Some(Act::SwitchLabel(l.clone(), all));
                             }
                         }
                         None => {
@@ -372,25 +421,25 @@ pub fn checks_panel(ui: &mut egui::Ui, st: &mut ChecksUi, input: Input<'_>) -> O
                 });
             }
             for c in members {
-                ui.indent((label, c.name()), |ui| check_row(ui, st, c, results, running, plot, &mut act));
+                let here = on.contains(&key(c.name()));
+                ui.indent((label, c.name()), |ui| check_row(ui, st, c, here, results, running, plot, &mut act));
             }
         }
     });
     match act {
-        Some(Act::Switch(name, on)) => {
-            if let Some(c) = saved.get(&name) {
-                let c = c.clone().with_on(on);
-                saved.set(c);
-                out.changed = true;
-            }
+        // This tab only: nothing is saved (owner, 2026-11-09, U2).
+        Some(Act::Switch(name, v)) => {
+            switch(on, &name, v);
         }
-        Some(Act::SwitchLabel(label, on)) => {
-            saved.set_label_on(&label, on);
-            out.changed = true;
+        Some(Act::SwitchLabel(label, v)) => {
+            for c in saved.iter().filter(|c| c.labels().contains(&label)) {
+                switch(on, c.name(), v);
+            }
         }
         Some(Act::Remove(name)) => {
             saved.remove(&name);
             out.changed = true;
+            out.renamed = Some((name, None));
         }
         Some(Act::Edit(name)) => {
             if let Some(c) = saved.get(&name) {
@@ -435,6 +484,15 @@ pub fn checks_panel(ui: &mut egui::Ui, st: &mut ChecksUi, input: Input<'_>) -> O
     out
 }
 
+/// Switch `name` on or off in a tab's set.
+fn switch(on: &mut HashSet<String>, name: &str, v: bool) {
+    if v {
+        on.insert(key(name));
+    } else {
+        on.remove(&key(name));
+    }
+}
+
 /// One check: on/off, its name and kind, ✎, −; then its results, overall │
 /// per lifecycle.
 /// Why a check's signal isn't made (its name is taken), from its result.
@@ -442,23 +500,29 @@ fn signal_note<'a>(results: &'a [(String, Outcome)], name: &str) -> Option<&'a s
     results.iter().find(|(n, _)| n == name)?.1.as_ref().ok()?.signal_note.as_deref()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn check_row(
     ui: &mut egui::Ui,
     st: &mut ChecksUi,
     c: &CheckDef,
+    here: bool,
     results: &[(String, Outcome)],
     running: bool,
     plot: &mut crate::plot::PlotState,
     act: &mut Option<Act>,
 ) {
     ui.horizontal_wrapped(|ui| {
-        let mut on = c.is_on();
-        if ui.checkbox(&mut on, "").on_hover_text("On: run on every tab. Off: kept, not run").changed() {
+        let mut on = here;
+        let tip = format!(
+            "On: runs in this tab. Off: kept, not run here. New tabs: {} (✎ → On in new tabs)",
+            if c.is_on() { "on" } else { "off" }
+        );
+        if ui.checkbox(&mut on, "").on_hover_text(tip).changed() {
             *act = Some(Act::Switch(c.name().to_owned(), on));
         }
         let icon = if c.kind() == Kind::Issue { "⚠" } else { "ℹ" };
         let name = RichText::new(format!("{icon} {}", c.name())).strong();
-        ui.label(if c.is_on() { name } else { name.weak() }).on_hover_text(c.spec());
+        ui.label(if here { name } else { name.weak() }).on_hover_text(c.spec());
         ui.weak(c.kind().as_str());
         // Its signal: plotted only when asked (owner, 2026-11-07: a check
         // on, not plotted; low-priority ones would clutter the plot).
@@ -471,8 +535,8 @@ fn check_row(
         );
         let made = signal_note(results, c.name()).is_none();
         let button = egui::Button::selectable(plotted && made, "📈");
-        let r = ui.add_enabled(c.is_on() && made, button).on_hover_text(tip);
-        let r = r.on_disabled_hover_text(signal_note(results, c.name()).unwrap_or("Off: not run"));
+        let r = ui.add_enabled(here && made, button).on_hover_text(tip);
+        let r = r.on_disabled_hover_text(signal_note(results, c.name()).unwrap_or("Off in this tab: not run"));
         if r.clicked() {
             plot.toggle(&sig);
             plot.shown = true;
@@ -493,7 +557,7 @@ fn check_row(
     let result = results.iter().find(|(n, _)| n == c.name()).map(|(_, r)| r);
     ui.horizontal_wrapped(|ui| {
         ui.add_space(22.0);
-        match (c.is_on(), result) {
+        match (here, result) {
             (false, _) => {
                 ui.weak("off");
             }
@@ -537,7 +601,8 @@ fn form_ui(
     file: &dyn LogSource,
     signals: &Signals,
     lib: &Library,
-) {
+) -> Option<String> {
+    let mut added = None;
     let f = &mut st.form;
     egui::Grid::new("check_form_grid").num_columns(2).spacing([8.0, 6.0]).show(ui, |ui| {
         ui.label("Name");
@@ -623,6 +688,12 @@ fn form_ui(
         ui.label("Labels").on_hover_text("Groups: switch every check of a label on or off at once");
         ui.add(egui::TextEdit::singleline(&mut f.labels).hint_text("ota, network").desired_width(ui.available_width()));
         ui.end_row();
+        ui.label("New tabs");
+        ui.checkbox(&mut f.default_on, "On in new tabs").on_hover_text(
+            "Whether it runs in tabs opened from now on (and for nerka check). Tabs open now keep their own \
+             choice: the checkbox next to the check",
+        );
+        ui.end_row();
     });
     if f.tests.len() == 1 {
         let (issue, fact) = f.tests[0].test.help();
@@ -655,14 +726,16 @@ fn form_ui(
         if ui.button(label).clicked() {
             match CheckDef::parse_spec(&f.spec()) {
                 Ok(c) => {
-                    let on = st.editing.as_deref().and_then(|n| saved.get(n)).is_none_or(|o| o.is_on());
-                    if let Some(old) = st.editing.take()
-                        && old != c.name()
-                    {
-                        saved.remove(&old);
+                    match st.editing.take() {
+                        Some(old) if old != c.name() => {
+                            saved.remove(&old);
+                            out.renamed = Some((old, Some(c.name().to_owned())));
+                        }
+                        Some(_) => {}
+                        None => added = Some(c.name().to_owned()),
                     }
                     out.adopted = Some(c.name().to_owned());
-                    saved.set(c.with_on(on));
+                    saved.set(c.with_on(f.default_on));
                     *f = Form::default();
                     st.form_open = false;
                     out.changed = true;
@@ -691,6 +764,7 @@ fn form_ui(
         }
         None => {}
     }
+    added
 }
 
 /// One test's own fields (grid rows).
@@ -884,6 +958,7 @@ mod tests {
         st.form.lines = long.replace(' ', "_");
         st.form.name = long.clone();
         let (signals, lib) = (Signals::default(), Library::new());
+        let mut on: HashSet<String> = saved.iter().map(|c| key(c.name())).collect();
         let ctx = egui::Context::default();
         let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1200.0, 900.0));
         for _ in 0..4 {
@@ -897,6 +972,10 @@ mod tests {
                     room = ui.max_rect().width();
                     let input = Input {
                         saved: &mut saved,
+                        on: &mut on,
+                        auto: false,
+                        stale: true,
+                        ran: true,
                         results: &results,
                         running: false,
                         file: &file,

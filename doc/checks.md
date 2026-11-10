@@ -26,7 +26,7 @@ A check has **its lines** (NFD or a library query `{pack.query}`), **one test**,
 | `missing QUERY within DUR` | issue | one of its lines, no QUERY line within DUR after it (not judged when the scope ends first) |
 | `value first\|last\|min\|max` | fact | what its query's first named group captures |
 
-Spec (CLI `--check`, saved in `<config>/nerka/checks`, one per line, `off ` for one switched off):
+Spec (CLI `--check`, saved in `<config>/nerka/checks`, one per line, `off ` for one that is off in new tabs and not run by `nerka check`):
 
 ```
 stall: lines {net.down}; missing {ota.progress} within 30s; per ecu1
@@ -39,6 +39,7 @@ A lifecycle's scope is its time span (from its first line to the next one's): li
 - **Core:** `core/src/check.rs`: `CheckDef` (spec, `resolved` with the library, `run` → `CheckResult`: per scope a verdict (ok / issue ×N / fact value) and up to 1000 pieces of evidence (lines and a note)), `Checks` (the saved list).
 - **CLI:** `--check SPEC`, `nerka check FILE` (`-e N` prints N pieces of evidence per result with the lines, `--json`, `--strict` fails on issues, `-n NAME`).
 - **GUI:** ✔ Checks in the toolbar opens the pane. Each check: on/off, its kind, ✎, −, then its results, overall │ per lifecycle (`#2: 3×`, red for issues). Click a result: its evidence below (line numbers → go there; the note; the line). A form: name, its lines (📚 / drag from the Library), the test as a choice with its fields, for the whole log or each lifecycle of …, Preview, Add. Checks run in the background when they, the signals or the file change. `nerka-gui --check SPEC` adds one for the session.
+- **Per tab (owner, 2026-11-09, review U2):** the checks are the app's (one list, one file), but which are **on** is each tab's: a check's checkbox (and a label's) switches it in this tab only and saves nothing. A new tab starts with each check's **On in new tabs** (✎; the saved `off ` flag, so the file format is unchanged). **When they run** is each tab's too: **Auto** (default) runs them when the file, the signals or the checks on change; off, only **▶ Run** does, and the pane says "Out of date: ▶ Run" (or "Not run yet") meanwhile; the checks' `@signals` come back with the next run. Switching Auto also sets it for new tabs (prefs `checks_auto`). A check that uses `@name` of one switched off says so ("uses @lost of check 'lost', which is off"). Session only: a reopened file starts from the saved flags again.
 
 512 MiB DLT: each check 30–300 ms (a `count` per ECU1 lifecycle 211 ms with the lifecycles; a `gap` on GW's NAV lines 30 ms; a `value max` per lifecycle 302 ms).
 

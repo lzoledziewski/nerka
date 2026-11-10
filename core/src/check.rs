@@ -1064,6 +1064,12 @@ impl Checks {
         self.0.retain(|c| !c.name.eq_ignore_ascii_case(name));
     }
 
+    /// The same checks, each on where `on` says so (a tab's own choice:
+    /// owner, 2026-11-09, U2; the saved flag is what new tabs start with).
+    pub fn switched(&self, on: impl Fn(&CheckDef) -> bool) -> Checks {
+        Checks(self.0.iter().map(|c| c.clone().with_on(on(c))).collect())
+    }
+
     pub fn is_empty(&self) -> bool {
         self.0.is_empty()
     }
@@ -1116,6 +1122,17 @@ impl Checks {
             })
             .collect();
         let theirs = |n: &str| signals.get(n).is_none().then(|| own.iter().position(|o| o == n)).flatten();
+        // A check that uses the signal of one that is off: said so (else
+        // the signal is just unknown).
+        let off_used = |d: &CheckDef| {
+            d.signals_used().into_iter().find_map(|n| {
+                if signals.get(&n).is_some() || own.contains(&n) {
+                    return None;
+                }
+                let off = self.0.iter().find(|c| !c.is_on() && signal_name(&c.name) == n)?;
+                Some(format!("check '{}': uses @{n} of check '{}', which is off", d.name, off.name))
+            })
+        };
         let needs: Vec<Vec<usize>> = defs
             .iter()
             .map(|d| {
@@ -1128,8 +1145,10 @@ impl Checks {
             let ready = (0..on.len()).find(|&i| results[i].is_none() && needs[i].iter().all(|&j| results[j].is_some()));
             let Some(i) = ready else { break };
             let failed = needs[i].iter().find(|&&j| results[j].as_ref().is_some_and(|r| r.is_err()));
+            let off = defs[i].as_ref().ok().and_then(off_used);
             let r = match (&defs[i], failed) {
                 (Err(e), _) => Err(e.clone()),
+                (Ok(_), _) if off.is_some() => Err(off.expect("checked")),
                 (Ok(_), Some(&j)) => {
                     Err(format!("check '{}': uses @{} of check '{}', which failed", on[i].name, own[j], on[j].name))
                 }

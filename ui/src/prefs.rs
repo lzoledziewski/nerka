@@ -39,6 +39,10 @@ pub struct SearchPrefs {
     /// Tabs of several files that know their times interleave their lines
     /// by time (the last choice in a tab's menu).
     pub merge_by_time: bool,
+    /// New tabs run their checks by themselves when something changes, or
+    /// only on ▶ Run (the last choice in a tab's Checks pane; owner,
+    /// 2026-11-09, U2).
+    pub checks_auto: bool,
     /// Rules for protocols in captures (`NAME:RULE`, as `--route` takes
     /// them): a protocol given rules uses these instead of its defaults.
     pub routes: Vec<String>,
@@ -67,6 +71,7 @@ impl Default for SearchPrefs {
             mf4_local_time: true,
             bookmark_notes: NoteMode::default(),
             merge_by_time: false,
+            checks_auto: true,
             routes: Vec::new(),
             disabled_protocols: Vec::new(),
             protocols: Vec::new(),
@@ -136,6 +141,7 @@ impl SearchPrefs {
                 "local_time" => p.local_time = flag,
                 "mf4_local_time" => p.mf4_local_time = flag,
                 "merge_by_time" => p.merge_by_time = flag,
+                "checks_auto" => p.checks_auto = flag,
                 _ => {}
             }
         }
@@ -166,6 +172,7 @@ impl SearchPrefs {
             self.bookmark_notes.key(),
             self.merge_by_time
         );
+        out.push_str(&format!("checks_auto={}\n", self.checks_auto));
         for r in &self.routes {
             out.push_str(&format!("route={r}\n"));
         }
@@ -251,6 +258,7 @@ mod tests {
             mf4_local_time: false,
             bookmark_notes: NoteMode::Column,
             merge_by_time: true,
+            checks_auto: false,
             routes: vec!["DLT:port=3490,vlan=5".into()],
             disabled_protocols: vec!["syslog".into()],
             protocols: Vec::new(),

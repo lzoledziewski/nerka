@@ -464,6 +464,22 @@ mod as_signals {
         assert_eq!(filter("@temp > 80", &r.signals), [5]);
     }
 
+    /// Owner, 2026-11-09 (U2): checks are switched per tab. One that uses
+    /// the signal of a check switched off says so; switched on, it runs.
+    #[test]
+    fn a_check_using_one_that_is_off_says_so() {
+        let c = checks(&["Retries: lines raw == retry", "burst: lines @retries.event; count >= 2"]);
+        let off = c.switched(|d| d.name() != "Retries");
+        let r = run(&off, &signals());
+        assert_eq!(r.results.len(), 1, "only the checks on run");
+        let (_, e) = &r.results[0];
+        assert_eq!(e.as_ref().unwrap_err(), "check 'burst': uses @retries of check 'Retries', which is off");
+        let on = c.switched(|_| true);
+        assert_eq!(result(&run(&on, &signals()), "burst").overall().verdict, Verdict::Issue(4));
+        // The saved flags stay as they were.
+        assert!(c.iter().all(|d| d.is_on()));
+    }
+
     #[test]
     fn checks_feed_checks_in_any_order() {
         // `burst` is listed first and uses `retries`: it runs after it.

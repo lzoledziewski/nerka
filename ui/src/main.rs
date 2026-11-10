@@ -653,7 +653,19 @@ struct Tab {
     check_results: Vec<(String, checks::Outcome)>,
     /// The job, and the generation of `own_signals` it ran with.
     checks_job: Option<(Job<nerka_core::check::CheckRun>, u64)>,
-    checks_key: Option<(usize, u64, u64, String)>,
+    checks_key: Option<(usize, u64, u64, String, String)>,
+    /// The checks on in this tab (lower-case names), from the saved ones'
+    /// flags when first needed (owner, 2026-11-09, U2: on / off per tab;
+    /// the saved flag is what new tabs start with).
+    checks_on: Option<std::collections::HashSet<String>>,
+    /// Checks run by themselves when something changes, or only on ▶ Run
+    /// (per tab; new tabs take the last choice, `SearchPrefs::checks_auto`).
+    checks_auto: bool,
+    /// ▶ Run was pressed.
+    checks_run: bool,
+    /// Run on request only, and something changed since the last run (or
+    /// it never ran).
+    checks_stale: bool,
     /// The tab's signals without the checks' (`signals` adds them once the
     /// checks ran), and their generation.
     own_signals: Signals,
@@ -1207,6 +1219,10 @@ impl Tab {
             check_results: Vec::new(),
             checks_job: None,
             checks_key: None,
+            checks_on: None,
+            checks_auto: prefs.checks_auto,
+            checks_run: false,
+            checks_stale: false,
             own_signals: Signals::default(),
             own_gen: 0,
             plot: Default::default(),
@@ -1507,9 +1523,16 @@ impl Tab {
         self.signals_changed(ctx);
     }
 
-    /// Run the checks on the tab's file in the background when they, the
-    /// signals (lifecycles), the library queries they use or the file
-    /// changed; take the results of a finished run.
+    /// The checks on in this tab, from the saved ones' flags at first.
+    fn checks_on(&mut self, saved: &nerka_core::check::Checks) -> &mut std::collections::HashSet<String> {
+        self.checks_on
+            .get_or_insert_with(|| saved.iter().filter(|c| c.is_on()).map(|c| c.name().to_lowercase()).collect())
+    }
+
+    /// Run the tab's checks on its file in the background when they, the
+    /// signals (lifecycles), the library queries they use, the file or
+    /// the checks on here changed (on request: only on ▶ Run, marked out
+    /// of date till then); take the results of a finished run.
     fn poll_checks(&mut self, ctx: &egui::Context, checks: &nerka_core::check::Checks, checks_gen: u64, lib: &Library) {
         if let Some((job, gen_)) = &self.checks_job
             && let Poll::Done(r, _) = job.poll()
@@ -1527,17 +1550,27 @@ impl Tab {
             self.checks_job = None;
         }
         let Some(file) = self.file.clone() else { return };
+        let on = self.checks_on(checks).clone();
+        let mut names: Vec<&String> = on.iter().collect();
+        names.sort();
         let queries: Vec<Option<&str>> =
             checks.iter().flat_map(|c| c.unresolved()).map(|id| lib.get(id).map(|(_, q)| q.text.as_str())).collect();
-        let key = (file.data_id(), self.own_gen, checks_gen, format!("{queries:?}"));
-        if self.checks_key.as_ref() == Some(&key) {
+        let key = (file.data_id(), self.own_gen, checks_gen, format!("{queries:?}"), format!("{names:?}"));
+        if self.checks_key.as_ref() == Some(&key) && !self.checks_run {
             return;
         }
+        if !self.checks_auto && !self.checks_run {
+            self.checks_stale = true;
+            return;
+        }
+        self.checks_run = false;
+        self.checks_stale = false;
         self.checks_key = Some(key);
         if let Some((j, _)) = self.checks_job.take() {
             j.cancel();
         }
-        let (checks, signals, lib) = (checks.clone(), self.own_signals.clone(), lib.clone());
+        let checks = checks.switched(|c| on.contains(&c.name().to_lowercase()));
+        let (signals, lib) = (self.own_signals.clone(), lib.clone());
         let job = Job::spawn(ctx, move |p| checks.run_all(&*file, &signals, &lib, p));
         self.checks_job = Some((job, self.own_gen));
     }
@@ -4279,7 +4312,10 @@ impl App {
                     "Values the lines of this tab carry, captured by a regex group: filter with @name \
                      (@speed > 100, @gear == D)",
                 );
-                let checks = self.saved_checks.iter().filter(|c| c.is_on()).count();
+                let checks = match self.tabs.get(self.active).and_then(|t| t.checks_on.as_ref()) {
+                    Some(on) => self.saved_checks.iter().filter(|c| on.contains(&c.name().to_lowercase())).count(),
+                    None => self.saved_checks.iter().filter(|c| c.is_on()).count(),
+                };
                 ui.toggle_value(&mut self.show_checks, format!("✔ Checks ({checks})"))
                     .on_hover_text("Issues and facts found in the file, overall and per lifecycle");
                 ui.toggle_value(&mut self.show_library, format!("📚 Library ({queries})")).on_hover_text(
@@ -4364,6 +4400,8 @@ impl App {
         // FIBEX files chosen there (every DLT tab reads its file again).
         let mut save_signals = false;
         let mut save_checks = false;
+        // A check renamed or removed: every tab's set follows.
+        let mut checks_renamed: Option<(String, Option<String>)> = None;
         let mut fibex_action = None;
         let show_bookmarks = self.show_bookmarks;
         let mut focus_search = std::mem::take(&mut self.focus_search);
@@ -4541,6 +4579,7 @@ impl App {
             // At most half the window: its results wrap (owner, 2026-11-07:
             // it grew to the whole window).
             let max = (ui.available_width() * 0.5).max(320.0);
+            tab.checks_on(&self.saved_checks);
             let out = egui::Panel::right("checks")
                 .resizable(true)
                 .default_size(440.0)
@@ -4548,6 +4587,10 @@ impl App {
                 .show(ui, |ui| {
                     let input = checks::Input {
                         saved: &mut self.saved_checks,
+                        on: tab.checks_on.as_mut().expect("set above"),
+                        auto: tab.checks_auto,
+                        stale: tab.checks_stale,
+                        ran: tab.checks_key.is_some(),
                         results: &tab.check_results,
                         running: tab.checks_job.is_some(),
                         file: &*file,
@@ -4567,6 +4610,20 @@ impl App {
             if out.changed {
                 save_checks = true;
             }
+            if out.run {
+                tab.checks_run = true;
+            }
+            // Per tab; new tabs follow the last choice (owner, 2026-11-09).
+            if let Some(auto) = out.auto {
+                tab.checks_auto = auto;
+                self.prefs.checks_auto = auto;
+                if let Some(path) = prefs_path()
+                    && let Err(e) = self.prefs.save(&path)
+                {
+                    tab.status = format!("Could not save preferences: {e}");
+                }
+            }
+            checks_renamed = out.renamed;
             if let Some(line) = out.goto {
                 tab.goto_line(line);
             }
@@ -4703,6 +4760,16 @@ impl App {
         if save_signals {
             self.save_saved_signals();
         }
+        if let Some((old, new)) = checks_renamed {
+            for t in &mut self.tabs {
+                if let Some(on) = &mut t.checks_on
+                    && on.remove(&old.to_lowercase())
+                    && let Some(new) = &new
+                {
+                    on.insert(new.to_lowercase());
+                }
+            }
+        }
         if save_checks {
             self.save_checks();
         }
@@ -4760,6 +4827,67 @@ mod tests {
         app.add_session_signal(signal(r"w=/w=(?<w>\d+)/"));
         let text = app.signals_to_save().to_text();
         assert!(text.contains("/v=(?<v>") && !text.contains("volts") && !text.contains("w=/w="), "{text}");
+    }
+
+    /// Owner, 2026-11-09 (U2): checks are switched on and off per tab (a
+    /// new tab starts with each check's saved flag, which a switch doesn't
+    /// change), and a tab runs them by itself or only on ▶ Run.
+    #[test]
+    fn checks_are_switched_and_run_per_tab() {
+        use nerka_core::check::CheckDef;
+        let dir = std::env::temp_dir().join(format!("nerka-gui-tabchecks-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (a, b) = (dir.join("a.log"), dir.join("b.log"));
+        std::fs::write(&a, LOG).unwrap();
+        std::fs::write(&b, LOG).unwrap();
+        let ctx = egui::Context::default();
+        let mut app = App::default();
+        app.saved_checks.set(CheckDef::parse_spec("errors: lines level >= ERROR; exists").unwrap());
+        app.saved_checks.set(CheckDef::parse_spec("off timeouts: lines /timeout/; exists").unwrap());
+        app.open(&ctx, a);
+        app.open(&ctx, b);
+        settle_app(&mut app, &ctx);
+        // Frames of the active tab until its checks ran (or are waiting).
+        let run = |app: &mut App| {
+            for _ in 0..500 {
+                let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1200.0, 800.0));
+                let input = egui::RawInput { screen_rect: Some(screen), ..Default::default() };
+                let mut out = ctx.run_ui(input, |ui| app.frame(ui));
+                out.textures_delta.clear();
+                let t = &app.tabs[app.active];
+                if t.checks_job.is_none() && (t.checks_key.is_some() || t.checks_stale) {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            panic!("checks still running");
+        };
+        let ran = |app: &App, i: usize| app.tabs[i].check_results.iter().map(|(n, _)| n.clone()).collect::<Vec<_>>();
+
+        // New tabs: the saved flags.
+        app.active = 0;
+        run(&mut app);
+        assert_eq!(ran(&app, 0), ["errors"]);
+        // Switched on in the first tab only; the saved flag stays off.
+        app.tabs[0].checks_on.as_mut().unwrap().insert("timeouts".into());
+        run(&mut app);
+        assert_eq!(ran(&app, 0), ["errors", "timeouts"]);
+        app.active = 1;
+        run(&mut app);
+        assert_eq!(ran(&app, 1), ["errors"]);
+        assert!(!app.saved_checks.get("timeouts").unwrap().is_on());
+
+        // On request: a change marks the results out of date, ▶ Run runs.
+        app.tabs[1].checks_auto = false;
+        app.tabs[1].checks_on.as_mut().unwrap().insert("timeouts".into());
+        run(&mut app);
+        assert!(app.tabs[1].checks_stale);
+        assert_eq!(ran(&app, 1), ["errors"], "not run again by itself");
+        app.tabs[1].checks_run = true;
+        run(&mut app);
+        assert!(!app.tabs[1].checks_stale);
+        assert_eq!(ran(&app, 1), ["errors", "timeouts"]);
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     const LOG: &str = "\
