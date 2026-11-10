@@ -10,12 +10,17 @@ use std::time::Instant;
 
 struct Counting;
 static ALLOCS: AtomicU64 = AtomicU64::new(0);
+// SAFETY: every call is passed to the system allocator unchanged; counting
+// doesn't touch the memory, so `System`'s guarantees are this allocator's.
 unsafe impl std::alloc::GlobalAlloc for Counting {
     unsafe fn alloc(&self, l: std::alloc::Layout) -> *mut u8 {
         ALLOCS.fetch_add(1, Ordering::Relaxed);
+        // SAFETY: the caller's contract for `alloc` (a non-zero size
+        // layout) is `System.alloc`'s.
         unsafe { std::alloc::System.alloc(l) }
     }
     unsafe fn dealloc(&self, p: *mut u8, l: std::alloc::Layout) {
+        // SAFETY: `p` came from `alloc` above, so from `System`, with `l`.
         unsafe { std::alloc::System.dealloc(p, l) }
     }
 }

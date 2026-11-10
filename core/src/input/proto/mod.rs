@@ -209,7 +209,7 @@ pub const NET_FIELDS: [FieldDef; 5] = [
     FieldDef::new("net.vlan", FieldKind::U64, false),
 ];
 
-/// Where a capture's messages came from, by [`Framed::origin`]: an id below
+/// Where a capture's messages came from, by `Framed::origin`: an id below
 /// [`MAX_CHANNELS`] is a channel alone (MF4 `DLT_Frame`, or a sender not
 /// kept); the others are a channel and the sender of a UDP datagram (its
 /// addresses, ports and VLAN), each pair and each sender kept once.
@@ -306,35 +306,23 @@ pub(crate) const PROTO_FIELD: FieldDef = FieldDef::new("proto", FieldKind::Name,
 impl View {
     /// The view for the protocols `present` (indexes into `protos`).
     fn new(protos: &[Arc<dyn Protocol>], present: &[ProtoId], net: bool) -> View {
+        use crate::input::schema::{SchemaMap, qualifier};
         let present: &[ProtoId] = if present.is_empty() { &[0] } else { present };
-        let mut schema: Vec<FieldDef> = Vec::new();
         let mixed = present.len() > 1;
-        if mixed {
-            schema.push(PROTO_FIELD);
-        }
         // Fields of the same name are one field (all protocols have a
-        // `payload`); a later protocol's of another kind is left out.
-        for &p in present {
-            for def in protos[p].schema() {
-                if !schema.iter().any(|d| d.name == def.name) {
-                    schema.push(def.clone());
-                }
-            }
+        // `payload`); a name two protocols give different kinds is a field
+        // of each, `dlt.type` and `sens.type` (`input::schema`).
+        let lead: Vec<FieldDef> = if mixed { vec![PROTO_FIELD] } else { Vec::new() };
+        let mut tail: Vec<FieldDef> = if mixed { Vec::new() } else { vec![PROTO_FIELD] };
+        if net {
+            tail.extend(NET_FIELDS);
         }
-        if !mixed {
-            schema.push(PROTO_FIELD);
-        }
-        let net = net.then(|| {
-            let first = schema.len();
-            schema.extend(NET_FIELDS);
-            first
-        });
-        let fields = protos
-            .iter()
-            .map(|p| {
-                schema.iter().map(|d| p.schema().iter().position(|o| o.name == d.name && o.kind == d.kind)).collect()
-            })
-            .collect();
+        let parts: Vec<(String, &[FieldDef])> =
+            present.iter().map(|&p| (qualifier(protos[p].name()), protos[p].schema())).collect();
+        let map = SchemaMap::new(&lead, &parts, &tail);
+        let schema = map.schema.clone();
+        let net = net.then(|| schema.iter().position(|d| d.name == NET_FIELDS[0].name).expect("in the tail"));
+        let fields = protos.iter().map(|p| map.ids(&qualifier(p.name()), p.schema())).collect();
         let columns = if mixed {
             MIXED_COLUMNS.to_vec()
         } else {
@@ -357,6 +345,12 @@ pub struct Records {
     protos: Vec<Arc<dyn Protocol>>,
     view: View,
     skipped: u64,
+    /// What reading it dropped (a capture's: [`super::capture::CaptureStats::notes`]),
+    /// and how many messages have no sender.
+    notes: Vec<String>,
+    no_sender: u64,
+    /// The protocols its messages are of, found once when it is read.
+    present: Vec<ProtoId>,
     data_id: usize,
 }
 
@@ -374,7 +368,20 @@ impl Records {
         let protos = vec![proto];
         let view = View::new(&protos, &[0], false);
         let index = Index::Stored { offsets, header };
-        Records { name, path, data, index, origins: Origins::default(), protos, view, skipped, data_id: new_data_id() }
+        Records {
+            name,
+            path,
+            data,
+            index,
+            origins: Origins::default(),
+            protos,
+            view,
+            skipped,
+            notes: Vec::new(),
+            no_sender: 0,
+            present: vec![0],
+            data_id: new_data_id(),
+        }
     }
 
     /// Messages found inside a container (`data`, e.g. a mapped pcap):
@@ -398,7 +405,8 @@ impl Records {
         let present: Vec<ProtoId> = (0..protos.len()).filter(|&p| seen[p]).collect();
         let view = View::new(&protos, &present, !origins.senders.is_empty());
         let index = Index::Framed { msgs, side };
-        Records { name, path, data, index, origins, protos, view, skipped, data_id: new_data_id() }
+        let (notes, no_sender, data_id) = (Vec::new(), 0, new_data_id());
+        Records { name, path, data, index, origins, protos, view, skipped, notes, no_sender, present, data_id }
     }
 
     /// The same messages with protocol `id`'s reader replaced (DLT with
@@ -438,16 +446,17 @@ impl Records {
         self.skipped
     }
 
+    /// With what reading it dropped (`notes`), and how many messages have no
+    /// sender.
+    pub(crate) fn with_notes(mut self, notes: Vec<String>, no_sender: u64) -> Records {
+        self.notes = notes;
+        self.no_sender = no_sender;
+        self
+    }
+
     /// The protocols of the messages, by name, each once.
     pub fn protocols(&self) -> Vec<&str> {
-        match &self.index {
-            Index::Stored { .. } => vec![self.protos[0].name()],
-            Index::Framed { msgs, .. } => {
-                let mut seen = [false; MAX_PROTOCOLS];
-                msgs.iter().for_each(|m| seen[m.proto()] = true);
-                (0..self.protos.len()).filter(|&p| seen[p]).map(|p| self.protos[p].name()).collect()
-            }
-        }
+        self.present.iter().map(|&p| self.protos[p].name()).collect()
     }
 
     /// Field `k` of [`NET_FIELDS`] for message `line`.
@@ -532,6 +541,20 @@ pub(crate) fn write_time(out: &mut Vec<u8>, secs: u32, usecs: i32) {
 impl LogSource for Records {
     fn data_id(&self) -> usize {
         self.data_id
+    }
+
+    fn info(&self) -> super::SourceInfo {
+        let mut notes = self.notes.clone();
+        // A stored file (`.dlt`): bytes between messages (a capture's are
+        // in its notes already).
+        if matches!(self.index, Index::Stored { .. }) && self.skipped > 0 {
+            notes.push(format!("{} bytes weren't {} messages: skipped", self.skipped, self.protos[0].name()));
+        }
+        super::SourceInfo {
+            protocols: self.protocols().into_iter().map(str::to_owned).collect(),
+            notes,
+            no_sender: self.no_sender,
+        }
     }
 
     fn name(&self) -> &str {

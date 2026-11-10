@@ -148,7 +148,7 @@ Choices made for the GUI (open questions below answered provisionally; confirm o
 7. The Search box has the Filter box's modes (Auto, Text, NFD since 2026-10-19), without Invert.
 8. Colours come from the pack, with a palette fallback; there is no colour picker in the UI.
 9. Parameter values live in the tab and aren't remembered between runs.
-10. ~~Search history isn't kept~~ The Search box has its own history with ↑ / ↓ (owner, issue #5; see `status.md`). Both histories store the expanded NFD but not the chip names (the history file is one `tag<TAB>pattern` per line; adding names needs a format change).
+10. ~~Search history isn't kept~~ The Search box has its own history with ↑ / ↓ (owner, issue #5; see `gui-decisions.md`). Both histories store the expanded NFD but not the chip names (the history file is one `tag<TAB>pattern` per line; adding names needs a format change).
 11. The selection is per tab; the library's grouping is shared by all tabs.
 12. Chips only switch line colours (no × to drop a query from the box).
 13. Library `+` and drops add a query as "include in the filter"; change the role in the selection. The same library query isn't added twice in one role.

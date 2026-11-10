@@ -1,5 +1,5 @@
 //! Kaitai Struct's expression language (the part definitions use): the
-//! parse tree, before names are bound ([`super::model`]).
+//! parse tree, before names are bound (`super::model`).
 //!
 //! ```text
 //! expr    := or ('?' expr ':' expr)?

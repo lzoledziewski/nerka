@@ -82,6 +82,32 @@ fn dlt_bytes(apids: &[&str]) -> Vec<u8> {
     buf
 }
 
+/// Review 2026-11-09, R3: what a reader skipped is said, with the file it
+/// is about in a view of several; 2026-11-08, R8: a `proto` no message has
+/// is said instead of finding nothing.
+#[test]
+fn what_a_reader_skipped_and_unknown_protocols_are_said() {
+    let mut bytes = dlt_bytes(&["NAV", "SYS"]);
+    let half = bytes.len() / 2;
+    bytes.splice(half..half, [0xEEu8; 14]);
+    let a = DltFile::from_bytes("a.dlt", bytes);
+    let info = a.info();
+    assert_eq!(info.protocols, ["DLT"]);
+    assert_eq!(info.notes.len(), 1, "{info:?}");
+    assert!(info.notes[0].ends_with("weren't DLT messages: skipped"), "{info:?}");
+    assert!(text("t.log", "x\n").info() == crate::SourceInfo::default());
+
+    let both = Concat::new(vec![Box::new(a), Box::new(DltFile::from_bytes("b.dlt", dlt_bytes(&["NAV"])))]).unwrap();
+    let info = both.info();
+    assert_eq!(info.protocols, ["DLT"]);
+    assert!(info.notes.len() == 1 && info.notes[0].starts_with("a.dlt: "), "{info:?}");
+
+    let warn = |q: &str| crate::query_warnings(&Query::compile(q).unwrap().bind(both.schema()).unwrap(), &both);
+    assert_eq!(warn("proto == SENS AND apid == NAV"), ["no message here is of a protocol 'sens' (there are: DLT)"]);
+    assert!(warn("proto == dlt").is_empty(), "case doesn't matter");
+    assert!(warn("apid == NAV").is_empty());
+}
+
 #[test]
 fn dlt_files_and_captures_are_one_kind() {
     let a: Box<dyn LogSource> = Box::new(DltFile::from_bytes("a.dlt", dlt_bytes(&["NAV", "SYS"])));
@@ -133,7 +159,27 @@ fn open_many_reads_files_in_order() {
     let s = open_many(&[b.clone(), a.clone()], &o, &p).unwrap();
     assert_eq!((0..3).map(|l| s.line_text(l).unwrap().into_owned()).collect::<Vec<_>>(), ["three", "one", "two"]);
     assert_eq!(open_many(std::slice::from_ref(&a), &o, &p).unwrap().part_files(), [(0, 2)]);
-    assert!(open_many(&[a, d], &o, &p).is_err());
+    assert!(open_many(&[a.clone(), d], &o, &p).is_err());
+
+    // A file that can't be opened is named (review 2026-11-09, R7: the
+    // GUI named the first file); its reason is in the text.
+    let missing = dir.join("nope.log");
+    let Err(e) = open_many(&[a.clone(), missing.clone()], &o, &p) else { panic!("a missing file") };
+    assert!(matches!(&e, crate::Error::Open { path, .. } if *path == missing), "{e:?}");
+    assert!(e.to_string().starts_with(&format!("{}: I/O error (", missing.display())), "{e}");
+    let Err(e) = open_many_by_time(&[missing.clone(), a.clone()], &o, &p) else { panic!("a missing file") };
+    assert!(matches!(&e, crate::Error::Open { path, .. } if *path == missing), "{e:?}");
+
+    // JSON files with other keys: said so (R17).
+    let (j1, j2) = (dir.join("a.jsonl"), dir.join("b.jsonl"));
+    std::fs::write(&j1, "{\"level\":\"INFO\",\"msg\":\"one\"}\n").unwrap();
+    std::fs::write(&j2, "{\"sev\":3,\"text\":\"two\"}\n").unwrap();
+    let Err(e) = open_many(&[j1, j2], &o, &p) else { panic!("other keys") };
+    assert_eq!(
+        e.to_string(),
+        "a.jsonl and b.jsonl are both JSON but with other keys: only files with the same keys open as one view"
+    );
+    assert!(matches!(e, crate::Error::MixedKinds(_)));
     std::fs::remove_dir_all(&dir).ok();
 }
 
@@ -284,4 +330,150 @@ fn messages_of_different_protocols_share_the_mixed_layout() {
         (0..7).map(|l| merged.line_text(l).unwrap().split('\t').nth(1).unwrap().to_owned()).collect();
     assert_eq!(order, ["DLT", "DLT", "DLT", "SENS", "SENS", "SENS", "SENS"]);
     assert_eq!(run_on(&merged, &q("proto == SENS AND v > 100")).len(), 2);
+}
+
+/// Review 2026-11-09, R1: two captures of different protocols whose fields
+/// are the same (name and kind) but whose columns differ share the mixed
+/// layout; each part's fields must still be found by name (`proto` moves
+/// to the front of the whole's fields, so the ids differ from a part's).
+#[test]
+fn mixed_parts_with_the_same_fields_keep_their_fields() {
+    use crate::input::capture::{self, CaptureOptions};
+    use crate::input::proto::{LoadedProtocol, ksy::KsyProtocol};
+    // The same fields as SENS, other columns, another name and port.
+    let other = SENS
+        .replace("name: SENS", "name: SENB")
+        .replace("41000", "41001")
+        .replace("    - { name: v, width: 5 }\n    - note\n", "    - note\n");
+    assert_ne!(other, SENS);
+    let open = |name: &str, def: &str, port: u16, v: u16, note: &str| -> Box<dyn LogSource> {
+        let defs = vec![LoadedProtocol::new(std::sync::Arc::new(KsyProtocol::parse(def).unwrap()))];
+        let o = CaptureOptions { protocols: defs, ..Default::default() };
+        Box::new(capture::from_bytes(name, pcap_of(&[(100, port, sens(v, note))]), &o).unwrap().0)
+    };
+    let (a, b) = (open("a.pcap", SENS, 41000, 150, "hot"), open("b.pcap", &other, 41001, 20, "ok"));
+    assert_eq!(a.schema(), b.schema(), "the case: equal fields");
+    assert_ne!(a.columns(), b.columns(), "the case: other columns");
+    let all = Concat::new(vec![a, b]).unwrap();
+    assert!(all.is_mixed());
+    assert_eq!(run_on(&all, &q("proto == SENS")), [0]);
+    assert_eq!(run_on(&all, &q("proto == SENB")), [1]);
+    assert_eq!(run_on(&all, &q("v > 100")), [0]);
+    assert_eq!(run_on(&all, &q("note == ok")), [1]);
+    assert_eq!(run_on(&all, &q("net.port == 41001")), [1]);
+    assert_eq!(run_on(&all, &q("file == b.pcap AND v == 20")), [1]);
+}
+
+/// A definition whose `type` is a number: DLT's `type` is text.
+const TYPED: &str = "meta: { id: typed, endian: le }
+seq:
+  - { id: kind, type: u1 }
+  - { id: note, type: str, size-eos: true, encoding: UTF-8 }
+-nerka:
+  name: TYPED
+  framing: datagram
+  match: [ 41001 ]
+  fields:
+    type: kind
+    note: note
+  columns:
+    - note
+";
+
+/// Every field of `whole`, by name, on every line, against the part's own
+/// (review 2026-11-09, ARCH-10: R1 and R9 were positions read in the wrong
+/// part's schema). A field split by a clash (`dlt.type`) is the part's
+/// `type` in the part it is named after, none elsewhere; `file` is the
+/// whole's own.
+fn fields_agree(whole: &dyn LogSource, parts: &[(&dyn LogSource, &str)]) {
+    let lines = whole.part_files();
+    for (i, d) in whole.schema().iter().enumerate() {
+        if d.name == FILE_FIELD {
+            continue;
+        }
+        for (k, &(first, n)) in lines.iter().enumerate() {
+            let (part, qual) = parts[k];
+            let own = if part.schema().iter().any(|p| p.name == d.name) {
+                Some(d.name.as_ref())
+            } else {
+                match d.name.split_once('.') {
+                    Some((q, base)) if !matches!(q, "net" | "json") => (q == qual).then_some(base),
+                    _ => Some(d.name.as_ref()),
+                }
+            };
+            let id = own.and_then(|o| part.schema().iter().position(|p| p.name == o && p.kind == d.kind));
+            for l in 0..n {
+                let want = id.and_then(|id| part.field(l, id)).map(|v| format!("{v:?}"));
+                let got = whole.field(first + l, i).map(|v| format!("{v:?}"));
+                assert_eq!(got, want, "field {} on line {} (part {k}, line {l})", d.name, first + l);
+            }
+        }
+    }
+}
+
+/// Review 2026-11-09, R9: a name two protocols give different kinds is a
+/// field of each (`dlt.type`, `typed.type`), in a capture of both and in a
+/// view of files; a plain `type` says which to write. Every field reads
+/// its part's own value, merged by time too.
+#[test]
+fn a_name_of_two_kinds_is_a_field_of_each() {
+    use crate::input::capture::{self, CaptureOptions};
+    use crate::input::proto::{LoadedProtocol, ksy::KsyProtocol};
+    let defs = vec![LoadedProtocol::new(std::sync::Arc::new(KsyProtocol::parse(TYPED).unwrap()))];
+    let typed = |k: u8, note: &str| {
+        let mut m = vec![k];
+        m.extend_from_slice(note.as_bytes());
+        m
+    };
+    let dlt = dlt_bytes(&["GPS"]);
+    let datagrams = [(200, 3490, dlt[16..].to_vec()), (201, 41001, typed(7, "seven")), (202, 41001, typed(3, "three"))];
+    let options = CaptureOptions { protocols: defs, ..Default::default() };
+
+    // One capture of both: its own fields are split.
+    let (c, _) = capture::from_bytes("c.pcap", pcap_of(&datagrams), &options).unwrap();
+    let names: Vec<&str> = c.schema().iter().map(|f| f.name.as_ref()).collect();
+    assert!(names.contains(&"dlt.type") && names.contains(&"typed.type") && !names.contains(&"type"), "{names:?}");
+    assert_eq!(run_on(&c, &q("typed.type == 7")), [1]);
+    let e = Query::compile("type == 7").unwrap().bind(c.schema()).unwrap_err();
+    assert!(e.msg.contains("write dlt.type or typed.type"), "{e}");
+
+    // A `.dlt` file and a capture of TYPED only: the view splits them.
+    let a = DltFile::from_bytes("a.dlt", dlt_bytes(&["NAV", "SYS"]));
+    let only = CaptureOptions { disabled: vec!["DLT".into()], ..options.clone() };
+    let (b, _) = capture::from_bytes("b.pcap", pcap_of(&datagrams), &only).unwrap();
+    let parts: [(&dyn LogSource, &str); 2] = [(&a, "dlt"), (&b, "typed")];
+    let a2 = DltFile::from_bytes("a.dlt", dlt_bytes(&["NAV", "SYS"]));
+    let (b2, _) = capture::from_bytes("b.pcap", pcap_of(&datagrams), &only).unwrap();
+    let view = Concat::new(vec![Box::new(a2), Box::new(b2)]).unwrap();
+    let names: Vec<&str> = view.schema().iter().map(|f| f.name.as_ref()).collect();
+    assert!(names.contains(&"dlt.type") && names.contains(&"typed.type"), "{names:?}");
+    fields_agree(&view, &parts);
+    assert_eq!(run_on(&view, &q("typed.type < 5")), [3]);
+    assert_eq!(run_on(&view, &q("dlt.type ~ /log/ AND apid == SYS")), [1]);
+
+    // The earlier layouts: same kind (mapped), mixed, mixed with one schema.
+    let same = Concat::new(vec![
+        Box::new(DltFile::from_bytes("a.dlt", dlt_bytes(&["NAV"]))),
+        Box::new(DltFile::from_bytes("b.dlt", dlt_bytes(&["SYS", "GPS"]))),
+    ])
+    .unwrap();
+    let (x, y) =
+        (DltFile::from_bytes("a.dlt", dlt_bytes(&["NAV"])), DltFile::from_bytes("b.dlt", dlt_bytes(&["SYS", "GPS"])));
+    fields_agree(&same, &[(&x, "dlt"), (&y, "dlt")]);
+    let (c2, _) = capture::from_bytes("c.pcap", pcap_of(&datagrams), &options).unwrap();
+    let (c3, _) = capture::from_bytes("c.pcap", pcap_of(&datagrams), &options).unwrap();
+    let a3 = DltFile::from_bytes("a.dlt", dlt_bytes(&["NAV", "SYS"]));
+    let a4 = DltFile::from_bytes("a.dlt", dlt_bytes(&["NAV", "SYS"]));
+    let mixed = Concat::new(vec![Box::new(a3), Box::new(c2)]).unwrap();
+    assert!(mixed.is_mixed());
+    fields_agree(&mixed, &[(&a4, "dlt"), (&c3, "c")]);
+    // The `.dlt` file's `type` is `dlt.type` there too: one name for DLT's.
+    assert!(mixed.schema().iter().all(|f| f.name != "type"));
+    assert_eq!(run_on(&mixed, &q("dlt.type ~ /log/")), [0, 1, 2]);
+
+    // Merged by time: the same values, by name.
+    let merged = crate::input::merged::Merged::new(view, &crate::Progress::new()).unwrap();
+    let typed_rows = run_on(&merged, &q("typed.type == 7 OR typed.type == 3"));
+    assert_eq!(typed_rows.len(), 2);
+    assert_eq!(run_on(&merged, &q("dlt.type ~ /log/")).len(), 2);
 }

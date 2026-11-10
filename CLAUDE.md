@@ -22,6 +22,7 @@ cargo run -p nerka-cli -- --fibex ecu1.xml filter 'apid == NAV' trace.dlt       
 cargo run -p nerka-cli -- --someip-port 30501 filter 'proto == SOMEIP AND type == ERROR' trace.pcap   # protocols by UDP port
 cargo run -p nerka-cli -- --protocol examples/protocols/dlt.ksy --protocol-port DLTK=3491 filter 'proto == DLTK AND apid == NAV' trace.pcap   # a protocol definition (.ksy, doc/protocol-definitions.md)
 cargo run -p nerka-cli -- --records 'start=/\d{4}-\d\d-\d\d/' filter 'level >= ERROR' app.log   # multi-line records
+cargo run -p nerka-cli -- --merge filter 'apid == NAV' ecu1.dlt ecu2.dlt bus.pcap   # several files as one view (by time with --merge)
 cargo run -p nerka-cli -- --lifecycle 'ecu1: lines ecu == ECU1; reset uptime; planned payload ~ /shutdown/' lifecycles trace.dlt   # ECU1's boots
 cargo run -p nerka-cli -- --pack packs/ --lifecycle 'ecu1: lines ecu == ECU1; reset uptime; planned {sys.shutdown}' --signal 'ota(s):enum:per(ecu1):default(idle)=ecu == ECU1 AND /OTA (?<s>\w+)/' filter '@ota == idle' trace.dlt
 cargo run -p nerka-cli -- --check 'storm: lines level >= ERROR; rate 25 per 1s' check -e 2 trace.dlt   # checks: issues and facts
@@ -52,8 +53,12 @@ checklist `doc/review/checklist.md`, latest findings `doc/review/*-findings.md`.
 CI (`.github/workflows/ci.yml`) runs fmt, clippy and tests on Linux and Windows, `cargo deny`, and a DCO sign-off check on pull requests (`CONTRIBUTING.md`; commit with `git commit -s`); `release.yml`
 builds Linux/Windows archives and publishes a pre-release on a `v*` tag.
 
-`doc/status.md` records the current state and the owner's GUI decisions; read it
-before changing the UI, and update it when the state changes.
+`doc/status.md` records the current state, the decisions pending with the owner
+and the next steps; read it first, and update it (with a dated line at the top of
+`doc/history.md`) when the state changes. `doc/gui-decisions.md` holds the owner's
+GUI decisions: read it before changing the UI, and record new ones there.
+`doc/features.md` describes each built feature and the owner's decisions about it;
+`doc/history.md` is the dated log (read on demand).
 
 ## Rules
 - Line numbers are 0-based `LineNo` (u64) internally; add 1 only for display.

@@ -110,14 +110,14 @@ fn rates_find_bursts() {
     assert_eq!(check("storm: lines raw == retry; rate 3 per 1s").overall().verdict, Verdict::Ok);
 }
 
-/// Review finding R4: times that go back (two overlapping files one after
-/// another) must not make a burst out of lines 10 s apart. Ignored until
-/// the owner decides how checks treat times out of order.
+/// Review finding R4 (2026-11-07; owner, 2026-11-10: warn only, explicit
+/// rather than implicit): times that go back (two overlapping files one
+/// after another) are read in the view's order, as they come, and the
+/// result says so; a check that doesn't test times, or lines in order,
+/// says nothing.
 #[test]
-#[ignore = "R4: checks assume rows in time order (doc/review/2026-11-07-findings.md)"]
-fn rates_with_times_going_back() {
-    // File A: 100 s .. 130 s; then file B: 105 s .. 135 s. Every retry is
-    // 10 s from the one before it in its own file.
+fn a_check_says_when_its_times_go_back() {
+    // File A: 100 s .. 130 s; then file B: 105 s .. 135 s, 10 s apart in each.
     let src = Src(vec![
         ("A", 100.0, 0.0, "retry"),
         ("A", 110.0, 0.0, "retry"),
@@ -128,11 +128,14 @@ fn rates_with_times_going_back() {
         ("B", 125.0, 0.0, "retry"),
         ("B", 135.0, 0.0, "retry"),
     ]);
-    let r = CheckDef::parse_spec("storm: lines raw == retry; rate 2 per 1s")
-        .unwrap()
-        .run(&src, &Signals::default(), &Progress::new())
-        .unwrap();
-    assert_eq!(r.overall().verdict, Verdict::Ok, "{:?}", r.overall().evidence);
+    let run =
+        |spec: &str| CheckDef::parse_spec(spec).unwrap().run(&src, &Signals::default(), &Progress::new()).unwrap();
+    // Read as they come: B's lines after A's look like a burst. Said.
+    let r = run("storm: lines raw == retry; rate 2 per 1s");
+    assert!(r.times_go_back);
+    assert!(matches!(r.overall().verdict, Verdict::Issue(_)), "not mended: {:?}", r.overall().verdict);
+    assert!(!run("n: lines raw == retry; count").times_go_back, "no test of times");
+    assert!(!check("quiet: lines ecu == A; gap 30s").times_go_back, "in order");
 }
 
 #[test]
@@ -462,6 +465,22 @@ mod as_signals {
         let r = run(&checks(&[r"Temp: lines /temp=(?<t>\d+)/; value max; per a"]), &signals());
         assert_eq!(filter("@temp.event", &r.signals), [5, 8]);
         assert_eq!(filter("@temp > 80", &r.signals), [5]);
+    }
+
+    /// Owner, 2026-11-09 (U2): checks are switched per tab. One that uses
+    /// the signal of a check switched off says so; switched on, it runs.
+    #[test]
+    fn a_check_using_one_that_is_off_says_so() {
+        let c = checks(&["Retries: lines raw == retry", "burst: lines @retries.event; count >= 2"]);
+        let off = c.switched(|d| d.name() != "Retries");
+        let r = run(&off, &signals());
+        assert_eq!(r.results.len(), 1, "only the checks on run");
+        let (_, e) = &r.results[0];
+        assert_eq!(e.as_ref().unwrap_err(), "check 'burst': uses @retries of check 'Retries', which is off");
+        let on = c.switched(|_| true);
+        assert_eq!(result(&run(&on, &signals()), "burst").overall().verdict, Verdict::Issue(4));
+        // The saved flags stay as they were.
+        assert!(c.iter().all(|d| d.is_on()));
     }
 
     #[test]

@@ -5,7 +5,7 @@
 //! gets its data blocks — all of them, unpacked or copied, in the order the
 //! block tree reaches them — written as a stream into one file in the
 //! unpack cache, which is mapped like any log. The block tree is still read
-//! from the original; [`Layout`] says where each data block's bytes are in
+//! from the original; `Layout` says where each data block's bytes are in
 //! the unpacked file. Memory stays as low as for an uncompressed file, and
 //! the search is as fast; the cost is disk.
 //!

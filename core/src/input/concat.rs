@@ -13,10 +13,11 @@
 //! name) is added, so `file == b.dlt` filters by file.
 //!
 //! The engine searches part by part ([`LogSource::parts`]), so each part
-//! keeps its own fast path; a part's [`View`] answers with the whole's
+//! keeps its own fast path; a part's `View` answers with the whole's
 //! fields, columns and line text, so `file` and `raw` read the same there.
 
 use super::proto::{MIXED_COLUMNS, PROTO_FIELD, Records};
+use super::schema::{SchemaMap, qualifier};
 use super::{ColumnDef, LogSource};
 use crate::event::{FieldDef, FieldId, FieldKind, FieldValue, Level};
 use crate::{Error, LineNo, Result};
@@ -45,6 +46,9 @@ pub struct Concat {
     /// Per part, whether its lines are rendered into the mixed layout
     /// (they have columns of their own).
     convert: Vec<bool>,
+    /// Its own, not its address: a view read again may land where the
+    /// last one was, and caches and the GUI tell them apart by it.
+    data_id: usize,
 }
 
 /// What kind of source this is, for "same kind": columns and fields.
@@ -61,9 +65,12 @@ fn has_proto(s: &dyn LogSource) -> bool {
     !s.columns().is_empty() && s.schema().iter().any(|f| f.name == PROTO_FIELD.name)
 }
 
-/// A readable kind for messages: plain text, DLT, or another table.
+/// A readable kind for messages: plain text, text records, JSON, DLT, or
+/// another table.
 fn kind_name(s: &dyn LogSource) -> &'static str {
     match s.columns() {
+        [] if s.format() == "JSON" => "JSON",
+        [] if s.format().starts_with("text records") => "text records",
         [] => "plain text",
         c if c == super::dlt::COLUMNS => "DLT",
         _ => "a table of other columns",
@@ -87,36 +94,47 @@ impl Concat {
         if let (true, Some(i)) = (differ, lone) {
             let (first, k) = (&parts[i], kind(parts[i].as_ref()));
             let other = parts.iter().find(|p| kind(p.as_ref()) != k).expect("they differ");
-            return Err(Error::MixedKinds(format!(
-                "{} is {} but {} is {}: only files of one kind open as one view",
-                file_name(first.name()),
-                kind_name(first.as_ref()),
-                file_name(other.name()),
-                kind_name(other.as_ref())
-            )));
+            let (a, b) = (file_name(first.name()), file_name(other.name()));
+            let (ka, kb) = (kind_name(first.as_ref()), kind_name(other.as_ref()));
+            // Of one kind with other fields (JSON with other keys): say so
+            // (review 2026-11-09, R17: "is JSON but … is JSON").
+            return Err(Error::MixedKinds(if ka == kb {
+                let what = if ka == "JSON" { "keys" } else { "fields" };
+                format!(
+                    "{a} and {b} are both {ka} but with other {what}: only files with the same {what} open as one view"
+                )
+            } else {
+                format!("{a} is {ka} but {b} is {kb}: only files of one kind open as one view")
+            }));
         }
         // Columns differ: the mixed layout. Only fields differ (a `.dlt`
         // file and a capture of DLT): the columns stay.
         let mixed = parts.iter().any(|p| p.columns() != first.columns());
-        let mapped = parts.iter().any(|p| p.schema() != first.schema());
+        // The mixed layout puts `proto` first, so a part's field ids are
+        // never the whole's there, even when every part has the same fields.
+        let mapped = mixed || parts.iter().any(|p| p.schema() != first.schema());
         // As a capture of several protocols, `proto` first when mixed; then
         // each part's fields (the first part's keep their ids). One of a
-        // name already there is the same field when its kind is the same,
-        // and left out when it isn't.
-        let mut schema: Vec<FieldDef> = if mixed { vec![PROTO_FIELD] } else { Vec::new() };
-        for p in &parts {
-            for def in p.schema() {
-                if !schema.iter().any(|d| d.name == def.name) {
-                    schema.push(def.clone());
-                }
-            }
-        }
-        let fields = parts
+        // name already there is the same field when its kind is the same;
+        // of another kind, each is a field of its own named after its part's
+        // protocol (`dlt.type`, `sens.type`; a part of several protocols,
+        // or none, by its file: `input::schema`).
+        let quals: Vec<String> = parts
             .iter()
-            .map(|p| {
-                schema.iter().map(|d| p.schema().iter().position(|o| o.name == d.name && o.kind == d.kind)).collect()
+            .map(|p| match p.info().protocols.as_slice() {
+                [one] => qualifier(one),
+                _ => {
+                    let file = file_name(p.name());
+                    qualifier(file.rsplit_once('.').map_or(file.as_str(), |(stem, _)| stem))
+                }
             })
             .collect();
+        let lead: Vec<FieldDef> = if mixed { vec![PROTO_FIELD] } else { Vec::new() };
+        let schemas: Vec<(String, &[FieldDef])> =
+            parts.iter().zip(&quals).map(|(p, q)| (q.clone(), p.schema())).collect();
+        let map = SchemaMap::new(&lead, &schemas, &[]);
+        let fields = parts.iter().zip(&quals).map(|(p, q)| map.ids(q, p.schema())).collect();
+        let mut schema = map.schema;
         let convert = parts.iter().map(|p| mixed && p.columns() != MIXED_COLUMNS).collect();
         let columns = if mixed { MIXED_COLUMNS.to_vec() } else { first.columns().to_vec() };
         schema.push(FieldDef::new(FILE_FIELD, FieldKind::Str, false));
@@ -127,7 +145,8 @@ impl Concat {
         }
         let files = parts.iter().map(|p| file_name(p.name())).collect();
         let name = parts.iter().map(|p| p.name()).collect::<Vec<_>>().join(" + ");
-        Ok(Concat { name, parts, starts, files, total, schema, mixed, mapped, columns, fields, convert })
+        let data_id = super::new_data_id();
+        Ok(Concat { name, parts, starts, files, total, schema, mixed, mapped, columns, fields, convert, data_id })
     }
 
     /// Whether parts of different protocols share the mixed layout.
@@ -205,6 +224,26 @@ impl Concat {
 }
 
 impl LogSource for Concat {
+    fn data_id(&self) -> usize {
+        self.data_id
+    }
+
+    /// Its parts': protocols each once, notes with the file they're about.
+    fn info(&self) -> super::SourceInfo {
+        let mut out = super::SourceInfo::default();
+        for (p, file) in self.parts.iter().zip(&self.files) {
+            let i = p.info();
+            for proto in i.protocols {
+                if !out.protocols.iter().any(|o| o.eq_ignore_ascii_case(&proto)) {
+                    out.protocols.push(proto);
+                }
+            }
+            out.notes.extend(i.notes.into_iter().map(|n| format!("{file}: {n}")));
+            out.no_sender += i.no_sender;
+        }
+        out
+    }
+
     fn name(&self) -> &str {
         &self.name
     }
@@ -309,6 +348,10 @@ impl LogSource for View<'_> {
         self.part().line_count()
     }
 
+    fn info(&self) -> super::SourceInfo {
+        self.part().info()
+    }
+
     fn anchor(&self, line: LineNo) -> Option<super::Anchor> {
         self.part().anchor(line)
     }
@@ -379,7 +422,7 @@ pub fn open_many(
 ) -> Result<Box<dyn LogSource>> {
     let mut parts = Vec::with_capacity(paths.len());
     for p in paths {
-        parts.push(super::open_with(p, options, progress)?);
+        parts.push(super::open_with(p, options, progress).map_err(|e| Error::opening(p, e))?);
     }
     if parts.len() == 1 {
         return Ok(parts.pop().expect("one"));
@@ -431,7 +474,7 @@ fn open_sorted(
 ) -> Result<Sorted> {
     let mut parts = Vec::with_capacity(paths.len());
     for p in paths {
-        parts.push((p.clone(), super::open_with(p, options, progress)?));
+        parts.push((p.clone(), super::open_with(p, options, progress).map_err(|e| Error::opening(p, e))?));
     }
     let starts: Option<Vec<f64>> = parts.iter().map(|(_, s)| start_time(s.as_ref())).collect();
     let timed = starts.is_some();

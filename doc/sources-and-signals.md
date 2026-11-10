@@ -1,6 +1,6 @@
 # Sources & Signals — design
 
-_Status: agreed direction. Written 2026-10-17. **Signals** (2026-10-24): per-tab signals from explicit captures, events and states in NFD (`@x`, `@x.event`, `@x.changed`), time as a signal (`@time` on DLT, `time` captures), the signal plot; see "What a signal is" and `status.md` → "Signals". Implemented so far: **DLT from `.dlt` files** (2026-10-18: source-supplied fields, DSL field predicates, own reader, table view) and **DLT inside pcap / pcapng and MF4** (2026-10-20: own readers in `core/src/input/capture/`, no dependency). Signals, SOME/IP, the time model and the plugin crates are still design. Current state and decisions: `status.md`._
+_Status: agreed direction. Written 2026-10-17. **Signals** (2026-10-24): per-tab signals from explicit captures, events and states in NFD (`@x`, `@x.event`, `@x.changed`), time as a signal (`@time` on DLT, `time` captures), the signal plot; see "What a signal is" and `features.md` → "Signals". Implemented so far: **DLT from `.dlt` files** (2026-10-18: source-supplied fields, DSL field predicates, own reader, table view) and **DLT inside pcap / pcapng and MF4** (2026-10-20: own readers in `core/src/input/capture/`, no dependency). Signals, SOME/IP, the time model and the plugin crates are still design. Current state and decisions: `status.md`._
 
 ## Goal
 
@@ -101,7 +101,7 @@ Constraints: the grammar comment in `dsl/mod.rs` and parser tests with error pos
 
 ## Plugin surface
 
-**Built so far (2026-11-01):** the decoder side as `input::proto::Protocol` (DLT, SOME/IP headers, syslog), routed by UDP port, with one source type for every container (`input::proto::Records`); see `status.md` → Next steps. Containers are still functions of `input::capture` (pcap, pcapng, MF4) and the `.dlt` reader, not a trait yet.
+**Built so far (2026-11-01):** the decoder side as `input::proto::Protocol` (DLT, SOME/IP headers, syslog), routed by UDP port, with one source type for every container (`input::proto::Records`); see `history.md` → "Next steps as of 2026-11-09". Containers are still functions of `input::capture` (pcap, pcapng, MF4) and the `.dlt` reader, not a trait yet.
 
 The traits `Container`, `Decoder`, `SignalDbLoader` and `Extractor`. They exchange **batches** (of frames, events or samples), never single items, so a future WASM or C-ABI boundary stays cheap. Planned crates:
 

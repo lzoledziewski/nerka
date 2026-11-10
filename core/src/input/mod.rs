@@ -11,6 +11,7 @@ pub mod json;
 pub mod merged;
 pub mod proto;
 pub mod records;
+pub(crate) mod schema;
 
 use crate::event::{FieldDef, FieldId, FieldValue, Level};
 use crate::{LineNo, Progress, Result};
@@ -129,6 +130,41 @@ impl ColumnDef {
     }
 }
 
+/// What a source can say about itself besides its lines (review
+/// 2026-11-09, R2 and R3: counts that reached no one; 2026-11-08, R8).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct SourceInfo {
+    /// The protocols of its messages, by name, each once (empty: none).
+    pub protocols: Vec<String>,
+    /// What it dropped or couldn't read, for people: `14 bytes skipped:
+    /// not DLT messages`. Empty: nothing.
+    pub notes: Vec<String>,
+    /// Messages without `net.*` fields: their sender wasn't kept (a capture
+    /// of more senders than it keeps).
+    pub no_sender: u64,
+}
+
+/// What a query on `source` can't find, said before it finds nothing: a
+/// `proto` no message has, `net.*` of messages whose sender wasn't kept.
+pub fn query_warnings(query: &crate::Query, source: &dyn LogSource) -> Vec<String> {
+    let info = source.info();
+    let mut out = Vec::new();
+    if !info.protocols.is_empty() {
+        for v in query.values_compared("proto") {
+            if !info.protocols.iter().any(|p| p.eq_ignore_ascii_case(&v)) {
+                out.push(format!("no message here is of a protocol '{v}' (there are: {})", info.protocols.join(", ")));
+            }
+        }
+    }
+    if info.no_sender > 0 && query.expr().field_names().iter().any(|f| f.starts_with("net.")) {
+        out.push(format!(
+            "net.* has no value for {} messages: the capture has more senders than are kept",
+            info.no_sender
+        ));
+    }
+    out
+}
+
 pub trait LogSource: Send + Sync {
     /// Human readable name (usually the file path).
     fn name(&self) -> &str;
@@ -168,6 +204,11 @@ pub trait LogSource: Send + Sync {
     /// Memory used by the source's line or message index.
     fn index_memory_bytes(&self) -> usize {
         0
+    }
+
+    /// Its protocols, and what it dropped or couldn't read.
+    fn info(&self) -> SourceInfo {
+        SourceInfo::default()
     }
 
     /// What the source is read as, for people: `text`, `JSON`,
@@ -285,7 +326,7 @@ pub trait LogSource: Send + Sync {
 
     /// Identifies the data the source reads, for caches (signal events): a
     /// part of a [`concat::Concat`] answers its file's, so the part made
-    /// for each scan is the same one. Files take a [`new_data_id`] when
+    /// for each scan is the same one. Files take a `new_data_id` when
     /// opened (an address could be reused by the next file); the default,
     /// the address, is for sources that live as long as their caches (tests).
     fn data_id(&self) -> usize {

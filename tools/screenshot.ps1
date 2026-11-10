@@ -44,8 +44,18 @@ public class NerkaShotWin32 {
 [NerkaShotWin32]::SetProcessDPIAware() | Out-Null
 
 # Start-Process rejects an empty -ArgumentList, so pass it only when set.
+# It joins the items with spaces as they are, so an item with a space or a
+# quote is quoted here (Windows' rules: a quote is \", backslashes before a
+# quote or the closing quote doubled), else `--query 'level >= WARN'`
+# arrives as three arguments.
+function Quote-Arg([string]$a) {
+    if ($a -ne '' -and $a -notmatch '[\s"]') { return $a }
+    $q = [regex]::Replace($a, '(\\*)"', { param($m) $m.Groups[1].Value * 2 + '\"' })
+    $q = [regex]::Replace($q, '(\\+)$', { param($m) $m.Groups[1].Value * 2 })
+    return '"' + $q + '"'
+}
 $start = @{ FilePath = (Resolve-Path $Exe); PassThru = $true }
-if ($AppArgs) { $start.ArgumentList = $AppArgs }
+if ($AppArgs) { $start.ArgumentList = ($AppArgs | ForEach-Object { Quote-Arg $_ }) -join ' ' }
 $p = Start-Process @start
 try {
     # winit creates a tiny helper window first; wait for the real one.

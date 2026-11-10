@@ -114,7 +114,7 @@ fields or wrong operators with their position. `Event` is lazy over
 ## 5. Measured performance
 
 Measured for the scaffold (2026-10-17) on a 2-core cloud VM. Current numbers
-on Windows, for text and DLT, are in `status.md` and the commit messages.
+on Windows, for text and DLT, are in `history.md` ("Next steps as of 2026-11-09") and the commit messages.
 
 1 GiB synthetic log, 12.0 M lines, 2-core cloud VM, release build, warm page cache:
 

@@ -33,6 +33,7 @@
 
 mod bundles;
 mod checks;
+mod console;
 mod icon;
 mod icon_art;
 mod instance;
@@ -47,6 +48,7 @@ mod recall;
 mod records;
 mod shot;
 mod signals;
+mod sync;
 mod view;
 
 use eframe::egui::{self, Color32, Key, KeyboardShortcut, Modifiers, RichText};
@@ -66,6 +68,38 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 use view::{Columns, Highlight, NoteMode, SearchMarks, ViewOutput, ViewState, log_view};
+
+/// `nerka-gui --help`.
+const USAGE: &str = "\
+Usage: nerka-gui [OPTIONS] [FILE]...
+
+Opens log files (several: one view) in a window. With only files given, a
+nerka window already open takes them.
+
+Options:
+  -q, --query NFD          Filter with a query
+  -r, --regex RE           Filter with a regex
+  -t, --text TEXT          Filter with plain text
+      --pack PATH          Load a library pack (file or folder)
+      --pick PACK.QUERY    Select a library query (Include)
+      --exclude PACK.QUERY Select a library query (Exclude)
+      --signal-pick PACK.QUERY  Select a library query (Signal)
+      --search-pick PACK.QUERY  Put a library query in the Search box
+      --highlight NFD      Colour the lines a query matches
+      --param NAME=VALUE   A library parameter's value
+      --library            Show the library
+      --signal SPEC        A signal for this session (as `nerka --signal`)
+      --check SPEC         A check for this session (as `nerka --check`)
+      --plot NAME          Plot a signal
+      --plot-window        The plot in a window of its own
+      --marker NAME=VALUE[:LABEL]  A horizontal line in a plotted lane
+      --cursor TIME        A time cursor in the plot
+      --fibex FILE         FIBEX file for DLT non-verbose messages
+      --new-window         A new window, even if one is open
+      --name NAME          The window's name
+  -h, --help               This text
+  -V, --version            The version
+";
 
 fn main() -> eframe::Result {
     let mut initial: Vec<PathBuf> = Vec::new();
@@ -93,11 +127,24 @@ fn main() -> eframe::Result {
     let mut markers: Vec<(String, plot::Marker)> = Vec::new();
     // `--plot-window`: the plot starts in a window of its own.
     let mut plot_window = false;
-    let (mut new_window, mut window_name, mut preset_file) = (false, None, None);
+    let (mut window_name, mut preset_file) = (None, None);
+    // Options given (anything but files): with none, a running window opens
+    // the files (review 2026-11-09, R7: an option left out of a list of
+    // them handed the files over and dropped the option).
+    let mut options_given = 0usize;
     let mut args = std::env::args_os().skip(1);
     while let Some(a) = args.next() {
+        options_given += 1;
         let mut value = || args.next().map(|v| v.to_string_lossy().into_owned()).unwrap_or_default();
         let tag = match a.to_str() {
+            Some("--help" | "-h") => {
+                console::print(USAGE);
+                return Ok(());
+            }
+            Some("--version" | "-V") => {
+                console::print(&format!("nerka-gui {}\n", env!("CARGO_PKG_VERSION")));
+                return Ok(());
+            }
             Some("--query" | "-q") => "query",
             Some("--regex" | "-r") => "regex",
             Some("--text" | "-t") => "text",
@@ -184,10 +231,8 @@ fn main() -> eframe::Result {
                 }
                 continue;
             }
-            Some("--new-window") => {
-                new_window = true;
-                continue;
-            }
+            // An option: the files aren't handed to a running window.
+            Some("--new-window") => continue,
             Some("--name") => {
                 window_name = Some(value());
                 continue;
@@ -198,7 +243,19 @@ fn main() -> eframe::Result {
                 preset_file = Some(PathBuf::from(value()));
                 continue;
             }
+            // `--` ends the options: a file named `-x` follows.
+            Some("--") => {
+                options_given -= 1;
+                initial.extend(args.by_ref().map(PathBuf::from));
+                continue;
+            }
+            // Not a file (R7: `--help` was opened as one).
+            Some(o) if o.starts_with('-') && o.len() > 1 && !Path::new(o).exists() => {
+                console::error(&format!("nerka-gui: unknown option {o}\n\n{USAGE}"));
+                std::process::exit(2);
+            }
             _ => {
+                options_given -= 1;
                 initial.push(PathBuf::from(a));
                 continue;
             }
@@ -206,21 +263,7 @@ fn main() -> eframe::Result {
         preset = args.next().map(|v| (tag, v.to_string_lossy().into_owned()));
     }
     // Plain `nerka-gui FILE…`: the window focused last opens them.
-    let plain = preset.is_none()
-        && packs.is_empty()
-        && startup.is_empty()
-        && searches.is_empty()
-        && highlight.is_empty()
-        && params.is_empty()
-        && signals.is_empty()
-        && plotted.is_empty()
-        && fibex.is_empty()
-        && markers.is_empty()
-        && cursors.is_empty()
-        && !show_library
-        && preset_file.is_none()
-        && window_name.is_none();
-    if plain && !new_window && !initial.is_empty() && instance::hand_off(&initial) {
+    if options_given == 0 && !initial.is_empty() && instance::hand_off(&initial) {
         return Ok(());
     }
     let options = eframe::NativeOptions {
@@ -522,8 +565,8 @@ impl PreviewCache {
     }
 }
 
-/// One open file (or several of one kind, one after another) with its own
-/// filter, view positions and bookmarks.
+/// One open file (or several, one after another or merged by time) with
+/// its own filter, view positions and bookmarks.
 /// A tab's files, read: the source and the paths in the order read.
 type Opened = (Box<dyn LogSource>, Vec<PathBuf>);
 
@@ -537,7 +580,19 @@ struct Tab {
     /// The files turned out to be of different kinds: why. The app then
     /// opens them as separate tabs.
     mixed: Option<String>,
+    /// The files couldn't be opened: why. The tab is closed and the app
+    /// shows it (`App::open_errors`).
+    open_error: Option<String>,
+    /// The filter failed (every line is shown): why, kept in the status
+    /// while a search over those lines reports (it overwrote it).
+    filter_failed: Option<String>,
+    /// Said first in the status once the file is read: why it was opened
+    /// as a tab of its own (its "Indexed …" replaced the reason before).
+    load_note: Option<String>,
     file: Option<Arc<dyn LogSource>>,
+    /// The file's protocols and what reading it dropped, once it is read
+    /// (review 2026-11-09, R3: counted, never said).
+    info: nerka_core::SourceInfo,
     /// The files being read, and their paths in the order read.
     loading: Option<Job<Opened>>,
     /// The lines the filter keeps (all lines without a filter).
@@ -608,7 +663,22 @@ struct Tab {
     check_results: Vec<(String, checks::Outcome)>,
     /// The job, and the generation of `own_signals` it ran with.
     checks_job: Option<(Job<nerka_core::check::CheckRun>, u64)>,
-    checks_key: Option<(usize, u64, u64, String)>,
+    checks_key: Option<(usize, u64, u64, String, String)>,
+    /// What the tab's own signals were last built as (the file, and
+    /// `Signals::fingerprint`): built again the same, nothing changes.
+    own_fp: Option<(usize, String)>,
+    /// The checks on in this tab (lower-case names), from the saved ones'
+    /// flags when first needed (owner, 2026-11-09, U2: on / off per tab;
+    /// the saved flag is what new tabs start with).
+    checks_on: Option<std::collections::HashSet<String>>,
+    /// Checks run by themselves when something changes, or only on ▶ Run
+    /// (per tab; new tabs take the last choice, `SearchPrefs::checks_auto`).
+    checks_auto: bool,
+    /// ▶ Run was pressed.
+    checks_run: bool,
+    /// Run on request only, and something changed since the last run (or
+    /// it never ran).
+    checks_stale: bool,
     /// The tab's signals without the checks' (`signals` adds them once the
     /// checks ran), and their generation.
     own_signals: Signals,
@@ -1090,8 +1160,9 @@ impl Tab {
         Self::open_many(ctx, vec![path], prefs, None)
     }
 
-    /// One tab for `paths`: one file, or several of one kind one after
-    /// another (nerka_core::open_many checks the kind).
+    /// One tab for `paths`: one file, or several one after another
+    /// (nerka_core::open_many checks they go together: text with text, JSON
+    /// with JSON of the same keys, messages of any protocols mixed).
     /// `fibex` describes DLT non-verbose messages.
     fn open_many(
         ctx: &egui::Context,
@@ -1111,6 +1182,10 @@ impl Tab {
             paths,
             part_files: Vec::new(),
             mixed: None,
+            open_error: None,
+            filter_failed: None,
+            load_note: None,
+            info: Default::default(),
             file: None,
             // Files that know their times (DLT, captures) in the order they
             // start, their lines interleaved by time if that was last chosen.
@@ -1160,6 +1235,11 @@ impl Tab {
             check_results: Vec::new(),
             checks_job: None,
             checks_key: None,
+            own_fp: None,
+            checks_on: None,
+            checks_auto: prefs.checks_auto,
+            checks_run: false,
+            checks_stale: false,
             own_signals: Signals::default(),
             own_gen: 0,
             plot: Default::default(),
@@ -1337,6 +1417,7 @@ impl Tab {
         options.disabled_for = self.disabled_for.clone();
         self.file = None;
         self.reopen_at = Some(line);
+        self.open_error = None;
         self.loading = Some(self.open_job(ctx, ps, options));
     }
 
@@ -1373,6 +1454,7 @@ impl Tab {
         options.fibex = fibex;
         options.records = self.records.clone();
         options.disabled_for = self.disabled_for.clone();
+        self.open_error = None;
         self.loading = Some(self.open_job(ctx, ps, options));
     }
 
@@ -1451,6 +1533,15 @@ impl Tab {
         if let Some(e) = s.resolve_lifecycles(lib).into_iter().next() {
             self.status = e;
         }
+        // The same definitions as before, on this file (a Selection change
+        // that makes no signal: an Exclude query, one without named
+        // groups): nothing changed, so the checks, filters and the plot
+        // don't run again or go out of date (owner, 2026-11-10).
+        let fp = (file.data_id(), s.fingerprint());
+        if self.own_fp.as_ref() == Some(&fp) {
+            return;
+        }
+        self.own_fp = Some(fp);
         // The checks' signals come back when they ran with these.
         self.own_signals = s.clone();
         self.own_gen += 1;
@@ -1458,9 +1549,16 @@ impl Tab {
         self.signals_changed(ctx);
     }
 
-    /// Run the checks on the tab's file in the background when they, the
-    /// signals (lifecycles), the library queries they use or the file
-    /// changed; take the results of a finished run.
+    /// The checks on in this tab, from the saved ones' flags at first.
+    fn checks_on(&mut self, saved: &nerka_core::check::Checks) -> &mut std::collections::HashSet<String> {
+        self.checks_on
+            .get_or_insert_with(|| saved.iter().filter(|c| c.is_on()).map(|c| c.name().to_lowercase()).collect())
+    }
+
+    /// Run the tab's checks on its file in the background when they, the
+    /// signals (lifecycles), the library queries they use, the file or
+    /// the checks on here changed (on request: only on ▶ Run, marked out
+    /// of date till then); take the results of a finished run.
     fn poll_checks(&mut self, ctx: &egui::Context, checks: &nerka_core::check::Checks, checks_gen: u64, lib: &Library) {
         if let Some((job, gen_)) = &self.checks_job
             && let Poll::Done(r, _) = job.poll()
@@ -1478,17 +1576,27 @@ impl Tab {
             self.checks_job = None;
         }
         let Some(file) = self.file.clone() else { return };
+        let on = self.checks_on(checks).clone();
+        let mut names: Vec<&String> = on.iter().collect();
+        names.sort();
         let queries: Vec<Option<&str>> =
             checks.iter().flat_map(|c| c.unresolved()).map(|id| lib.get(id).map(|(_, q)| q.text.as_str())).collect();
-        let key = (file.data_id(), self.own_gen, checks_gen, format!("{queries:?}"));
-        if self.checks_key.as_ref() == Some(&key) {
+        let key = (file.data_id(), self.own_gen, checks_gen, format!("{queries:?}"), format!("{names:?}"));
+        if self.checks_key.as_ref() == Some(&key) && !self.checks_run {
             return;
         }
+        if !self.checks_auto && !self.checks_run {
+            self.checks_stale = true;
+            return;
+        }
+        self.checks_run = false;
+        self.checks_stale = false;
         self.checks_key = Some(key);
         if let Some((j, _)) = self.checks_job.take() {
             j.cancel();
         }
-        let (checks, signals, lib) = (checks.clone(), self.own_signals.clone(), lib.clone());
+        let checks = checks.switched(|c| on.contains(&c.name().to_lowercase()));
+        let (signals, lib) = (self.own_signals.clone(), lib.clone());
         let job = Job::spawn(ctx, move |p| checks.run_all(&*file, &signals, &lib, p));
         self.checks_job = Some((job, self.own_gen));
     }
@@ -1527,6 +1635,7 @@ impl Tab {
         if self.filter_exp.as_ref().is_some_and(|a| a.exp.nfd != self.pattern) {
             self.filter_exp = None;
         }
+        self.filter_failed = None;
         if self.pattern.trim().is_empty() {
             let cur = self.current_line();
             self.session.set_filter(None);
@@ -1609,6 +1718,19 @@ impl Tab {
                                 ),
                                 n => format!("Indexed {} lines of {n} files in {took:.2?}", f.line_count()),
                             };
+                            if let Some(note) = self.load_note.take() {
+                                self.status = format!("{note} · {}", self.status);
+                            }
+                            // What reading it dropped: the first here, all in
+                            // the top bar's hover.
+                            self.info = f.info();
+                            if let Some(first) = self.info.notes.first() {
+                                self.status += &format!(" · ⚠ {first}");
+                                if self.info.notes.len() > 1 {
+                                    self.status +=
+                                        &format!(" (and {} more: hover the top bar)", self.info.notes.len() - 1);
+                                }
+                            }
                             self.part_files = f.part_files();
                             self.bookmarks = self.load_bookmarks(&*f).unwrap_or_else(|e| {
                                 self.status = format!("Could not read bookmarks: {e}");
@@ -1652,8 +1774,17 @@ impl Tab {
                             return false;
                         }
                         Err(e) => {
-                            let src = std::error::Error::source(&e).map(|s| format!(" ({s})")).unwrap_or_default();
-                            self.status = format!("Cannot open {}: {e}{src}", self.path.display());
+                            // One of several files names itself (R7).
+                            let why = match &e {
+                                nerka_core::Error::Open { .. } => e.to_string(),
+                                e => {
+                                    let src =
+                                        std::error::Error::source(e).map(|s| format!(" ({s})")).unwrap_or_default();
+                                    format!("{}: {e}{src}", self.path.display())
+                                }
+                            };
+                            self.status = format!("Cannot open {why}");
+                            self.open_error = Some(why);
                             return false;
                         }
                     }
@@ -1667,13 +1798,23 @@ impl Tab {
                 i += 1;
                 continue;
             };
-            let (_, ticket, _) = self.stage_jobs.remove(i);
+            let (stage, ticket, _) = self.stage_jobs.remove(i);
             // Where the view is, before the filter's lines change.
             let cur = self.current_line();
             match self.session.finish(ticket, r) {
                 Ok(Finished::Done(Stage::Filter)) => {
+                    self.filter_failed = None;
                     let n = self.result().map_or(0, |r| r.lines.len());
                     self.status = format!("Filter keeps {n} lines ({took:.2?})");
+                    // What it can't find (a `proto` no message has, `net.*`
+                    // of senders not kept): said (2026-11-08 R8, 2026-11-09 R2).
+                    if let (Some(f), Some(file)) = (self.session.filter(), &self.file)
+                        && let Filter::Query(q) = &**f
+                    {
+                        for w in nerka_core::query_warnings(q, &**file) {
+                            self.status += &format!(" · ⚠ {w}");
+                        }
+                    }
                     self.goto_line(cur);
                 }
                 Ok(Finished::Done(Stage::Search)) => {
@@ -1686,12 +1827,20 @@ impl Tab {
                                 a.names.iter().zip(counts).map(|(n, c)| format!("{} {c}", short(n))).collect();
                             msg += &format!(" ({})", per.join(" · "));
                         }
+                        if let Some(why) = &self.filter_failed {
+                            msg = format!("Filter failed: {why}; every line is shown · {msg}");
+                        }
                         self.status = msg;
                     }
                     self.hits_view = ViewState::default();
                 }
                 Ok(Finished::Done(Stage::Colors)) => self.colors_shown = self.colors_set.clone(),
                 Ok(Finished::Ignored) => {}
+                // The failed filter's lines aren't the old filter's (R5).
+                Err(e) if stage == Stage::Filter => {
+                    self.status = format!("Filter failed: {e}; every line is shown");
+                    self.filter_failed = Some(e.to_string());
+                }
                 Err(e) => self.status = format!("Failed: {e}"),
             }
             // A filter result lets the search and the colours run over it.
@@ -2838,6 +2987,24 @@ struct App {
     prefs: SearchPrefs,
     /// Shown when no tab is open (e.g. why the last open failed).
     status: String,
+    /// The checks, signals and prefs files as this window last read or
+    /// wrote them: a save merges its changes into what another window
+    /// wrote since (`sync`, owner, 2026-11-09: U3).
+    checks_base: String,
+    signals_base: String,
+    prefs_base: String,
+    /// The configuration files when this window lost the focus (or read
+    /// them): changed when it gets it back, a notice says what.
+    config_stamp: Option<sync::Stamp>,
+    focused: bool,
+    /// Configuration files another window (or an editor) changed and this
+    /// window hasn't read, and what they say changed: the notice bar with
+    /// Reload and Not now (owner, 2026-11-10: nothing is read by itself, a
+    /// session isn't changed under the user).
+    config_notice: Option<(std::collections::BTreeSet<PathBuf>, Vec<String>)>,
+    /// Why files couldn't be opened, in a window until OK (review
+    /// 2026-11-09, R7: the reason was the cut-off end of the status line).
+    open_errors: Vec<String>,
     focus_search: bool,
     window_title: String,
     /// Query packs (search manager) and where they come from besides the
@@ -2903,6 +3070,8 @@ struct SettingsChange {
     /// Export… or Import… of a settings bundle clicked.
     export: bool,
     import: bool,
+    /// Reload configuration clicked.
+    reload: bool,
 }
 
 /// What the Settings window shows: this window's name, the unpack cache
@@ -2982,7 +3151,8 @@ fn settings_ui(ui: &mut egui::Ui, f: SettingsFields<'_>) -> SettingsChange {
         });
         ui.end_row();
         ui.label(RichText::new("Settings bundle").strong()).on_hover_text(
-            "Packs, presets, plots, checks and signals as one .nerka-bundle file: to share them or move them              to another computer",
+            "Packs, presets, plots, checks and signals as one .nerka-bundle file: to share them or move them \
+             to another computer",
         );
         ui.end_row();
         ui.label("");
@@ -2993,6 +3163,16 @@ fn settings_ui(ui: &mut egui::Ui, f: SettingsFields<'_>) -> SettingsChange {
                 .on_hover_text("Open a bundle and see what it would change before anything is written")
                 .clicked();
         });
+        ui.end_row();
+        ui.label(RichText::new("Configuration").strong());
+        save.reload = ui
+            .button("Reload configuration")
+            .on_hover_text(
+                "Read packs, presets, plots, checks, signals and settings again, as another nerka window or an \
+                 editor left them (a bar says so when this window gets the focus back). Open tabs keep how \
+                 their files were read",
+            )
+            .clicked();
         ui.end_row();
     });
     save
@@ -3242,45 +3422,147 @@ impl App {
     fn load_checks(&mut self) {
         let Some(path) = checks_path() else { return };
         let Ok(text) = std::fs::read_to_string(&path) else { return };
-        let (c, errors) = nerka_core::check::Checks::parse_text(&text);
-        self.saved_checks = c;
-        if !errors.is_empty() {
-            self.status = format!("{}: {}", path.display(), errors.join("; "));
+        if let Some(e) = self.take_checks_text(&text) {
+            self.status = format!("{}: {e}", path.display());
         }
+    }
+
+    /// The checks file's `text` as this window's checks; the session's
+    /// (`--check`) stay on top. Errors of lines that aren't checks.
+    fn take_checks_text(&mut self, text: &str) -> Option<String> {
+        let (fresh, errors) = nerka_core::check::Checks::parse_text(text);
+        let session: Vec<_> =
+            self.session_checks.0.iter().filter_map(|(n, _)| self.saved_checks.get(n).cloned()).collect();
+        self.saved_checks = fresh;
+        for (n, replaced) in &mut self.session_checks.0 {
+            *replaced = self.saved_checks.get(n).cloned();
+        }
+        for c in session {
+            self.saved_checks.set(c);
+        }
+        self.checks_base = text.to_owned();
+        (!errors.is_empty()).then(|| errors.join("; "))
+    }
+
+    /// The checks file to write, given what it holds now (`theirs`): this
+    /// window's checks, or, when another window changed the file since,
+    /// this window's changes applied to it (and taken here too).
+    fn checks_text_to_write(&mut self, theirs: &str) -> String {
+        use nerka_core::check::{CheckDef, Checks};
+        let mine = self.checks_to_save();
+        if theirs == self.checks_base || theirs.is_empty() {
+            return mine.to_text();
+        }
+        let items = |c: &Checks| c.iter().map(|c| (c.name().to_owned(), c.spec())).collect::<Vec<_>>();
+        let (base, _) = Checks::parse_text(&self.checks_base);
+        let (now, _) = Checks::parse_text(theirs);
+        let m = sync::merge3(&items(&base), &items(&mine), &items(&now));
+        let mut c = Checks::default();
+        for d in m.items.iter().filter_map(|(_, spec)| CheckDef::parse_spec(spec).ok()) {
+            c.set(d);
+        }
+        let text = c.to_text();
+        self.take_checks_text(&text);
+        self.checks_gen += 1;
+        self.merge_status("check", &m);
+        text
     }
 
     fn save_checks(&mut self) {
         self.checks_gen += 1;
         let Some(path) = checks_path() else { return };
-        let write = path
-            .parent()
-            .map_or(Ok(()), std::fs::create_dir_all)
-            .and_then(|_| nerka_core::write_atomic(&path, self.checks_to_save().to_text()));
-        if let Err(e) = write {
-            self.status = format!("Could not save checks to {}: {e}", path.display());
+        let theirs = std::fs::read_to_string(&path).unwrap_or_default();
+        let text = self.checks_text_to_write(&theirs);
+        let write =
+            path.parent().map_or(Ok(()), std::fs::create_dir_all).and_then(|_| nerka_core::write_atomic(&path, &text));
+        match write {
+            Ok(()) => self.checks_base = text,
+            Err(e) => self.status = format!("Could not save checks to {}: {e}", path.display()),
         }
+        self.refresh_notice();
     }
 
     fn load_saved_signals(&mut self) {
         let Some(path) = signals_path() else { return };
         let Ok(text) = std::fs::read_to_string(&path) else { return };
-        let (s, errors) = Signals::parse_text(&text);
-        self.saved_signals = s;
-        if !errors.is_empty() {
-            self.status = format!("{}: {}", path.display(), errors.join("; "));
+        if let Some(e) = self.take_signals_text(&text) {
+            self.status = format!("{}: {e}", path.display());
         }
+    }
+
+    /// The signals file's `text` as this window's saved signals; the
+    /// session's (`--signal`) stay on top (as [`Self::take_checks_text`]).
+    fn take_signals_text(&mut self, text: &str) -> Option<String> {
+        let (fresh, errors) = Signals::parse_text(text);
+        let session: Vec<_> = self
+            .session_signals
+            .0
+            .iter()
+            .filter_map(|(n, _)| self.saved_signals.get(n).map(|d| (**d).clone()))
+            .collect();
+        self.saved_signals = fresh;
+        for (n, replaced) in &mut self.session_signals.0 {
+            *replaced = self.saved_signals.get(n).map(|d| (**d).clone());
+        }
+        for d in session {
+            self.saved_signals.set(d);
+        }
+        self.signals_base = text.to_owned();
+        (!errors.is_empty()).then(|| errors.join("; "))
+    }
+
+    /// The signals file to write (as [`Self::checks_text_to_write`]).
+    fn signals_text_to_write(&mut self, theirs: &str) -> String {
+        let mine = self.signals_to_save();
+        if theirs == self.signals_base || theirs.is_empty() {
+            return mine.to_text();
+        }
+        let items = |s: &Signals| s.iter().map(|d| (d.name().to_owned(), d.spec())).collect::<Vec<_>>();
+        let (base, _) = Signals::parse_text(&self.signals_base);
+        let (now, _) = Signals::parse_text(theirs);
+        let m = sync::merge3(&items(&base), &items(&mine), &items(&now));
+        let lines: String = m.items.iter().map(|(_, spec)| format!("{spec}\n")).collect();
+        let text = Signals::parse_text(&lines).0.to_text();
+        self.take_signals_text(&text);
+        self.saved_gen += 1;
+        self.merge_status("signal", &m);
+        text
+    }
+
+    /// Say what a save took in from another window, and where both changed
+    /// one item (this window's kept), in the window's and its tab's status.
+    fn merge_status(&mut self, what: &str, m: &sync::Merge) {
+        let mut parts = Vec::new();
+        if !m.taken.is_empty() {
+            let taken: Vec<String> = m.taken.iter().map(|t| format!("{what} {t}")).collect();
+            parts.push(format!("also took from another window: {}", taken.join(", ")));
+        }
+        if !m.both.is_empty() {
+            parts.push(format!("changed there too, this window's kept: {what} {}", m.both.join(", ")));
+        }
+        if parts.is_empty() {
+            return;
+        }
+        let msg = format!("Saved; {}", parts.join("; "));
+        if let Some(t) = self.tabs.get_mut(self.active) {
+            t.status.clone_from(&msg);
+        }
+        self.status = msg;
+        self.refresh_notice();
     }
 
     fn save_saved_signals(&mut self) {
         self.saved_gen += 1;
         let Some(path) = signals_path() else { return };
-        let write = path
-            .parent()
-            .map_or(Ok(()), std::fs::create_dir_all)
-            .and_then(|_| nerka_core::write_atomic(&path, self.signals_to_save().to_text()));
-        if let Err(e) = write {
-            self.status = format!("Could not save signals to {}: {e}", path.display());
+        let theirs = std::fs::read_to_string(&path).unwrap_or_default();
+        let text = self.signals_text_to_write(&theirs);
+        let write =
+            path.parent().map_or(Ok(()), std::fs::create_dir_all).and_then(|_| nerka_core::write_atomic(&path, &text));
+        match write {
+            Ok(()) => self.signals_base = text,
+            Err(e) => self.status = format!("Could not save signals to {}: {e}", path.display()),
         }
+        self.refresh_notice();
     }
 
     fn load_history(&mut self) {
@@ -3301,7 +3583,10 @@ impl App {
     fn load_prefs(&mut self) {
         if let Some(path) = prefs_path() {
             match SearchPrefs::load(&path) {
-                Ok(p) => self.prefs = p,
+                Ok(p) => {
+                    self.prefs = p;
+                    self.prefs_base = std::fs::read_to_string(&path).unwrap_or_default();
+                }
                 Err(e) => self.status = format!("Could not read preferences: {e}"),
             }
         }
@@ -3349,8 +3634,11 @@ impl App {
         }
     }
 
-    /// Load the packs, presets, plots, checks and signals again (an import
-    /// changed them).
+    /// Load the packs, presets, plots, checks, signals and prefs again (an
+    /// import, or another window, changed them). Session items (`--check`,
+    /// `--signal`, `•` presets and plots) and each tab's own state (its
+    /// selection, checks on, draft plots) stay. Open tabs keep how their
+    /// files were read (ports, protocols); new tabs use the prefs read.
     fn reload_settings(&mut self) {
         self.load_library();
         self.presets.load();
@@ -3359,6 +3647,134 @@ impl App {
         self.checks_gen += 1;
         self.load_saved_signals();
         self.saved_gen += 1;
+        let protocols = self.prefs.protocols.clone();
+        self.load_prefs();
+        if self.prefs.protocols.is_empty() {
+            self.prefs.protocols = protocols;
+        }
+        self.config_stamp = Some(self.config_stamp_now());
+        self.config_notice = None;
+    }
+
+    /// The configuration files and folders another window may change and
+    /// a notice is about. Not the prefs: saved at every change of a box's
+    /// options, they would make it show all the time; a save merges them.
+    fn config_stamp_now(&self) -> sync::Stamp {
+        let mut paths: Vec<PathBuf> = [checks_path(), signals_path()].into_iter().flatten().collect();
+        paths.extend(
+            [pack::default_dir(), nerka_core::plot::default_dir(), nerka_core::preset::default_dir()]
+                .into_iter()
+                .flatten(),
+        );
+        paths.extend(self.pack_paths.iter().cloned());
+        sync::Stamp::of(&paths)
+    }
+
+    /// The focus came back and configuration files changed while it was
+    /// away (another window, or an editor): the notice says what (owner,
+    /// 2026-11-10: notice only, nothing read by itself). Losing the focus
+    /// notes how they are, so this window's own saves don't count.
+    fn follow_focus(&mut self, ctx: &egui::Context) {
+        let focused = ctx.input(|i| i.viewport().focused).unwrap_or(false);
+        if focused == self.focused {
+            return;
+        }
+        self.focused = focused;
+        let now = self.config_stamp_now();
+        let changed = match (&self.config_stamp, focused) {
+            (Some(was), true) => was.changed(&now),
+            _ => Vec::new(),
+        };
+        self.config_stamp = Some(now);
+        if !changed.is_empty() {
+            self.config_notice.get_or_insert_with(Default::default).0.extend(changed);
+            self.refresh_notice();
+        }
+    }
+
+    /// What the notice says, from its files: checks and signals by name
+    /// (what the file has that this window didn't read), plots, presets
+    /// and packs by file. Nothing left to say: no notice.
+    fn refresh_notice(&mut self) {
+        let Some((files, _)) = &self.config_notice else { return };
+        let mut lines = Vec::new();
+        let read = |p: &Option<PathBuf>| p.as_ref().and_then(|p| std::fs::read_to_string(p).ok());
+        if checks_path().is_some_and(|p| files.contains(&p))
+            && let Some(now) = read(&checks_path())
+        {
+            use nerka_core::check::Checks;
+            let items =
+                |t: &str| Checks::parse_text(t).0.iter().map(|c| (c.name().to_owned(), c.spec())).collect::<Vec<_>>();
+            lines.extend(
+                sync::changes(&items(&self.checks_base), &items(&now)).into_iter().map(|c| format!("check {c}")),
+            );
+        }
+        if signals_path().is_some_and(|p| files.contains(&p))
+            && let Some(now) = read(&signals_path())
+        {
+            let items =
+                |t: &str| Signals::parse_text(t).0.iter().map(|d| (d.name().to_owned(), d.spec())).collect::<Vec<_>>();
+            lines.extend(
+                sync::changes(&items(&self.signals_base), &items(&now)).into_iter().map(|c| format!("signal {c}")),
+            );
+        }
+        let (plots, presets) = (nerka_core::plot::default_dir(), nerka_core::preset::default_dir());
+        let packs: Vec<PathBuf> = pack::default_dir().into_iter().chain(self.pack_paths.iter().cloned()).collect();
+        for f in files {
+            let stem = f.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+            let line = if plots.as_ref().is_some_and(|d| f.starts_with(d)) {
+                format!("plot {stem}")
+            } else if presets.as_ref().is_some_and(|d| f.starts_with(d)) {
+                format!("preset {stem}")
+            } else if packs.iter().any(|d| f.starts_with(d)) {
+                format!("pack file {}", f.file_name().map(|s| s.to_string_lossy()).unwrap_or_default())
+            } else {
+                continue;
+            };
+            if !lines.contains(&line) {
+                lines.push(line);
+            }
+        }
+        if lines.is_empty() {
+            self.config_notice = None;
+        } else if let Some(n) = &mut self.config_notice {
+            n.1 = lines;
+        }
+    }
+
+    /// The notice bar: what changed elsewhere, Reload, Not now.
+    fn config_notice_bar(&mut self, ui: &mut egui::Ui) {
+        let Some((_, lines)) = &self.config_notice else { return };
+        let text = format!("Changed in another window: {}", lines.join(", "));
+        let (mut reload, mut later) = (false, false);
+        egui::Panel::top("config_notice").show(ui, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                ui.colored_label(ui.visuals().warn_fg_color, "⚠");
+                ui.label(text);
+                reload = ui
+                    .button("Reload")
+                    .on_hover_text(
+                        "Read packs, presets, plots, checks and signals again: this window's tabs use the new \
+                         definitions",
+                    )
+                    .clicked();
+                later = ui
+                    .button("Not now")
+                    .on_hover_text(
+                        "Keep this window as it is (Settings → Reload configuration reads them later). Saving \
+                         here keeps the other window's changes all the same",
+                    )
+                    .clicked();
+            });
+        });
+        if reload {
+            self.reload_settings();
+            if let Some(t) = self.tabs.get_mut(self.active) {
+                t.status = "Configuration read again".into();
+            }
+        } else if later {
+            self.config_notice = None;
+        }
     }
 
     fn settings_window(&mut self, ctx: &egui::Context) {
@@ -3392,6 +3808,13 @@ impl App {
             self.settings_open = false;
             self.protocols_edit = None;
             self.limit_text = None;
+        }
+        if save.reload {
+            self.reload_settings();
+            self.status = "Configuration read again".into();
+            if let Some(t) = self.tabs.get_mut(self.active) {
+                t.status = "Configuration read again".into();
+            }
         }
         if save.export {
             match nerka_core::bundle::Store::user() {
@@ -3465,7 +3888,7 @@ impl App {
         }
         if changed
             && let Some(path) = prefs_path()
-            && let Err(e) = self.prefs.save(&path)
+            && let Err(e) = sync::save_prefs(&mut self.prefs, &mut self.prefs_base, &path)
         {
             self.status = format!("Could not save preferences: {e}");
         }
@@ -3493,7 +3916,7 @@ impl App {
         }
         self.prefs = prefs;
         if let Some(path) = prefs_path()
-            && let Err(e) = self.prefs.save(&path)
+            && let Err(e) = sync::save_prefs(&mut self.prefs, &mut self.prefs_base, &path)
             && let Some(t) = self.tabs.get_mut(self.active)
         {
             t.status = format!("Could not save preferences: {e}");
@@ -3532,7 +3955,8 @@ impl App {
     }
 
     /// Files opened together become one view, one after another (owner,
-    /// 2026-10-20), if they are of one kind; otherwise separate tabs. A view
+    /// 2026-10-20), if they go together (`open_many`); otherwise separate
+    /// tabs. A view
     /// already open with the same files is switched to.
     fn open_files(&mut self, ctx: &egui::Context, paths: Vec<PathBuf>) {
         if paths.is_empty() {
@@ -3595,15 +4019,28 @@ impl App {
             if let Some(why) = self.tabs[i].mixed.take() {
                 let paths = self.tabs[i].paths.clone();
                 self.close(i);
-                for p in paths {
-                    self.open(ctx, p);
+                for p in &paths {
+                    self.open(ctx, p.clone());
                 }
-                if let Some(t) = self.tab() {
-                    t.status = format!("Opened as separate tabs: {why}");
+                // Each of them says why, once read (or now, if it was open).
+                let note = format!("Opened as separate tabs: {why}");
+                for t in self
+                    .tabs
+                    .iter_mut()
+                    .filter(|t| t.paths.len() == 1 && paths.iter().any(|p| same_file(p, &t.paths[0])))
+                {
+                    if t.file.is_some() {
+                        t.status.clone_from(&note);
+                    } else {
+                        t.load_note = Some(note.clone());
+                    }
                 }
                 continue;
             }
             let msg = std::mem::take(&mut self.tabs[i].status);
+            if let Some(why) = self.tabs[i].open_error.take() {
+                self.open_errors.push(why);
+            }
             self.close(i);
             match self.tab() {
                 Some(t) => t.status = msg,
@@ -3864,7 +4301,7 @@ impl App {
             // New tabs of several files follow the last choice.
             self.prefs.merge_by_time = t.merge;
             if let Some(path) = prefs_path()
-                && let Err(e) = self.prefs.save(&path)
+                && let Err(e) = sync::save_prefs(&mut self.prefs, &mut self.prefs_base, &path)
             {
                 self.status = format!("Could not save preferences: {e}");
             }
@@ -3914,8 +4351,9 @@ impl App {
             .default_width(640.0)
             .show(ctx, |ui| {
                 ui.weak(
-                    "The tab shows these files as one view, one after another in this order. They must be of one \
-                     kind: plain text with plain text, DLT with DLT and captures. In a capture, only the \
+                    "The tab shows these files as one view, one after another in this order. Plain text opens only \
+                     with plain text, and JSON with JSON of the same keys; DLT files and captures mix, whatever \
+                     their protocols (messages of other protocols share one table). In a capture, only the \
                      highlighted protocols are read (Settings → Captures: protocols says which datagrams are whose).",
                 );
                 ui.separator();
@@ -4049,6 +4487,33 @@ impl App {
     }
 
     /// F1 / the About button: name, version, licence and where to find it.
+    /// Files that couldn't be opened: each with its whole reason, wrapped.
+    fn open_errors_dialog(&mut self, ctx: &egui::Context) {
+        if self.open_errors.is_empty() {
+            return;
+        }
+        let mut ok = false;
+        egui::Window::new("Cannot open")
+            .collapsible(false)
+            .resizable(false)
+            .default_width(520.0)
+            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+            .show(ctx, |ui| {
+                for why in &self.open_errors {
+                    ui.add(egui::Label::new(egui::RichText::new(why).color(ui.visuals().error_fg_color)).wrap());
+                }
+                ui.add_space(4.0);
+                // Enter / Esc only when no field takes the keys (they closed
+                // it while typing in the Filter box).
+                let keys = !ui.ctx().egui_wants_keyboard_input()
+                    && ui.input(|i| i.key_pressed(Key::Escape) || i.key_pressed(Key::Enter));
+                ok = ui.button("OK").clicked() || keys;
+            });
+        if ok {
+            self.open_errors.clear();
+        }
+    }
+
     fn about_dialog(&mut self, ctx: &egui::Context) {
         if !self.about {
             return;
@@ -4127,6 +4592,7 @@ impl App {
     /// One frame of the whole window (also driven by tests).
     fn frame(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
+        self.follow_focus(&ctx);
         self.poll_instance(&ctx);
         self.poll_jobs(&ctx);
         for t in &mut self.tabs {
@@ -4139,6 +4605,7 @@ impl App {
         self.files_window(&ctx);
         self.records_window(&ctx);
         self.about_dialog(&ctx);
+        self.open_errors_dialog(&ctx);
         self.settings_window(&ctx);
         self.bundle_windows(&ctx);
         if let Some(t) = self.tabs.get_mut(self.active)
@@ -4187,24 +4654,40 @@ impl App {
                     "Values the lines of this tab carry, captured by a regex group: filter with @name \
                      (@speed > 100, @gear == D)",
                 );
-                let checks = self.saved_checks.iter().filter(|c| c.is_on()).count();
+                let checks = match self.tabs.get(self.active).and_then(|t| t.checks_on.as_ref()) {
+                    Some(on) => self.saved_checks.iter().filter(|c| on.contains(&c.name().to_lowercase())).count(),
+                    None => self.saved_checks.iter().filter(|c| c.is_on()).count(),
+                };
                 ui.toggle_value(&mut self.show_checks, format!("✔ Checks ({checks})"))
                     .on_hover_text("Issues and facts found in the file, overall and per lifecycle");
                 ui.toggle_value(&mut self.show_library, format!("📚 Library ({queries})")).on_hover_text(
                     "Saved queries from packs (*.nerka-pack): pick them for the filter or the search \
                      (Ctrl+Shift+L)",
                 );
-                if let Some(f) = self.tabs.get(self.active).and_then(|t| t.file.as_ref()) {
+                if let Some(t) = self.tabs.get(self.active)
+                    && let Some(f) = t.file.as_ref()
+                {
                     ui.separator();
                     let indexes: usize =
                         self.tabs.iter().filter_map(|t| t.file.as_ref()).map(|f| f.index_memory_bytes()).sum();
-                    let text = format!("{} lines · {} · {}", f.line_count(), size_text(f.size_bytes()), f.format());
-                    let tip = format!(
+                    let mut text = format!("{} lines · {} · {}", f.line_count(), size_text(f.size_bytes()), f.format());
+                    let mut tip = format!(
                         "Read as: {}\nIndex of this tab: {}; of all tabs: {}",
                         f.format(),
                         size_text(f.index_memory_bytes() as u64),
                         size_text(indexes as u64)
                     );
+                    if !t.info.protocols.is_empty() {
+                        tip += &format!("\nProtocols: {}", t.info.protocols.join(", "));
+                    }
+                    // What reading it dropped (review 2026-11-09, R3).
+                    if !t.info.notes.is_empty() {
+                        text += " · ⚠";
+                        tip += "\n\nNot read:";
+                        for n in &t.info.notes {
+                            tip += &format!("\n• {n}");
+                        }
+                    }
                     ui.label(text).on_hover_text(tip);
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -4230,6 +4713,7 @@ impl App {
             });
         });
 
+        self.config_notice_bar(ui);
         if !self.tabs.is_empty() {
             egui::Panel::top("tabs").show(ui, |ui| self.tab_bar(ui));
         }
@@ -4272,6 +4756,8 @@ impl App {
         // FIBEX files chosen there (every DLT tab reads its file again).
         let mut save_signals = false;
         let mut save_checks = false;
+        // A check renamed or removed: every tab's set follows.
+        let mut checks_renamed: Option<(String, Option<String>)> = None;
         let mut fibex_action = None;
         let show_bookmarks = self.show_bookmarks;
         let mut focus_search = std::mem::take(&mut self.focus_search);
@@ -4350,7 +4836,7 @@ impl App {
             if notes != self.prefs.bookmark_notes {
                 self.prefs.bookmark_notes = notes;
                 if let Some(path) = prefs_path()
-                    && let Err(e) = self.prefs.save(&path)
+                    && let Err(e) = sync::save_prefs(&mut self.prefs, &mut self.prefs_base, &path)
                 {
                     tab.status = format!("Could not save preferences: {e}");
                 }
@@ -4449,6 +4935,7 @@ impl App {
             // At most half the window: its results wrap (owner, 2026-11-07:
             // it grew to the whole window).
             let max = (ui.available_width() * 0.5).max(320.0);
+            tab.checks_on(&self.saved_checks);
             let out = egui::Panel::right("checks")
                 .resizable(true)
                 .default_size(440.0)
@@ -4456,6 +4943,10 @@ impl App {
                 .show(ui, |ui| {
                     let input = checks::Input {
                         saved: &mut self.saved_checks,
+                        on: tab.checks_on.as_mut().expect("set above"),
+                        auto: tab.checks_auto,
+                        stale: tab.checks_stale,
+                        ran: tab.checks_key.is_some(),
                         results: &tab.check_results,
                         running: tab.checks_job.is_some(),
                         file: &*file,
@@ -4475,6 +4966,20 @@ impl App {
             if out.changed {
                 save_checks = true;
             }
+            if out.run {
+                tab.checks_run = true;
+            }
+            // Per tab; new tabs follow the last choice (owner, 2026-11-09).
+            if let Some(auto) = out.auto {
+                tab.checks_auto = auto;
+                self.prefs.checks_auto = auto;
+                if let Some(path) = prefs_path()
+                    && let Err(e) = sync::save_prefs(&mut self.prefs, &mut self.prefs_base, &path)
+                {
+                    tab.status = format!("Could not save preferences: {e}");
+                }
+            }
+            checks_renamed = out.renamed;
             if let Some(line) = out.goto {
                 tab.goto_line(line);
             }
@@ -4586,6 +5091,7 @@ impl App {
                             if p.name.as_deref() == Some(name.as_str()) {
                                 p.name = None;
                             }
+                            p.drafts.remove(&name);
                         }
                     }
                 }
@@ -4609,6 +5115,16 @@ impl App {
         }
         if save_signals {
             self.save_saved_signals();
+        }
+        if let Some((old, new)) = checks_renamed {
+            for t in &mut self.tabs {
+                if let Some(on) = &mut t.checks_on
+                    && on.remove(&old.to_lowercase())
+                    && let Some(new) = &new
+                {
+                    on.insert(new.to_lowercase());
+                }
+            }
         }
         if save_checks {
             self.save_checks();
@@ -4667,6 +5183,110 @@ mod tests {
         app.add_session_signal(signal(r"w=/w=(?<w>\d+)/"));
         let text = app.signals_to_save().to_text();
         assert!(text.contains("/v=(?<v>") && !text.contains("volts") && !text.contains("w=/w="), "{text}");
+    }
+
+    /// Owner, 2026-11-09 (U3): two windows on one configuration. A save
+    /// writes this window's changes into what the other wrote since, and
+    /// takes the other's; a `--check` of the session stays out of the file
+    /// and in the window.
+    #[test]
+    fn two_windows_keep_each_others_checks_and_signals() {
+        use nerka_core::check::CheckDef;
+        let check = |s: &str| CheckDef::parse_spec(s).unwrap();
+        let (mut one, mut two) = (App::default(), App::default());
+        let disk = "a: lines raw ~ /a/; exists\nb: lines raw ~ /b/; exists\n".to_owned();
+        one.take_checks_text(&disk);
+        two.take_checks_text(&disk);
+        two.add_session_check(check("test: lines raw ~ /t/; exists"));
+        // Window one edits a and adds c; then window two, not knowing,
+        // removes b.
+        one.saved_checks.set(check("a: lines raw ~ /a2/; exists"));
+        one.saved_checks.set(check("c: lines raw ~ /c/; exists"));
+        let disk = one.checks_text_to_write(&disk);
+        two.saved_checks.remove("b");
+        let disk = two.checks_text_to_write(&disk);
+        let names =
+            |text: &str| nerka_core::check::Checks::parse_text(text).0.iter().map(|c| c.spec()).collect::<Vec<_>>();
+        assert_eq!(names(&disk), ["a: lines raw ~ /a2/; exists", "c: lines raw ~ /c/; exists"]);
+        assert!(two.saved_checks.get("a").unwrap().spec().contains("/a2/"), "window two took one's edit");
+        assert_eq!(two.status, "Saved; also took from another window: check a edited, check c added");
+        assert!(two.saved_checks.get("test").is_some(), "the session's check stays in the window");
+        // Window one reads again: b is gone there too.
+        one.take_checks_text(&disk);
+        assert!(one.saved_checks.get("b").is_none() && one.saved_checks.get("c").is_some());
+
+        // Signals the same way: each window adds one.
+        let signal = |s: &str| nerka_core::SignalDef::parse_spec(s).unwrap();
+        let disk = Signals::default().to_text();
+        one.take_signals_text(&disk);
+        two.take_signals_text(&disk);
+        one.saved_signals.set(signal(r"v=/v=(?<v>\d+)/"));
+        let disk = one.signals_text_to_write(&disk);
+        two.saved_signals.set(signal(r"w=/w=(?<w>\d+)/"));
+        let disk = two.signals_text_to_write(&disk);
+        let (both, _) = Signals::parse_text(&disk);
+        assert!(both.get("v").is_some() && both.get("w").is_some(), "{disk}");
+    }
+
+    /// Owner, 2026-11-09 (U2): checks are switched on and off per tab (a
+    /// new tab starts with each check's saved flag, which a switch doesn't
+    /// change), and a tab runs them by itself or only on ▶ Run.
+    #[test]
+    fn checks_are_switched_and_run_per_tab() {
+        use nerka_core::check::CheckDef;
+        let dir = std::env::temp_dir().join(format!("nerka-gui-tabchecks-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (a, b) = (dir.join("a.log"), dir.join("b.log"));
+        std::fs::write(&a, LOG).unwrap();
+        std::fs::write(&b, LOG).unwrap();
+        let ctx = egui::Context::default();
+        let mut app = App::default();
+        app.saved_checks.set(CheckDef::parse_spec("errors: lines level >= ERROR; exists").unwrap());
+        app.saved_checks.set(CheckDef::parse_spec("off timeouts: lines /timeout/; exists").unwrap());
+        app.open(&ctx, a);
+        app.open(&ctx, b);
+        settle_app(&mut app, &ctx);
+        // Frames of the active tab until its checks ran (or are waiting).
+        let run = |app: &mut App| {
+            for _ in 0..500 {
+                let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1200.0, 800.0));
+                let input = egui::RawInput { screen_rect: Some(screen), ..Default::default() };
+                let mut out = ctx.run_ui(input, |ui| app.frame(ui));
+                out.textures_delta.clear();
+                let t = &app.tabs[app.active];
+                if t.checks_job.is_none() && (t.checks_key.is_some() || t.checks_stale) {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            panic!("checks still running");
+        };
+        let ran = |app: &App, i: usize| app.tabs[i].check_results.iter().map(|(n, _)| n.clone()).collect::<Vec<_>>();
+
+        // New tabs: the saved flags.
+        app.active = 0;
+        run(&mut app);
+        assert_eq!(ran(&app, 0), ["errors"]);
+        // Switched on in the first tab only; the saved flag stays off.
+        app.tabs[0].checks_on.as_mut().unwrap().insert("timeouts".into());
+        run(&mut app);
+        assert_eq!(ran(&app, 0), ["errors", "timeouts"]);
+        app.active = 1;
+        run(&mut app);
+        assert_eq!(ran(&app, 1), ["errors"]);
+        assert!(!app.saved_checks.get("timeouts").unwrap().is_on());
+
+        // On request: a change marks the results out of date, ▶ Run runs.
+        app.tabs[1].checks_auto = false;
+        app.tabs[1].checks_on.as_mut().unwrap().insert("timeouts".into());
+        run(&mut app);
+        assert!(app.tabs[1].checks_stale);
+        assert_eq!(ran(&app, 1), ["errors"], "not run again by itself");
+        app.tabs[1].checks_run = true;
+        run(&mut app);
+        assert!(!app.tabs[1].checks_stale);
+        assert_eq!(ran(&app, 1), ["errors", "timeouts"]);
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     const LOG: &str = "\
@@ -5531,8 +6151,15 @@ gear=D
         settle_app(&mut app, &ctx);
         settle_app(&mut app, &ctx);
         assert_eq!(app.tabs.iter().map(|t| t.title()).collect::<Vec<_>>(), ["a.log", "d.dlt"]);
-        let status = &app.tabs[app.active].status;
-        assert!(status.contains("separate tabs") || status.starts_with("Indexed"), "{status}");
+        // Each tab says why once read (its "Indexed …" replaced the reason).
+        for t in &app.tabs {
+            assert!(
+                t.status.starts_with("Opened as separate tabs: a.log is plain text but d.dlt is DLT")
+                    && t.status.contains(" · Indexed "),
+                "{}",
+                t.status
+            );
+        }
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -5899,6 +6526,38 @@ gear=D
         tab.recolor_from(&ctx, &lib);
         settle(&mut tab, &ctx);
         assert!(tab.line_colors().is_none());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Owner, 2026-11-10: a Selection change that makes no signal (a query
+    /// without named groups, an Exclude one) leaves the tab's signals as
+    /// they were, so its checks aren't out of date; one with a named group
+    /// changes them.
+    #[test]
+    fn selection_changes_that_make_no_signal_change_nothing() {
+        let dir = std::env::temp_dir().join(format!("nerka-gui-samesignals-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("app.log");
+        std::fs::write(&log, LOG).unwrap();
+        let mut lib = Library::new();
+        lib.add(pack::parse_pack("vision.nerka-pack", PACK).unwrap()).unwrap();
+        let groups = "pack g\nquery cam\n    /(?<cam>cam\\d) /\n";
+        lib.add(pack::parse_pack("g.nerka-pack", groups).unwrap()).unwrap();
+        let ctx = egui::Context::default();
+        let mut tab = Tab::open(&ctx, log, &SearchPrefs::default());
+        settle(&mut tab, &ctx);
+        let saved = Signals::default();
+        tab.refresh_signals(&ctx, &lib, &saved, 0);
+        let built = tab.own_gen;
+        for (id, role) in [("vision.drops", Use::Include), ("vision.timeouts", Use::Exclude)] {
+            tab.picks.add(&lib, id, role, None);
+            tab.refresh_signals(&ctx, &lib, &saved, 0);
+            assert_eq!(tab.own_gen, built, "{id}: no signal, nothing changed");
+        }
+        tab.picks.add(&lib, "g.cam", Use::Include, None);
+        tab.refresh_signals(&ctx, &lib, &saved, 0);
+        assert_ne!(tab.own_gen, built, "@cam is new");
+        assert!(tab.signals.get("cam").is_some());
         std::fs::remove_dir_all(&dir).ok();
     }
 

@@ -448,6 +448,13 @@ fn senders_past_the_cap_are_not_kept() {
     let (f, s) = from_bytes("t", pcap_file(1, &frames), &CaptureOptions::default()).unwrap();
     assert_eq!(f.line_count() as usize, n + 1);
     assert_eq!(s.senders_not_kept, 5);
+    // Said (review 2026-11-09, R2: `net.*` queries missed them silently).
+    let info = f.info();
+    assert_eq!(info.no_sender, 5);
+    assert!(info.notes.iter().any(|n| n.starts_with("5 messages have no net.* fields")), "{info:?}");
+    let q = |s: &str| Query::compile(s).unwrap().bind(f.schema()).unwrap();
+    assert_eq!(crate::query_warnings(&q("net.port == 3490"), &f).len(), 1);
+    assert!(crate::query_warnings(&q("apid == S"), &f).is_empty());
     let src = |l: usize| field_named(&f, l as LineNo, "net.src");
     assert_eq!(src(0), Some(crate::FieldValue::Str(b"0.0.0.0".as_slice().into())));
     assert!(src(MAX_SENDERS - 1).is_some());

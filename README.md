@@ -13,7 +13,7 @@ one UI-free engine (`nerka-core`).
 
 ![nerka on a synthetic DLT drive: warnings filtered from a query pack, speed, temperature and battery voltage plotted with a throttling threshold, a text search (regex, ignoring case) for throttling messages in the bottom pane, and the library and selection panes on the right](doc/img/nerka.png)
 
-> Status: **0.2.0-alpha.2**. Windows is the main platform;
+> Status: **0.2.0-alpha.3**. Windows is the main platform;
 > Linux builds come from CI; macOS isn't built yet. While nerka is at 0.x,
 > file formats, the filter language and the GUI can still change.
 
@@ -47,6 +47,7 @@ mode, with history on ↑ / ↓.
 nerka filter 'level >= ERROR AND raw ~ /SSL|CERT/i AND NOT /healthcheck/' app.log
 nerka filter 'apid == NAV AND level >= WARN AND payload ~ "timeout"' trace.dlt
 nerka search --in 'level >= WARN' -c timeout app.log
+nerka --merge filter 'apid == NAV OR file == ecu2.dlt' ecu1.dlt ecu2.dlt bus.pcap   # several files: one view, FILE:LINE: per line
 ```
 
 ### Every format by its content
@@ -247,7 +248,10 @@ nerka --local-time lines trace.dlt 1 20                  # local time (CLI: UTC 
 
 ## Documentation
 
-- [doc/status.md](doc/status.md): current state, decisions and next steps.
+- [doc/status.md](doc/status.md): current state, pending decisions and next steps.
+- [doc/gui-decisions.md](doc/gui-decisions.md): the owner's decisions about the GUI.
+- [doc/features.md](doc/features.md): built features and the decisions about them.
+- [doc/history.md](doc/history.md): the dated log.
 - [doc/architecture-analysis.md](doc/architecture-analysis.md): architecture, decisions and deviations from the
   [original spec](doc/nerka_architecture_implementation_spec_v_0.md).
 - [doc/search-manager.md](doc/search-manager.md): query packs, expansion, library and selection.

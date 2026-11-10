@@ -60,6 +60,13 @@
 //! `raw` or `bookmark` on that source is an error saying so (`level` isn't:
 //! a JSON level key is the row's level, and `json.level` its text).
 //!
+//! Messages of several protocols in one view share fields of one name and
+//! kind. A name two protocols give different kinds (DLT's `type` is text, a
+//! definition's a number) is a field of each, written with the protocol's
+//! lower-case name: `dlt.type`, `sens.type`; a plain `type` there is an
+//! error saying which to write. A file of several protocols, or of none,
+//! gives its file name instead (`trace.type`).
+//!
 //! `bookmark` (case-insensitive, like every field name) is the line's
 //! bookmark, a regular field the tab supplies ([`Query::with_bookmarks`]):
 //! alone it holds on a bookmarked line (`level >= ERROR OR bookmark`);
@@ -373,6 +380,25 @@ impl FieldCond {
         // its prefix (a clashing key is only that way: `json.raw`).
         let named = |n: &str| schema.iter().position(|d| d.name == n);
         let Some(id) = named(&self.name).or_else(|| self.name.strip_prefix("json.").and_then(named)) else {
+            // Split by a clash of kinds in a view of several protocols
+            // (`input::schema`): say which to write.
+            let dotted = format!(".{}", self.name);
+            let split: Vec<&str> = schema
+                .iter()
+                .map(|d| d.name.as_ref())
+                .filter(|n| n.ends_with(&dotted) && !n.starts_with("net.") && !n.starts_with("json."))
+                .collect();
+            if split.len() > 1 {
+                return Err(DslError {
+                    msg: format!(
+                        "'{}' is {} fields here, of different kinds: write {}",
+                        self.name,
+                        split.len(),
+                        split.join(" or ")
+                    ),
+                    pos: self.pos,
+                });
+            }
             let mut known: Vec<&str> = vec!["raw", "level"];
             known.extend(schema.iter().map(|d| d.name.as_ref()));
             return Err(DslError {
@@ -709,6 +735,33 @@ impl Query {
         walk(&self.expr, source, &mut Vec::new())
     }
 
+    /// The values `field` is compared with by `==` or `!=` (each once, in
+    /// order, as written).
+    pub fn values_compared(&self, field: &str) -> Vec<String> {
+        fn walk(e: &Expr, field: &str, out: &mut Vec<String>) {
+            match e {
+                Expr::And(xs) | Expr::Or(xs) => xs.iter().for_each(|x| walk(x, field, out)),
+                Expr::Not(x) => walk(x, field, out),
+                Expr::Cond(Cond::Field(f)) if f.name == field => {
+                    let v = match &f.test {
+                        FieldTest::Literal(CmpOp::Eq | CmpOp::Ne, v, _) => v.clone(),
+                        FieldTest::Str(CmpOp::Eq | CmpOp::Ne, v) | FieldTest::StrNoCase(CmpOp::Eq | CmpOp::Ne, v) => {
+                            String::from_utf8_lossy(v).into_owned()
+                        }
+                        _ => return,
+                    };
+                    if !out.iter().any(|o| o.eq_ignore_ascii_case(&v)) {
+                        out.push(v);
+                    }
+                }
+                Expr::Cond(_) => {}
+            }
+        }
+        let mut out = Vec::new();
+        walk(&self.expr, &field.to_lowercase(), &mut out);
+        out
+    }
+
     /// Signals the query uses (lower-case, each once, in order).
     pub fn signal_names(&self) -> Vec<String> {
         fn walk(e: &Expr, out: &mut Vec<String>) {
@@ -997,6 +1050,18 @@ mod tests {
         ]);
         let hits: Vec<bool> = (0..3).map(|l| q.matches_event(&mut Event::from_source(&src, l))).collect();
         assert_eq!(hits, [true, false, false]);
+        // A name split by a clash of kinds (review 2026-11-09, R9).
+        let split = [
+            FieldDef::new("proto", FieldKind::Name, false),
+            FieldDef::new("dlt.type", FieldKind::Str, false),
+            FieldDef::new("sens.type", FieldKind::U64, false),
+        ];
+        let e = Query::compile_for("proto == SENS AND type > 3", &split).unwrap_err();
+        assert_eq!(
+            (e.pos, e.msg.as_str()),
+            (18, "'type' is 2 fields here, of different kinds: write dlt.type or sens.type")
+        );
+        assert!(Query::compile_for("sens.type > 3 OR dlt.type == log", &split).is_ok());
         let e = Query::compile("apid == (").unwrap_err();
         assert_eq!(e.pos, 8);
         let e = Query::compile("apid ~ NAV").unwrap_err();

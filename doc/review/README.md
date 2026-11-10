@@ -6,7 +6,8 @@ agent and its results compared over time.
 | File | What |
 |---|---|
 | `checklist.md` | Every item to check, by perspective, with an ID, how to check it, and whether it blocks (`gate`) or is reviewed periodically (`cycle`) |
-| `YYYY-MM-DD-findings.md` | One review's findings, metrics and open items (newest: `2026-11-08-findings.md`) |
+| `YYYY-MM-DD-findings.md` | One review's findings, metrics and open items (newest: `2026-11-09-findings.md`) |
+| `YYYY-MM-DD-handoff.md` | The findings as work packages with suggested changes, for whoever picks them up (since 2026-11-09) |
 | `baseline/bench-YYYY-MM-DD.tsv` | Benchmark baselines (`tools/bench.sh`) |
 | `../../tools/review-gate.sh` | The automated items (🤖 in the checklist) |
 | `../../tools/bench.sh` | The 1 GiB `--stats` benchmark; `compare` against a baseline |

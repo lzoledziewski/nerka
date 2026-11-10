@@ -6,9 +6,11 @@
 //!
 //! * [`input`] — [`LogSource`]: random access to rows whatever the on-disk
 //!   format: plain text, text records and JSON, DLT files, and DLT / SOME/IP
-//!   / syslog inside pcap, pcapng and MF4 captures (`input::proto`);
+//!   / syslog inside pcap, pcapng and MF4 captures (`input::proto`), and
+//!   protocols described by a definition (`.ksy`, `input::proto::ksy`);
 //!   several files one after another or merged by time ([`open_many`],
-//!   [`open_merged_by_time`]). [`open`] picks the reader from the content.
+//!   [`open_merged_by_time`]), messages of different protocols in one
+//!   table (the mixed layout). [`open`] picks the reader from the content.
 //! * [`engine`] — [`LineIndex`] (parallel line indexing) and [`search`]:
 //!   filtering that yields the set of matching lines; [`search_within`]:
 //!   search inside a filter result, per query.
@@ -57,7 +59,7 @@ pub use input::concat::{open_many, open_many_by_time, open_merged_by_time};
 pub use input::dlt::DltFile;
 pub use input::dlt::fibex::{ArgType, Argument, Fibex, FibexError};
 pub use input::text::TextFile;
-pub use input::{Anchor, ColumnDef, LogSource, OpenOptions, open, open_with};
+pub use input::{Anchor, ColumnDef, LogSource, OpenOptions, SourceInfo, open, open_with, query_warnings};
 pub use pack::{Library, Pack, PackError, PackQuery};
 pub use session::{QueryContext, Session};
 pub use signal::{
@@ -83,6 +85,28 @@ pub enum Error {
     /// Files of different kinds (columns, fields) asked to open as one view.
     #[error("{0}")]
     MixedKinds(String),
+    /// One of several files couldn't be opened: which one, and why (its
+    /// reason included, so the message stands alone).
+    #[error("{}: {}", path.display(), with_reason(reason))]
+    Open { path: std::path::PathBuf, reason: Box<Error> },
+}
+
+impl Error {
+    /// `e` as an error opening `path`; a cancel stays a cancel.
+    pub fn opening(path: &std::path::Path, e: Error) -> Error {
+        match e {
+            Error::Cancelled | Error::Open { .. } => e,
+            e => Error::Open { path: path.to_owned(), reason: Box::new(e) },
+        }
+    }
+}
+
+/// An error's text with its source's, as `I/O error (access denied)`.
+fn with_reason(e: &Error) -> String {
+    match std::error::Error::source(e) {
+        Some(s) => format!("{e} ({s})"),
+        None => e.to_string(),
+    }
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

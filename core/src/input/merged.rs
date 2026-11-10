@@ -104,6 +104,10 @@ impl LogSource for Merged {
         &self.name
     }
 
+    fn info(&self) -> super::SourceInfo {
+        self.inner.info()
+    }
+
     fn line_count(&self) -> LineNo {
         self.line_of.len() as LineNo
     }

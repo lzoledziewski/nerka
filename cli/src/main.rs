@@ -21,8 +21,8 @@ use clap::{Parser, Subcommand};
 use nerka_core::bundle::{Bundle, Choice, Item, Kind, Status, Store};
 use nerka_core::pack::{self, Expansion, Library, ParamValue, Params, Pick, Role, Selection};
 use nerka_core::{
-    Bookmarks, Filter, LogSource, Matcher, MatcherOptions, Progress, Query, SearchSet, SignalDef, Signals, search,
-    search_within,
+    Bookmarks, Filter, LineNo, LogSource, Matcher, MatcherOptions, Progress, Query, SearchSet, SignalDef, Signals,
+    search, search_within,
 };
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
@@ -80,7 +80,8 @@ struct Cli {
     #[arg(long, global = true, value_name = "FILE")]
     fibex: Vec<PathBuf>,
     /// Define a signal for `@name` in queries (repeatable):
-    /// NAME[(GROUP)][:num|enum]=QUERY, e.g. 'speed=/speed=(?<speed>\d+)/'.
+    /// NAME[(GROUP)][:num|enum|time][:all|filtered][:per(LIFECYCLE)][:default(VALUE)]=QUERY,
+    /// e.g. 'speed=/speed=(?<speed>\d+)/'.
     #[arg(long, global = true, value_name = "SPEC")]
     signal: Vec<String>,
     /// Define a lifecycle of one entity (repeatable): NAME: CLAUSES, e.g.
@@ -92,7 +93,8 @@ struct Cli {
     /// Define a check (repeatable): NAME: lines QUERY; TEST[; per
     /// LIFECYCLE], e.g. 'storm: lines raw ~ /retry/; rate 20 per 10s'.
     /// Tests: exists, count [OP N], rate N per DUR, gap DUR, then QUERY
-    /// within DUR, missing QUERY within DUR, value first|last|min|max.
+    /// within DUR, missing QUERY within DUR, value first|last|min|max. Rate,
+    /// gap, then and missing expect lines in time order (several files: --merge).
     #[arg(long, global = true, value_name = "SPEC")]
     check: Vec<String>,
     /// Show times (DLT's time column, signals) in this computer's local
@@ -109,20 +111,30 @@ struct Cli {
     /// or `auto` (the default: JSON if the file looks like JSON, else lines).
     #[arg(long, global = true, value_name = "SPEC")]
     records: Option<String>,
+    /// Several files: interleave their lines by time (when every file knows
+    /// its lines' times: DLT, captures); else one after another, in the
+    /// order given.
+    #[arg(long, global = true)]
+    merge: bool,
     #[command(subcommand)]
     cmd: Cmd,
 }
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Index a file and print statistics (lines, size, throughput).
+    /// Index a file (several: one view) and print statistics (lines, size,
+    /// throughput), its fields, protocols and what was skipped.
     #[command(alias = "info")]
-    Open { file: PathBuf },
+    Open {
+        #[arg(required = true, value_name = "FILE")]
+        files: Vec<PathBuf>,
+    },
     /// Print lines matching a regex (like grep -n). With --in, search only
     /// the lines of a filter. With pack picks (-q, -l, -x, -X) instead of a
-    /// pattern, print which query matched each line.
+    /// pattern, print which query matched each line. Several files: one
+    /// view, each line as FILE:LINE:.
     Search {
-        #[arg(required = true, num_args = 1..=2, value_names = ["PATTERN", "FILE"])]
+        #[arg(required = true, num_args = 1.., value_names = ["PATTERN", "FILE"])]
         args: Vec<String>,
         /// Only search the lines matching this NFD filter.
         #[arg(long = "in", value_name = "FILTER")]
@@ -142,9 +154,13 @@ enum Cmd {
         out: OutputArgs,
     },
     /// Print lines matching an NFD query, e.g. 'level >= ERROR AND raw ~ /SSL/'.
+    /// Several files: one view (`file` is a field), each line as FILE:LINE:.
     Filter {
+        /// The NFD query.
         query: String,
-        file: PathBuf,
+        /// The files: text, DLT, captures (pcap, pcapng, MF4).
+        #[arg(required = true, value_name = "FILE")]
+        files: Vec<PathBuf>,
         #[command(flatten)]
         out: OutputArgs,
     },
@@ -161,11 +177,19 @@ enum Cmd {
     /// List bookmarks saved for a file (by the UI).
     Marks { file: PathBuf },
     /// Print a 1-based inclusive range of lines.
-    Lines { file: PathBuf, from: u64, to: u64 },
+    Lines {
+        file: PathBuf,
+        /// The first line (1-based).
+        from: u64,
+        /// The last line (included).
+        to: u64,
+    },
     /// Run the checks (`--check`) on a file: issues and facts, overall and
     /// per lifecycle (`per`).
     Check {
-        file: PathBuf,
+        /// The files (several: one view).
+        #[arg(required = true, value_name = "FILE")]
+        files: Vec<PathBuf>,
         /// Only this check (default: all defined).
         #[arg(short = 'n', long)]
         name: Option<String>,
@@ -183,7 +207,9 @@ enum Cmd {
     /// how it ends, and where the definition and the uptime disagree
     /// (findings, on stderr).
     Lifecycles {
-        file: PathBuf,
+        /// The files (several: one view).
+        #[arg(required = true, value_name = "FILE")]
+        files: Vec<PathBuf>,
         /// Only this lifecycle (default: all defined).
         #[arg(short = 'n', long)]
         name: Option<String>,
@@ -406,41 +432,94 @@ fn import(file: &Path, dry_run: bool, conflicts: Conflicts, out: &mut impl Write
 fn compile(query: &str, source: &dyn LogSource) -> Result<Query> {
     // `--signal` definitions, and `@time` on files that know their time.
     let signals = SIGNALS.get_or_init(Default::default).for_source(source);
-    Query::compile_in(query, source.schema(), &signals)
-        .map_err(|e| anyhow::anyhow!("{}\n  {query}\n  {}", e.at(query), e.caret(query)))
+    let q = Query::compile_in(query, source.schema(), &signals)
+        .map_err(|e| anyhow::anyhow!("{}\n  {query}\n  {}", e.at(query), e.caret(query)))?;
+    // What it can't find, said before it finds nothing (review 2026-11-08 R8,
+    // 2026-11-09 R2).
+    for w in nerka_core::query_warnings(&q, source) {
+        eprintln!("nerka: warning: {w}");
+    }
+    Ok(q)
 }
 
 /// `bookmark` in a query: the bookmarks of the log (its `.nerka-marks`),
 /// on the lines of `source` their anchors find.
-fn with_marks(filter: Filter, file: &Path, source: &dyn LogSource) -> Result<Filter> {
+fn with_marks(filter: Filter, view: &Opened) -> Result<Filter> {
     if !filter.uses_bookmarks() {
         return Ok(filter);
     }
-    let marks =
-        Bookmarks::load_for(file, source).with_context(|| format!("reading the bookmarks of {}", file.display()))?;
+    let marks = view_marks(&view.paths, &*view.source).context("reading the bookmarks")?;
     Ok(filter.with_bookmarks(&std::sync::Arc::new(marks)))
+}
+
+/// The bookmarks of a view's files (their `.nerka-marks`), on the rows
+/// their lines are, as the GUI loads them.
+fn view_marks(paths: &[PathBuf], f: &dyn LogSource) -> std::io::Result<Bookmarks> {
+    if let Some(r) = f.reordered() {
+        return Ok(view_marks(paths, r.inner)?.remapped(|l| r.row_of[l as usize]));
+    }
+    let Some(parts) = f.parts() else { return Bookmarks::load_for(&paths[0], f) };
+    let files: Vec<(&Path, LineNo, &dyn LogSource)> =
+        paths.iter().zip(&parts).map(|(p, part)| (p.as_path(), part.first, part.source.as_ref())).collect();
+    Bookmarks::load_for_parts(&files)
+}
+
+/// Each row of a view: its file (index into the view's paths) and its
+/// line there, merged by time or not.
+fn locator(f: &dyn LogSource) -> impl Fn(LineNo) -> (usize, LineNo) + '_ {
+    let (inner, line_of) = match f.reordered() {
+        Some(r) => (r.inner, Some(r.line_of)),
+        None => (f, None),
+    };
+    let starts: Vec<LineNo> = inner.part_files().iter().map(|&(first, _)| first).collect();
+    move |row| {
+        let l = line_of.map_or(row, |m| m[row as usize]);
+        let k = starts.partition_point(|&s| s <= l).saturating_sub(1);
+        (k, l - starts[k])
+    }
+}
+
+/// A printed line's prefix: `LINE:`, or `FILE:LINE:` for a view of several
+/// files (the line its file's own, as grep prints them); `-N` drops the line.
+fn write_prefix(
+    out: &mut impl Write,
+    o: &OutputArgs,
+    view: &Opened,
+    at: &impl Fn(LineNo) -> (usize, LineNo),
+    row: LineNo,
+) -> std::io::Result<()> {
+    if view.paths.len() > 1 {
+        let (k, line) = at(row);
+        write!(out, "{}:", view.paths[k].display())?;
+        if !o.no_line_numbers {
+            write!(out, "{}:", line + 1)?;
+        }
+    } else if !o.no_line_numbers {
+        write!(out, "{}:", row + 1)?;
+    }
+    Ok(())
 }
 
 /// `build` gets the opened source (its fields, its time), so query errors about
 /// unknown fields point into the query like syntax errors do.
 fn run_filter(
-    file: &PathBuf,
+    files: &[PathBuf],
     build: impl FnOnce(&dyn LogSource) -> Result<Filter>,
     o: &OutputArgs,
     out: &mut impl Write,
 ) -> Result<()> {
-    let (f, t_index) = open(file)?;
-    let filter = with_marks(build(&*f)?, file, &*f)?;
+    let view = open(files)?;
+    let (f, t_index) = (&*view.source, view.took);
+    let filter = with_marks(build(f)?, &view)?;
+    let at = locator(f);
     let t = Instant::now();
-    let res = search(&*f, &filter, &Progress::new())?;
+    let res = search(f, &filter, &Progress::new())?;
     let t_search = t.elapsed();
     if o.count {
         writeln!(out, "{}", res.lines.len())?;
     } else {
         for &l in &res.lines {
-            if !o.no_line_numbers {
-                write!(out, "{}:", l + 1)?;
-            }
+            write_prefix(out, o, &view, &at, l)?;
             out.write_all(&f.line_bytes(l).unwrap_or_default())?;
             out.write_all(b"\n")?;
         }
@@ -460,27 +539,29 @@ fn run_filter(
 /// Search inside the lines of `within` (every line without it). `names`
 /// are the include queries' names, printed per hit; empty for a pattern.
 fn run_search_within(
-    file: &PathBuf,
+    files: &[PathBuf],
     within: Option<&str>,
     set: SearchSet,
     names: &[String],
     o: &OutputArgs,
     out: &mut impl Write,
 ) -> Result<()> {
-    let (f, t_index) = open(file)?;
-    let filter = within.map(|q| compile(q, &*f).and_then(|q| with_marks(Filter::Query(q), file, &*f))).transpose()?;
+    let view = open(files)?;
+    let (f, t_index) = (&*view.source, view.took);
+    let filter = within.map(|q| compile(q, f).and_then(|q| with_marks(Filter::Query(q), &view))).transpose()?;
     let set = SearchSet {
-        include: set.include.into_iter().map(|q| with_marks(q, file, &*f)).collect::<Result<_>>()?,
-        exclude: set.exclude.into_iter().map(|q| with_marks(q, file, &*f)).collect::<Result<_>>()?,
+        include: set.include.into_iter().map(|q| with_marks(q, &view)).collect::<Result<_>>()?,
+        exclude: set.exclude.into_iter().map(|q| with_marks(q, &view)).collect::<Result<_>>()?,
     };
+    let at = locator(f);
     let t = Instant::now();
     let lines = match filter {
-        Some(q) => Some(search(&*f, &q, &Progress::new())?.lines),
+        Some(q) => Some(search(f, &q, &Progress::new())?.lines),
         None => None,
     };
     let t_filter = t.elapsed();
     let t = Instant::now();
-    let hits = search_within(&*f, lines.as_deref(), &set, &Progress::new())?;
+    let hits = search_within(f, lines.as_deref(), &set, &Progress::new())?;
     let t_search = t.elapsed();
     if o.count {
         writeln!(out, "{}", hits.len())?;
@@ -491,9 +572,7 @@ fn run_search_within(
         }
     } else {
         for (i, &l) in hits.lines.iter().enumerate() {
-            if !o.no_line_numbers {
-                write!(out, "{}:", l + 1)?;
-            }
+            write_prefix(out, o, &view, &at, l)?;
             if !names.is_empty() {
                 let ids: Vec<&str> = hits.matched(i).map(|q| names[q].as_str()).collect();
                 write!(out, "[{}] ", ids.join(","))?;
@@ -517,14 +596,14 @@ fn run_search_within(
 /// Print the lifecycles of `file` (all definitions, or the one named);
 /// returns the number of findings.
 fn lifecycles(
-    file: &PathBuf,
+    files: &[PathBuf],
     name: Option<&str>,
     count: Option<&str>,
     json: bool,
     out: &mut impl Write,
 ) -> Result<usize> {
     use nerka_core::time::format_time;
-    let (f, _) = open(file)?;
+    let f = open(files)?.source;
     let signals = SIGNALS.get_or_init(Default::default).for_source(&*f);
     let mut defs: Vec<_> = signals.lifecycles().collect();
     if defs.is_empty() {
@@ -533,7 +612,8 @@ fn lifecycles(
     if let Some(n) = name {
         defs.retain(|d| d.name().eq_ignore_ascii_case(n));
         if defs.is_empty() {
-            anyhow::bail!("no lifecycle '{n}'");
+            let names: Vec<&str> = signals.lifecycles().map(|d| d.name()).collect();
+            anyhow::bail!("no lifecycle '{n}' (defined: {})", names.join(", "));
         }
     }
     let hits = match count {
@@ -652,7 +732,7 @@ fn lifecycles(
 /// Run the `--check` checks on `file` (all, or the one named); returns how
 /// many results are issues.
 fn checks(
-    file: &PathBuf,
+    files: &[PathBuf],
     name: Option<&str>,
     json: bool,
     evidence: usize,
@@ -673,17 +753,25 @@ fn checks(
         })?;
         all.set(d);
     }
-    if all.iter().all(|d| name.is_some_and(|n| !d.name().eq_ignore_ascii_case(n))) {
+    if all.iter().next().is_none() {
         anyhow::bail!("no check defined: use --check 'NAME: lines QUERY; TEST'");
     }
+    if let Some(n) = name
+        && all.get(n).is_none()
+    {
+        let names: Vec<&str> = all.iter().map(|d| d.name()).collect();
+        anyhow::bail!("no check '{n}' (defined: {})", names.join(", "));
+    }
     let lib = if all.iter().any(|d| !d.unresolved().is_empty()) { library(packs)? } else { Default::default() };
-    let (f, _) = open(file)?;
+    let f = open(files)?.source;
     let signals = SIGNALS.get_or_init(Default::default).for_source(&*f);
     // Every check runs (one may use another's signal); the named one shows.
     let t = Instant::now();
     let run = all.run_all(&*f, &signals, &lib, &Progress::new())?;
     let took = t.elapsed();
     let (mut issues, mut rows) = (0, Vec::new());
+    // Time goes backward for a check on times: one warning (owner, 2026-11-10).
+    let mut back = false;
     if !json {
         writeln!(out, "check	kind	scope	result")?;
     }
@@ -695,6 +783,7 @@ fn checks(
         if let Some(note) = &r.signal_note {
             eprintln!("check '{}': {note}", r.name);
         }
+        back |= r.times_go_back;
         for s in &r.scopes {
             let shown = match &s.verdict {
                 Verdict::Ok => "ok".to_owned(),
@@ -722,12 +811,13 @@ fn checks(
                     .collect();
                 rows.push(format!(
                     "  {{\"check\": {}, \"kind\": {}, \"scope\": {}, \"first_line\": {}, \"end_line\": {}, \
-                     \"verdict\": {verdict}, \"evidence\": [{}]}}",
+                     \"verdict\": {verdict}, \"times_go_back\": {}, \"evidence\": [{}]}}",
                     js(&r.name),
                     js(r.kind.as_str()),
                     js(&s.scope.label),
                     s.scope.from + 1,
                     s.scope.to,
+                    r.times_go_back,
                     ev.join(", ")
                 ));
             } else {
@@ -740,6 +830,13 @@ fn checks(
                 }
             }
         }
+    }
+    if back {
+        eprintln!(
+            "nerka: warning: time goes backward in this view: rate, gap and then / missing expect lines in time \
+             order, so their results may be wrong{}",
+            if MERGE.get().copied().unwrap_or(false) { "" } else { " (--merge puts several files in time order)" }
+        );
     }
     if !json {
         out.flush()?;
@@ -827,13 +924,48 @@ fn capture_protocols(cli: &Cli, capture: &mut nerka_core::input::capture::Captur
     Ok(())
 }
 
-fn open(path: &PathBuf) -> Result<(Box<dyn LogSource>, std::time::Duration)> {
+/// Files opened as one view.
+struct Opened {
+    source: Box<dyn LogSource>,
+    took: std::time::Duration,
+    /// The files in the view's order (`--merge` orders them by their start).
+    paths: Vec<PathBuf>,
+}
+
+/// [`open_silent`], and what the reader skipped or dropped on stderr
+/// (review 2026-11-09, R3: counted, never said).
+fn open(paths: &[PathBuf]) -> Result<Opened> {
+    let view = open_silent(paths)?;
+    for n in view.source.info().notes {
+        eprintln!("nerka: note: {n}");
+    }
+    Ok(view)
+}
+
+/// One file, or several as one view (review 2026-11-09, R6: the console
+/// opened one file): one after another in the order given, or merged by
+/// time with `--merge`; files of kinds that don't go together are refused.
+fn open_silent(paths: &[PathBuf]) -> Result<Opened> {
+    // Said plainly (it was "access denied" on Windows).
+    if let Some(dir) = paths.iter().find(|p| p.is_dir()) {
+        anyhow::bail!("{} is a folder: give a file", dir.display());
+    }
     let t = Instant::now();
     let options = OPEN_OPTIONS.get_or_init(Default::default);
-    let f = nerka_core::open_with(path, options, &Progress::new())
-        .with_context(|| format!("opening {}", path.display()))?;
-    Ok((f, t.elapsed()))
+    let progress = Progress::new();
+    let (source, paths) = match paths {
+        [one] => (
+            nerka_core::open_with(one, options, &progress).with_context(|| format!("opening {}", one.display()))?,
+            vec![one.clone()],
+        ),
+        _ if MERGE.get().copied().unwrap_or(false) => nerka_core::open_merged_by_time(paths, options, &progress)?,
+        _ => (nerka_core::open_many(paths, options, &progress)?, paths.to_vec()),
+    };
+    Ok(Opened { source, took: t.elapsed(), paths })
 }
+
+/// `--merge`, set once in `main`.
+static MERGE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
 
 fn mib_per_s(bytes: u64, d: std::time::Duration) -> f64 {
     bytes as f64 / 1024.0 / 1024.0 / d.as_secs_f64().max(1e-9)
@@ -880,6 +1012,7 @@ fn run() -> Result<()> {
         options.fibex = Some(std::sync::Arc::new(nerka_core::Fibex::load(&cli.fibex)?));
     }
     OPEN_OPTIONS.set(options).expect("set once");
+    MERGE.set(cli.merge).expect("set once");
     let mut signals = Signals::default();
     for spec in &cli.signal {
         signals.set(SignalDef::parse_spec(spec).with_context(|| format!("--signal {spec}"))?);
@@ -901,31 +1034,53 @@ fn run() -> Result<()> {
     let mut out = BufWriter::with_capacity(1 << 16, stdout);
 
     match cli.cmd {
-        Cmd::Open { file } => {
-            let (f, took) = open(&file)?;
-            writeln!(out, "file:        {}", f.name())?;
+        Cmd::Open { files } => {
+            let view = open_silent(&files)?;
+            let (f, took) = (&*view.source, view.took);
+            let info = f.info();
+            if view.paths.len() > 1 {
+                let names: Vec<String> = view.paths.iter().map(|p| p.display().to_string()).collect();
+                writeln!(out, "files:       {}", names.join(", "))?;
+            } else {
+                writeln!(out, "file:        {}", f.name())?;
+            }
+            writeln!(out, "read as:     {}", f.format())?;
             writeln!(out, "size:        {} bytes", f.size_bytes())?;
             writeln!(out, "lines:       {}", f.line_count())?;
+            if !info.protocols.is_empty() {
+                writeln!(out, "protocols:   {}", info.protocols.join(", "))?;
+            }
             if !f.schema().is_empty() {
                 let names: Vec<&str> = f.schema().iter().map(|d| d.name.as_ref()).collect();
                 writeln!(out, "fields:      {}", names.join(", "))?;
             }
             writeln!(out, "index mem:   {} KiB", f.index_memory_bytes() / 1024)?;
             writeln!(out, "index time:  {took:.2?} ({:.0} MiB/s)", mib_per_s(f.size_bytes(), took))?;
+            for n in &info.notes {
+                writeln!(out, "note:        {n}")?;
+            }
         }
-        Cmd::Search { mut args, within, picks, ignore_case, fixed, invert, out: o } => {
-            let file = PathBuf::from(args.pop().expect("clap requires FILE"));
+        Cmd::Search { args, within, picks, ignore_case, fixed, invert, out: o } => {
             let options = MatcherOptions { case_insensitive: ignore_case, fixed_string: fixed, invert };
-            match (args.pop(), picks.is_empty()) {
-                (Some(_), false) => anyhow::bail!("give either a PATTERN or pack picks (-q, -l, -x, -X), not both"),
+            // PATTERN FILE…, or FILE… with pack picks.
+            let pattern = if picks.is_empty() { args.first().cloned() } else { None };
+            let files: Vec<PathBuf> = args.iter().skip(usize::from(pattern.is_some())).map(PathBuf::from).collect();
+            if !picks.is_empty() && !files.is_empty() && !files[0].exists() {
+                anyhow::bail!("give either a PATTERN or pack picks (-q, -l, -x, -X), not both");
+            }
+            if files.is_empty() {
+                anyhow::bail!("missing FILE (search PATTERN FILE…, or search FILE… with pack picks)");
+            }
+            match (pattern, picks.is_empty()) {
                 (None, true) => anyhow::bail!("missing PATTERN (or pack picks: -q, -l, -x, -X)"),
+                (Some(_), false) => unreachable!("a pattern is read only without picks"),
                 (Some(pattern), true) => {
                     let m = Matcher::new(&pattern, options)?;
                     match within {
-                        None => run_filter(&file, |_| Ok(Filter::Regex(m)), &o, &mut out)?,
+                        None => run_filter(&files, |_| Ok(Filter::Regex(m)), &o, &mut out)?,
                         Some(w) => {
                             let set = SearchSet { include: vec![Filter::Regex(m)], exclude: vec![] };
-                            run_search_within(&file, Some(&w), set, &[], &o, &mut out)?;
+                            run_search_within(&files, Some(&w), set, &[], &o, &mut out)?;
                         }
                     }
                 }
@@ -935,12 +1090,12 @@ fn run() -> Result<()> {
                     }
                     let e = picks.expand(&library(&cli.pack)?)?;
                     let names: Vec<String> = e.parts_with(Role::Include).map(|p| p.query.clone()).collect();
-                    run_search_within(&file, within.as_deref(), e.search_set()?, &names, &o, &mut out)?;
+                    run_search_within(&files, within.as_deref(), e.search_set()?, &names, &o, &mut out)?;
                 }
             }
         }
-        Cmd::Filter { query, file, out: o } => {
-            run_filter(&file, |source| Ok(Filter::Query(compile(&query, source)?)), &o, &mut out)?;
+        Cmd::Filter { query, files, out: o } => {
+            run_filter(&files, |source| Ok(Filter::Query(compile(&query, source)?)), &o, &mut out)?;
         }
         Cmd::Expand { picks, parts } => {
             if picks.is_empty() {
@@ -982,7 +1137,7 @@ fn run() -> Result<()> {
         Cmd::Export { output, only } => export(output.as_deref(), &only, &mut out)?,
         Cmd::Import { file, dry_run, conflicts } => import(&file, dry_run, conflicts, &mut out)?,
         Cmd::Marks { file } => {
-            let (f, _) = open(&file)?;
+            let f = open(std::slice::from_ref(&file))?.source;
             let marks = Bookmarks::load_for(&file, &*f)?;
             for (l, name, note) in marks.iter_named() {
                 let text = f.line_text(l).unwrap_or_default();
@@ -995,22 +1150,25 @@ fn run() -> Result<()> {
                 }
             }
         }
-        Cmd::Check { file, name, json, strict, evidence } => {
-            let issues = checks(&file, name.as_deref(), json, evidence, &cli.pack, &mut out)?;
+        Cmd::Check { files, name, json, strict, evidence } => {
+            let issues = checks(&files, name.as_deref(), json, evidence, &cli.pack, &mut out)?;
             if strict && issues > 0 {
                 out.flush()?;
                 anyhow::bail!("{issues} issue{} found", if issues == 1 { "" } else { "s" });
             }
         }
-        Cmd::Lifecycles { file, name, json, strict, count } => {
-            let found = lifecycles(&file, name.as_deref(), count.as_deref(), json, &mut out)?;
+        Cmd::Lifecycles { files, name, json, strict, count } => {
+            let found = lifecycles(&files, name.as_deref(), count.as_deref(), json, &mut out)?;
             if strict && found > 0 {
                 out.flush()?;
                 anyhow::bail!("{found} finding{}", if found == 1 { "" } else { "s" });
             }
         }
         Cmd::Lines { file, from, to } => {
-            let (f, _) = open(&file)?;
+            if from > to {
+                anyhow::bail!("lines {from} to {to}: the first line is after the last");
+            }
+            let f = open(std::slice::from_ref(&file))?.source;
             let last = to.min(f.line_count());
             for l in from.max(1)..=last {
                 out.write_all(&f.line_bytes(l - 1).unwrap_or_default())?;

@@ -382,3 +382,74 @@ fn import_says_what_it_cant_read() {
     let o = nerka_at(&home, &["export", "--only", "check:nope"]);
     assert!(err(&o).contains("--only check:nope: no such check"), "{}", err(&o));
 }
+
+/// Review 2026-11-09, R6: several files as one view, as the GUI opens
+/// them: one after another, or merged by time; each line as FILE:LINE:
+/// with its file's own line number; `file` is a field.
+#[test]
+fn several_files_are_one_view() {
+    let d = dir("several");
+    let a = dlt_file(&d);
+    let a2 = d.join("a.dlt");
+    std::fs::rename(&a, &a2).unwrap();
+    // The same messages half a second later each.
+    let b = d.join("b.dlt");
+    let mut buf = Vec::new();
+    for (i, apid) in ["NAV", "NAV", "COM", "COM", "NAV", "COM"].into_iter().enumerate() {
+        let mut m = Msg::log(Level::Info, "ECU2", apid, "MAIN", vec![Value::Str(format!("b {i}")).into()]);
+        m.secs += i as u32;
+        m.usecs = 500_000;
+        m.encode(&mut buf);
+    }
+    std::fs::write(&b, buf).unwrap();
+    let (a, b) = (s(&a2), s(&b));
+    // (file, line) of each printed line; a path may hold a `:` (`C:`).
+    let lines = |o: &Output| {
+        out(o)
+            .lines()
+            .map(|l| {
+                let f = [a, b].into_iter().find(|f| l.starts_with(&format!("{f}:"))).expect("a file first");
+                (f.to_owned(), l[f.len() + 1..].split(':').next().unwrap().to_owned())
+            })
+            .collect::<Vec<_>>()
+    };
+    let o = nerka(&["filter", "apid == NAV", a, b]);
+    assert!(o.status.success(), "{}", err(&o));
+    let at = |f: &str, l: &str| (f.to_owned(), l.to_owned());
+    assert_eq!(lines(&o), [at(a, "1"), at(a, "2"), at(a, "5"), at(b, "1"), at(b, "2"), at(b, "5")]);
+    // Merged by time: interleaved, each still with its own line.
+    let o = nerka(&["--merge", "filter", "apid == NAV", a, b]);
+    assert_eq!(lines(&o), [at(a, "1"), at(b, "1"), at(a, "2"), at(b, "2"), at(a, "5"), at(b, "5")]);
+    let o = nerka(&["filter", "-c", "file == b.dlt AND apid == COM", a, b]);
+    assert_eq!(
+        out(&o),
+        "3
+"
+    );
+    let o = nerka(&["search", "-N", "link up", a, b]);
+    // `-N`: the file, no line number.
+    let printed = out(&o);
+    let rest = printed.strip_prefix(&format!("{a}:")).expect("the file first");
+    assert!(!rest.split(':').next().unwrap().chars().all(|c| c.is_ascii_digit()), "-N drops the line: {printed}");
+    let o = nerka(&["open", a, b]);
+    assert!(
+        out(&o).starts_with(&format!(
+            "files:       {a}, {b}
+"
+        )),
+        "{}",
+        out(&o)
+    );
+    // A check on times over files whose times overlap: said (owner,
+    // 2026-11-10: warn only); merged by time, the times don't go back.
+    let o = nerka(&["--check", "r: lines apid == NAV; rate 5 per 1s", "check", "--json", a, b]);
+    assert!(err(&o).contains("time goes backward in this view: rate, gap and then / missing expect"), "{}", err(&o));
+    assert!(out(&o).contains("\"times_go_back\": true"), "{}", out(&o));
+    let o = nerka(&["--merge", "--check", "r: lines apid == NAV; rate 5 per 1s", "check", a, b]);
+    assert!(!err(&o).contains("time goes backward"), "{}", err(&o));
+    // Files that don't go together are refused, saying why.
+    let log = log_file(&d);
+    let o = nerka(&["filter", "level >= WARN", s(&log), a]);
+    assert_eq!(o.status.code(), Some(1));
+    assert!(err(&o).contains("only files of one kind open as one view"), "{}", err(&o));
+}

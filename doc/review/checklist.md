@@ -33,6 +33,7 @@ regression over 15 %; **S3** debt that makes the next change harder;
 | ARCH-6 | New input formats implement `LogSource` / `Protocol`; the engine has no format `match` | read `engine/`, `input/mod.rs::open_with` |
 | ARCH-7 | Every long operation takes `&Progress` and checks `is_cancelled()` per chunk | read new loops over lines / bytes |
 | ARCH-8 | Public API of `nerka-core` (`lib.rs` re-exports) matches what CLI and GUI need; module docs current | read `core/src/lib.rs` header against the module list |
+| ARCH-10 | A source that wraps others (`Concat`, its parts, `Merged`) answers every field as its parts do, for every layout (same kind, other fields, mixed, mixed with equal fields) | a test that compares each line's fields by name with the part's own; expected values, since both paths share the mapping |
 | ARCH-9 | Decisions recorded: a change against `doc/` decisions links the owner's decision | `doc/status.md`, `doc/architecture-analysis.md` |
 
 ## CODE — correctness and robustness (gate for S1)
@@ -57,7 +58,7 @@ regression over 15 %; **S3** debt that makes the next change harder;
 | PERF-2 🤖 | No query more than 15 % slower than the baseline, match counts identical | `tools/bench.sh compare doc/review/baseline/bench-….tsv bench.tsv` |
 | PERF-3 | Index memory per line stays as documented (8 B text, 8 / 16 B DLT, +16 B merged) | `nerka open FILE` → `index mem` |
 | PERF-4 | New per-line work in the hot path (allocation, `to_string`, rendering) is avoided or measured | read `scan_*`, `Event`, `field` implementations |
-| PERF-5 | GUI: no repaint loop when idle; heavy work off the UI thread | status.md "CPU with software rendering"; `ui/src/job.rs` |
+| PERF-5 | GUI: no repaint loop when idle; heavy work off the UI thread | `gui-decisions.md` "CPU with software rendering"; `ui/src/job.rs` |
 
 ## HUX — human usability (cycle)
 
@@ -65,11 +66,12 @@ regression over 15 %; **S3** debt that makes the next change harder;
 |---|---|---|
 | HUX-1 | CLI errors say what is wrong and where (caret under the column) and what would work | try a wrong field, a bad regex, a missing file |
 | HUX-2 | CLI help: each option has an example; the `about` line still describes the tool | `nerka --help`, `nerka <cmd> --help` |
-| HUX-3 | Owner's GUI decisions in `doc/status.md` are kept (Filter at the top, Search at the bottom, runs on Enter only, …) | read the diff against "GUI as of now" |
+| HUX-3 | Owner's GUI decisions in `doc/gui-decisions.md` are kept (Filter at the top, Search at the bottom, runs on Enter only, …) | read the diff against it |
 | HUX-4 | GUI change checked on screen | `tools/screenshot.ps1` |
 | HUX-5 | Messages use the same words as the docs (filter / search / query / pack / signal / lifecycle / check) | read new strings |
 | HUX-6 | README's quick start works from a fresh clone | follow it |
 | HUX-7 | A setting the user made never loses silently to a default (rules, ports, protocols turned off) | try a user rule on a port a default rule has |
+| HUX-8 | What a reader drops is reported: bytes skipped, messages not read, fields past a cap (`net.*` senders) | open a file with garbage in it, and a capture past the cap; `nerka open` and the GUI's status must say so |
 
 ## AIX — usability for AI agents and scripts (cycle)
 
@@ -82,6 +84,7 @@ regression over 15 %; **S3** debt that makes the next change harder;
 | AIX-5 | Exit status tells "no match" from "error" (grep: 0 / 1 / 2) where a script needs it | `nerka filter … ; echo $?` |
 | AIX-6 | A file's fields can be discovered without the GUI | `nerka open FILE` lists `fields:`; kinds too? |
 | AIX-7 | Status and decisions are split: current state (short) vs history (append-only) | `doc/status.md` structure |
+| AIX-8 | Each file an agent must read fits one read (under 20k tokens), with what must not be missed (pending decisions) near the top | the gate measures `status.md`, `gui-decisions.md`, `features.md`, `history.md` |
 
 ## SEC — security (gate for S1)
 

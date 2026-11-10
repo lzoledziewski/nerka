@@ -34,7 +34,7 @@ The procedure is in `doc/review/README.md`; the items are in
 6. Generate missing inputs (synthetic only; see "Inputs" in the last findings).
 7. Write `doc/review/YYYY-MM-DD-findings.md` in the same format as the last one, with the metrics side by side.
 8. Fix S1 findings with a regression test. Leave everything else as findings.
-   Don't change the owner's GUI decisions (`doc/status.md`) or open issues unasked.
+   Don't change the owner's GUI decisions (`doc/gui-decisions.md`) or open issues unasked.
 9. Commit on the review branch. Ask before pushing (the owner's rule).
 
 ## Rules that apply here

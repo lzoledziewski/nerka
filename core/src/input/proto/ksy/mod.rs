@@ -4,7 +4,7 @@
 //!
 //! [`KsyProtocol`] is a [`Protocol`] like the native ones: captures route
 //! UDP ports to it ([`super::LoadedProtocol`]), and its fields, level and
-//! columns come from the definition, read in place ([`run`]).
+//! columns come from the definition, read in place (`run`).
 
 pub mod expr;
 mod model;
@@ -276,11 +276,13 @@ impl KsyProtocol {
     /// Read a definition file.
     pub fn load(path: impl AsRef<Path>) -> crate::Result<KsyProtocol> {
         let path = path.as_ref();
-        let meta = std::fs::metadata(path)?;
+        // The file is named (review 2026-11-08, R3: "I/O error" alone).
+        let io = |e: std::io::Error| crate::Error::opening(path, e.into());
+        let meta = std::fs::metadata(path).map_err(io)?;
         if meta.len() > yaml::MAX_BYTES as u64 {
             return Err(crate::Error::Format(format!("{}: larger than {} KiB", path.display(), yaml::MAX_BYTES >> 10)));
         }
-        let text = std::fs::read_to_string(path)?;
+        let text = std::fs::read_to_string(path).map_err(io)?;
         KsyProtocol::parse(&text).map_err(|e| crate::Error::Format(format!("{}: {e}", path.display())))
     }
 
