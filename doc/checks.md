@@ -34,7 +34,7 @@ storm: lines ecu == ECU1 AND level >= ERROR; rate 25 per 1s; per ecu1
 temp: lines /temp=(?<t>\d+)/; value max; per ecu1
 ```
 
-A lifecycle's scope is its time span (from its first line to the next one's): lines of any entity in it count. Tests on time need the lines' times (the source's, or a time signal).
+A lifecycle's scope is its time span (from its first line to the next one's): lines of any entity in it count. **A `per` check's overall result is the whole log judged at once, reboots included, and it counts like any result** (owner, 2026-11-10, review 2026-11-09 U4 cancelled: the more general rule; one check answers both per lifecycle and across them, and nothing before the first lifecycle is missed). So a gap that spans a reboot shows overall and in no lifecycle; to ignore it, read the lifecycles' results. Tests on time need the lines' times (the source's, or a time signal).
 
 - **Core:** `core/src/check.rs`: `CheckDef` (spec, `resolved` with the library, `run` → `CheckResult`: per scope a verdict (ok / issue ×N / fact value) and up to 1000 pieces of evidence (lines and a note)), `Checks` (the saved list).
 - **CLI:** `--check SPEC`, `nerka check FILE` (`-e N` prints N pieces of evidence per result with the lines, `--json`, `--strict` fails on issues, `-n NAME`).
