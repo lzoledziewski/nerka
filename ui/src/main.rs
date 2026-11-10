@@ -586,6 +586,9 @@ struct Tab {
     /// The filter failed (every line is shown): why, kept in the status
     /// while a search over those lines reports (it overwrote it).
     filter_failed: Option<String>,
+    /// Said first in the status once the file is read: why it was opened
+    /// as a tab of its own (its "Indexed …" replaced the reason before).
+    load_note: Option<String>,
     file: Option<Arc<dyn LogSource>>,
     /// The file's protocols and what reading it dropped, once it is read
     /// (review 2026-11-09, R3: counted, never said).
@@ -1181,6 +1184,7 @@ impl Tab {
             mixed: None,
             open_error: None,
             filter_failed: None,
+            load_note: None,
             info: Default::default(),
             file: None,
             // Files that know their times (DLT, captures) in the order they
@@ -1714,6 +1718,9 @@ impl Tab {
                                 ),
                                 n => format!("Indexed {} lines of {n} files in {took:.2?}", f.line_count()),
                             };
+                            if let Some(note) = self.load_note.take() {
+                                self.status = format!("{note} · {}", self.status);
+                            }
                             // What reading it dropped: the first here, all in
                             // the top bar's hover.
                             self.info = f.info();
@@ -4012,11 +4019,21 @@ impl App {
             if let Some(why) = self.tabs[i].mixed.take() {
                 let paths = self.tabs[i].paths.clone();
                 self.close(i);
-                for p in paths {
-                    self.open(ctx, p);
+                for p in &paths {
+                    self.open(ctx, p.clone());
                 }
-                if let Some(t) = self.tab() {
-                    t.status = format!("Opened as separate tabs: {why}");
+                // Each of them says why, once read (or now, if it was open).
+                let note = format!("Opened as separate tabs: {why}");
+                for t in self
+                    .tabs
+                    .iter_mut()
+                    .filter(|t| t.paths.len() == 1 && paths.iter().any(|p| same_file(p, &t.paths[0])))
+                {
+                    if t.file.is_some() {
+                        t.status.clone_from(&note);
+                    } else {
+                        t.load_note = Some(note.clone());
+                    }
                 }
                 continue;
             }
@@ -6134,8 +6151,15 @@ gear=D
         settle_app(&mut app, &ctx);
         settle_app(&mut app, &ctx);
         assert_eq!(app.tabs.iter().map(|t| t.title()).collect::<Vec<_>>(), ["a.log", "d.dlt"]);
-        let status = &app.tabs[app.active].status;
-        assert!(status.contains("separate tabs") || status.starts_with("Indexed"), "{status}");
+        // Each tab says why once read (its "Indexed …" replaced the reason).
+        for t in &app.tabs {
+            assert!(
+                t.status.starts_with("Opened as separate tabs: a.log is plain text but d.dlt is DLT")
+                    && t.status.contains(" · Indexed "),
+                "{}",
+                t.status
+            );
+        }
         std::fs::remove_dir_all(&dir).ok();
     }
 
