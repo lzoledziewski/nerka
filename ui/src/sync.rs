@@ -2,33 +2,43 @@
 //! Each `nerka-gui` window is a process of its own (`instance.rs`) that
 //! reads the configuration at startup and writes whole files. So:
 //!
-//! - **Reload:** Settings → Reload configuration, and by itself when the
-//!   window gets the focus back and a configuration file changed while it
-//!   didn't have it ([`Stamp`]; nothing runs in between).
+//! - **Notice, then reload:** when the window gets the focus back and
+//!   packs, presets, plots, checks or signals changed while it didn't have
+//!   it ([`Stamp`]), a bar says what changed, with Reload and Not now;
+//!   nothing is read by itself, so a session isn't changed under the user
+//!   (owner, 2026-11-10). Settings → Reload configuration does it any time.
 //! - **Merge on save:** a list kept in one file (checks, signals, prefs) is
 //!   written as this window's changes applied to what is in the file now
 //!   ([`merge3`]), not as this window's copy: another window's change made
-//!   since isn't lost. Files of one item each (plots, presets, packs) are
-//!   written only when that item is saved.
+//!   since isn't lost, and the status says what came in with it. A pack
+//!   query is written into the pack file as it is then; plots and presets
+//!   are a file each, written only when that one is saved.
 
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
+/// What [`merge3`] made.
+#[derive(Debug, PartialEq)]
+pub struct Merge {
+    pub items: Vec<(String, String)>,
+    /// Keys both sides changed: this window's version was kept.
+    pub both: Vec<String>,
+    /// What came from the other side: `storm added`, `lost edited`, `x removed`.
+    pub taken: Vec<String>,
+}
+
 /// Three-way merge of named items (`(key, text)`, keys compared without
 /// case): what this window changed since `base` (what it last read or
 /// wrote) applied to `theirs` (the file now). An item both changed keeps
-/// this window's version and is named in the second list. Order: theirs',
-/// then the items only this window added, in its order.
-pub fn merge3(
-    base: &[(String, String)],
-    mine: &[(String, String)],
-    theirs: &[(String, String)],
-) -> (Vec<(String, String)>, Vec<String>) {
+/// this window's version. Order: theirs', then the items only this window
+/// added, in its order.
+pub fn merge3(base: &[(String, String)], mine: &[(String, String)], theirs: &[(String, String)]) -> Merge {
     let find =
         |v: &[(String, String)], k: &str| v.iter().find(|(n, _)| n.eq_ignore_ascii_case(k)).map(|(_, t)| t.clone());
     let mut out = Vec::new();
     let mut both = Vec::new();
-    let keys = theirs.iter().map(|(k, _)| k).chain(mine.iter().map(|(k, _)| k));
+    let mut taken = Vec::new();
+    let keys = theirs.iter().map(|(k, _)| k).chain(mine.iter().chain(base).map(|(k, _)| k));
     let mut seen: Vec<String> = Vec::new();
     for k in keys {
         let low = k.to_lowercase();
@@ -38,6 +48,9 @@ pub fn merge3(
         seen.push(low);
         let (b, m, t) = (find(base, k), find(mine, k), find(theirs, k));
         let take = if m == b {
+            if let Some(what) = change(&b, &t) {
+                taken.push(format!("{k} {what}"));
+            }
             t
         } else {
             if t != b && t != m {
@@ -49,7 +62,35 @@ pub fn merge3(
             out.push((k.clone(), text));
         }
     }
-    (out, both)
+    Merge { items: out, both, taken }
+}
+
+/// How an item went from `was` to `now`, if it changed.
+fn change(was: &Option<String>, now: &Option<String>) -> Option<&'static str> {
+    match (was, now) {
+        (None, Some(_)) => Some("added"),
+        (Some(_), None) => Some("removed"),
+        (Some(a), Some(b)) if a != b => Some("edited"),
+        _ => None,
+    }
+}
+
+/// What changed from `was` to `now`: `storm added`, `lost edited`, …
+pub fn changes(was: &[(String, String)], now: &[(String, String)]) -> Vec<String> {
+    let find =
+        |v: &[(String, String)], k: &str| v.iter().find(|(n, _)| n.eq_ignore_ascii_case(k)).map(|(_, t)| t.clone());
+    let mut out = Vec::new();
+    let mut seen: Vec<String> = Vec::new();
+    for (k, _) in now.iter().chain(was) {
+        if seen.contains(&k.to_lowercase()) {
+            continue;
+        }
+        seen.push(k.to_lowercase());
+        if let Some(what) = change(&find(was, k), &find(now, k)) {
+            out.push(format!("{k} {what}"));
+        }
+    }
+    out
 }
 
 /// `KEY=VALUE` lines as items, one per key (a key given on several lines,
@@ -85,6 +126,20 @@ impl Stamp {
         out.sort();
         Stamp(out)
     }
+
+    /// The files added, removed or changed in `newer`.
+    pub fn changed(&self, newer: &Stamp) -> Vec<PathBuf> {
+        let mut out: Vec<PathBuf> = Vec::new();
+        for (a, b) in [(&self.0, &newer.0), (&newer.0, &self.0)] {
+            for e in a {
+                if !b.contains(e) && !out.contains(&e.0) {
+                    out.push(e.0.clone());
+                }
+            }
+        }
+        out.sort();
+        out
+    }
 }
 
 fn walk(p: &Path, depth: usize, out: &mut Vec<(PathBuf, u64, Option<SystemTime>)>) {
@@ -115,7 +170,7 @@ pub fn save_prefs(prefs: &mut crate::prefs::SearchPrefs, base: &mut String, path
     } else {
         // Read before the file was there: the defaults were the base.
         let was = if base.is_empty() { crate::prefs::SearchPrefs::default().serialize() } else { base.clone() };
-        let (merged, _) = merge3(&key_items(&was), &key_items(&mine), &key_items(&theirs));
+        let merged = merge3(&key_items(&was), &key_items(&mine), &key_items(&theirs)).items;
         let text: String = merged.iter().map(|(_, v)| format!("{v}\n")).collect();
         let protocols = std::mem::take(&mut prefs.protocols);
         *prefs = crate::prefs::SearchPrefs::parse(&text);
@@ -145,22 +200,25 @@ mod tests {
         // Mine: a edited, c removed, d added. Theirs: b edited, e added.
         let mine = items(&[("a", "a2"), ("b", "b1"), ("d", "d1")]);
         let theirs = items(&[("a", "a1"), ("b", "b2"), ("c", "c1"), ("e", "e1")]);
-        let (out, both) = merge3(&base, &mine, &theirs);
-        assert_eq!(out, items(&[("a", "a2"), ("b", "b2"), ("e", "e1"), ("d", "d1")]));
-        assert!(both.is_empty());
+        let m = merge3(&base, &mine, &theirs);
+        assert_eq!(m.items, items(&[("a", "a2"), ("b", "b2"), ("e", "e1"), ("d", "d1")]));
+        assert!(m.both.is_empty());
+        assert_eq!(m.taken, ["b edited", "e added"]);
         // Removed there, untouched here: gone. Names without case.
-        let (out, _) = merge3(&base, &items(&[("A", "a1"), ("b", "b1"), ("c", "c1")]), &items(&[("a", "a1")]));
-        assert_eq!(out, items(&[("a", "a1")]));
+        let m = merge3(&base, &items(&[("A", "a1"), ("b", "b1"), ("c", "c1")]), &items(&[("a", "a1")]));
+        assert_eq!(m.items, items(&[("a", "a1")]));
+        assert_eq!(m.taken, ["b removed", "c removed"]);
     }
 
     #[test]
     fn both_changed_keeps_mine_and_says_so() {
         let base = items(&[("a", "a1")]);
-        let (out, both) = merge3(&base, &items(&[("a", "mine")]), &items(&[("a", "theirs")]));
-        assert_eq!((out, both), (items(&[("a", "mine")]), vec!["a".to_owned()]));
+        let m = merge3(&base, &items(&[("a", "mine")]), &items(&[("a", "theirs")]));
+        assert_eq!((m.items, m.both), (items(&[("a", "mine")]), vec!["a".to_owned()]));
         // The same change on both sides isn't a clash.
-        let (out, both) = merge3(&base, &items(&[("a", "same")]), &items(&[("a", "same")]));
-        assert_eq!((out, both.len()), (items(&[("a", "same")]), 0));
+        let m = merge3(&base, &items(&[("a", "same")]), &items(&[("a", "same")]));
+        assert_eq!((m.items, m.both.len()), (items(&[("a", "same")]), 0));
+        assert_eq!(changes(&base, &items(&[("b", "b1")])), ["b added", "a removed"]);
     }
 
     #[test]
@@ -199,8 +257,10 @@ mod tests {
         std::fs::write(dir.join("plots").join("drive.nerka-plot"), "x").unwrap();
         let after = Stamp::of(&paths);
         assert_ne!(before, after);
+        assert_eq!(before.changed(&after), [dir.join("plots").join("drive.nerka-plot")]);
         std::fs::write(dir.join("checks"), "a: lines /x/; exists\n").unwrap();
         assert_ne!(after, Stamp::of(&paths));
+        assert_eq!(after.changed(&Stamp::of(&paths)), [dir.join("checks")]);
         std::fs::remove_dir_all(&dir).ok();
     }
 }

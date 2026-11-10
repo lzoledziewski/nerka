@@ -2951,10 +2951,15 @@ struct App {
     checks_base: String,
     signals_base: String,
     prefs_base: String,
-    /// The configuration files when this window lost the focus: changed
-    /// when it gets it back, they are read again.
+    /// The configuration files when this window lost the focus (or read
+    /// them): changed when it gets it back, a notice says what.
     config_stamp: Option<sync::Stamp>,
     focused: bool,
+    /// Configuration files another window (or an editor) changed and this
+    /// window hasn't read, and what they say changed: the notice bar with
+    /// Reload and Not now (owner, 2026-11-10: nothing is read by itself, a
+    /// session isn't changed under the user).
+    config_notice: Option<(std::collections::BTreeSet<PathBuf>, Vec<String>)>,
     /// Why files couldn't be opened, in a window until OK (review
     /// 2026-11-09, R7: the reason was the cut-off end of the status line).
     open_errors: Vec<String>,
@@ -3122,7 +3127,7 @@ fn settings_ui(ui: &mut egui::Ui, f: SettingsFields<'_>) -> SettingsChange {
             .button("Reload configuration")
             .on_hover_text(
                 "Read packs, presets, plots, checks, signals and settings again, as another nerka window or an \
-                 editor left them (done by itself when this window gets the focus back). Open tabs keep how \
+                 editor left them (a bar says so when this window gets the focus back). Open tabs keep how \
                  their files were read",
             )
             .clicked();
@@ -3409,17 +3414,15 @@ impl App {
         let items = |c: &Checks| c.iter().map(|c| (c.name().to_owned(), c.spec())).collect::<Vec<_>>();
         let (base, _) = Checks::parse_text(&self.checks_base);
         let (now, _) = Checks::parse_text(theirs);
-        let (merged, both) = sync::merge3(&items(&base), &items(&mine), &items(&now));
+        let m = sync::merge3(&items(&base), &items(&mine), &items(&now));
         let mut c = Checks::default();
-        for d in merged.iter().filter_map(|(_, spec)| CheckDef::parse_spec(spec).ok()) {
+        for d in m.items.iter().filter_map(|(_, spec)| CheckDef::parse_spec(spec).ok()) {
             c.set(d);
         }
         let text = c.to_text();
         self.take_checks_text(&text);
         self.checks_gen += 1;
-        if !both.is_empty() {
-            self.status = format!("Changed in another window too, this window's kept: check {}", both.join(", "));
-        }
+        self.merge_status("check", &m);
         text
     }
 
@@ -3434,6 +3437,7 @@ impl App {
             Ok(()) => self.checks_base = text,
             Err(e) => self.status = format!("Could not save checks to {}: {e}", path.display()),
         }
+        self.refresh_notice();
     }
 
     fn load_saved_signals(&mut self) {
@@ -3474,15 +3478,35 @@ impl App {
         let items = |s: &Signals| s.iter().map(|d| (d.name().to_owned(), d.spec())).collect::<Vec<_>>();
         let (base, _) = Signals::parse_text(&self.signals_base);
         let (now, _) = Signals::parse_text(theirs);
-        let (merged, both) = sync::merge3(&items(&base), &items(&mine), &items(&now));
-        let lines: String = merged.iter().map(|(_, spec)| format!("{spec}\n")).collect();
+        let m = sync::merge3(&items(&base), &items(&mine), &items(&now));
+        let lines: String = m.items.iter().map(|(_, spec)| format!("{spec}\n")).collect();
         let text = Signals::parse_text(&lines).0.to_text();
         self.take_signals_text(&text);
         self.saved_gen += 1;
-        if !both.is_empty() {
-            self.status = format!("Changed in another window too, this window's kept: signal {}", both.join(", "));
-        }
+        self.merge_status("signal", &m);
         text
+    }
+
+    /// Say what a save took in from another window, and where both changed
+    /// one item (this window's kept), in the window's and its tab's status.
+    fn merge_status(&mut self, what: &str, m: &sync::Merge) {
+        let mut parts = Vec::new();
+        if !m.taken.is_empty() {
+            let taken: Vec<String> = m.taken.iter().map(|t| format!("{what} {t}")).collect();
+            parts.push(format!("also took from another window: {}", taken.join(", ")));
+        }
+        if !m.both.is_empty() {
+            parts.push(format!("changed there too, this window's kept: {what} {}", m.both.join(", ")));
+        }
+        if parts.is_empty() {
+            return;
+        }
+        let msg = format!("Saved; {}", parts.join("; "));
+        if let Some(t) = self.tabs.get_mut(self.active) {
+            t.status.clone_from(&msg);
+        }
+        self.status = msg;
+        self.refresh_notice();
     }
 
     fn save_saved_signals(&mut self) {
@@ -3496,6 +3520,7 @@ impl App {
             Ok(()) => self.signals_base = text,
             Err(e) => self.status = format!("Could not save signals to {}: {e}", path.display()),
         }
+        self.refresh_notice();
     }
 
     fn load_history(&mut self) {
@@ -3586,11 +3611,14 @@ impl App {
             self.prefs.protocols = protocols;
         }
         self.config_stamp = Some(self.config_stamp_now());
+        self.config_notice = None;
     }
 
-    /// The configuration files and folders another window may change.
+    /// The configuration files and folders another window may change and
+    /// a notice is about. Not the prefs: saved at every change of a box's
+    /// options, they would make it show all the time; a save merges them.
     fn config_stamp_now(&self) -> sync::Stamp {
-        let mut paths: Vec<PathBuf> = [checks_path(), signals_path(), prefs_path()].into_iter().flatten().collect();
+        let mut paths: Vec<PathBuf> = [checks_path(), signals_path()].into_iter().flatten().collect();
         paths.extend(
             [pack::default_dir(), nerka_core::plot::default_dir(), nerka_core::preset::default_dir()]
                 .into_iter()
@@ -3600,26 +3628,110 @@ impl App {
         sync::Stamp::of(&paths)
     }
 
-    /// The focus came back and a configuration file changed while it was
-    /// away (another window, or an editor): read them again (owner,
-    /// 2026-11-09, U3). Losing the focus notes how they are.
+    /// The focus came back and configuration files changed while it was
+    /// away (another window, or an editor): the notice says what (owner,
+    /// 2026-11-10: notice only, nothing read by itself). Losing the focus
+    /// notes how they are, so this window's own saves don't count.
     fn follow_focus(&mut self, ctx: &egui::Context) {
         let focused = ctx.input(|i| i.viewport().focused).unwrap_or(false);
         if focused == self.focused {
             return;
         }
         self.focused = focused;
-        if !focused {
-            self.config_stamp = Some(self.config_stamp_now());
-            return;
+        let now = self.config_stamp_now();
+        let changed = match (&self.config_stamp, focused) {
+            (Some(was), true) => was.changed(&now),
+            _ => Vec::new(),
+        };
+        self.config_stamp = Some(now);
+        if !changed.is_empty() {
+            self.config_notice.get_or_insert_with(Default::default).0.extend(changed);
+            self.refresh_notice();
         }
-        if self.config_stamp.as_ref().is_some_and(|s| *s != self.config_stamp_now()) {
-            self.reload_settings();
-            let msg = "Configuration changed elsewhere: read again".to_owned();
-            match self.tabs.get_mut(self.active) {
-                Some(t) => t.status = msg,
-                None => self.status = msg,
+    }
+
+    /// What the notice says, from its files: checks and signals by name
+    /// (what the file has that this window didn't read), plots, presets
+    /// and packs by file. Nothing left to say: no notice.
+    fn refresh_notice(&mut self) {
+        let Some((files, _)) = &self.config_notice else { return };
+        let mut lines = Vec::new();
+        let read = |p: &Option<PathBuf>| p.as_ref().and_then(|p| std::fs::read_to_string(p).ok());
+        if checks_path().is_some_and(|p| files.contains(&p))
+            && let Some(now) = read(&checks_path())
+        {
+            use nerka_core::check::Checks;
+            let items =
+                |t: &str| Checks::parse_text(t).0.iter().map(|c| (c.name().to_owned(), c.spec())).collect::<Vec<_>>();
+            lines.extend(
+                sync::changes(&items(&self.checks_base), &items(&now)).into_iter().map(|c| format!("check {c}")),
+            );
+        }
+        if signals_path().is_some_and(|p| files.contains(&p))
+            && let Some(now) = read(&signals_path())
+        {
+            let items =
+                |t: &str| Signals::parse_text(t).0.iter().map(|d| (d.name().to_owned(), d.spec())).collect::<Vec<_>>();
+            lines.extend(
+                sync::changes(&items(&self.signals_base), &items(&now)).into_iter().map(|c| format!("signal {c}")),
+            );
+        }
+        let (plots, presets) = (nerka_core::plot::default_dir(), nerka_core::preset::default_dir());
+        let packs: Vec<PathBuf> = pack::default_dir().into_iter().chain(self.pack_paths.iter().cloned()).collect();
+        for f in files {
+            let stem = f.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+            let line = if plots.as_ref().is_some_and(|d| f.starts_with(d)) {
+                format!("plot {stem}")
+            } else if presets.as_ref().is_some_and(|d| f.starts_with(d)) {
+                format!("preset {stem}")
+            } else if packs.iter().any(|d| f.starts_with(d)) {
+                format!("pack file {}", f.file_name().map(|s| s.to_string_lossy()).unwrap_or_default())
+            } else {
+                continue;
+            };
+            if !lines.contains(&line) {
+                lines.push(line);
             }
+        }
+        if lines.is_empty() {
+            self.config_notice = None;
+        } else if let Some(n) = &mut self.config_notice {
+            n.1 = lines;
+        }
+    }
+
+    /// The notice bar: what changed elsewhere, Reload, Not now.
+    fn config_notice_bar(&mut self, ui: &mut egui::Ui) {
+        let Some((_, lines)) = &self.config_notice else { return };
+        let text = format!("Changed in another window: {}", lines.join(", "));
+        let (mut reload, mut later) = (false, false);
+        egui::Panel::top("config_notice").show(ui, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                ui.colored_label(ui.visuals().warn_fg_color, "⚠");
+                ui.label(text);
+                reload = ui
+                    .button("Reload")
+                    .on_hover_text(
+                        "Read packs, presets, plots, checks and signals again: this window's tabs use the new \
+                         definitions",
+                    )
+                    .clicked();
+                later = ui
+                    .button("Not now")
+                    .on_hover_text(
+                        "Keep this window as it is (Settings → Reload configuration reads them later). Saving \
+                         here keeps the other window's changes all the same",
+                    )
+                    .clicked();
+            });
+        });
+        if reload {
+            self.reload_settings();
+            if let Some(t) = self.tabs.get_mut(self.active) {
+                t.status = "Configuration read again".into();
+            }
+        } else if later {
+            self.config_notice = None;
         }
     }
 
@@ -4532,6 +4644,7 @@ impl App {
             });
         });
 
+        self.config_notice_bar(ui);
         if !self.tabs.is_empty() {
             egui::Panel::top("tabs").show(ui, |ui| self.tab_bar(ui));
         }
@@ -5027,6 +5140,7 @@ mod tests {
             |text: &str| nerka_core::check::Checks::parse_text(text).0.iter().map(|c| c.spec()).collect::<Vec<_>>();
         assert_eq!(names(&disk), ["a: lines raw ~ /a2/; exists", "c: lines raw ~ /c/; exists"]);
         assert!(two.saved_checks.get("a").unwrap().spec().contains("/a2/"), "window two took one's edit");
+        assert_eq!(two.status, "Saved; also took from another window: check a edited, check c added");
         assert!(two.saved_checks.get("test").is_some(), "the session's check stays in the window");
         // Window one reads again: b is gone there too.
         one.take_checks_text(&disk);
