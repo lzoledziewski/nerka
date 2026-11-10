@@ -4,6 +4,8 @@ The dated log of the project, newest first; append-only: add an entry at the top
 
 ## 2026-11-10
 
+0.2.0-alpha.3 (a pre-release; 0.1.0 stays GitHub's Latest, owner): review 2026-11-09's fixes. The owner's findings: every plotted lifecycle labelled (U1); checks on / off and Auto / ▶ Run per tab (U2); windows notice configuration changed elsewhere and saves merge it (U3); a kept plot changes only on Keep / Save (U5); U4 cancelled, U6 and U7 postponed. The review's: what readers skip is said (R3), `net.*` past the sender cap warns (R2), one field merge with `dlt.type` / `sens.type` for a clash (R9), several files in the CLI with `--merge` (R6), checks warn when time goes backward (11-07 R4), `nerka-gui --help` and open errors that name their file (R7), a failed filter and a panicking job said (R5, R8), CLI messages (R13). Proofs: screenshots, CLI output and tests per fix.
+
 `status.md` split (review 2026-11-09, R4): the owner's GUI decisions to `gui-decisions.md`, built features to `features.md`, this history here; `status.md` keeps the state, pending decisions, next steps and limitations. Review 2026-11-09's fixes on `claude/fixes-2026-11-09`: `doc/review/2026-11-09-findings.md`.
 
 ## Updates up to 2026-11-09
