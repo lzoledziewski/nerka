@@ -306,35 +306,23 @@ pub(crate) const PROTO_FIELD: FieldDef = FieldDef::new("proto", FieldKind::Name,
 impl View {
     /// The view for the protocols `present` (indexes into `protos`).
     fn new(protos: &[Arc<dyn Protocol>], present: &[ProtoId], net: bool) -> View {
+        use crate::input::schema::{SchemaMap, qualifier};
         let present: &[ProtoId] = if present.is_empty() { &[0] } else { present };
-        let mut schema: Vec<FieldDef> = Vec::new();
         let mixed = present.len() > 1;
-        if mixed {
-            schema.push(PROTO_FIELD);
-        }
         // Fields of the same name are one field (all protocols have a
-        // `payload`); a later protocol's of another kind is left out.
-        for &p in present {
-            for def in protos[p].schema() {
-                if !schema.iter().any(|d| d.name == def.name) {
-                    schema.push(def.clone());
-                }
-            }
+        // `payload`); a name two protocols give different kinds is a field
+        // of each, `dlt.type` and `sens.type` (`input::schema`).
+        let lead: Vec<FieldDef> = if mixed { vec![PROTO_FIELD] } else { Vec::new() };
+        let mut tail: Vec<FieldDef> = if mixed { Vec::new() } else { vec![PROTO_FIELD] };
+        if net {
+            tail.extend(NET_FIELDS);
         }
-        if !mixed {
-            schema.push(PROTO_FIELD);
-        }
-        let net = net.then(|| {
-            let first = schema.len();
-            schema.extend(NET_FIELDS);
-            first
-        });
-        let fields = protos
-            .iter()
-            .map(|p| {
-                schema.iter().map(|d| p.schema().iter().position(|o| o.name == d.name && o.kind == d.kind)).collect()
-            })
-            .collect();
+        let parts: Vec<(String, &[FieldDef])> =
+            present.iter().map(|&p| (qualifier(protos[p].name()), protos[p].schema())).collect();
+        let map = SchemaMap::new(&lead, &parts, &tail);
+        let schema = map.schema.clone();
+        let net = net.then(|| schema.iter().position(|d| d.name == NET_FIELDS[0].name).expect("in the tail"));
+        let fields = protos.iter().map(|p| map.ids(&qualifier(p.name()), p.schema())).collect();
         let columns = if mixed {
             MIXED_COLUMNS.to_vec()
         } else {

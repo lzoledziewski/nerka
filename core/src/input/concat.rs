@@ -17,6 +17,7 @@
 //! fields, columns and line text, so `file` and `raw` read the same there.
 
 use super::proto::{MIXED_COLUMNS, PROTO_FIELD, Records};
+use super::schema::{SchemaMap, qualifier};
 use super::{ColumnDef, LogSource};
 use crate::event::{FieldDef, FieldId, FieldKind, FieldValue, Level};
 use crate::{Error, LineNo, Result};
@@ -114,22 +115,26 @@ impl Concat {
         let mapped = mixed || parts.iter().any(|p| p.schema() != first.schema());
         // As a capture of several protocols, `proto` first when mixed; then
         // each part's fields (the first part's keep their ids). One of a
-        // name already there is the same field when its kind is the same,
-        // and left out when it isn't.
-        let mut schema: Vec<FieldDef> = if mixed { vec![PROTO_FIELD] } else { Vec::new() };
-        for p in &parts {
-            for def in p.schema() {
-                if !schema.iter().any(|d| d.name == def.name) {
-                    schema.push(def.clone());
-                }
-            }
-        }
-        let fields = parts
+        // name already there is the same field when its kind is the same;
+        // of another kind, each is a field of its own named after its part's
+        // protocol (`dlt.type`, `sens.type`; a part of several protocols,
+        // or none, by its file: `input::schema`).
+        let quals: Vec<String> = parts
             .iter()
-            .map(|p| {
-                schema.iter().map(|d| p.schema().iter().position(|o| o.name == d.name && o.kind == d.kind)).collect()
+            .map(|p| match p.info().protocols.as_slice() {
+                [one] => qualifier(one),
+                _ => {
+                    let file = file_name(p.name());
+                    qualifier(file.rsplit_once('.').map_or(file.as_str(), |(stem, _)| stem))
+                }
             })
             .collect();
+        let lead: Vec<FieldDef> = if mixed { vec![PROTO_FIELD] } else { Vec::new() };
+        let schemas: Vec<(String, &[FieldDef])> =
+            parts.iter().zip(&quals).map(|(p, q)| (q.clone(), p.schema())).collect();
+        let map = SchemaMap::new(&lead, &schemas, &[]);
+        let fields = parts.iter().zip(&quals).map(|(p, q)| map.ids(q, p.schema())).collect();
+        let mut schema = map.schema;
         let convert = parts.iter().map(|p| mixed && p.columns() != MIXED_COLUMNS).collect();
         let columns = if mixed { MIXED_COLUMNS.to_vec() } else { first.columns().to_vec() };
         schema.push(FieldDef::new(FILE_FIELD, FieldKind::Str, false));

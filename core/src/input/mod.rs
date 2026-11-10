@@ -11,6 +11,7 @@ pub mod json;
 pub mod merged;
 pub mod proto;
 pub mod records;
+pub(crate) mod schema;
 
 use crate::event::{FieldDef, FieldId, FieldValue, Level};
 use crate::{LineNo, Progress, Result};

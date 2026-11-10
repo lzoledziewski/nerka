@@ -363,3 +363,117 @@ fn mixed_parts_with_the_same_fields_keep_their_fields() {
     assert_eq!(run_on(&all, &q("net.port == 41001")), [1]);
     assert_eq!(run_on(&all, &q("file == b.pcap AND v == 20")), [1]);
 }
+
+/// A definition whose `type` is a number: DLT's `type` is text.
+const TYPED: &str = "meta: { id: typed, endian: le }
+seq:
+  - { id: kind, type: u1 }
+  - { id: note, type: str, size-eos: true, encoding: UTF-8 }
+-nerka:
+  name: TYPED
+  framing: datagram
+  match: [ 41001 ]
+  fields:
+    type: kind
+    note: note
+  columns:
+    - note
+";
+
+/// Every field of `whole`, by name, on every line, against the part's own
+/// (review 2026-11-09, ARCH-10: R1 and R9 were positions read in the wrong
+/// part's schema). A field split by a clash (`dlt.type`) is the part's
+/// `type` in the part it is named after, none elsewhere; `file` is the
+/// whole's own.
+fn fields_agree(whole: &dyn LogSource, parts: &[(&dyn LogSource, &str)]) {
+    let lines = whole.part_files();
+    for (i, d) in whole.schema().iter().enumerate() {
+        if d.name == FILE_FIELD {
+            continue;
+        }
+        for (k, &(first, n)) in lines.iter().enumerate() {
+            let (part, qual) = parts[k];
+            let own = if part.schema().iter().any(|p| p.name == d.name) {
+                Some(d.name.as_ref())
+            } else {
+                match d.name.split_once('.') {
+                    Some((q, base)) if !matches!(q, "net" | "json") => (q == qual).then_some(base),
+                    _ => Some(d.name.as_ref()),
+                }
+            };
+            let id = own.and_then(|o| part.schema().iter().position(|p| p.name == o && p.kind == d.kind));
+            for l in 0..n {
+                let want = id.and_then(|id| part.field(l, id)).map(|v| format!("{v:?}"));
+                let got = whole.field(first + l, i).map(|v| format!("{v:?}"));
+                assert_eq!(got, want, "field {} on line {} (part {k}, line {l})", d.name, first + l);
+            }
+        }
+    }
+}
+
+/// Review 2026-11-09, R9: a name two protocols give different kinds is a
+/// field of each (`dlt.type`, `typed.type`), in a capture of both and in a
+/// view of files; a plain `type` says which to write. Every field reads
+/// its part's own value, merged by time too.
+#[test]
+fn a_name_of_two_kinds_is_a_field_of_each() {
+    use crate::input::capture::{self, CaptureOptions};
+    use crate::input::proto::{LoadedProtocol, ksy::KsyProtocol};
+    let defs = vec![LoadedProtocol::new(std::sync::Arc::new(KsyProtocol::parse(TYPED).unwrap()))];
+    let typed = |k: u8, note: &str| {
+        let mut m = vec![k];
+        m.extend_from_slice(note.as_bytes());
+        m
+    };
+    let dlt = dlt_bytes(&["GPS"]);
+    let datagrams = [(200, 3490, dlt[16..].to_vec()), (201, 41001, typed(7, "seven")), (202, 41001, typed(3, "three"))];
+    let options = CaptureOptions { protocols: defs, ..Default::default() };
+
+    // One capture of both: its own fields are split.
+    let (c, _) = capture::from_bytes("c.pcap", pcap_of(&datagrams), &options).unwrap();
+    let names: Vec<&str> = c.schema().iter().map(|f| f.name.as_ref()).collect();
+    assert!(names.contains(&"dlt.type") && names.contains(&"typed.type") && !names.contains(&"type"), "{names:?}");
+    assert_eq!(run_on(&c, &q("typed.type == 7")), [1]);
+    let e = Query::compile("type == 7").unwrap().bind(c.schema()).unwrap_err();
+    assert!(e.msg.contains("write dlt.type or typed.type"), "{e}");
+
+    // A `.dlt` file and a capture of TYPED only: the view splits them.
+    let a = DltFile::from_bytes("a.dlt", dlt_bytes(&["NAV", "SYS"]));
+    let only = CaptureOptions { disabled: vec!["DLT".into()], ..options.clone() };
+    let (b, _) = capture::from_bytes("b.pcap", pcap_of(&datagrams), &only).unwrap();
+    let parts: [(&dyn LogSource, &str); 2] = [(&a, "dlt"), (&b, "typed")];
+    let a2 = DltFile::from_bytes("a.dlt", dlt_bytes(&["NAV", "SYS"]));
+    let (b2, _) = capture::from_bytes("b.pcap", pcap_of(&datagrams), &only).unwrap();
+    let view = Concat::new(vec![Box::new(a2), Box::new(b2)]).unwrap();
+    let names: Vec<&str> = view.schema().iter().map(|f| f.name.as_ref()).collect();
+    assert!(names.contains(&"dlt.type") && names.contains(&"typed.type"), "{names:?}");
+    fields_agree(&view, &parts);
+    assert_eq!(run_on(&view, &q("typed.type < 5")), [3]);
+    assert_eq!(run_on(&view, &q("dlt.type ~ /log/ AND apid == SYS")), [1]);
+
+    // The earlier layouts: same kind (mapped), mixed, mixed with one schema.
+    let same = Concat::new(vec![
+        Box::new(DltFile::from_bytes("a.dlt", dlt_bytes(&["NAV"]))),
+        Box::new(DltFile::from_bytes("b.dlt", dlt_bytes(&["SYS", "GPS"]))),
+    ])
+    .unwrap();
+    let (x, y) =
+        (DltFile::from_bytes("a.dlt", dlt_bytes(&["NAV"])), DltFile::from_bytes("b.dlt", dlt_bytes(&["SYS", "GPS"])));
+    fields_agree(&same, &[(&x, "dlt"), (&y, "dlt")]);
+    let (c2, _) = capture::from_bytes("c.pcap", pcap_of(&datagrams), &options).unwrap();
+    let (c3, _) = capture::from_bytes("c.pcap", pcap_of(&datagrams), &options).unwrap();
+    let a3 = DltFile::from_bytes("a.dlt", dlt_bytes(&["NAV", "SYS"]));
+    let a4 = DltFile::from_bytes("a.dlt", dlt_bytes(&["NAV", "SYS"]));
+    let mixed = Concat::new(vec![Box::new(a3), Box::new(c2)]).unwrap();
+    assert!(mixed.is_mixed());
+    fields_agree(&mixed, &[(&a4, "dlt"), (&c3, "c")]);
+    // The `.dlt` file's `type` is `dlt.type` there too: one name for DLT's.
+    assert!(mixed.schema().iter().all(|f| f.name != "type"));
+    assert_eq!(run_on(&mixed, &q("dlt.type ~ /log/")), [0, 1, 2]);
+
+    // Merged by time: the same values, by name.
+    let merged = crate::input::merged::Merged::new(view, &crate::Progress::new()).unwrap();
+    let typed_rows = run_on(&merged, &q("typed.type == 7 OR typed.type == 3"));
+    assert_eq!(typed_rows.len(), 2);
+    assert_eq!(run_on(&merged, &q("dlt.type ~ /log/")).len(), 2);
+}
