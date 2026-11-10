@@ -47,6 +47,7 @@ mode, with history on ↑ / ↓.
 nerka filter 'level >= ERROR AND raw ~ /SSL|CERT/i AND NOT /healthcheck/' app.log
 nerka filter 'apid == NAV AND level >= WARN AND payload ~ "timeout"' trace.dlt
 nerka search --in 'level >= WARN' -c timeout app.log
+nerka --merge filter 'apid == NAV OR file == ecu2.dlt' ecu1.dlt ecu2.dlt bus.pcap   # several files: one view, FILE:LINE: per line
 ```
 
 ### Every format by its content

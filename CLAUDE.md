@@ -22,6 +22,7 @@ cargo run -p nerka-cli -- --fibex ecu1.xml filter 'apid == NAV' trace.dlt       
 cargo run -p nerka-cli -- --someip-port 30501 filter 'proto == SOMEIP AND type == ERROR' trace.pcap   # protocols by UDP port
 cargo run -p nerka-cli -- --protocol examples/protocols/dlt.ksy --protocol-port DLTK=3491 filter 'proto == DLTK AND apid == NAV' trace.pcap   # a protocol definition (.ksy, doc/protocol-definitions.md)
 cargo run -p nerka-cli -- --records 'start=/\d{4}-\d\d-\d\d/' filter 'level >= ERROR' app.log   # multi-line records
+cargo run -p nerka-cli -- --merge filter 'apid == NAV' ecu1.dlt ecu2.dlt bus.pcap   # several files as one view (by time with --merge)
 cargo run -p nerka-cli -- --lifecycle 'ecu1: lines ecu == ECU1; reset uptime; planned payload ~ /shutdown/' lifecycles trace.dlt   # ECU1's boots
 cargo run -p nerka-cli -- --pack packs/ --lifecycle 'ecu1: lines ecu == ECU1; reset uptime; planned {sys.shutdown}' --signal 'ota(s):enum:per(ecu1):default(idle)=ecu == ECU1 AND /OTA (?<s>\w+)/' filter '@ota == idle' trace.dlt
 cargo run -p nerka-cli -- --check 'storm: lines level >= ERROR; rate 25 per 1s' check -e 2 trace.dlt   # checks: issues and facts
