@@ -24,7 +24,7 @@ Don't settle these silently: ask.
 6. **Trying Linux locally:** CI builds and tests Linux, but this Windows PC has no WSL, Docker or zig, so the Linux GUI is untried. WSL would also run it.
 7. **Copying multi-line messages (owner, 2026-10-19: action item, rethink later):** a decoded message's own line breaks and tabs show as spaces in the views and are kept only in the line window (Enter). Ctrl+C / Copy in the views copy the display text (formatting dropped); the line window's Copy message / Copy line keep it. The owner isn't fully happy with this, but neither single rule is good: always copying with the original formatting breaks the one-row-per-line, tab-separated paste (spreadsheets, grep), while always copying the display text loses stack traces and JSON. Revisit (e.g. a copy mode, or a second shortcut).
 8. **The CLI's open options in the GUI** (review 2026-11-09, R7 e; owner, 2026-11-10: to discuss): `--protocol`, `--route`, `--records`, `--lifecycle` for `nerka-gui`, through one parser both binaries share.
-9. **Checks and time order** (review 2026-11-07, R4; owner, 2026-11-10: not sure yet): tests on time (gap, rate, then / missing) assume a check's lines come in time order; a view of files one after another, or a capture with clocks that jump, breaks that (`core/src/check.rs`, an ignored test).
+9. ~~Checks and time order~~ **decided** (owner, 2026-11-10): warn only, explicit rather than implicit: tests on times expect lines in time order and aren't mended; where time goes backward the pane and the CLI say so (`checks.md` → Time order).
 10. **Pulling a needed query into the Selection** (review 2026-11-09, U7; owner: needs a discussion first) and **query signals with saved signals' options** (U6: a feature of its own, later).
 
 ## State

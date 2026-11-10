@@ -299,6 +299,12 @@ pub struct CheckResult {
     /// Why its signal isn't made, if it isn't: the name is taken (owner,
     /// 2026-11-07: a conflict was silent, like a check that finds nothing).
     pub signal_note: Option<String>,
+    /// It tests times (rate, gap, then / missing) and its lines' times go
+    /// back in the view (files one after another whose times overlap, a
+    /// clock that jumps). It reads them in the view's order all the same,
+    /// so a result may be wrong; the UI says so (owner, 2026-11-10: warn
+    /// only, explicit rather than implicit; review 2026-11-07 R4).
+    pub times_go_back: bool,
 }
 
 impl CheckResult {
@@ -693,6 +699,9 @@ impl CheckDef {
                 scopes.push(Scope { label: format!("{p} #{}", l.number), life: Some(l.number), from: l.first, to });
             }
         }
+        // Times that go back: said, not mended (owner, 2026-11-10).
+        let times_go_back = self.parts.iter().any(|p| p.test.needs_time())
+            && (goes_back(&rows, &time) || others.iter().flatten().any(|v| goes_back(v, &time)));
         let mut out = Vec::with_capacity(scopes.len());
         for scope in scopes {
             if progress.is_cancelled() {
@@ -735,6 +744,7 @@ impl CheckDef {
             scopes: out,
             per: self.per.clone(),
             signal_note: None,
+            times_go_back,
         })
     }
 
@@ -985,6 +995,18 @@ struct Cx<'a> {
     end: Option<f64>,
     values: Option<&'a crate::SignalSeries>,
     scope: &'a Scope,
+}
+
+/// Whether the times of `rows` (those that have one) ever go back.
+fn goes_back(rows: &[LineNo], time: &dyn Fn(LineNo) -> Option<f64>) -> bool {
+    let mut last = f64::NEG_INFINITY;
+    for t in rows.iter().filter_map(|&r| time(r)) {
+        if t < last {
+            return true;
+        }
+        last = t;
+    }
+    false
 }
 
 /// One test's verdict on one scope.

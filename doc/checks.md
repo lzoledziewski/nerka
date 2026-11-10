@@ -34,6 +34,8 @@ storm: lines ecu == ECU1 AND level >= ERROR; rate 25 per 1s; per ecu1
 temp: lines /temp=(?<t>\d+)/; value max; per ecu1
 ```
 
+**Time order (owner, 2026-11-10: warn only, explicit rather than implicit; review 2026-11-07 R4):** `rate`, `gap` and `then` / `missing` read a check's lines in the view's order and expect their times to go forward. Where time goes backward (files one after another whose times overlap, a clock that jumps) they aren't mended: the Checks pane says "Time goes backward in this view: rate, gap and then / missing expect lines in time order" (hover: Merge by time) and `nerka check` warns once on stderr (`--merge`), with `"times_go_back": true` in `--json`. `CheckResult::times_go_back`.
+
 A lifecycle's scope is its time span (from its first line to the next one's): lines of any entity in it count. **A `per` check's overall result is the whole log judged at once, reboots included, and it counts like any result** (owner, 2026-11-10, review 2026-11-09 U4 cancelled: the more general rule; one check answers both per lifecycle and across them, and nothing before the first lifecycle is missed). So a gap that spans a reboot shows overall and in no lifecycle; to ignore it, read the lifecycles' results. Tests on time need the lines' times (the source's, or a time signal).
 
 - **Core:** `core/src/check.rs`: `CheckDef` (spec, `resolved` with the library, `run` → `CheckResult`: per scope a verdict (ok / issue ×N / fact value) and up to 1000 pieces of evidence (lines and a note)), `Checks` (the saved list).

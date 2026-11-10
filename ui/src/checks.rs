@@ -364,6 +364,22 @@ pub fn checks_panel(ui: &mut egui::Ui, st: &mut ChecksUi, input: Input<'_>) -> O
             );
         }
     });
+    // Times go back here, and checks on times expect them in order: one
+    // warning for the pane (owner, 2026-11-10: warn only, about the tests'
+    // assumption, not each case; review 2026-11-07 R4).
+    if results.iter().any(|(_, r)| r.as_ref().is_ok_and(|r| r.times_go_back)) {
+        let several = file.part_files().len() > 1 && file.reordered().is_none();
+        let fix = if several { " Tab menu → Merge by time puts this view's files in time order." } else { "" };
+        ui.colored_label(
+            ui.visuals().warn_fg_color,
+            "⚠ Time goes backward in this view: rate, gap and then / missing expect lines in time order.",
+        )
+        .on_hover_text(format!(
+            "These tests read the lines in the view's order and compare each one's time with the one before it. \
+             Where time goes backward (files one after another whose times overlap, a clock that jumps) their \
+             results may be wrong: a false burst or gap, a step missed.{fix}"
+        ));
+    }
 
     // The form, at the top while open.
     if st.form_open {
@@ -945,6 +961,7 @@ mod tests {
             kind: Kind::Issue,
             per: None,
             signal_note: Some(long.clone()),
+            times_go_back: true,
             scopes: vec![ScopeResult {
                 scope,
                 verdict: Verdict::Issue(1),

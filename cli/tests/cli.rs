@@ -440,6 +440,13 @@ fn several_files_are_one_view() {
         "{}",
         out(&o)
     );
+    // A check on times over files whose times overlap: said (owner,
+    // 2026-11-10: warn only); merged by time, the times don't go back.
+    let o = nerka(&["--check", "r: lines apid == NAV; rate 5 per 1s", "check", "--json", a, b]);
+    assert!(err(&o).contains("time goes backward in this view: rate, gap and then / missing expect"), "{}", err(&o));
+    assert!(out(&o).contains("\"times_go_back\": true"), "{}", out(&o));
+    let o = nerka(&["--merge", "--check", "r: lines apid == NAV; rate 5 per 1s", "check", a, b]);
+    assert!(!err(&o).contains("time goes backward"), "{}", err(&o));
     // Files that don't go together are refused, saying why.
     let log = log_file(&d);
     let o = nerka(&["filter", "level >= WARN", s(&log), a]);

@@ -93,7 +93,8 @@ struct Cli {
     /// Define a check (repeatable): NAME: lines QUERY; TEST[; per
     /// LIFECYCLE], e.g. 'storm: lines raw ~ /retry/; rate 20 per 10s'.
     /// Tests: exists, count [OP N], rate N per DUR, gap DUR, then QUERY
-    /// within DUR, missing QUERY within DUR, value first|last|min|max.
+    /// within DUR, missing QUERY within DUR, value first|last|min|max. Rate,
+    /// gap, then and missing expect lines in time order (several files: --merge).
     #[arg(long, global = true, value_name = "SPEC")]
     check: Vec<String>,
     /// Show times (DLT's time column, signals) in this computer's local
@@ -769,6 +770,8 @@ fn checks(
     let run = all.run_all(&*f, &signals, &lib, &Progress::new())?;
     let took = t.elapsed();
     let (mut issues, mut rows) = (0, Vec::new());
+    // Time goes backward for a check on times: one warning (owner, 2026-11-10).
+    let mut back = false;
     if !json {
         writeln!(out, "check	kind	scope	result")?;
     }
@@ -780,6 +783,7 @@ fn checks(
         if let Some(note) = &r.signal_note {
             eprintln!("check '{}': {note}", r.name);
         }
+        back |= r.times_go_back;
         for s in &r.scopes {
             let shown = match &s.verdict {
                 Verdict::Ok => "ok".to_owned(),
@@ -807,12 +811,13 @@ fn checks(
                     .collect();
                 rows.push(format!(
                     "  {{\"check\": {}, \"kind\": {}, \"scope\": {}, \"first_line\": {}, \"end_line\": {}, \
-                     \"verdict\": {verdict}, \"evidence\": [{}]}}",
+                     \"verdict\": {verdict}, \"times_go_back\": {}, \"evidence\": [{}]}}",
                     js(&r.name),
                     js(r.kind.as_str()),
                     js(&s.scope.label),
                     s.scope.from + 1,
                     s.scope.to,
+                    r.times_go_back,
                     ev.join(", ")
                 ));
             } else {
@@ -825,6 +830,13 @@ fn checks(
                 }
             }
         }
+    }
+    if back {
+        eprintln!(
+            "nerka: warning: time goes backward in this view: rate, gap and then / missing expect lines in time \
+             order, so their results may be wrong{}",
+            if MERGE.get().copied().unwrap_or(false) { "" } else { " (--merge puts several files in time order)" }
+        );
     }
     if !json {
         out.flush()?;
