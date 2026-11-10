@@ -53,8 +53,12 @@ checklist `doc/review/checklist.md`, latest findings `doc/review/*-findings.md`.
 CI (`.github/workflows/ci.yml`) runs fmt, clippy and tests on Linux and Windows, `cargo deny`, and a DCO sign-off check on pull requests (`CONTRIBUTING.md`; commit with `git commit -s`); `release.yml`
 builds Linux/Windows archives and publishes a pre-release on a `v*` tag.
 
-`doc/status.md` records the current state and the owner's GUI decisions; read it
-before changing the UI, and update it when the state changes.
+`doc/status.md` records the current state, the decisions pending with the owner
+and the next steps; read it first, and update it (with a dated line at the top of
+`doc/history.md`) when the state changes. `doc/gui-decisions.md` holds the owner's
+GUI decisions: read it before changing the UI, and record new ones there.
+`doc/features.md` describes each built feature and the owner's decisions about it;
+`doc/history.md` is the dated log (read on demand).
 
 ## Rules
 - Line numbers are 0-based `LineNo` (u64) internally; add 1 only for display.

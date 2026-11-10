@@ -58,7 +58,7 @@ regression over 15 %; **S3** debt that makes the next change harder;
 | PERF-2 🤖 | No query more than 15 % slower than the baseline, match counts identical | `tools/bench.sh compare doc/review/baseline/bench-….tsv bench.tsv` |
 | PERF-3 | Index memory per line stays as documented (8 B text, 8 / 16 B DLT, +16 B merged) | `nerka open FILE` → `index mem` |
 | PERF-4 | New per-line work in the hot path (allocation, `to_string`, rendering) is avoided or measured | read `scan_*`, `Event`, `field` implementations |
-| PERF-5 | GUI: no repaint loop when idle; heavy work off the UI thread | status.md "CPU with software rendering"; `ui/src/job.rs` |
+| PERF-5 | GUI: no repaint loop when idle; heavy work off the UI thread | `gui-decisions.md` "CPU with software rendering"; `ui/src/job.rs` |
 
 ## HUX — human usability (cycle)
 
@@ -66,7 +66,7 @@ regression over 15 %; **S3** debt that makes the next change harder;
 |---|---|---|
 | HUX-1 | CLI errors say what is wrong and where (caret under the column) and what would work | try a wrong field, a bad regex, a missing file |
 | HUX-2 | CLI help: each option has an example; the `about` line still describes the tool | `nerka --help`, `nerka <cmd> --help` |
-| HUX-3 | Owner's GUI decisions in `doc/status.md` are kept (Filter at the top, Search at the bottom, runs on Enter only, …) | read the diff against "GUI as of now" |
+| HUX-3 | Owner's GUI decisions in `doc/gui-decisions.md` are kept (Filter at the top, Search at the bottom, runs on Enter only, …) | read the diff against it |
 | HUX-4 | GUI change checked on screen | `tools/screenshot.ps1` |
 | HUX-5 | Messages use the same words as the docs (filter / search / query / pack / signal / lifecycle / check) | read new strings |
 | HUX-6 | README's quick start works from a fresh clone | follow it |
@@ -84,7 +84,7 @@ regression over 15 %; **S3** debt that makes the next change harder;
 | AIX-5 | Exit status tells "no match" from "error" (grep: 0 / 1 / 2) where a script needs it | `nerka filter … ; echo $?` |
 | AIX-6 | A file's fields can be discovered without the GUI | `nerka open FILE` lists `fields:`; kinds too? |
 | AIX-7 | Status and decisions are split: current state (short) vs history (append-only) | `doc/status.md` structure |
-| AIX-8 | Each file an agent must read fits one read (under 20k tokens), with what must not be missed (pending decisions) near the top | read `doc/status.md` whole with the agent's file tool |
+| AIX-8 | Each file an agent must read fits one read (under 20k tokens), with what must not be missed (pending decisions) near the top | the gate measures `status.md`, `gui-decisions.md`, `features.md`, `history.md` |
 
 ## SEC — security (gate for S1)
 

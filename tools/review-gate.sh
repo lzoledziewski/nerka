@@ -139,6 +139,12 @@ if [ $tok -gt 25000 ]; then warn DOC-2 "required reading is ~${tok} tokens (budg
 # DOC-3: very long lines make docs hard to diff and to edit by exact match.
 long=$(awk 'length($0) > 1500 { n++ } END { print n + 0 }' doc/*.md)
 [ "$long" -gt 0 ] && warn DOC-3 "$long doc lines over 1500 characters" || pass DOC-3 "no doc line over 1500 characters"
+# AIX-8: each doc an agent reads fits one read (~4 bytes a token; 20k tokens).
+for f in doc/status.md doc/gui-decisions.md doc/features.md doc/history.md; do
+  [ -f "$f" ] || continue
+  t=$(( $(wc -c < "$f") / 4 ))
+  if [ $t -gt 20000 ]; then warn AIX-8 "$f is ~${t} tokens: more than one read"; else pass AIX-8 "$f ~${t} tokens"; fi
+done
 # DOC-4: status.md is dated.
 d=$(sed -nE 's/^_Last update: ([0-9-]{10}).*/\1/p' doc/status.md)
 pass DOC-4 "status.md last update: ${d:-none}"
