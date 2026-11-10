@@ -120,7 +120,7 @@ impl Bookmarks {
 
     /// Put each bookmark on the line its anchor finds in `source`: the
     /// line at the anchor's offset if its hash matches, else the nearest
-    /// line with that hash within [`NEAR_ROWS`] of its old row. One that
+    /// line with that hash within `NEAR_ROWS` of its old row. One that
     /// isn't found stays on its old row (or the next free one), unsure.
     /// Bookmarks without anchors, and sources without them, stay as they are.
     pub fn resolve(&mut self, source: &dyn LogSource) {

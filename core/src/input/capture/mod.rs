@@ -128,6 +128,29 @@ pub struct CaptureStats {
     pub senders_not_kept: u64,
 }
 
+impl CaptureStats {
+    /// What was dropped, for people (empty: nothing).
+    pub fn notes(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        if self.msg_skipped > 0 {
+            out.push(format!("{} bytes of datagrams weren't whole messages: skipped", self.msg_skipped));
+        }
+        if self.file_skipped > 0 {
+            out.push(format!("{} bytes of the file couldn't be read: skipped", self.file_skipped));
+        }
+        if self.net.incomplete > 0 {
+            out.push(format!("{} datagrams lost a fragment: not read", self.net.incomplete));
+        }
+        if self.senders_not_kept > 0 {
+            out.push(format!(
+                "{} messages have no net.* fields: more than {MAX_SENDERS} senders",
+                self.senders_not_kept
+            ));
+        }
+        out
+    }
+}
+
 /// Does `head` (the first bytes of a file) look like a capture this module
 /// reads?
 pub fn is_capture(head: &[u8]) -> bool {
@@ -214,7 +237,9 @@ fn read(
         Some((b, _)) => b,
         None => data,
     };
-    Ok((Records::framed(name, path, data, msgs, side, origins, protos, skipped), stats))
+    let records = Records::framed(name, path, data, msgs, side, origins, protos, skipped)
+        .with_notes(stats.notes(), stats.senders_not_kept);
+    Ok((records, stats))
 }
 
 /// Where containers deliver frames: transport, router and protocols.

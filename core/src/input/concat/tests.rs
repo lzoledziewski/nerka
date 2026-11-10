@@ -82,6 +82,32 @@ fn dlt_bytes(apids: &[&str]) -> Vec<u8> {
     buf
 }
 
+/// Review 2026-11-09, R3: what a reader skipped is said, with the file it
+/// is about in a view of several; 2026-11-08, R8: a `proto` no message has
+/// is said instead of finding nothing.
+#[test]
+fn what_a_reader_skipped_and_unknown_protocols_are_said() {
+    let mut bytes = dlt_bytes(&["NAV", "SYS"]);
+    let half = bytes.len() / 2;
+    bytes.splice(half..half, [0xEEu8; 14]);
+    let a = DltFile::from_bytes("a.dlt", bytes);
+    let info = a.info();
+    assert_eq!(info.protocols, ["DLT"]);
+    assert_eq!(info.notes.len(), 1, "{info:?}");
+    assert!(info.notes[0].ends_with("weren't DLT messages: skipped"), "{info:?}");
+    assert!(text("t.log", "x\n").info() == crate::SourceInfo::default());
+
+    let both = Concat::new(vec![Box::new(a), Box::new(DltFile::from_bytes("b.dlt", dlt_bytes(&["NAV"])))]).unwrap();
+    let info = both.info();
+    assert_eq!(info.protocols, ["DLT"]);
+    assert!(info.notes.len() == 1 && info.notes[0].starts_with("a.dlt: "), "{info:?}");
+
+    let warn = |q: &str| crate::query_warnings(&Query::compile(q).unwrap().bind(both.schema()).unwrap(), &both);
+    assert_eq!(warn("proto == SENS AND apid == NAV"), ["no message here is of a protocol 'sens' (there are: DLT)"]);
+    assert!(warn("proto == dlt").is_empty(), "case doesn't matter");
+    assert!(warn("apid == NAV").is_empty());
+}
+
 #[test]
 fn dlt_files_and_captures_are_one_kind() {
     let a: Box<dyn LogSource> = Box::new(DltFile::from_bytes("a.dlt", dlt_bytes(&["NAV", "SYS"])));

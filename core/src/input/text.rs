@@ -14,7 +14,7 @@ pub struct TextFile {
 }
 
 impl TextFile {
-    /// Memory-map `path` (see [`Bytes::map`]) and build its line index.
+    /// Memory-map `path` (see `Bytes::map`) and build its line index.
     pub fn open(path: impl AsRef<Path>, progress: &Progress) -> Result<Self> {
         let path = path.as_ref();
         let data = Bytes::map(path)?;

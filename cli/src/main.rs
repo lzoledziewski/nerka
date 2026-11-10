@@ -80,7 +80,8 @@ struct Cli {
     #[arg(long, global = true, value_name = "FILE")]
     fibex: Vec<PathBuf>,
     /// Define a signal for `@name` in queries (repeatable):
-    /// NAME[(GROUP)][:num|enum]=QUERY, e.g. 'speed=/speed=(?<speed>\d+)/'.
+    /// NAME[(GROUP)][:num|enum|time][:all|filtered][:per(LIFECYCLE)][:default(VALUE)]=QUERY,
+    /// e.g. 'speed=/speed=(?<speed>\d+)/'.
     #[arg(long, global = true, value_name = "SPEC")]
     signal: Vec<String>,
     /// Define a lifecycle of one entity (repeatable): NAME: CLAUSES, e.g.
@@ -143,7 +144,9 @@ enum Cmd {
     },
     /// Print lines matching an NFD query, e.g. 'level >= ERROR AND raw ~ /SSL/'.
     Filter {
+        /// The NFD query.
         query: String,
+        /// The file: text, DLT, a capture (pcap, pcapng, MF4).
         file: PathBuf,
         #[command(flatten)]
         out: OutputArgs,
@@ -161,7 +164,13 @@ enum Cmd {
     /// List bookmarks saved for a file (by the UI).
     Marks { file: PathBuf },
     /// Print a 1-based inclusive range of lines.
-    Lines { file: PathBuf, from: u64, to: u64 },
+    Lines {
+        file: PathBuf,
+        /// The first line (1-based).
+        from: u64,
+        /// The last line (included).
+        to: u64,
+    },
     /// Run the checks (`--check`) on a file: issues and facts, overall and
     /// per lifecycle (`per`).
     Check {
@@ -406,8 +415,14 @@ fn import(file: &Path, dry_run: bool, conflicts: Conflicts, out: &mut impl Write
 fn compile(query: &str, source: &dyn LogSource) -> Result<Query> {
     // `--signal` definitions, and `@time` on files that know their time.
     let signals = SIGNALS.get_or_init(Default::default).for_source(source);
-    Query::compile_in(query, source.schema(), &signals)
-        .map_err(|e| anyhow::anyhow!("{}\n  {query}\n  {}", e.at(query), e.caret(query)))
+    let q = Query::compile_in(query, source.schema(), &signals)
+        .map_err(|e| anyhow::anyhow!("{}\n  {query}\n  {}", e.at(query), e.caret(query)))?;
+    // What it can't find, said before it finds nothing (review 2026-11-08 R8,
+    // 2026-11-09 R2).
+    for w in nerka_core::query_warnings(&q, source) {
+        eprintln!("nerka: warning: {w}");
+    }
+    Ok(q)
 }
 
 /// `bookmark` in a query: the bookmarks of the log (its `.nerka-marks`),
@@ -533,7 +548,8 @@ fn lifecycles(
     if let Some(n) = name {
         defs.retain(|d| d.name().eq_ignore_ascii_case(n));
         if defs.is_empty() {
-            anyhow::bail!("no lifecycle '{n}'");
+            let names: Vec<&str> = signals.lifecycles().map(|d| d.name()).collect();
+            anyhow::bail!("no lifecycle '{n}' (defined: {})", names.join(", "));
         }
     }
     let hits = match count {
@@ -673,8 +689,14 @@ fn checks(
         })?;
         all.set(d);
     }
-    if all.iter().all(|d| name.is_some_and(|n| !d.name().eq_ignore_ascii_case(n))) {
+    if all.iter().next().is_none() {
         anyhow::bail!("no check defined: use --check 'NAME: lines QUERY; TEST'");
+    }
+    if let Some(n) = name
+        && all.get(n).is_none()
+    {
+        let names: Vec<&str> = all.iter().map(|d| d.name()).collect();
+        anyhow::bail!("no check '{n}' (defined: {})", names.join(", "));
     }
     let lib = if all.iter().any(|d| !d.unresolved().is_empty()) { library(packs)? } else { Default::default() };
     let (f, _) = open(file)?;
@@ -827,7 +849,21 @@ fn capture_protocols(cli: &Cli, capture: &mut nerka_core::input::capture::Captur
     Ok(())
 }
 
+/// [`open_silent`], and what the reader skipped or dropped on stderr
+/// (review 2026-11-09, R3: counted, never said).
 fn open(path: &PathBuf) -> Result<(Box<dyn LogSource>, std::time::Duration)> {
+    let (f, took) = open_silent(path)?;
+    for n in f.info().notes {
+        eprintln!("nerka: note: {n}");
+    }
+    Ok((f, took))
+}
+
+fn open_silent(path: &PathBuf) -> Result<(Box<dyn LogSource>, std::time::Duration)> {
+    // Said plainly (it was "access denied" on Windows).
+    if path.is_dir() {
+        anyhow::bail!("{} is a folder: give a file", path.display());
+    }
     let t = Instant::now();
     let options = OPEN_OPTIONS.get_or_init(Default::default);
     let f = nerka_core::open_with(path, options, &Progress::new())
@@ -902,16 +938,24 @@ fn run() -> Result<()> {
 
     match cli.cmd {
         Cmd::Open { file } => {
-            let (f, took) = open(&file)?;
+            let (f, took) = open_silent(&file)?;
+            let info = f.info();
             writeln!(out, "file:        {}", f.name())?;
+            writeln!(out, "read as:     {}", f.format())?;
             writeln!(out, "size:        {} bytes", f.size_bytes())?;
             writeln!(out, "lines:       {}", f.line_count())?;
+            if !info.protocols.is_empty() {
+                writeln!(out, "protocols:   {}", info.protocols.join(", "))?;
+            }
             if !f.schema().is_empty() {
                 let names: Vec<&str> = f.schema().iter().map(|d| d.name.as_ref()).collect();
                 writeln!(out, "fields:      {}", names.join(", "))?;
             }
             writeln!(out, "index mem:   {} KiB", f.index_memory_bytes() / 1024)?;
             writeln!(out, "index time:  {took:.2?} ({:.0} MiB/s)", mib_per_s(f.size_bytes(), took))?;
+            for n in &info.notes {
+                writeln!(out, "note:        {n}")?;
+            }
         }
         Cmd::Search { mut args, within, picks, ignore_case, fixed, invert, out: o } => {
             let file = PathBuf::from(args.pop().expect("clap requires FILE"));
@@ -1010,6 +1054,9 @@ fn run() -> Result<()> {
             }
         }
         Cmd::Lines { file, from, to } => {
+            if from > to {
+                anyhow::bail!("lines {from} to {to}: the first line is after the last");
+            }
             let (f, _) = open(&file)?;
             let last = to.min(f.line_count());
             for l in from.max(1)..=last {

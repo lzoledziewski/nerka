@@ -709,6 +709,33 @@ impl Query {
         walk(&self.expr, source, &mut Vec::new())
     }
 
+    /// The values `field` is compared with by `==` or `!=` (each once, in
+    /// order, as written).
+    pub fn values_compared(&self, field: &str) -> Vec<String> {
+        fn walk(e: &Expr, field: &str, out: &mut Vec<String>) {
+            match e {
+                Expr::And(xs) | Expr::Or(xs) => xs.iter().for_each(|x| walk(x, field, out)),
+                Expr::Not(x) => walk(x, field, out),
+                Expr::Cond(Cond::Field(f)) if f.name == field => {
+                    let v = match &f.test {
+                        FieldTest::Literal(CmpOp::Eq | CmpOp::Ne, v, _) => v.clone(),
+                        FieldTest::Str(CmpOp::Eq | CmpOp::Ne, v) | FieldTest::StrNoCase(CmpOp::Eq | CmpOp::Ne, v) => {
+                            String::from_utf8_lossy(v).into_owned()
+                        }
+                        _ => return,
+                    };
+                    if !out.iter().any(|o| o.eq_ignore_ascii_case(&v)) {
+                        out.push(v);
+                    }
+                }
+                Expr::Cond(_) => {}
+            }
+        }
+        let mut out = Vec::new();
+        walk(&self.expr, &field.to_lowercase(), &mut out);
+        out
+    }
+
     /// Signals the query uses (lower-case, each once, in order).
     pub fn signal_names(&self) -> Vec<String> {
         fn walk(e: &Expr, out: &mut Vec<String>) {

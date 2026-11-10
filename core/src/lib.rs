@@ -59,7 +59,7 @@ pub use input::concat::{open_many, open_many_by_time, open_merged_by_time};
 pub use input::dlt::DltFile;
 pub use input::dlt::fibex::{ArgType, Argument, Fibex, FibexError};
 pub use input::text::TextFile;
-pub use input::{Anchor, ColumnDef, LogSource, OpenOptions, open, open_with};
+pub use input::{Anchor, ColumnDef, LogSource, OpenOptions, SourceInfo, open, open_with, query_warnings};
 pub use pack::{Library, Pack, PackError, PackQuery};
 pub use session::{QueryContext, Session};
 pub use signal::{

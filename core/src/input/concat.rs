@@ -13,7 +13,7 @@
 //! name) is added, so `file == b.dlt` filters by file.
 //!
 //! The engine searches part by part ([`LogSource::parts`]), so each part
-//! keeps its own fast path; a part's [`View`] answers with the whole's
+//! keeps its own fast path; a part's `View` answers with the whole's
 //! fields, columns and line text, so `file` and `raw` read the same there.
 
 use super::proto::{MIXED_COLUMNS, PROTO_FIELD, Records};
@@ -223,6 +223,22 @@ impl LogSource for Concat {
         self.data_id
     }
 
+    /// Its parts': protocols each once, notes with the file they're about.
+    fn info(&self) -> super::SourceInfo {
+        let mut out = super::SourceInfo::default();
+        for (p, file) in self.parts.iter().zip(&self.files) {
+            let i = p.info();
+            for proto in i.protocols {
+                if !out.protocols.iter().any(|o| o.eq_ignore_ascii_case(&proto)) {
+                    out.protocols.push(proto);
+                }
+            }
+            out.notes.extend(i.notes.into_iter().map(|n| format!("{file}: {n}")));
+            out.no_sender += i.no_sender;
+        }
+        out
+    }
+
     fn name(&self) -> &str {
         &self.name
     }
@@ -325,6 +341,10 @@ impl LogSource for View<'_> {
 
     fn line_count(&self) -> LineNo {
         self.part().line_count()
+    }
+
+    fn info(&self) -> super::SourceInfo {
+        self.part().info()
     }
 
     fn anchor(&self, line: LineNo) -> Option<super::Anchor> {

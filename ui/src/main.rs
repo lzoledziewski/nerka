@@ -583,7 +583,13 @@ struct Tab {
     /// The files couldn't be opened: why. The tab is closed and the app
     /// shows it (`App::open_errors`).
     open_error: Option<String>,
+    /// The filter failed (every line is shown): why, kept in the status
+    /// while a search over those lines reports (it overwrote it).
+    filter_failed: Option<String>,
     file: Option<Arc<dyn LogSource>>,
+    /// The file's protocols and what reading it dropped, once it is read
+    /// (review 2026-11-09, R3: counted, never said).
+    info: nerka_core::SourceInfo,
     /// The files being read, and their paths in the order read.
     loading: Option<Job<Opened>>,
     /// The lines the filter keeps (all lines without a filter).
@@ -1174,6 +1180,8 @@ impl Tab {
             part_files: Vec::new(),
             mixed: None,
             open_error: None,
+            filter_failed: None,
+            info: Default::default(),
             file: None,
             // Files that know their times (DLT, captures) in the order they
             // start, their lines interleaved by time if that was last chosen.
@@ -1623,6 +1631,7 @@ impl Tab {
         if self.filter_exp.as_ref().is_some_and(|a| a.exp.nfd != self.pattern) {
             self.filter_exp = None;
         }
+        self.filter_failed = None;
         if self.pattern.trim().is_empty() {
             let cur = self.current_line();
             self.session.set_filter(None);
@@ -1705,6 +1714,16 @@ impl Tab {
                                 ),
                                 n => format!("Indexed {} lines of {n} files in {took:.2?}", f.line_count()),
                             };
+                            // What reading it dropped: the first here, all in
+                            // the top bar's hover.
+                            self.info = f.info();
+                            if let Some(first) = self.info.notes.first() {
+                                self.status += &format!(" · ⚠ {first}");
+                                if self.info.notes.len() > 1 {
+                                    self.status +=
+                                        &format!(" (and {} more: hover the top bar)", self.info.notes.len() - 1);
+                                }
+                            }
                             self.part_files = f.part_files();
                             self.bookmarks = self.load_bookmarks(&*f).unwrap_or_else(|e| {
                                 self.status = format!("Could not read bookmarks: {e}");
@@ -1777,8 +1796,18 @@ impl Tab {
             let cur = self.current_line();
             match self.session.finish(ticket, r) {
                 Ok(Finished::Done(Stage::Filter)) => {
+                    self.filter_failed = None;
                     let n = self.result().map_or(0, |r| r.lines.len());
                     self.status = format!("Filter keeps {n} lines ({took:.2?})");
+                    // What it can't find (a `proto` no message has, `net.*`
+                    // of senders not kept): said (2026-11-08 R8, 2026-11-09 R2).
+                    if let (Some(f), Some(file)) = (self.session.filter(), &self.file)
+                        && let Filter::Query(q) = &**f
+                    {
+                        for w in nerka_core::query_warnings(q, &**file) {
+                            self.status += &format!(" · ⚠ {w}");
+                        }
+                    }
                     self.goto_line(cur);
                 }
                 Ok(Finished::Done(Stage::Search)) => {
@@ -1791,6 +1820,9 @@ impl Tab {
                                 a.names.iter().zip(counts).map(|(n, c)| format!("{} {c}", short(n))).collect();
                             msg += &format!(" ({})", per.join(" · "));
                         }
+                        if let Some(why) = &self.filter_failed {
+                            msg = format!("Filter failed: {why}; every line is shown · {msg}");
+                        }
                         self.status = msg;
                     }
                     self.hits_view = ViewState::default();
@@ -1798,7 +1830,10 @@ impl Tab {
                 Ok(Finished::Done(Stage::Colors)) => self.colors_shown = self.colors_set.clone(),
                 Ok(Finished::Ignored) => {}
                 // The failed filter's lines aren't the old filter's (R5).
-                Err(e) if stage == Stage::Filter => self.status = format!("Filter failed: {e}; every line is shown"),
+                Err(e) if stage == Stage::Filter => {
+                    self.status = format!("Filter failed: {e}; every line is shown");
+                    self.filter_failed = Some(e.to_string());
+                }
                 Err(e) => self.status = format!("Failed: {e}"),
             }
             // A filter result lets the search and the colours run over it.
@@ -4451,7 +4486,11 @@ impl App {
                     ui.add(egui::Label::new(egui::RichText::new(why).color(ui.visuals().error_fg_color)).wrap());
                 }
                 ui.add_space(4.0);
-                ok = ui.button("OK").clicked() || ui.input(|i| i.key_pressed(Key::Escape) || i.key_pressed(Key::Enter));
+                // Enter / Esc only when no field takes the keys (they closed
+                // it while typing in the Filter box).
+                let keys = !ui.ctx().egui_wants_keyboard_input()
+                    && ui.input(|i| i.key_pressed(Key::Escape) || i.key_pressed(Key::Enter));
+                ok = ui.button("OK").clicked() || keys;
             });
         if ok {
             self.open_errors.clear();
@@ -4608,17 +4647,30 @@ impl App {
                     "Saved queries from packs (*.nerka-pack): pick them for the filter or the search \
                      (Ctrl+Shift+L)",
                 );
-                if let Some(f) = self.tabs.get(self.active).and_then(|t| t.file.as_ref()) {
+                if let Some(t) = self.tabs.get(self.active)
+                    && let Some(f) = t.file.as_ref()
+                {
                     ui.separator();
                     let indexes: usize =
                         self.tabs.iter().filter_map(|t| t.file.as_ref()).map(|f| f.index_memory_bytes()).sum();
-                    let text = format!("{} lines · {} · {}", f.line_count(), size_text(f.size_bytes()), f.format());
-                    let tip = format!(
+                    let mut text = format!("{} lines · {} · {}", f.line_count(), size_text(f.size_bytes()), f.format());
+                    let mut tip = format!(
                         "Read as: {}\nIndex of this tab: {}; of all tabs: {}",
                         f.format(),
                         size_text(f.index_memory_bytes() as u64),
                         size_text(indexes as u64)
                     );
+                    if !t.info.protocols.is_empty() {
+                        tip += &format!("\nProtocols: {}", t.info.protocols.join(", "));
+                    }
+                    // What reading it dropped (review 2026-11-09, R3).
+                    if !t.info.notes.is_empty() {
+                        text += " · ⚠";
+                        tip += "\n\nNot read:";
+                        for n in &t.info.notes {
+                            tip += &format!("\n• {n}");
+                        }
+                    }
                     ui.label(text).on_hover_text(tip);
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
