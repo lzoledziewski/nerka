@@ -48,6 +48,7 @@ mod recall;
 mod records;
 mod shot;
 mod signals;
+mod sync;
 mod view;
 
 use eframe::egui::{self, Color32, Key, KeyboardShortcut, Modifiers, RichText};
@@ -2944,6 +2945,16 @@ struct App {
     prefs: SearchPrefs,
     /// Shown when no tab is open (e.g. why the last open failed).
     status: String,
+    /// The checks, signals and prefs files as this window last read or
+    /// wrote them: a save merges its changes into what another window
+    /// wrote since (`sync`, owner, 2026-11-09: U3).
+    checks_base: String,
+    signals_base: String,
+    prefs_base: String,
+    /// The configuration files when this window lost the focus: changed
+    /// when it gets it back, they are read again.
+    config_stamp: Option<sync::Stamp>,
+    focused: bool,
     /// Why files couldn't be opened, in a window until OK (review
     /// 2026-11-09, R7: the reason was the cut-off end of the status line).
     open_errors: Vec<String>,
@@ -3012,6 +3023,8 @@ struct SettingsChange {
     /// Export… or Import… of a settings bundle clicked.
     export: bool,
     import: bool,
+    /// Reload configuration clicked.
+    reload: bool,
 }
 
 /// What the Settings window shows: this window's name, the unpack cache
@@ -3091,7 +3104,8 @@ fn settings_ui(ui: &mut egui::Ui, f: SettingsFields<'_>) -> SettingsChange {
         });
         ui.end_row();
         ui.label(RichText::new("Settings bundle").strong()).on_hover_text(
-            "Packs, presets, plots, checks and signals as one .nerka-bundle file: to share them or move them              to another computer",
+            "Packs, presets, plots, checks and signals as one .nerka-bundle file: to share them or move them \
+             to another computer",
         );
         ui.end_row();
         ui.label("");
@@ -3102,6 +3116,16 @@ fn settings_ui(ui: &mut egui::Ui, f: SettingsFields<'_>) -> SettingsChange {
                 .on_hover_text("Open a bundle and see what it would change before anything is written")
                 .clicked();
         });
+        ui.end_row();
+        ui.label(RichText::new("Configuration").strong());
+        save.reload = ui
+            .button("Reload configuration")
+            .on_hover_text(
+                "Read packs, presets, plots, checks, signals and settings again, as another nerka window or an \
+                 editor left them (done by itself when this window gets the focus back). Open tabs keep how \
+                 their files were read",
+            )
+            .clicked();
         ui.end_row();
     });
     save
@@ -3351,44 +3375,126 @@ impl App {
     fn load_checks(&mut self) {
         let Some(path) = checks_path() else { return };
         let Ok(text) = std::fs::read_to_string(&path) else { return };
-        let (c, errors) = nerka_core::check::Checks::parse_text(&text);
-        self.saved_checks = c;
-        if !errors.is_empty() {
-            self.status = format!("{}: {}", path.display(), errors.join("; "));
+        if let Some(e) = self.take_checks_text(&text) {
+            self.status = format!("{}: {e}", path.display());
         }
+    }
+
+    /// The checks file's `text` as this window's checks; the session's
+    /// (`--check`) stay on top. Errors of lines that aren't checks.
+    fn take_checks_text(&mut self, text: &str) -> Option<String> {
+        let (fresh, errors) = nerka_core::check::Checks::parse_text(text);
+        let session: Vec<_> =
+            self.session_checks.0.iter().filter_map(|(n, _)| self.saved_checks.get(n).cloned()).collect();
+        self.saved_checks = fresh;
+        for (n, replaced) in &mut self.session_checks.0 {
+            *replaced = self.saved_checks.get(n).cloned();
+        }
+        for c in session {
+            self.saved_checks.set(c);
+        }
+        self.checks_base = text.to_owned();
+        (!errors.is_empty()).then(|| errors.join("; "))
+    }
+
+    /// The checks file to write, given what it holds now (`theirs`): this
+    /// window's checks, or, when another window changed the file since,
+    /// this window's changes applied to it (and taken here too).
+    fn checks_text_to_write(&mut self, theirs: &str) -> String {
+        use nerka_core::check::{CheckDef, Checks};
+        let mine = self.checks_to_save();
+        if theirs == self.checks_base || theirs.is_empty() {
+            return mine.to_text();
+        }
+        let items = |c: &Checks| c.iter().map(|c| (c.name().to_owned(), c.spec())).collect::<Vec<_>>();
+        let (base, _) = Checks::parse_text(&self.checks_base);
+        let (now, _) = Checks::parse_text(theirs);
+        let (merged, both) = sync::merge3(&items(&base), &items(&mine), &items(&now));
+        let mut c = Checks::default();
+        for d in merged.iter().filter_map(|(_, spec)| CheckDef::parse_spec(spec).ok()) {
+            c.set(d);
+        }
+        let text = c.to_text();
+        self.take_checks_text(&text);
+        self.checks_gen += 1;
+        if !both.is_empty() {
+            self.status = format!("Changed in another window too, this window's kept: check {}", both.join(", "));
+        }
+        text
     }
 
     fn save_checks(&mut self) {
         self.checks_gen += 1;
         let Some(path) = checks_path() else { return };
-        let write = path
-            .parent()
-            .map_or(Ok(()), std::fs::create_dir_all)
-            .and_then(|_| nerka_core::write_atomic(&path, self.checks_to_save().to_text()));
-        if let Err(e) = write {
-            self.status = format!("Could not save checks to {}: {e}", path.display());
+        let theirs = std::fs::read_to_string(&path).unwrap_or_default();
+        let text = self.checks_text_to_write(&theirs);
+        let write =
+            path.parent().map_or(Ok(()), std::fs::create_dir_all).and_then(|_| nerka_core::write_atomic(&path, &text));
+        match write {
+            Ok(()) => self.checks_base = text,
+            Err(e) => self.status = format!("Could not save checks to {}: {e}", path.display()),
         }
     }
 
     fn load_saved_signals(&mut self) {
         let Some(path) = signals_path() else { return };
         let Ok(text) = std::fs::read_to_string(&path) else { return };
-        let (s, errors) = Signals::parse_text(&text);
-        self.saved_signals = s;
-        if !errors.is_empty() {
-            self.status = format!("{}: {}", path.display(), errors.join("; "));
+        if let Some(e) = self.take_signals_text(&text) {
+            self.status = format!("{}: {e}", path.display());
         }
+    }
+
+    /// The signals file's `text` as this window's saved signals; the
+    /// session's (`--signal`) stay on top (as [`Self::take_checks_text`]).
+    fn take_signals_text(&mut self, text: &str) -> Option<String> {
+        let (fresh, errors) = Signals::parse_text(text);
+        let session: Vec<_> = self
+            .session_signals
+            .0
+            .iter()
+            .filter_map(|(n, _)| self.saved_signals.get(n).map(|d| (**d).clone()))
+            .collect();
+        self.saved_signals = fresh;
+        for (n, replaced) in &mut self.session_signals.0 {
+            *replaced = self.saved_signals.get(n).map(|d| (**d).clone());
+        }
+        for d in session {
+            self.saved_signals.set(d);
+        }
+        self.signals_base = text.to_owned();
+        (!errors.is_empty()).then(|| errors.join("; "))
+    }
+
+    /// The signals file to write (as [`Self::checks_text_to_write`]).
+    fn signals_text_to_write(&mut self, theirs: &str) -> String {
+        let mine = self.signals_to_save();
+        if theirs == self.signals_base || theirs.is_empty() {
+            return mine.to_text();
+        }
+        let items = |s: &Signals| s.iter().map(|d| (d.name().to_owned(), d.spec())).collect::<Vec<_>>();
+        let (base, _) = Signals::parse_text(&self.signals_base);
+        let (now, _) = Signals::parse_text(theirs);
+        let (merged, both) = sync::merge3(&items(&base), &items(&mine), &items(&now));
+        let lines: String = merged.iter().map(|(_, spec)| format!("{spec}\n")).collect();
+        let text = Signals::parse_text(&lines).0.to_text();
+        self.take_signals_text(&text);
+        self.saved_gen += 1;
+        if !both.is_empty() {
+            self.status = format!("Changed in another window too, this window's kept: signal {}", both.join(", "));
+        }
+        text
     }
 
     fn save_saved_signals(&mut self) {
         self.saved_gen += 1;
         let Some(path) = signals_path() else { return };
-        let write = path
-            .parent()
-            .map_or(Ok(()), std::fs::create_dir_all)
-            .and_then(|_| nerka_core::write_atomic(&path, self.signals_to_save().to_text()));
-        if let Err(e) = write {
-            self.status = format!("Could not save signals to {}: {e}", path.display());
+        let theirs = std::fs::read_to_string(&path).unwrap_or_default();
+        let text = self.signals_text_to_write(&theirs);
+        let write =
+            path.parent().map_or(Ok(()), std::fs::create_dir_all).and_then(|_| nerka_core::write_atomic(&path, &text));
+        match write {
+            Ok(()) => self.signals_base = text,
+            Err(e) => self.status = format!("Could not save signals to {}: {e}", path.display()),
         }
     }
 
@@ -3410,7 +3516,10 @@ impl App {
     fn load_prefs(&mut self) {
         if let Some(path) = prefs_path() {
             match SearchPrefs::load(&path) {
-                Ok(p) => self.prefs = p,
+                Ok(p) => {
+                    self.prefs = p;
+                    self.prefs_base = std::fs::read_to_string(&path).unwrap_or_default();
+                }
                 Err(e) => self.status = format!("Could not read preferences: {e}"),
             }
         }
@@ -3458,8 +3567,11 @@ impl App {
         }
     }
 
-    /// Load the packs, presets, plots, checks and signals again (an import
-    /// changed them).
+    /// Load the packs, presets, plots, checks, signals and prefs again (an
+    /// import, or another window, changed them). Session items (`--check`,
+    /// `--signal`, `•` presets and plots) and each tab's own state (its
+    /// selection, checks on, draft plots) stay. Open tabs keep how their
+    /// files were read (ports, protocols); new tabs use the prefs read.
     fn reload_settings(&mut self) {
         self.load_library();
         self.presets.load();
@@ -3468,6 +3580,47 @@ impl App {
         self.checks_gen += 1;
         self.load_saved_signals();
         self.saved_gen += 1;
+        let protocols = self.prefs.protocols.clone();
+        self.load_prefs();
+        if self.prefs.protocols.is_empty() {
+            self.prefs.protocols = protocols;
+        }
+        self.config_stamp = Some(self.config_stamp_now());
+    }
+
+    /// The configuration files and folders another window may change.
+    fn config_stamp_now(&self) -> sync::Stamp {
+        let mut paths: Vec<PathBuf> = [checks_path(), signals_path(), prefs_path()].into_iter().flatten().collect();
+        paths.extend(
+            [pack::default_dir(), nerka_core::plot::default_dir(), nerka_core::preset::default_dir()]
+                .into_iter()
+                .flatten(),
+        );
+        paths.extend(self.pack_paths.iter().cloned());
+        sync::Stamp::of(&paths)
+    }
+
+    /// The focus came back and a configuration file changed while it was
+    /// away (another window, or an editor): read them again (owner,
+    /// 2026-11-09, U3). Losing the focus notes how they are.
+    fn follow_focus(&mut self, ctx: &egui::Context) {
+        let focused = ctx.input(|i| i.viewport().focused).unwrap_or(false);
+        if focused == self.focused {
+            return;
+        }
+        self.focused = focused;
+        if !focused {
+            self.config_stamp = Some(self.config_stamp_now());
+            return;
+        }
+        if self.config_stamp.as_ref().is_some_and(|s| *s != self.config_stamp_now()) {
+            self.reload_settings();
+            let msg = "Configuration changed elsewhere: read again".to_owned();
+            match self.tabs.get_mut(self.active) {
+                Some(t) => t.status = msg,
+                None => self.status = msg,
+            }
+        }
     }
 
     fn settings_window(&mut self, ctx: &egui::Context) {
@@ -3501,6 +3654,13 @@ impl App {
             self.settings_open = false;
             self.protocols_edit = None;
             self.limit_text = None;
+        }
+        if save.reload {
+            self.reload_settings();
+            self.status = "Configuration read again".into();
+            if let Some(t) = self.tabs.get_mut(self.active) {
+                t.status = "Configuration read again".into();
+            }
         }
         if save.export {
             match nerka_core::bundle::Store::user() {
@@ -3574,7 +3734,7 @@ impl App {
         }
         if changed
             && let Some(path) = prefs_path()
-            && let Err(e) = self.prefs.save(&path)
+            && let Err(e) = sync::save_prefs(&mut self.prefs, &mut self.prefs_base, &path)
         {
             self.status = format!("Could not save preferences: {e}");
         }
@@ -3602,7 +3762,7 @@ impl App {
         }
         self.prefs = prefs;
         if let Some(path) = prefs_path()
-            && let Err(e) = self.prefs.save(&path)
+            && let Err(e) = sync::save_prefs(&mut self.prefs, &mut self.prefs_base, &path)
             && let Some(t) = self.tabs.get_mut(self.active)
         {
             t.status = format!("Could not save preferences: {e}");
@@ -3977,7 +4137,7 @@ impl App {
             // New tabs of several files follow the last choice.
             self.prefs.merge_by_time = t.merge;
             if let Some(path) = prefs_path()
-                && let Err(e) = self.prefs.save(&path)
+                && let Err(e) = sync::save_prefs(&mut self.prefs, &mut self.prefs_base, &path)
             {
                 self.status = format!("Could not save preferences: {e}");
             }
@@ -4264,6 +4424,7 @@ impl App {
     /// One frame of the whole window (also driven by tests).
     fn frame(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
+        self.follow_focus(&ctx);
         self.poll_instance(&ctx);
         self.poll_jobs(&ctx);
         for t in &mut self.tabs {
@@ -4493,7 +4654,7 @@ impl App {
             if notes != self.prefs.bookmark_notes {
                 self.prefs.bookmark_notes = notes;
                 if let Some(path) = prefs_path()
-                    && let Err(e) = self.prefs.save(&path)
+                    && let Err(e) = sync::save_prefs(&mut self.prefs, &mut self.prefs_base, &path)
                 {
                     tab.status = format!("Could not save preferences: {e}");
                 }
@@ -4631,7 +4792,7 @@ impl App {
                 tab.checks_auto = auto;
                 self.prefs.checks_auto = auto;
                 if let Some(path) = prefs_path()
-                    && let Err(e) = self.prefs.save(&path)
+                    && let Err(e) = sync::save_prefs(&mut self.prefs, &mut self.prefs_base, &path)
                 {
                     tab.status = format!("Could not save preferences: {e}");
                 }
@@ -4840,6 +5001,48 @@ mod tests {
         app.add_session_signal(signal(r"w=/w=(?<w>\d+)/"));
         let text = app.signals_to_save().to_text();
         assert!(text.contains("/v=(?<v>") && !text.contains("volts") && !text.contains("w=/w="), "{text}");
+    }
+
+    /// Owner, 2026-11-09 (U3): two windows on one configuration. A save
+    /// writes this window's changes into what the other wrote since, and
+    /// takes the other's; a `--check` of the session stays out of the file
+    /// and in the window.
+    #[test]
+    fn two_windows_keep_each_others_checks_and_signals() {
+        use nerka_core::check::CheckDef;
+        let check = |s: &str| CheckDef::parse_spec(s).unwrap();
+        let (mut one, mut two) = (App::default(), App::default());
+        let disk = "a: lines raw ~ /a/; exists\nb: lines raw ~ /b/; exists\n".to_owned();
+        one.take_checks_text(&disk);
+        two.take_checks_text(&disk);
+        two.add_session_check(check("test: lines raw ~ /t/; exists"));
+        // Window one edits a and adds c; then window two, not knowing,
+        // removes b.
+        one.saved_checks.set(check("a: lines raw ~ /a2/; exists"));
+        one.saved_checks.set(check("c: lines raw ~ /c/; exists"));
+        let disk = one.checks_text_to_write(&disk);
+        two.saved_checks.remove("b");
+        let disk = two.checks_text_to_write(&disk);
+        let names =
+            |text: &str| nerka_core::check::Checks::parse_text(text).0.iter().map(|c| c.spec()).collect::<Vec<_>>();
+        assert_eq!(names(&disk), ["a: lines raw ~ /a2/; exists", "c: lines raw ~ /c/; exists"]);
+        assert!(two.saved_checks.get("a").unwrap().spec().contains("/a2/"), "window two took one's edit");
+        assert!(two.saved_checks.get("test").is_some(), "the session's check stays in the window");
+        // Window one reads again: b is gone there too.
+        one.take_checks_text(&disk);
+        assert!(one.saved_checks.get("b").is_none() && one.saved_checks.get("c").is_some());
+
+        // Signals the same way: each window adds one.
+        let signal = |s: &str| nerka_core::SignalDef::parse_spec(s).unwrap();
+        let disk = Signals::default().to_text();
+        one.take_signals_text(&disk);
+        two.take_signals_text(&disk);
+        one.saved_signals.set(signal(r"v=/v=(?<v>\d+)/"));
+        let disk = one.signals_text_to_write(&disk);
+        two.saved_signals.set(signal(r"w=/w=(?<w>\d+)/"));
+        let disk = two.signals_text_to_write(&disk);
+        let (both, _) = Signals::parse_text(&disk);
+        assert!(both.get("v").is_some() && both.get("w").is_some(), "{disk}");
     }
 
     /// Owner, 2026-11-09 (U2): checks are switched on and off per tab (a

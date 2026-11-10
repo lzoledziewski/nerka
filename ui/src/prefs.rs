@@ -203,13 +203,6 @@ impl SearchPrefs {
             Err(e) => Err(e),
         }
     }
-
-    pub fn save(&self, path: &Path) -> std::io::Result<()> {
-        if let Some(dir) = path.parent() {
-            std::fs::create_dir_all(dir)?;
-        }
-        nerka_core::write_atomic(path, self.serialize())
-    }
 }
 
 /// Ports as typed: numbers separated by spaces or commas; at least one,
