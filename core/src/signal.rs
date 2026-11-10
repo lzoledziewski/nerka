@@ -1156,6 +1156,25 @@ impl Signals {
         s
     }
 
+    /// What these signals are, as text: equal fingerprints mean the same
+    /// definitions (spec, the selection queries each comes from, a
+    /// lifecycle's library queries as resolved), whatever their caches
+    /// hold. A tab built again from the same ones keeps what it had (owner,
+    /// 2026-11-10: a Selection change that makes no signal left the checks
+    /// out of date).
+    pub fn fingerprint(&self) -> String {
+        let mut out = String::new();
+        for d in &self.0 {
+            out += &d.spec();
+            out += &format!(" {:?}", d.queries);
+            if let Builtin::Life(l) = &d.builtin {
+                out += &format!(" {:?}", l.sources());
+            }
+            out.push('\n');
+        }
+        out
+    }
+
     pub fn remove(&mut self, name: &str) {
         self.0.retain(|d| !d.name.eq_ignore_ascii_case(name));
         self.link();
@@ -1606,5 +1625,34 @@ mod tests {
         assert!(matches!(e(r"x=NOT /(?<x>\d)/"), SignalError::Group(_)), "a negated regex captures nothing");
         assert!(matches!(e(r"x=/(?<x>\d)/ AND @y > 1"), SignalError::Query(q) if q.msg.contains("other signals")));
         assert!(matches!(e(r"x=/(?<x>\d)/ AND"), SignalError::Query(_)));
+    }
+
+    /// Owner, 2026-11-10: a tab built again from the same definitions is
+    /// the same (a Selection change that makes no signal left the checks
+    /// out of date). What a lifecycle's library query says counts.
+    #[test]
+    fn fingerprints_tell_the_same_definitions() {
+        let dir = std::env::temp_dir().join(format!("nerka-signal-fp-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let pack = dir.join("sys.nerka-pack");
+        let build = |shutdown: &str| {
+            std::fs::write(&pack, format!("pack sys\n\nquery shutdown\n  raw ~ /{shutdown}/\n")).unwrap();
+            let mut lib = crate::pack::Library::new();
+            lib.load(&pack).unwrap();
+            let mut s = Signals::default();
+            s.set(SignalDef::parse_spec(r"v=/v=(?<v>\d+)/").unwrap());
+            s.set(SignalDef::parse_spec("lifecycle a: reset uptime; planned {sys.shutdown}").unwrap());
+            assert!(s.resolve_lifecycles(&lib).is_empty());
+            s
+        };
+        let (one, two) = (build("shutdown"), build("shutdown"));
+        assert_eq!(one.fingerprint(), two.fingerprint());
+        // Another library text: another lifecycle, though its spec is the same.
+        assert_ne!(one.fingerprint(), build("power off").fingerprint());
+        // Another definition.
+        let mut three = build("shutdown");
+        three.set(SignalDef::parse_spec(r"v:enum=/v=(?<v>\d+)/").unwrap());
+        assert_ne!(one.fingerprint(), three.fingerprint());
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

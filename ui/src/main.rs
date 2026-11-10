@@ -654,6 +654,9 @@ struct Tab {
     /// The job, and the generation of `own_signals` it ran with.
     checks_job: Option<(Job<nerka_core::check::CheckRun>, u64)>,
     checks_key: Option<(usize, u64, u64, String, String)>,
+    /// What the tab's own signals were last built as (the file, and
+    /// `Signals::fingerprint`): built again the same, nothing changes.
+    own_fp: Option<(usize, String)>,
     /// The checks on in this tab (lower-case names), from the saved ones'
     /// flags when first needed (owner, 2026-11-09, U2: on / off per tab;
     /// the saved flag is what new tabs start with).
@@ -1219,6 +1222,7 @@ impl Tab {
             check_results: Vec::new(),
             checks_job: None,
             checks_key: None,
+            own_fp: None,
             checks_on: None,
             checks_auto: prefs.checks_auto,
             checks_run: false,
@@ -1516,6 +1520,15 @@ impl Tab {
         if let Some(e) = s.resolve_lifecycles(lib).into_iter().next() {
             self.status = e;
         }
+        // The same definitions as before, on this file (a Selection change
+        // that makes no signal: an Exclude query, one without named
+        // groups): nothing changed, so the checks, filters and the plot
+        // don't run again or go out of date (owner, 2026-11-10).
+        let fp = (file.data_id(), s.fingerprint());
+        if self.own_fp.as_ref() == Some(&fp) {
+            return;
+        }
+        self.own_fp = Some(fp);
         // The checks' signals come back when they ran with these.
         self.own_signals = s.clone();
         self.own_gen += 1;
@@ -6120,6 +6133,38 @@ gear=D
         tab.recolor_from(&ctx, &lib);
         settle(&mut tab, &ctx);
         assert!(tab.line_colors().is_none());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Owner, 2026-11-10: a Selection change that makes no signal (a query
+    /// without named groups, an Exclude one) leaves the tab's signals as
+    /// they were, so its checks aren't out of date; one with a named group
+    /// changes them.
+    #[test]
+    fn selection_changes_that_make_no_signal_change_nothing() {
+        let dir = std::env::temp_dir().join(format!("nerka-gui-samesignals-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("app.log");
+        std::fs::write(&log, LOG).unwrap();
+        let mut lib = Library::new();
+        lib.add(pack::parse_pack("vision.nerka-pack", PACK).unwrap()).unwrap();
+        let groups = "pack g\nquery cam\n    /(?<cam>cam\\d) /\n";
+        lib.add(pack::parse_pack("g.nerka-pack", groups).unwrap()).unwrap();
+        let ctx = egui::Context::default();
+        let mut tab = Tab::open(&ctx, log, &SearchPrefs::default());
+        settle(&mut tab, &ctx);
+        let saved = Signals::default();
+        tab.refresh_signals(&ctx, &lib, &saved, 0);
+        let built = tab.own_gen;
+        for (id, role) in [("vision.drops", Use::Include), ("vision.timeouts", Use::Exclude)] {
+            tab.picks.add(&lib, id, role, None);
+            tab.refresh_signals(&ctx, &lib, &saved, 0);
+            assert_eq!(tab.own_gen, built, "{id}: no signal, nothing changed");
+        }
+        tab.picks.add(&lib, "g.cam", Use::Include, None);
+        tab.refresh_signals(&ctx, &lib, &saved, 0);
+        assert_ne!(tab.own_gen, built, "@cam is new");
+        assert!(tab.signals.get("cam").is_some());
         std::fs::remove_dir_all(&dir).ok();
     }
 

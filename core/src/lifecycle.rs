@@ -560,14 +560,17 @@ impl LifecycleDef {
             crash: r(&self.crash)?,
             ..self.clone()
         };
-        let nfd = |d: &LifecycleDef| {
-            [&d.lines, &d.start, &d.planned, &d.crash]
-                .map(|q| q.as_ref().and_then(|q| q.query()).map(|q| q.source().to_owned()))
-        };
-        if nfd(&out) != nfd(self) {
+        if out.sources() != self.sources() {
             out.cache = Cache::default();
         }
         Ok(out)
+    }
+
+    /// The NFD of its queries (`lines`, `start`, `planned`, `crash`) as
+    /// they run: a library query's once resolved, else none.
+    pub(crate) fn sources(&self) -> [Option<String>; 4] {
+        [&self.lines, &self.start, &self.planned, &self.crash]
+            .map(|q| q.as_ref().and_then(|q| q.query()).map(|q| q.source().to_owned()))
     }
 
     /// The library queries it uses, not resolved yet.

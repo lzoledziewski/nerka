@@ -45,6 +45,9 @@ pub struct Concat {
     /// Per part, whether its lines are rendered into the mixed layout
     /// (they have columns of their own).
     convert: Vec<bool>,
+    /// Its own, not its address: a view read again may land where the
+    /// last one was, and caches and the GUI tell them apart by it.
+    data_id: usize,
 }
 
 /// What kind of source this is, for "same kind": columns and fields.
@@ -137,7 +140,8 @@ impl Concat {
         }
         let files = parts.iter().map(|p| file_name(p.name())).collect();
         let name = parts.iter().map(|p| p.name()).collect::<Vec<_>>().join(" + ");
-        Ok(Concat { name, parts, starts, files, total, schema, mixed, mapped, columns, fields, convert })
+        let data_id = super::new_data_id();
+        Ok(Concat { name, parts, starts, files, total, schema, mixed, mapped, columns, fields, convert, data_id })
     }
 
     /// Whether parts of different protocols share the mixed layout.
@@ -215,6 +219,10 @@ impl Concat {
 }
 
 impl LogSource for Concat {
+    fn data_id(&self) -> usize {
+        self.data_id
+    }
+
     fn name(&self) -> &str {
         &self.name
     }
