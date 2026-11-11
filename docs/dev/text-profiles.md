@@ -3,7 +3,7 @@
 A **profile** says how a text file is read: how its lines group into records,
 and where a line's level and time are. It picks up
 review 2026-11-09 R11 (levels in text are upper case only) and "Decisions
-pending" 2 in `status.md`, and comes with **adjusting a file's time** (Time
+pending" 1 in `status.md`, and comes with **adjusting a file's time** (Time
 per file, below). Discussed with the owner on 2026-11-11; nothing is built
 yet, and the open questions below are the owner's to settle.
 

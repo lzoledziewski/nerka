@@ -83,22 +83,6 @@ A **signal** is a named value that some rows of a log carry, defined **per tab**
   - FIBEX: hand-written on `roxmltree`. No maintained crate exists.
 - **Subscription model.** Browsing the catalog is cheap. Decoding everything is not. The user subscribes to signals, the SOME/IP decoder builds a `(service, method/event) → layouts` lookup from the subscription, and every other payload is skipped after one hash lookup.
 
-## DSL sketch for derived signals (tentative)
-
-_Superseded for v1 by "What a signal is" above: signals are defined per tab outside NFD, and NFD only refers to them with `@name`. Kept as ideas for derived signals later._
-
-```
-signal speed   = /speed=(\d+)/ as f64            # regex capture → numeric
-signal state   = states {                         # state machine → enum
-    IDLE    on /engine stopped/
-    RUNNING on /engine started/
-    ERROR   on level >= ERROR AND apid == "ENG"
-}
-signal errrate = rate(level >= ERROR, 1s)        # events per window
-```
-
-Constraints: the grammar comment in `dsl/mod.rs` and parser tests with error positions apply (CLAUDE.md). Keep signal definitions separate from filter expressions, so that a filter remains a pure predicate.
-
 ## Plugin surface
 
 **Built so far (2026-11-01):** the decoder side as `input::proto::Protocol` (DLT, SOME/IP headers, syslog), routed by UDP port, with one source type for every container (`input::proto::Records`); see `history.md` → "Next steps as of 2026-11-09". Containers are still functions of `input::capture` (pcap, pcapng, MF4) and the `.dlt` reader, not a trait yet.
@@ -112,23 +96,19 @@ The traits `Container`, `Decoder`, `SignalDbLoader` and `Extractor`. They exchan
 | `nerka-mf4` | MF4 container (bus-logging channels) |
 | `nerka-someip` | SOME/IP decoder, FIBEX/ARXML loaders |
 
-## Candidate dependencies
+## Dependencies
 
-All checked on crates.io on 2026-10-17. All MIT and/or Apache-2.0.
+The readers are our own: DLT, pcap / pcapng, the network layers (with
+fragment reassembly), SOME/IP, syslog and MF4 (spec §3.1: few dependencies).
+Crates in use for sources, each justified in its PR:
 
-| Purpose | Crate | Notes |
-|---|---|---|
-| DLT | ~~`dlt-core` 0.20~~, ~~`dlt_parse` 0.10~~ | **Not used**: own reader (owner, 2026-10-18). |
-| pcap/pcapng | ~~`pcap-parser` 0.17~~ | **Not used**: own reader (`capture/pcap.rs`, 2026-10-20). |
-| Ethernet/IP/UDP | ~~`etherparse` 0.21~~ | **Not used**: own parsing with fragment reassembly (`capture/net.rs`). |
-| SOME/IP headers | `someip_parse` 0.7 | Doesn't interpret payloads: that is `SignalDb`'s job. |
-| ARXML | `autosar-data` 0.23 | |
-| FIBEX | ~~`roxmltree` 0.21~~ `quick-xml` 0.42 + own mapping | **Used** (2026-10-24): streaming, needs only `memchr`. |
-| MF4 | ~~`mdf4-rs`, `mf4-rs`, `falcon_mdf`, `mdflib`, `mdfr`~~ | **Not used**: own reader for bus-logging channels (`capture/mf4.rs`, 2026-10-20). |
-| Deflate (MF4 DZ blocks) | `miniz_oxide` 0.9 | **Used** (2026-10-26): pure Rust, MIT / Zlib / Apache-2.0, no dependencies of its own that aren't already built (the GUI's image decoding uses it). Streaming inflate into the unpack cache (`capture/unpack.rs`). Later for `.gz` captures too. |
-| Signal plots (GUI) | `egui_plot` 0.37 | Matches the current egui version. |
+| Purpose | Crate |
+|---|---|
+| FIBEX | `quick-xml` + own mapping (streaming, needs only `memchr`) |
+| Deflate (MF4 DZ blocks) | `miniz_oxide` (pure Rust; the GUI's image decoding uses it already) |
+| Signal plots (GUI) | `egui_plot` |
 
-Each one must be justified in its PR (spec §3.1).
+ARXML (for `SignalDb`, not built) has `autosar-data` as a candidate.
 
 ## UI
 

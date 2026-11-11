@@ -21,28 +21,14 @@ From the README and spec, ranked by what shapes the architecture:
 | R5 | DSL filtering (NFD) | Small parser in core; the UI only sends query strings |
 | R6 | Deployable as light cloud nodes; collaboration later | Core must embed in a headless server; annotations need a shareable model |
 
-## 2. UI framework (spec §13 open question)
+## 2. UI framework
 
-You considered Qt/C++. Options compared against R1, R2 and R4:
-
-| Option | Footprint | Huge-list rendering | Rust integration | Cost / risk |
-|---|---|---|---|---|
-| **Qt 6 / C++** | 30–60 MB of DLLs to ship | Excellent (`QAbstractItemModel`) — what klogg uses | FFI boundary (cxx-qt): two languages, two build systems | LGPL dynamic-linking duties or a commercial licence; heavy CMake/vcpkg setup on Windows |
-| **Tauri** (spec default) | ~5–10 MB + system WebView2 | Needs a JS virtual list; every visible line crosses IPC as JSON | Good (commands/events) | Two stacks (Rust + TS/npm); IPC latency on fast scrolling |
-| **egui / eframe** ✅ | One ~10–20 MB binary, no runtime | Immediate mode: paint only the visible rows directly from mmap, zero copies | Native Rust, same process | Less "native" look; you write custom widgets (done for the log view) |
-| Slint | Small | OK | Native Rust | GPL/royalty licensing for commercial use; weaker for custom big views |
-| Iced | Small | Fair | Native Rust | API still churning; less mature text rendering |
-
-**Decision: egui for the desktop viewer.** It is the lightest option, which
-was your explicit constraint, and the only one that reads lines straight
-from the memory map into the GPU with no IPC or serialization in between.
-That is what a klogg-class viewer needs. It also compiles to WebAssembly, so
-a browser UI for the server/collaboration phase can reuse the same code.
-
-**Deviation from spec §2/§4:** the spec names Tauri. The spec's *rules*
-still hold: the UI does no filtering and no parsing, and only calls core
-APIs. Spec §3.6 (Tauri commands) becomes plain Rust calls. If you prefer
-Tauri, only `ui/` changes; `core/` and `cli/` are unaffected.
+**egui / eframe** (owner, 2026-11-11: settled, the frontend stays egui).
+It paints only the visible rows, straight from the memory map, with no IPC
+or serialization in between; it is one native binary, and it compiles to
+WebAssembly for a later browser UI. The spec's rules still hold: the UI does
+no filtering and no parsing and only calls core APIs; spec §3.6 (Tauri
+commands) are plain Rust calls.
 
 ## 3. Indexing strategy (spec §13 open question)
 

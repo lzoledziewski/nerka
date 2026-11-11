@@ -27,7 +27,7 @@ Open with the owner: save column widths? Sorting stays out (decided).
 
 ### DLT decisions (owner, 2026-10-18)
 
-- **Own parser, no crate** (`dlt-core` / `dlt_parse` rejected; spec §3.1 few dependencies). Zero-copy over the mmap.
+- **Own parser, no crate** (spec §3.1: few dependencies). Zero-copy over the mmap.
 - **Location:** `core/src/input/dlt/`, not a `nerka-dlt` crate yet. Extract it into a crate when the `Container` / `Decoder` traits of `sources-and-signals.md` arrive with pcap; that's where a crate boundary pays off.
 - **Filtering** by ECU / APID / CTID / level comes from the headers (source-supplied fields + DSL field predicates), never guessed from text. Header-only filters must not decode payloads, and every fast path is tested against the naive per-line evaluator.
 - **Display:** a real table (aligned, resizable columns), built into our own log view; **no column sorting** (it would break line numbers, bookmarks and next/previous match, and logs are read in time order). Each row is still one tab-separated text line underneath.
