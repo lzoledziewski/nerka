@@ -788,3 +788,16 @@ mod consistency {
         }
     }
 }
+
+/// `;` inside a regex, a string or a library query's name doesn't end the
+/// clause; a label's `/` doesn't start a regex (owner, 2026-11-11).
+#[test]
+fn clauses_keep_semicolons_inside_queries() {
+    let c = CheckDef::parse_spec(r#"x: lines raw ~ /a;b/ OR "c;d"; count; labels sys/vision, net; per ecu1"#).unwrap();
+    assert_eq!(c.labels(), ["sys/vision", "net"]);
+    assert!(c.spec().contains("per ecu1"), "{}", c.spec());
+    let c = CheckDef::parse_spec("y: lines {edge.two  spaces}; then {edge.semi;colon} within 1s").unwrap();
+    assert_eq!(c.unresolved(), ["edge.two  spaces", "edge.semi;colon"]);
+    let back = CheckDef::parse_spec(&c.spec()).unwrap();
+    assert_eq!(back.spec(), c.spec());
+}

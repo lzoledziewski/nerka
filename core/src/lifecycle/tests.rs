@@ -961,3 +961,44 @@ mod merged {
         assert_eq!(f("@b == 2"), [4, 5, 6, 7, 8]);
     }
 }
+
+/// Library queries named with two spaces, `=`, `;` or braces, and `;` inside
+/// a regex or a string, read as written (owner, 2026-11-11: checks with
+/// such references failed).
+#[test]
+fn references_and_clauses_keep_what_is_written() {
+    let id = |s: &str| match Rule::parse(s).unwrap_or_else(|e| panic!("{s}: {}", e.msg)) {
+        Rule::Library { id, params, .. } => (id, params),
+        Rule::Nfd(_) => panic!("{s}: not a library query"),
+    };
+    assert_eq!(id("{edge.two  spaces}").0, "edge.two  spaces");
+    assert_eq!(id("{Aurix_logs.Fusa Fault}").0, "Aurix_logs.Fusa Fault");
+    assert_eq!(id("{edge.a=b}").0, "edge.a=b", "not a parameter: 'edge.a' isn't a name");
+    assert_eq!(id("{edge.semi;colon}").0, "edge.semi;colon");
+    let (i, p) = id(r#"{"my pack.x=1 y" cam=CAM1 path=/a/b}"#);
+    assert_eq!((i.as_str(), p), ("my pack.x=1 y", vec![("cam".into(), "CAM1".into()), ("path".into(), "/a/b".into())]));
+    let (i, p) = id("{my pack.with param ecu=ECU1}");
+    assert_eq!((i.as_str(), p), ("my pack.with param", vec![("ecu".into(), "ECU1".into())]));
+    // Errors point at the word.
+    let e = Rule::parse("{p.q cam=1 oops}").unwrap_err();
+    assert_eq!((e.msg.as_str(), e.pos), ("expected NAME=VALUE but found 'oops'", 11));
+    assert!(Rule::parse(r#"{"p.q cam=1}"#).unwrap_err().msg.contains("after the query's name"));
+    // What it writes reads back the same.
+    for s in ["{edge.two  spaces}", "{edge.a=b}", r#"{"p.x=1 y" cam=CAM1}"#, "{p.q}", "{p.q cam=}", r#"{"p.{q}"}"#] {
+        let r = Rule::parse(s).unwrap();
+        let back = Rule::parse(&r.text()).unwrap_or_else(|e| panic!("{s} -> {}: {}", r.text(), e.msg));
+        assert_eq!(back.text(), r.text(), "{s}");
+        assert_eq!(back.library_id(), r.library_id(), "{s}");
+    }
+    // Quoted only where a word of the name would read as a parameter.
+    assert_eq!(Rule::library("p.x=1 y", vec![]).text(), "{p.x=1 y}");
+    assert_eq!(Rule::library("p.q x=1", vec![]).text(), r#"{"p.q x=1"}"#);
+    assert_eq!(id(r#"{"p.q x=1"}"#), ("p.q x=1".to_owned(), vec![]));
+    // Clauses split only at a `;` outside braces, strings and regexes.
+    assert_eq!(
+        clauses(r#" lines raw ~ /a;b/ OR "c;d"; start {p.e;f x=/g;h/}; reset uptime; x/y;z"#),
+        [r#" lines raw ~ /a;b/ OR "c;d""#, " start {p.e;f x=/g;h/}", " reset uptime", " x/y", "z"]
+    );
+    let d = LifecycleDef::parse_spec("l: lines raw ~ /timeout;x|timeout/; start {edge.semi;colon}").unwrap();
+    assert_eq!(d.unresolved(), ["edge.semi;colon"]);
+}

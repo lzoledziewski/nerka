@@ -392,7 +392,7 @@ impl CheckDef {
             Ok((op, n))
         };
         let mut at = colon + 1;
-        for clause in spec[colon + 1..].split(';') {
+        for clause in crate::lifecycle::clauses(&spec[colon + 1..]) {
             let start = at + clause.len() - clause.trim_start().len();
             at += clause.len() + 1;
             let c = clause.trim();

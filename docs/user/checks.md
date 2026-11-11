@@ -15,7 +15,8 @@ bursts: lines @lost.event; rate 2 per 60s
 
 `NAME: lines QUERY; TEST[; TEST…]` and, in any order, `per LIFECYCLE`,
 `issue` or `fact`, `any` or `all`, `labels a, b`. The **lines** are NFD or a
-library query (`{pack.query}`, `{pack.query name=value}`); they can use the
+library query (`{pack.query}`, `{pack.query name=value}`, written as in
+[lifecycles](lifecycles.md#defining-one)); they can use the
 tab's [signals](signals.md). Durations: `500ms`, `30s`, `5m`, `1h`.
 
 | Test | Finds |

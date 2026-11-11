@@ -27,7 +27,10 @@ app: lines apid == NAV; start payload ~ /NAV started/; crash payload ~ /panic/
 | `late 10s` | a first line above this uptime is a "late start" |
 
 A `QUERY` is NFD or a library query: `{pack.query}`, `{sys.of ecu=ECU1}`
-with parameters ([Query packs](packs.md)).
+with parameters ([Query packs](packs.md)). A query's name is written as it
+is, spaces included (`{Aurix logs.Fusa Fault}`); one holding a word like
+`x=1` is quoted (`{"pack.q x=1" cam=CAM1}`). A `;` inside a query, a
+regex or a string doesn't end the clause.
 
 Define one in the 📈 Signals panel (**New signal or lifecycle** → a form
 with **Preview**), with `--lifecycle SPEC` (CLI; the GUI takes it for the
