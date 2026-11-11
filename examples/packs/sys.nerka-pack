@@ -1,0 +1,7 @@
+# Sample packs for the examples in CLAUDE.md and README.md (`--pack examples/packs/`).
+# Your own packs live in %APPDATA%\nerka\packs\ (Linux: ~/.config/nerka/packs/).
+pack sys
+
+## A device going down on purpose: a lifecycle's planned end ({sys.shutdown}).
+query shutdown  labels: system
+    raw ~ /shutdown/

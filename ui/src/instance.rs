@@ -7,16 +7,26 @@
 //! when it gains focus, so the newest file is the window focused last. A
 //! request is one connection: `nerka1 <token>`, then `open\t<path>` lines,
 //! then `end`; the window answers `ok`. Only std, no dependency.
+//!
+//! Each connection is served on its own thread (at most [`MAX_SERVING`] at
+//! once) and has [`REQUEST_TIME`] for its whole request, so a client that
+//! connects and sends nothing, or a byte at a time, can't hold up the next
+//! hand-off (review 2026-11-07 R17).
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
-use std::sync::mpsc;
-use std::time::{Duration, SystemTime};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, mpsc};
+use std::time::{Duration, Instant, SystemTime};
 
 const MAGIC: &str = "nerka1";
 /// Bytes a request may have at most.
 const MAX_REQUEST: u64 = 1 << 20;
+/// Time a request may take from connecting to `end`, however it trickles in.
+const REQUEST_TIME: Duration = Duration::from_secs(2);
+/// Connections served at once; more are closed at once.
+const MAX_SERVING: usize = 8;
 
 fn dir() -> Option<PathBuf> {
     nerka_core::config_dir().map(|d| d.join("instances"))
@@ -54,7 +64,7 @@ pub struct Server {
 impl Server {
     /// Listen and register. `wake` is called after a request arrives (to
     /// repaint). `None` if this system has no config folder or no loopback.
-    pub fn start(wake: impl Fn() + Send + 'static) -> Option<Server> {
+    pub fn start(wake: impl Fn() + Send + Sync + 'static) -> Option<Server> {
         let dir = dir()?;
         std::fs::create_dir_all(&dir).ok()?;
         let listener = TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).ok()?;
@@ -64,15 +74,7 @@ impl Server {
         let line = format!("{port} {token}\n");
         nerka_core::write_atomic(&file, &line).ok()?;
         let (tx, rx) = mpsc::channel();
-        std::thread::spawn(move || {
-            for stream in listener.incoming().flatten() {
-                if let Some(req) = serve_one(stream, &token)
-                    && tx.send(req).is_ok()
-                {
-                    wake();
-                }
-            }
-        });
+        std::thread::spawn(move || listen(listener, token, tx, wake));
         Some(Server { rx, file, line, focused: true })
     }
 
@@ -97,10 +99,54 @@ impl Drop for Server {
     }
 }
 
+/// Serve every connection to `listener` on a thread of its own (at most
+/// [`MAX_SERVING`] at once); each request that arrives whole goes to `tx`,
+/// then `wake` is called.
+fn listen(listener: TcpListener, token: String, tx: mpsc::Sender<Request>, wake: impl Fn() + Send + Sync + 'static) {
+    let (token, wake) = (Arc::new(token), Arc::new(wake));
+    let serving = Arc::new(AtomicUsize::new(0));
+    for stream in listener.incoming().flatten() {
+        if serving.fetch_add(1, Ordering::SeqCst) >= MAX_SERVING {
+            serving.fetch_sub(1, Ordering::SeqCst);
+            continue; // dropped: closed
+        }
+        let (tx, token, wake, serving) = (tx.clone(), token.clone(), wake.clone(), serving.clone());
+        std::thread::spawn(move || {
+            if let Some(req) = serve_one(stream, &token)
+                && tx.send(req).is_ok()
+            {
+                wake();
+            }
+            serving.fetch_sub(1, Ordering::SeqCst);
+        });
+    }
+}
+
+/// A stream that may be read until a deadline: each read waits at most the
+/// time left, then reads fail.
+struct Until {
+    stream: TcpStream,
+    deadline: Instant,
+}
+
+impl Read for Until {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let left = self.deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Err(std::io::ErrorKind::TimedOut.into());
+        }
+        self.stream.set_read_timeout(Some(left))?;
+        self.stream.read(buf)
+    }
+}
+
 fn serve_one(stream: TcpStream, token: &str) -> Option<Request> {
-    stream.set_read_timeout(Some(Duration::from_secs(2))).ok()?;
+    serve_until(stream, token, Instant::now() + REQUEST_TIME)
+}
+
+fn serve_until(stream: TcpStream, token: &str, deadline: Instant) -> Option<Request> {
     let mut out = stream.try_clone().ok()?;
-    let mut lines = BufReader::new(stream.take(MAX_REQUEST)).lines();
+    let mut lines = BufReader::new(Until { stream, deadline }.take(MAX_REQUEST)).lines();
     let hello = lines.next()?.ok()?;
     let (magic, got) = hello.split_once(' ')?;
     // Compare without stopping at the first difference.
@@ -207,5 +253,42 @@ mod tests {
             assert_eq!(serve_one(stream, "secret"), want, "{msg:?}");
             assert_eq!(client.join().unwrap(), reply, "{msg:?}");
         }
+    }
+
+    /// Review 2026-11-07 R17: a request that trickles in a byte at a time
+    /// is cut off at its deadline, not served for as long as it keeps going.
+    #[test]
+    fn a_slow_request_ends_at_its_deadline() {
+        let listener = TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = std::thread::spawn(move || {
+            let mut s = TcpStream::connect(addr).unwrap();
+            for b in b"nerka1 secret\nopen\t/a.log\nend\n" {
+                if s.write_all(&[*b]).is_err() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        });
+        let (stream, _) = listener.accept().unwrap();
+        let start = Instant::now();
+        assert_eq!(serve_until(stream, "secret", start + Duration::from_millis(300)), None);
+        let took = start.elapsed();
+        assert!(took < Duration::from_millis(1000), "served for {took:?}");
+        client.join().unwrap();
+    }
+
+    /// While one client holds a connection open, another is served.
+    #[test]
+    fn a_stalled_client_does_not_block_the_next() {
+        let (tx, rx) = mpsc::channel();
+        let listener = TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || listen(listener, "secret".into(), tx, || {}));
+        let _stalled = TcpStream::connect(addr).unwrap(); // sends nothing
+        let mut s = TcpStream::connect(addr).unwrap();
+        s.write_all(b"nerka1 secret\nopen\t/a.log\nend\n").unwrap();
+        let got = rx.recv_timeout(Duration::from_millis(1000));
+        assert_eq!(got.ok(), Some(Request::Open(vec!["/a.log".into()])));
     }
 }

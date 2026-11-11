@@ -154,7 +154,7 @@ time in lanes, with time cursors (Δt), value markers and bookmarks. A plot
 can be kept by name for use on other files.
 
 ```
-nerka --pack packs/ expand -l ota -p cam=CAM1
+nerka --pack examples/packs/ expand -l ota -p cam=CAM1
 nerka-gui app.log --signal 't:time=/^(?<t>\S+ \S+)/' --signal 'lat=/latency_us=(?<lat>\d+)/' --plot lat
 ```
 
@@ -242,7 +242,7 @@ nerka --local-time lines trace.dlt 1 20                  # local time (CLI: UTC 
 | Regex | `field ~ /re/`, `field !~ /re/`, `/re/i` ignores case |
 | Text | bare `/re/` and `"text"` match the whole line (`raw`) |
 | Logic | `AND OR NOT`, parentheses |
-| Fields | `raw`, `level`; DLT adds `ecu apid ctid type mcnt tmsp seid mid mode payload`, SOME/IP `service method client session iface type rc len payload`, syslog `facility host app pid msgid stamp payload`, a protocol definition its own; captures `proto` and where each datagram came from: `net.src net.dst` (addresses), `net.sport net.port` (ports), `net.vlan` (fields only: not in the columns or `raw`); several files add `file`; JSON records add their keys (`ctx.user`). A key that clashes with NFD's own is `json.raw`; NFD's own are also `nfd.raw`, `nfd.level`, `nfd.bookmark` |
+| Fields | `raw`, `level`; DLT adds `ecu apid ctid type mcnt tmsp seid mid mode payload`, SOME/IP `service method client session iface type rc len payload`, syslog `facility host app pid msgid stamp payload`, a protocol definition its own; captures `proto` and where each datagram came from: `net.src net.dst` (addresses), `net.sport net.port` (ports), `net.vlan` (fields only: not in the columns or `raw`); several files add `file` (the file's name, or the end of its path that tells two of one name apart: `file == "ecu1/trace.dlt"`); JSON records add their keys (`ctx.user`). A key that clashes with NFD's own is `json.raw`; NFD's own are also `nfd.raw`, `nfd.level`, `nfd.bookmark` |
 | Bookmarks | `bookmark` alone: a bookmarked line; `bookmark == B2` its name; `bookmark ~ /fan/` its name or note |
 | Signals | `@name`: a value captured by a named regex group, of a picked query or a signal you define (📈 Signals panel, `--signal`; saved). `@gear == D` is the state (held until the next event), `@gear.event == D` a line that carries it, `@gear.changed` a change. Kinds `num`, `enum`, `time`; DLT has `@time` (receive time): `@time >= "2025-10-18 10:00:00"` |
 

@@ -108,6 +108,36 @@ fn what_a_reader_skipped_and_unknown_protocols_are_said() {
     assert!(warn("apid == NAV").is_empty());
 }
 
+/// Review 2026-11-09 R15: files of one name in different folders are told
+/// apart by `file` (the shortest ending of their paths that differs), and a
+/// `file` no file is says what to write.
+#[test]
+fn same_named_files_are_told_apart() {
+    let c = Concat::new(vec![
+        text("D:/logs/ecu1/trace.log", "[INFO] one\n"),
+        text("D:\\logs\\ecu2\\trace.log", "[INFO] two\n"),
+        text("D:/logs/other.log", "[INFO] three\n"),
+    ])
+    .unwrap();
+    assert_eq!(c.info().files, ["ecu1/trace.log", "ecu2/trace.log", "other.log"]);
+    assert_eq!(run_on(&c, &q(r#"file == "ecu2/trace.log""#)), [1]);
+    assert_eq!(run_on(&c, &q("file ~ /ecu1/")), [0]);
+    assert_eq!(run_on(&c, &q("file == other.log")), [2]);
+    let warn = |s: &str| crate::query_warnings(&Query::compile(s).unwrap().bind(c.schema()).unwrap(), &c);
+    assert_eq!(
+        warn(r#"file == "D:\\logs\\ecu1\\trace.log""#),
+        [r"no file here is 'D:\logs\ecu1\trace.log': write 'ecu1/trace.log'"]
+    );
+    assert_eq!(warn("file == trace.log"), ["no file here is 'trace.log': write 'ecu1/trace.log' or 'ecu2/trace.log'"]);
+    assert_eq!(
+        warn("file != nope.log"),
+        ["no file here is 'nope.log' (there are: ecu1/trace.log, ecu2/trace.log, other.log)"]
+    );
+    assert!(warn("file == other.log OR file ~ /trace/").is_empty());
+    assert_eq!(short_names(&["a/x.log", "a/x.log"]), ["x.log", "x.log"], "the same file twice");
+    assert_eq!(short_names(&["x.log", "b/x.log"]), ["x.log", "b/x.log"]);
+}
+
 #[test]
 fn dlt_files_and_captures_are_one_kind() {
     let a: Box<dyn LogSource> = Box::new(DltFile::from_bytes("a.dlt", dlt_bytes(&["NAV", "SYS"])));

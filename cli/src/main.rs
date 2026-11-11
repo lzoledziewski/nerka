@@ -1,20 +1,22 @@
 //! `nerka` — command line front end to the Nerka engine.
 //!
-//!     nerka open   app.log          (plain text or DLT, picked by content)
-//!     nerka search -i 'error|timeout' app.log
-//!     nerka filter 'level >= ERROR AND raw ~ /SSL|CERT/' app.log
-//!     nerka lines  app.log 1000 1050
-//!     nerka marks  app.log
-//!     nerka packs                                       (list loaded query packs)
-//!     nerka expand -q vision.frame_drops -p cam=CAM1    (pack picks -> plain NFD)
-//!     nerka search --in 'level >= WARN' timeout app.log (search inside a filter)
-//!     nerka search --in 'ecu == SOCB' -l ota app.log     (per pack query)
-//!     nerka --signal 'v=/v=(?<v>\d+)/' filter '@v > 100' app.log   (signals)
-//!     nerka --fibex ecu1.xml filter 'apid == NAV' trace.dlt         (non-verbose DLT)
-//!     nerka --lifecycle 'ecu1: lines ecu == ECU1; reset uptime' lifecycles trace.dlt   (ECU1's boots)
-//!     nerka --check 'stall: lines raw ~ /net down/; missing raw ~ /ota/ within 30s' check trace.dlt
-//!     nerka export -o mine.nerka-bundle --only packs --only check:storm   (settings bundle)
-//!     nerka import --dry-run theirs.nerka-bundle
+//! ```text
+//! nerka open   app.log          (plain text or DLT, picked by content)
+//! nerka search -i 'error|timeout' app.log
+//! nerka filter 'level >= ERROR AND raw ~ /SSL|CERT/' app.log
+//! nerka lines  app.log 1000 1050
+//! nerka marks  app.log
+//! nerka packs                                       (list loaded query packs)
+//! nerka expand -q vision.frame_drops -p cam=CAM1    (pack picks -> plain NFD)
+//! nerka search --in 'level >= WARN' timeout app.log (search inside a filter)
+//! nerka search --in 'ecu == SOCB' -l ota app.log     (per pack query)
+//! nerka --signal 'v=/v=(?<v>\d+)/' filter '@v > 100' app.log   (signals)
+//! nerka --fibex ecu1.xml filter 'apid == NAV' trace.dlt         (non-verbose DLT)
+//! nerka --lifecycle 'ecu1: lines ecu == ECU1; reset uptime' lifecycles trace.dlt   (ECU1's boots)
+//! nerka --check 'stall: lines raw ~ /net down/; missing raw ~ /ota/ within 30s' check trace.dlt
+//! nerka export -o mine.nerka-bundle --only packs --only check:storm   (settings bundle)
+//! nerka import --dry-run theirs.nerka-bundle
+//! ```
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -80,8 +82,8 @@ struct Cli {
     #[arg(long, global = true, value_name = "FILE")]
     fibex: Vec<PathBuf>,
     /// Define a signal for `@name` in queries (repeatable):
-    /// NAME[(GROUP)][:num|enum|time][:all|filtered][:per(LIFECYCLE)][:default(VALUE)]=QUERY,
-    /// e.g. 'speed=/speed=(?<speed>\d+)/'.
+    /// `NAME[(GROUP)][:num|enum|time][:all|filtered][:per(LIFECYCLE)][:default(VALUE)]=QUERY`,
+    /// e.g. `'speed=/speed=(?<speed>\d+)/'`.
     #[arg(long, global = true, value_name = "SPEC")]
     signal: Vec<String>,
     /// Define a lifecycle of one entity (repeatable): NAME: CLAUSES, e.g.

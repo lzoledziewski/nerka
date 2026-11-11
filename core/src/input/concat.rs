@@ -82,6 +82,28 @@ fn file_name(name: &str) -> String {
     name.rsplit(['/', '\\']).next().unwrap_or(name).to_owned()
 }
 
+/// The values of `file`: each name's shortest ending of whole path
+/// components that no other file's name ends with, joined by `/`: a file's
+/// name alone when it's unique, `ecu1/trace.dlt` beside `ecu2/trace.dlt`
+/// (review 2026-11-09 R15).
+fn short_names(names: &[&str]) -> Vec<String> {
+    let comps: Vec<Vec<&str>> =
+        names.iter().map(|n| n.split(['/', '\\']).filter(|c| !c.is_empty()).collect()).collect();
+    let tail = |c: &[&str], k: usize| c[c.len().saturating_sub(k)..].join("/");
+    comps
+        .iter()
+        .enumerate()
+        .map(|(i, c)| {
+            let mut k = 1;
+            // The same file twice has the same value.
+            while k < c.len() && comps.iter().enumerate().any(|(j, o)| j != i && o != c && tail(o, k) == tail(c, k)) {
+                k += 1;
+            }
+            tail(c, k)
+        })
+        .collect()
+}
+
 impl Concat {
     /// `parts` one after another. Errors if they aren't all of one kind.
     pub fn new(parts: Vec<Box<dyn LogSource>>) -> Result<Concat> {
@@ -143,7 +165,7 @@ impl Concat {
             starts.push(total);
             total += p.line_count();
         }
-        let files = parts.iter().map(|p| file_name(p.name())).collect();
+        let files = short_names(&parts.iter().map(|p| p.name()).collect::<Vec<_>>());
         let name = parts.iter().map(|p| p.name()).collect::<Vec<_>>().join(" + ");
         let data_id = super::new_data_id();
         Ok(Concat { name, parts, starts, files, total, schema, mixed, mapped, columns, fields, convert, data_id })
@@ -241,6 +263,7 @@ impl LogSource for Concat {
             out.notes.extend(i.notes.into_iter().map(|n| format!("{file}: {n}")));
             out.no_sender += i.no_sender;
         }
+        out.files = self.files.clone();
         out
     }
 

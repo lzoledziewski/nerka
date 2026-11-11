@@ -554,6 +554,7 @@ impl LogSource for Records {
             protocols: self.protocols().into_iter().map(str::to_owned).collect(),
             notes,
             no_sender: self.no_sender,
+            files: Vec::new(),
         }
     }
 

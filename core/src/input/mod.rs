@@ -142,10 +142,14 @@ pub struct SourceInfo {
     /// Messages without `net.*` fields: their sender wasn't kept (a capture
     /// of more senders than it keeps).
     pub no_sender: u64,
+    /// The values of `file` in a view of several files, one per file in
+    /// order (empty: one file).
+    pub files: Vec<String>,
 }
 
 /// What a query on `source` can't find, said before it finds nothing: a
-/// `proto` no message has, `net.*` of messages whose sender wasn't kept.
+/// `proto` no message has, `net.*` of messages whose sender wasn't kept, a
+/// `file` no file is (with what to write instead).
 pub fn query_warnings(query: &crate::Query, source: &dyn LogSource) -> Vec<String> {
     let info = source.info();
     let mut out = Vec::new();
@@ -161,6 +165,24 @@ pub fn query_warnings(query: &crate::Query, source: &dyn LogSource) -> Vec<Strin
             "net.* has no value for {} messages: the capture has more senders than are kept",
             info.no_sender
         ));
+    }
+    // A full path, or a name two files share: the value to write (review
+    // 2026-11-09 R15).
+    if !info.files.is_empty() {
+        let ends = |a: &str, b: &str| a == b || a.ends_with(&format!("/{b}"));
+        for v in query.values_compared(concat::FILE_FIELD) {
+            if info.files.contains(&v) {
+                continue;
+            }
+            let path = v.replace('\\', "/");
+            let near: Vec<String> =
+                info.files.iter().filter(|f| ends(&path, f) || ends(f, &path)).map(|f| format!("'{f}'")).collect();
+            out.push(if near.is_empty() {
+                format!("no file here is '{v}' (there are: {})", info.files.join(", "))
+            } else {
+                format!("no file here is '{v}': write {}", near.join(" or "))
+            });
+        }
     }
     out
 }

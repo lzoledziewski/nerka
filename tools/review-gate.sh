@@ -34,6 +34,8 @@ echo "== build gates"
 run GATE-1 "cargo fmt --check" cargo fmt --all --check
 run GATE-2 "clippy -D warnings" cargo clippy --workspace --all-targets -- -D warnings
 run GATE-3 "tests" cargo test --workspace
+# GATE-5: the API docs build without warnings (review 2026-11-07 R19 came back unseen).
+run GATE-5 "cargo doc -D warnings" env RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace
 if command -v cargo-deny >/dev/null 2>&1; then
   run GATE-4 "cargo deny" cargo deny check
   grep -q "yanked" "$OUT/GATE-4.log" && warn GATE-4 "a yanked crate in Cargo.lock (cargo update -p …)"
@@ -119,6 +121,8 @@ if [ "$FULL" = 1 ]; then
     head -c 65536 "$seeds/a.dlt" >"$seeds/a_small.dlt" &&
     printf '{"ts":"2026-11-07T10:00:00Z","level":"error","ctx":{"user":"u1","n":[1,2]},"msg":"x \\u00e9","lat":1.5}\n{"level":30,"msg":"y"}\n' >"$seeds/f.jsonl"
   } >"$OUT/seeds.log" 2>&1
+  # Protocol definitions: mutated, and loaded for half the rounds (11-08 R5).
+  cp examples/protocols/*.ksy "$seeds/"
   run CODE-2 "fuzz: 3000 mutated inputs, no panic" "$ex/mutate_open" "$seeds" 3000 "${FUZZ_SEED:-$RANDOM}"
 fi
 

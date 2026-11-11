@@ -145,27 +145,40 @@ annotations by sending it alongside the log.
 
 ## 7. Repository layout (spec §10)
 
-As of 2026-10-22:
+As of 2026-11-11 (review 2026-11-07 R18):
 
 ```
 nerka/
   Cargo.toml            workspace, shared deps, lints, release profile
   core/                 nerka-core  — UI-free engine (library)
-    src/input/          LogSource trait, open() by content, TextFile (mmap), dlt/ (DLT reader + writer),
-                        capture/ (pcap, pcapng, MF4, network layers), concat (several files as one), mem (tests)
+    src/input/          LogSource trait, open() by content, SourceInfo / query_warnings, schema (field merge)
+      text.rs, records.rs, json.rs   plain text, multi-line records, JSON (records split per file)
+      dlt/              DLT reader + writer, FIBEX (non-verbose)
+      proto/            Protocol trait; DLT, SOME/IP, syslog; ksy/ (protocols from .ksy definitions)
+      capture/          pcap, pcapng, MF4 (+ unpack cache), network layers, UDP port routes
+      concat.rs, merged.rs   several files as one view; interleaved by time (--merge)
     src/engine/         LineIndex, search/Filter/Highlighter, within (search inside a filter result)
     src/dsl/            NFD parser + evaluator, auto (Auto mode: plain words + NFD)
     src/pack/           query packs: parser, Library, expand, write
+    src/signal.rs       signals (@name) from captures, queries and lifecycles; src/plot.rs: kept plots
+    src/lifecycle.rs    lifecycles (boots per device); src/check.rs: checks over them
+    src/session.rs      a tab's state and jobs, shared by the GUI (filter, search, colours)
+    src/bundle.rs       settings bundles (export / import, format migrations)
+    src/time.rs         times: parsing, zones, local / UTC
     src/event.rs        lazy fields (level, source-supplied fields)
     src/bookmarks.rs    bookmarks + sidecar persistence
     src/history.rs      search history; src/preset.rs: presets
-    examples/           gen_log, gen_dlt, gen_multiline_dlt, dlt_to_pcap (test data), probe_capture
-  cli/                  nerka       — open | search | filter | expand | packs | marks | lines
-  ui/                   nerka-gui   — egui desktop viewer (view, library/selection, presets, prefs, instances)
-  tools/screenshot.ps1  GUI screenshot for visual checks (Windows)
-  doc/                  spec, this analysis, status and designs
-  .github/workflows/    ci.yml: fmt, clippy -D warnings, tests on Linux + Windows;
-                        release.yml: Linux + Windows archives, pre-release on a v* tag
+    examples/           test data: gen_log, gen_dlt, gen_multiline_dlt, gen_captures, dlt_to_pcap, dlt_to_mf4;
+                        tools: probe_capture, ksy_cells, mutate_open (the gate's fuzz run)
+  cli/                  nerka       — open | search | filter | lines | marks | expand | packs | check | lifecycles
+                                      | export | import (several files as one view, --merge)
+  ui/                   nerka-gui   — egui desktop viewer (view, library/selection, presets, prefs, signals,
+                                      plots, checks, protocols, bundles, instances, config sync)
+  examples/             protocols/ (.ksy definitions: dlt, sensor), packs/ (sample packs for the docs)
+  tools/                screenshot.ps1 (GUI screenshot, Windows), review-gate.sh, bench.sh
+  doc/                  spec, this analysis, status / features / GUI decisions / history, designs, review/
+  .github/workflows/    ci.yml: fmt, clippy -D warnings, tests on Linux + Windows, cargo deny, DCO;
+                        release.yml: Linux + Windows archives, pre-release on a v* tag (actions pinned by commit)
 ```
 
 ## 8. Roadmap

@@ -19,6 +19,7 @@ regression over 15 %; **S3** debt that makes the next change harder;
 | GATE-2 🤖 | No clippy warnings | `cargo clippy --workspace --all-targets -- -D warnings` |
 | GATE-3 🤖 | Tests pass | `cargo test --workspace` |
 | GATE-4 🤖 | Licences, advisories, bans; no yanked crates (warn) | `cargo deny check` |
+| GATE-5 🤖 | The API docs build without warnings | `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` |
 | MSRV-1 🤖 | The declared `rust-version` builds the workspace | `cargo +<rust-version> check --workspace --all-targets` (`--full`); without that toolchain the script looks for let-chains (1.88+) |
 
 ## ARCH — architecture (cycle; ARCH-1 gate)

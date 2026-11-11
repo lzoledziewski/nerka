@@ -4,7 +4,7 @@ Snapshot of where the project stands. Update this file whenever the state change
 
 Kept short, so that it reads in one go (review 2026-11-09, R4: the read stopped before "Decisions pending"). When the state changes, update it here and add a dated line at the top of `history.md`.
 
-_Last update: 2026-11-11 (text profiles designed with the owner, not built: `text-profiles.md`; the 1 GiB benchmark of 0.2.0-alpha.3). Before: 2026-11-10 (0.2.0-alpha.3: review 2026-11-09's fixes; `doc/review/2026-11-09-findings.md`)._
+_Last update: 2026-11-11 (text profiles designed with the owner, not built: `text-profiles.md`; the 1 GiB benchmark of 0.2.0-alpha.3; review findings fixed on `claude/fixes-2026-11-11`: R15, 11-07 R8, R16, R17, R18, R19, 11-08 R5, R11). Before: 2026-11-10 (0.2.0-alpha.3: review 2026-11-09's fixes; `doc/review/2026-11-09-findings.md`)._
 
 **Where the rest is:**
 - `doc/gui-decisions.md`: the owner's GUI decisions ("GUI as of now"), deliberate choices to keep. **Read it before changing the UI.**
@@ -46,7 +46,7 @@ The open work, in no fixed order; what was done before is in `history.md`, the o
 ## Known limitations
 
 - The line index uses 8 bytes per line (≈94 MB per 12 M lines); a block-compressed index is planned.
-- No follow/tail mode: if a file is truncated while it is mapped, reads may fault.
+- No follow/tail mode: if a file is truncated while it is mapped, reads may fault on Linux (11-07 R13); Windows refuses to shorten a mapped file, so there the writer's truncation fails instead (tried 2026-11-11).
 - Only UTF-8/ASCII text is handled; invalid bytes are shown as U+FFFD.
 - The GUI binary is ~19 MB on Linux. The size on Windows hasn't been measured.
 - DLT: only files with storage headers; FIBEX only in the common convention (non-verbose messages; no value tables, no FIBEX 4.x specifics yet); arrays/structs/fixed-point arguments shown as hex; time in UTC only; the message index is built single-threaded (~280 ms per GiB).

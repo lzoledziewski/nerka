@@ -11,10 +11,19 @@
 //! the default options. Failing inputs are kept as `SEEDS_DIR/crash-*.bin`
 //! with the panic message on stderr; the exit status is 1 if any failed.
 //! Deterministic for a given SEED (default 1), so a crash can be replayed.
+//!
+//! Protocol definitions (`.ksy`) among the seeds are used twice (review
+//! 2026-11-08 R5): mutated like any seed, for the definition reader; and as
+//! they are, loaded for half the rounds, with native DLT off and the
+//! definitions without rules of their own on DLT's port, so captures are
+//! split and read through them.
 
+use nerka_core::input::capture::route::{Match, Route};
+use nerka_core::input::proto::{LoadedProtocol, ksy::KsyProtocol};
 use nerka_core::{FieldId, LogSource, OpenOptions, Progress};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 struct Rng(u64);
 impl Rng {
@@ -117,6 +126,23 @@ fn main() {
         })
         .collect();
     assert!(!seeds.is_empty(), "no seed files in {}", dir.display());
+    let is_ksy = |p: &Path| p.extension().is_some_and(|e| e == "ksy");
+    let mut defs = OpenOptions::default();
+    for (p, d) in seeds.iter().filter(|(p, _)| is_ksy(p)) {
+        match KsyProtocol::parse(&String::from_utf8_lossy(d)) {
+            Ok(k) => {
+                let loaded = LoadedProtocol::new(Arc::new(k));
+                if loaded.routes.is_empty() {
+                    let protocol = loaded.protocol.name().to_owned();
+                    defs.capture.routes.push(Route { protocol, rule: Match::port(3490) });
+                }
+                defs.capture.protocols.push(loaded);
+            }
+            Err(e) => eprintln!("{}: not loaded: {e}", p.display()),
+        }
+    }
+    defs.capture.disabled = vec!["DLT".into()];
+    let plain = OpenOptions::default();
     std::panic::set_hook(Box::new(|_| {}));
     let tmp = std::env::temp_dir().join(format!("nerka-mutate-{}.tmp", std::process::id()));
     let mut failed = 0;
@@ -127,8 +153,11 @@ fn main() {
         // Keep the seed's extension: some readers are picked by it.
         let path = tmp.with_extension(name.extension().unwrap_or_default());
         std::fs::write(&path, &bytes).expect("write the mutated file");
+        let options = if !defs.capture.protocols.is_empty() && rng.below(2) == 0 { &defs } else { &plain };
         let r = catch_unwind(AssertUnwindSafe(|| {
-            if let Ok(src) = nerka_core::open_with(&path, &OpenOptions::default(), &Progress::new()) {
+            if is_ksy(name) {
+                let _ = KsyProtocol::parse(&String::from_utf8_lossy(&bytes));
+            } else if let Ok(src) = nerka_core::open_with(&path, options, &Progress::new()) {
                 exercise(&*src);
             }
         }));
