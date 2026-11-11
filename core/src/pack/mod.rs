@@ -1,4 +1,4 @@
-//! Query packs: shareable libraries of NFD queries (see `doc/search-manager.md`).
+//! Query packs: shareable libraries of NFD queries (see `docs/dev/search-manager.md`).
 //!
 //! A pack is a text file of queries; its name is the namespace, so queries
 //! are identified as `pack.query`. A query has NFD text, an optional parent

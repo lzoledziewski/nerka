@@ -5,8 +5,8 @@ DLT, pcap / pcapng, MF4): a UI-free engine (`core/`), a command line tool
 (`cli/`) and a desktop GUI (`ui/`, egui).
 
 Before larger changes, open an issue to agree on the approach. Design
-decisions are recorded in `doc/` (start with `doc/architecture-analysis.md`
-and `doc/status.md`); a change that goes against one needs that discussion
+decisions are recorded in `docs/dev/` (start with `docs/dev/architecture-analysis.md`
+and `docs/dev/status.md`); a change that goes against one needs that discussion
 first.
 
 ## Building and checking
@@ -56,7 +56,7 @@ check of the dependencies (`cargo deny check`) and the sign-off check below.
 ## Pull requests
 
 - One topic per pull request; describe what changes and why.
-- Update the docs in `doc/` (and `README.md`) when behaviour changes.
+- Update the docs in `docs/dev/` (and `README.md`) when behaviour changes.
 - Fill in the checklist of the pull request template.
 
 ## Sign your commits (DCO)

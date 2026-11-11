@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-# The automated part of a review (doc/review/README.md). Every check prints
-# PASS / WARN / FAIL with its ID from doc/review/checklist.md; the exit status
+# The automated part of a review (docs/dev/review/README.md). Every check prints
+# PASS / WARN / FAIL with its ID from docs/dev/review/checklist.md; the exit status
 # is 1 if any blocking check FAILs. WARN never blocks: it is something for
 # the reviewer to look at.
 #
 #   tools/review-gate.sh            # quick: build gates + metrics (minutes)
 #   tools/review-gate.sh --full     # + fuzz 3000 rounds, + MSRV if installed
-#   BENCH_BASE=doc/review/baseline/bench-YYYY-MM-DD.tsv tools/review-gate.sh --full --bench
+#   BENCH_BASE=docs/dev/review/baseline/bench-YYYY-MM-DD.tsv tools/review-gate.sh --full --bench
 #
 # Run from anywhere inside the repository; Git Bash on Windows, bash on Linux.
 set -uo pipefail
@@ -34,6 +34,8 @@ echo "== build gates"
 run GATE-1 "cargo fmt --check" cargo fmt --all --check
 run GATE-2 "clippy -D warnings" cargo clippy --workspace --all-targets -- -D warnings
 run GATE-3 "tests" cargo test --workspace
+# GATE-5: the API docs build without warnings (review 2026-11-07 R19 came back unseen).
+run GATE-5 "cargo doc -D warnings" env RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace
 if command -v cargo-deny >/dev/null 2>&1; then
   run GATE-4 "cargo deny" cargo deny check
   grep -q "yanked" "$OUT/GATE-4.log" && warn GATE-4 "a yanked crate in Cargo.lock (cargo update -p …)"
@@ -119,6 +121,8 @@ if [ "$FULL" = 1 ]; then
     head -c 65536 "$seeds/a.dlt" >"$seeds/a_small.dlt" &&
     printf '{"ts":"2026-11-07T10:00:00Z","level":"error","ctx":{"user":"u1","n":[1,2]},"msg":"x \\u00e9","lat":1.5}\n{"level":30,"msg":"y"}\n' >"$seeds/f.jsonl"
   } >"$OUT/seeds.log" 2>&1
+  # Protocol definitions: mutated, and loaded for half the rounds (11-08 R5).
+  cp examples/protocols/*.ksy "$seeds/"
   run CODE-2 "fuzz: 3000 mutated inputs, no panic" "$ex/mutate_open" "$seeds" 3000 "${FUZZ_SEED:-$RANDOM}"
 fi
 
@@ -132,21 +136,26 @@ grep -oE -- '--pack [a-z_]+/' CLAUDE.md | awk '{print $2}' | sort -u | while rea
 # DOC-2: context an agent must read before work (CLAUDE.md + the docs it requires).
 # ~3.3 bytes per token for these docs (code names, punctuation, Polish names):
 # status.md's 75 KB read as 28.5k tokens on 2026-11-07.
-req=$(wc -c < CLAUDE.md); for f in doc/nerka_architecture_implementation_spec_v_0.md doc/architecture-analysis.md doc/status.md; do
+req=$(wc -c < CLAUDE.md); for f in docs/dev/nerka_architecture_implementation_spec_v_0.md docs/dev/architecture-analysis.md docs/dev/status.md; do
   req=$((req + $(wc -c <"$f"))); done
 tok=$((req * 10 / 33))
 if [ $tok -gt 25000 ]; then warn DOC-2 "required reading is ~${tok} tokens (budget 25000): split status.md"; else pass DOC-2 "required reading ~${tok} tokens"; fi
 # DOC-3: very long lines make docs hard to diff and to edit by exact match.
-long=$(awk 'length($0) > 1500 { n++ } END { print n + 0 }' doc/*.md)
+long=$(awk 'length($0) > 1500 { n++ } END { print n + 0 }' docs/dev/*.md docs/user/*.md docs/index.md)
 [ "$long" -gt 0 ] && warn DOC-3 "$long doc lines over 1500 characters" || pass DOC-3 "no doc line over 1500 characters"
 # AIX-8: each doc an agent reads fits one read (~4 bytes a token; 20k tokens).
-for f in doc/status.md doc/gui-decisions.md doc/features.md doc/history.md; do
+for f in docs/dev/status.md docs/dev/gui-decisions.md docs/dev/features.md docs/dev/history.md; do
   [ -f "$f" ] || continue
   t=$(( $(wc -c < "$f") / 4 ))
   if [ $t -gt 20000 ]; then warn AIX-8 "$f is ~${t} tokens: more than one read"; else pass AIX-8 "$f ~${t} tokens"; fi
 done
+# DOC-5: the user guide builds on GitHub Pages: Jekyll's Liquid reads `{{` and
+# `{%` outside a raw block as template code.
+liq=$(awk '/\{% raw %\}/ { r = 1 } /\{% endraw %\}/ { r = 0; next } !r && /\{\{|\{%/ { print FILENAME ":" FNR }' docs/index.md docs/user/*.md | tr '
+' ' ')
+[ -n "$liq" ] && warn DOC-5 "Liquid markup outside a raw block (wrap it, CLAUDE.md): $liq" || pass DOC-5 "user guide has no stray Liquid markup"
 # DOC-4: status.md is dated.
-d=$(sed -nE 's/^_Last update: ([0-9-]{10}).*/\1/p' doc/status.md)
+d=$(sed -nE 's/^_Last update: ([0-9-]{10}).*/\1/p' docs/dev/status.md)
 pass DOC-4 "status.md last update: ${d:-none}"
 
 echo "== CI and supply chain"

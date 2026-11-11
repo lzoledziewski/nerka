@@ -1,5 +1,5 @@
 # A made-up sensor datagram, as a small example of a protocol definition
-# (doc/protocol-definitions.md). One reading per UDP datagram:
+# (docs/user/protocol-definitions.md). One reading per UDP datagram:
 #
 #   id u2, seq u4, kind u1 (1 temperature, 2 pressure), value s2 (tenths),
 #   then a free text note up to the datagram's end.

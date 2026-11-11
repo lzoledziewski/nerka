@@ -11,9 +11,9 @@ problems, and plot the values your logs carry. Everything runs on your
 machine: a desktop viewer (`nerka-gui`) and a command-line tool (`nerka`) on
 one UI-free engine (`nerka-core`).
 
-![nerka on a synthetic DLT drive: warnings filtered from a query pack, speed, temperature and battery voltage plotted with a throttling threshold, a text search (regex, ignoring case) for throttling messages in the bottom pane, and the library and selection panes on the right](doc/img/nerka.png)
+![nerka on a synthetic DLT drive: warnings filtered from a query pack, speed, temperature and battery voltage plotted with a throttling threshold, a text search (regex, ignoring case) for throttling messages in the bottom pane, and the library and selection panes on the right](docs/user/img/nerka.png)
 
-> Status: **0.2.0-alpha.3**. Windows is the main platform;
+> Status: **0.2.0-alpha.4**. Windows is the main platform;
 > Linux builds come from CI; macOS isn't built yet. While nerka is at 0.x,
 > file formats, the filter language and the GUI can still change.
 
@@ -74,7 +74,7 @@ own kind.
 
 ### Your own protocols
 
-![a capture holding DLT and a custom SENSOR protocol, filtered by level, "fan on" found in the sensor notes, and Settings showing the SENSOR protocol's rule](doc/img/protocols.png)
+![a capture holding DLT and a custom SENSOR protocol, filtered by level, "fan on" found in the sensor notes, and Settings showing the SENSOR protocol's rule](docs/user/img/protocols.png)
 
 A protocol inside captures can be described in a `.ksy` file:
 [Kaitai Struct](https://kaitai.io), plus a `-nerka:` section that says
@@ -110,16 +110,16 @@ nerka --route 'DLT:port=3490,vlan=5' --disable-protocol syslog filter 'level >= 
 [`examples/protocols/dlt.ksy`](examples/protocols/dlt.ksy) describes all of
 DLT, payloads included. It gives the same results as the built-in reader,
 and a test checks that. Language and rules:
-[doc/protocol-definitions.md](doc/protocol-definitions.md).
+[docs/user/protocol-definitions.md](docs/user/protocol-definitions.md).
 
 ### Lifecycles and checks
 
-![a DLT trace of a drive: ECU1's three boots listed with their outcomes (planned, crash, open) and what checks found in each; the Checks pane with issues and facts, the crash's evidence; speed, temperature and an OTA state plotted with the boots' boundaries](doc/img/lifecycles-checks.png)
+![a DLT trace of a drive: ECU1's three boots listed with their outcomes (planned, crash, open) and what checks found in each; the Checks pane with issues and facts, the crash's evidence; speed, temperature and an OTA state plotted with the boots' boundaries](docs/user/img/lifecycles-checks.png)
 
 A trace of several devices holds many boots. A **lifecycle** says which
 lines belong to one device and what starts and ends its boots. Each boot
 then becomes its own span, with an outcome (planned, crash, lost), and
-signals can reset with it ([doc/lifecycles.md](doc/lifecycles.md)).
+signals can reset with it ([docs/dev/lifecycles.md](docs/dev/lifecycles.md)).
 
 **Checks** are known problems written as small rules:
 - a line that shows up, or a count;
@@ -130,7 +130,7 @@ signals can reset with it ([doc/lifecycles.md](doc/lifecycles.md)).
 A check runs over the whole trace or per lifecycle. Its results are issues
 or facts with their evidence lines, shown in a pane of their own, next to
 each boot and on the command line. A check can feed another
-([doc/checks.md](doc/checks.md)).
+([docs/dev/checks.md](docs/dev/checks.md)).
 
 ```
 nerka --lifecycle 'ecu1: lines ecu == ECU1; reset uptime; planned payload ~ /shutdown/' lifecycles trace.dlt
@@ -154,7 +154,7 @@ time in lanes, with time cursors (Δt), value markers and bookmarks. A plot
 can be kept by name for use on other files.
 
 ```
-nerka --pack packs/ expand -l ota -p cam=CAM1
+nerka --pack examples/packs/ expand -l ota -p cam=CAM1
 nerka-gui app.log --signal 't:time=/^(?<t>\S+ \S+)/' --signal 'lat=/latency_us=(?<lat>\d+)/' --plot lat
 ```
 
@@ -166,7 +166,7 @@ nerka-gui app.log --signal 't:time=/^(?<t>\S+ \S+)/' --signal 'lat=/latency_us=(
 - **Settings bundles:** packs, presets, plots, checks and signals travel as
   one readable `.nerka-bundle` file. An import shows a preview of what it
   would change, and later versions of nerka upgrade what earlier ones wrote
-  ([doc/bundles.md](doc/bundles.md)).
+  ([docs/user/bundles.md](docs/user/bundles.md)).
 - **Tabs and windows:** there is one tab per file or set of files. A file
   opened from the shell goes to the nerka window focused last, and windows
   can be named.
@@ -202,6 +202,7 @@ nerka-gui app.log                              # open a file (several: one view)
 nerka-gui trace.pcapng --query 'apid == NAV'   # open and filter
 nerka-gui app.log --new-window --name triage   # a separate, named window
 nerka-gui app.log --signal 'lat=/latency_us=(?<lat>\d+)/' --query '@lat > 9000'   # a signal
+nerka-gui trace.dlt --lifecycle 'ecu1: lines ecu == ECU1; reset uptime' --query '@ecu1 == 2'   # a lifecycle (as the CLI's)
 ```
 
 | Keys | |
@@ -242,25 +243,25 @@ nerka --local-time lines trace.dlt 1 20                  # local time (CLI: UTC 
 | Regex | `field ~ /re/`, `field !~ /re/`, `/re/i` ignores case |
 | Text | bare `/re/` and `"text"` match the whole line (`raw`) |
 | Logic | `AND OR NOT`, parentheses |
-| Fields | `raw`, `level`; DLT adds `ecu apid ctid type mcnt tmsp seid mid mode payload`, SOME/IP `service method client session iface type rc len payload`, syslog `facility host app pid msgid stamp payload`, a protocol definition its own; captures `proto` and where each datagram came from: `net.src net.dst` (addresses), `net.sport net.port` (ports), `net.vlan` (fields only: not in the columns or `raw`); several files add `file`; JSON records add their keys (`ctx.user`). A key that clashes with NFD's own is `json.raw`; NFD's own are also `nfd.raw`, `nfd.level`, `nfd.bookmark` |
+| Fields | `raw`, `level`; DLT adds `ecu apid ctid type mcnt tmsp seid mid mode payload`, SOME/IP `service method client session iface type rc len payload`, syslog `facility host app pid msgid stamp payload`, a protocol definition its own; captures `proto` and where each datagram came from: `net.src net.dst` (addresses), `net.sport net.port` (ports), `net.vlan` (fields only: not in the columns or `raw`); several files add `file` (the file's name, or the end of its path that tells two of one name apart: `file == "ecu1/trace.dlt"`); JSON records add their keys (`ctx.user`). A key that clashes with NFD's own is `json.raw`; NFD's own are also `nfd.raw`, `nfd.level`, `nfd.bookmark` |
 | Bookmarks | `bookmark` alone: a bookmarked line; `bookmark == B2` its name; `bookmark ~ /fan/` its name or note |
 | Signals | `@name`: a value captured by a named regex group, of a picked query or a signal you define (📈 Signals panel, `--signal`; saved). `@gear == D` is the state (held until the next event), `@gear.event == D` a line that carries it, `@gear.changed` a change. Kinds `num`, `enum`, `time`; DLT has `@time` (receive time): `@time >= "2025-10-18 10:00:00"` |
 
 ## Documentation
 
-- [doc/status.md](doc/status.md): current state, pending decisions and next steps.
-- [doc/gui-decisions.md](doc/gui-decisions.md): the owner's decisions about the GUI.
-- [doc/features.md](doc/features.md): built features and the decisions about them.
-- [doc/history.md](doc/history.md): the dated log.
-- [doc/architecture-analysis.md](doc/architecture-analysis.md): architecture, decisions and deviations from the
-  [original spec](doc/nerka_architecture_implementation_spec_v_0.md).
-- [doc/search-manager.md](doc/search-manager.md): query packs, expansion, library and selection.
-- [doc/search-modes.md](doc/search-modes.md): Auto, Text and NFD modes.
-- [doc/sources-and-signals.md](doc/sources-and-signals.md): input formats and signals.
-- [doc/protocol-definitions.md](doc/protocol-definitions.md): protocols described in `.ksy` files, matching rules.
-- [doc/lifecycles.md](doc/lifecycles.md) and [doc/checks.md](doc/checks.md): boots per device, and checks over them.
-- [doc/bundles.md](doc/bundles.md): settings bundles (export, import) and how formats are upgraded.
+**User guide:** [docs/index.md](docs/index.md): getting started, the
+desktop viewer, the command line, the query language, formats, query packs,
+signals and plots, lifecycles, checks, protocol definitions, settings
+bundles. It ships in the release archives (`docs/`).
+
+**For contributors** (the project's working notes, in `docs/dev/`):
+
 - [CLAUDE.md](CLAUDE.md): guide for contributors and AI agents (commands, rules).
+- [docs/dev/status.md](docs/dev/status.md): current state, pending decisions and next steps.
+- [docs/dev/gui-decisions.md](docs/dev/gui-decisions.md) and [docs/dev/features.md](docs/dev/features.md): the decisions behind the GUI and the features.
+- [docs/dev/architecture-analysis.md](docs/dev/architecture-analysis.md): architecture and the [original spec](docs/dev/nerka_architecture_implementation_spec_v_0.md).
+- Designs: [search manager](docs/dev/search-manager.md), [search modes](docs/dev/search-modes.md), [sources and signals](docs/dev/sources-and-signals.md), [protocol definitions](docs/dev/protocol-definitions.md), [lifecycles](docs/dev/lifecycles.md), [checks](docs/dev/checks.md), [bundles](docs/dev/bundles.md), [text profiles](docs/dev/text-profiles.md) (not built).
+- [docs/dev/history.md](docs/dev/history.md): the dated log; reviews in [docs/dev/review/](docs/dev/review/).
 
 ## Contributing
 

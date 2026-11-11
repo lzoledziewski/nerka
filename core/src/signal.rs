@@ -1,4 +1,4 @@
-//! Signals: named values that rows carry (`doc/sources-and-signals.md` →
+//! Signals: named values that rows carry (`docs/dev/sources-and-signals.md` →
 //! "What a signal is").
 //!
 //! v1 defines a signal by an explicit capture: an NFD query plus the named
@@ -30,7 +30,7 @@
 //! every line, or only the lines the tab's filter keeps (for the panel and
 //! the plot; a filter can't use such a signal, it would depend on itself).
 //!
-//! **Lifecycles** ([`crate::lifecycle`], `doc/lifecycles.md`): a lifecycle
+//! **Lifecycles** ([`crate::lifecycle`], `docs/dev/lifecycles.md`): a lifecycle
 //! is a signal too (`@ecu1`: the number of the lifecycle a line is in, an
 //! event where one starts). A signal bound to one (`per(ecu1)`) only
 //! resets at each start (owner, 2026-11-07: its own query decides its

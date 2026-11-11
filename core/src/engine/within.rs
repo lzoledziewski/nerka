@@ -1,7 +1,7 @@
 //! Search inside a filter result: which of the filter's lines match the
 //! search queries, and which query matched each of them.
 //!
-//! Search never looks outside the filter's lines (`doc/search-manager.md`).
+//! Search never looks outside the filter's lines (`docs/dev/search-manager.md`).
 //! A hit is a line that matches at least one *include* query and no
 //! *exclude* query (without a filter: any line of the file); every include query that matches it is reported, so
 //! the UI can colour hits per query. With no include queries every line

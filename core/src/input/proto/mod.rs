@@ -1,6 +1,6 @@
 //! Protocols: what a message is, apart from the file it came in.
 //!
-//! The layers of `doc/sources-and-signals.md`: a **container** (a `.dlt`
+//! The layers of `docs/dev/sources-and-signals.md`: a **container** (a `.dlt`
 //! storage file, a pcap / pcapng capture, an MF4 bus log) yields messages
 //! with what it knows about them ([`Origin`]: when they were stored or
 //! captured, the channel they came on); a **router** picks the protocol of
@@ -554,6 +554,7 @@ impl LogSource for Records {
             protocols: self.protocols().into_iter().map(str::to_owned).collect(),
             notes,
             no_sender: self.no_sender,
+            files: Vec::new(),
         }
     }
 

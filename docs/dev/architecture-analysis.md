@@ -21,28 +21,14 @@ From the README and spec, ranked by what shapes the architecture:
 | R5 | DSL filtering (NFD) | Small parser in core; the UI only sends query strings |
 | R6 | Deployable as light cloud nodes; collaboration later | Core must embed in a headless server; annotations need a shareable model |
 
-## 2. UI framework (spec §13 open question)
+## 2. UI framework
 
-You considered Qt/C++. Options compared against R1, R2 and R4:
-
-| Option | Footprint | Huge-list rendering | Rust integration | Cost / risk |
-|---|---|---|---|---|
-| **Qt 6 / C++** | 30–60 MB of DLLs to ship | Excellent (`QAbstractItemModel`) — what klogg uses | FFI boundary (cxx-qt): two languages, two build systems | LGPL dynamic-linking duties or a commercial licence; heavy CMake/vcpkg setup on Windows |
-| **Tauri** (spec default) | ~5–10 MB + system WebView2 | Needs a JS virtual list; every visible line crosses IPC as JSON | Good (commands/events) | Two stacks (Rust + TS/npm); IPC latency on fast scrolling |
-| **egui / eframe** ✅ | One ~10–20 MB binary, no runtime | Immediate mode: paint only the visible rows directly from mmap, zero copies | Native Rust, same process | Less "native" look; you write custom widgets (done for the log view) |
-| Slint | Small | OK | Native Rust | GPL/royalty licensing for commercial use; weaker for custom big views |
-| Iced | Small | Fair | Native Rust | API still churning; less mature text rendering |
-
-**Decision: egui for the desktop viewer.** It is the lightest option, which
-was your explicit constraint, and the only one that reads lines straight
-from the memory map into the GPU with no IPC or serialization in between.
-That is what a klogg-class viewer needs. It also compiles to WebAssembly, so
-a browser UI for the server/collaboration phase can reuse the same code.
-
-**Deviation from spec §2/§4:** the spec names Tauri. The spec's *rules*
-still hold: the UI does no filtering and no parsing, and only calls core
-APIs. Spec §3.6 (Tauri commands) becomes plain Rust calls. If you prefer
-Tauri, only `ui/` changes; `core/` and `cli/` are unaffected.
+**egui / eframe** (owner, 2026-11-11: settled, the frontend stays egui).
+It paints only the visible rows, straight from the memory map, with no IPC
+or serialization in between; it is one native binary, and it compiles to
+WebAssembly for a later browser UI. The spec's rules still hold: the UI does
+no filtering and no parsing and only calls core APIs; spec §3.6 (Tauri
+commands) are plain Rust calls.
 
 ## 3. Indexing strategy (spec §13 open question)
 
@@ -145,27 +131,40 @@ annotations by sending it alongside the log.
 
 ## 7. Repository layout (spec §10)
 
-As of 2026-10-22:
+As of 2026-11-11 (review 2026-11-07 R18):
 
 ```
 nerka/
   Cargo.toml            workspace, shared deps, lints, release profile
   core/                 nerka-core  — UI-free engine (library)
-    src/input/          LogSource trait, open() by content, TextFile (mmap), dlt/ (DLT reader + writer),
-                        capture/ (pcap, pcapng, MF4, network layers), concat (several files as one), mem (tests)
+    src/input/          LogSource trait, open() by content, SourceInfo / query_warnings, schema (field merge)
+      text.rs, records.rs, json.rs   plain text, multi-line records, JSON (records split per file)
+      dlt/              DLT reader + writer, FIBEX (non-verbose)
+      proto/            Protocol trait; DLT, SOME/IP, syslog; ksy/ (protocols from .ksy definitions)
+      capture/          pcap, pcapng, MF4 (+ unpack cache), network layers, UDP port routes
+      concat.rs, merged.rs   several files as one view; interleaved by time (--merge)
     src/engine/         LineIndex, search/Filter/Highlighter, within (search inside a filter result)
     src/dsl/            NFD parser + evaluator, auto (Auto mode: plain words + NFD)
     src/pack/           query packs: parser, Library, expand, write
+    src/signal.rs       signals (@name) from captures, queries and lifecycles; src/plot.rs: kept plots
+    src/lifecycle.rs    lifecycles (boots per device); src/check.rs: checks over them
+    src/session.rs      a tab's state and jobs, shared by the GUI (filter, search, colours)
+    src/bundle.rs       settings bundles (export / import, format migrations)
+    src/time.rs         times: parsing, zones, local / UTC
     src/event.rs        lazy fields (level, source-supplied fields)
     src/bookmarks.rs    bookmarks + sidecar persistence
     src/history.rs      search history; src/preset.rs: presets
-    examples/           gen_log, gen_dlt, gen_multiline_dlt, dlt_to_pcap (test data), probe_capture
-  cli/                  nerka       — open | search | filter | expand | packs | marks | lines
-  ui/                   nerka-gui   — egui desktop viewer (view, library/selection, presets, prefs, instances)
-  tools/screenshot.ps1  GUI screenshot for visual checks (Windows)
-  doc/                  spec, this analysis, status and designs
-  .github/workflows/    ci.yml: fmt, clippy -D warnings, tests on Linux + Windows;
-                        release.yml: Linux + Windows archives, pre-release on a v* tag
+    examples/           test data: gen_log, gen_dlt, gen_multiline_dlt, gen_captures, dlt_to_pcap, dlt_to_mf4;
+                        tools: probe_capture, ksy_cells, mutate_open (the gate's fuzz run)
+  cli/                  nerka       — open | search | filter | lines | marks | expand | packs | check | lifecycles
+                                      | export | import (several files as one view, --merge)
+  ui/                   nerka-gui   — egui desktop viewer (view, library/selection, presets, prefs, signals,
+                                      plots, checks, protocols, bundles, instances, config sync)
+  examples/             protocols/ (.ksy definitions: dlt, sensor), packs/ (sample packs for the docs)
+  tools/                screenshot.ps1 (GUI screenshot, Windows), review-gate.sh, bench.sh
+  docs/dev/                  spec, this analysis, status / features / GUI decisions / history, designs, review/
+  .github/workflows/    ci.yml: fmt, clippy -D warnings, tests on Linux + Windows, cargo deny, DCO;
+                        release.yml: Linux + Windows archives, pre-release on a v* tag (actions pinned by commit)
 ```
 
 ## 8. Roadmap

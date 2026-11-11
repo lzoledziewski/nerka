@@ -4,7 +4,7 @@
 //! level >= ERROR AND raw ~ /SSL|CERT/i AND NOT raw ~ /healthcheck/
 //! ```
 //!
-//! Grammar (handwritten recursive descent, see doc/architecture-analysis.md
+//! Grammar (handwritten recursive descent, see docs/dev/architecture-analysis.md
 //! for why not PEG):
 //!
 //! ```text
@@ -75,7 +75,7 @@
 //! bookmark only satisfies `!=` and `!~`; without bookmarks given, no line
 //! has one.
 //!
-//! The search boxes' Auto mode (`auto.rs`, `doc/search-modes.md`) reads plain
+//! The search boxes' Auto mode (`auto.rs`, `docs/dev/search-modes.md`) reads plain
 //! words as text and rewrites them into this grammar; NFD itself has no
 //! bare text.
 //!

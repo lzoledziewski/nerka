@@ -1,6 +1,6 @@
 //! End-to-end tests of the `nerka` binary: what a script or an agent sees
 //! (stdout, stderr, exit status) on generated files. Review finding R12
-//! (doc/review/2026-11-07-findings.md). No dependency beyond std: the
+//! (review 2026-11-07, R12). No dependency beyond std: the
 //! binary is `CARGO_BIN_EXE_nerka`, the DLT file comes from core's writer.
 
 use nerka_core::Level;

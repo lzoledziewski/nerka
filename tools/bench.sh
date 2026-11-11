@@ -12,7 +12,7 @@
 # warms it and is dropped). Needs a release build: cargo build --release
 # -p nerka-cli -p nerka-core --bins --examples (NERKA_BIN: another folder of it).
 #
-# KSY=1 adds the protocol definition cases (doc/protocol-definitions.md):
+# KSY=1 adds the protocol definition cases (docs/dev/protocol-definitions.md):
 # big2.pcap has every datagram on ports 3490 and 3491; native DLT reads one,
 # examples/protocols/dlt.ksy (DLTK) the other. Each query runs per protocol
 # (`proto == DLT AND …`, `proto == DLTK AND …`), so both readers read the

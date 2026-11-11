@@ -19,6 +19,7 @@ regression over 15 %; **S3** debt that makes the next change harder;
 | GATE-2 🤖 | No clippy warnings | `cargo clippy --workspace --all-targets -- -D warnings` |
 | GATE-3 🤖 | Tests pass | `cargo test --workspace` |
 | GATE-4 🤖 | Licences, advisories, bans; no yanked crates (warn) | `cargo deny check` |
+| GATE-5 🤖 | The API docs build without warnings | `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` |
 | MSRV-1 🤖 | The declared `rust-version` builds the workspace | `cargo +<rust-version> check --workspace --all-targets` (`--full`); without that toolchain the script looks for let-chains (1.88+) |
 
 ## ARCH — architecture (cycle; ARCH-1 gate)
@@ -34,7 +35,7 @@ regression over 15 %; **S3** debt that makes the next change harder;
 | ARCH-7 | Every long operation takes `&Progress` and checks `is_cancelled()` per chunk | read new loops over lines / bytes |
 | ARCH-8 | Public API of `nerka-core` (`lib.rs` re-exports) matches what CLI and GUI need; module docs current | read `core/src/lib.rs` header against the module list |
 | ARCH-10 | A source that wraps others (`Concat`, its parts, `Merged`) answers every field as its parts do, for every layout (same kind, other fields, mixed, mixed with equal fields) | a test that compares each line's fields by name with the part's own; expected values, since both paths share the mapping |
-| ARCH-9 | Decisions recorded: a change against `doc/` decisions links the owner's decision | `doc/status.md`, `doc/architecture-analysis.md` |
+| ARCH-9 | Decisions recorded: a change against `docs/dev/` decisions links the owner's decision | `docs/dev/status.md`, `docs/dev/architecture-analysis.md` |
 
 ## CODE — correctness and robustness (gate for S1)
 
@@ -55,7 +56,7 @@ regression over 15 %; **S3** debt that makes the next change harder;
 | ID | Check | How |
 |---|---|---|
 | PERF-1 🤖 | The `--stats` benchmark runs and is recorded, a row per case (an empty table fails) | `tools/bench.sh DIR 1024 5 > bench.tsv` (`--bench`); `KSY=1` adds the protocol definition cases |
-| PERF-2 🤖 | No query more than 15 % slower than the baseline, match counts identical | `tools/bench.sh compare doc/review/baseline/bench-….tsv bench.tsv` |
+| PERF-2 🤖 | No query more than 15 % slower than the baseline, match counts identical | `tools/bench.sh compare docs/dev/review/baseline/bench-….tsv bench.tsv` |
 | PERF-3 | Index memory per line stays as documented (8 B text, 8 / 16 B DLT, +16 B merged) | `nerka open FILE` → `index mem` |
 | PERF-4 | New per-line work in the hot path (allocation, `to_string`, rendering) is avoided or measured | read `scan_*`, `Event`, `field` implementations |
 | PERF-5 | GUI: no repaint loop when idle; heavy work off the UI thread | `gui-decisions.md` "CPU with software rendering"; `ui/src/job.rs` |
@@ -66,7 +67,7 @@ regression over 15 %; **S3** debt that makes the next change harder;
 |---|---|---|
 | HUX-1 | CLI errors say what is wrong and where (caret under the column) and what would work | try a wrong field, a bad regex, a missing file |
 | HUX-2 | CLI help: each option has an example; the `about` line still describes the tool | `nerka --help`, `nerka <cmd> --help` |
-| HUX-3 | Owner's GUI decisions in `doc/gui-decisions.md` are kept (Filter at the top, Search at the bottom, runs on Enter only, …) | read the diff against it |
+| HUX-3 | Owner's GUI decisions in `docs/dev/gui-decisions.md` are kept (Filter at the top, Search at the bottom, runs on Enter only, …) | read the diff against it |
 | HUX-4 | GUI change checked on screen | `tools/screenshot.ps1` |
 | HUX-5 | Messages use the same words as the docs (filter / search / query / pack / signal / lifecycle / check) | read new strings |
 | HUX-6 | README's quick start works from a fresh clone | follow it |
@@ -83,7 +84,7 @@ regression over 15 %; **S3** debt that makes the next change harder;
 | AIX-4 | CLI results are machine-readable where scripts use them: `--json` (or TSV with a header) for `filter`, `search`, `open`, `marks`, not only `check` / `lifecycles` | run them |
 | AIX-5 | Exit status tells "no match" from "error" (grep: 0 / 1 / 2) where a script needs it | `nerka filter … ; echo $?` |
 | AIX-6 | A file's fields can be discovered without the GUI | `nerka open FILE` lists `fields:`; kinds too? |
-| AIX-7 | Status and decisions are split: current state (short) vs history (append-only) | `doc/status.md` structure |
+| AIX-7 | Status and decisions are split: current state (short) vs history (append-only) | `docs/dev/status.md` structure |
 | AIX-8 | Each file an agent must read fits one read (under 20k tokens), with what must not be missed (pending decisions) near the top | the gate measures `status.md`, `gui-decisions.md`, `features.md`, `history.md` |
 
 ## SEC — security (gate for S1)
@@ -121,4 +122,5 @@ regression over 15 %; **S3** debt that makes the next change harder;
 | DOC-1 🤖 | `CLAUDE.md` names only paths that exist | the script |
 | DOC-2 🤖 | `status.md` has a current date and its "Next steps" match the open work | read it |
 | DOC-3 | Module docs (`//!`) match what the module does now | read the changed modules |
-| DOC-4 | A user-visible change is in README or `doc/` | diff |
+| DOC-4 | A user-visible change is in README or the user guide (`docs/user/`); the ledger (`docs/dev/`) only gets decisions and state (CLAUDE.md) | diff |
+| DOC-5 🤖 | The user guide builds on GitHub Pages: no Liquid `{{` / `{%` outside a raw block | `tools/review-gate.sh` |

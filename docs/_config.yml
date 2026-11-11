@@ -1,0 +1,8 @@
+# GitHub Pages (Jekyll) for docs/: the user guide. Publish it in the
+# repository's Settings → Pages → Deploy from a branch: main, /docs.
+# docs/dev/ is the project's working ledger, not part of the site.
+title: nerka
+description: Fast log analysis for text, JSON, DLT and captures
+theme: jekyll-theme-cayman
+exclude:
+  - dev

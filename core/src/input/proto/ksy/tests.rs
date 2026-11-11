@@ -198,6 +198,20 @@ fn errors_say_where() {
     assert_eq!(error(&base.replace("    x: x", "    raw: x")).2, "`raw` is a name NFD has already");
     assert_eq!(error(&base.replace("    x: x", "    net.src: x")).2, "`net.src`: `net.` fields are the capture's own");
     assert_eq!(error(&base.replace("columns: [x]", "columns: [y]")).2, "there is no field `y`; give `from:`");
+    // Review 2026-11-08 R11: `decimals` on a column that names a field.
+    assert_eq!(
+        error(&base.replace("columns: [x]", "columns: [{ name: x, decimals: 2 }]")),
+        (
+            11,
+            24,
+            "column `x` shows the field `x` and takes only `width`; `decimals` needs a value of its own: give `from:`"
+                .into()
+        )
+    );
+    assert_eq!(
+        error(&base.replace("columns: [x]", "columns: [{ name: y, width: 4, decimals: 2 }]")).2,
+        "column `y` needs `from:` (no field is named `y`)"
+    );
     assert_eq!(error(&base.replace("seq:", "params: []\nseq:")).2, "params aren't read yet");
     assert_eq!(error(&base.replace("type: u1 }", "type: u1, enum: nope }")).2, "there is no enum `nope` here");
     let recursive = "meta: { id: r }\nseq:\n  - { id: a, type: n }\ntypes:\n  n:\n    seq:\n      - { id: b, type: n }\n-nerka: { name: R, framing: datagram, columns: [{ name: c, from: a }] }\n";

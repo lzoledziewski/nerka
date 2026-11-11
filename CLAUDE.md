@@ -1,7 +1,7 @@
 # Working on Nerka (guide for AI agents and contributors)
 
-Read `doc/nerka_architecture_implementation_spec_v_0.md` (requirements) and
-`doc/architecture-analysis.md` (decisions, deviations, roadmap) first.
+Read `docs/dev/nerka_architecture_implementation_spec_v_0.md` (requirements) and
+`docs/dev/architecture-analysis.md` (decisions, deviations, roadmap) first.
 
 ## Layout
 - `core/` — `nerka-core`, the UI-free engine. **All** filtering, parsing and
@@ -20,16 +20,16 @@ cargo run -p nerka-gui -- app.log --query 'level >= ERROR'
 cargo run -p nerka-cli -- --signal 'v=/v=(?<v>\d+)/' filter '@v > 100' app.log   # signals (@name)
 cargo run -p nerka-cli -- --fibex ecu1.xml filter 'apid == NAV' trace.dlt        # DLT non-verbose via FIBEX
 cargo run -p nerka-cli -- --someip-port 30501 filter 'proto == SOMEIP AND type == ERROR' trace.pcap   # protocols by UDP port
-cargo run -p nerka-cli -- --protocol examples/protocols/dlt.ksy --protocol-port DLTK=3491 filter 'proto == DLTK AND apid == NAV' trace.pcap   # a protocol definition (.ksy, doc/protocol-definitions.md)
+cargo run -p nerka-cli -- --protocol examples/protocols/dlt.ksy --protocol-port DLTK=3491 filter 'proto == DLTK AND apid == NAV' trace.pcap   # a protocol definition (.ksy, docs/dev/protocol-definitions.md)
 cargo run -p nerka-cli -- --records 'start=/\d{4}-\d\d-\d\d/' filter 'level >= ERROR' app.log   # multi-line records
 cargo run -p nerka-cli -- --merge filter 'apid == NAV' ecu1.dlt ecu2.dlt bus.pcap   # several files as one view (by time with --merge)
 cargo run -p nerka-cli -- --lifecycle 'ecu1: lines ecu == ECU1; reset uptime; planned payload ~ /shutdown/' lifecycles trace.dlt   # ECU1's boots
-cargo run -p nerka-cli -- --pack packs/ --lifecycle 'ecu1: lines ecu == ECU1; reset uptime; planned {sys.shutdown}' --signal 'ota(s):enum:per(ecu1):default(idle)=ecu == ECU1 AND /OTA (?<s>\w+)/' filter '@ota == idle' trace.dlt
+cargo run -p nerka-cli -- --pack examples/packs/ --lifecycle 'ecu1: lines ecu == ECU1; reset uptime; planned {sys.shutdown}' --signal 'ota(s):enum:per(ecu1):default(idle)=ecu == ECU1 AND /OTA (?<s>\w+)/' filter '@ota == idle' trace.dlt
 cargo run -p nerka-cli -- --check 'storm: lines level >= ERROR; rate 25 per 1s' check -e 2 trace.dlt   # checks: issues and facts
 cargo run -p nerka-cli -- --check 'lost: lines /timeout/; missing /connected/ within 200ms' --check 'bursts: lines @lost.event; rate 2 per 60s' check trace.dlt   # a check feeds a check (@name)
-cargo run -p nerka-cli -- --pack packs/ expand -l ota -p cam=CAM1 --parts   # pack picks -> NFD
-cargo run -p nerka-cli -- --pack packs/ search --in 'level >= WARN' -l ota app.log
-cargo run -p nerka-cli -- export -o mine.nerka-bundle --only packs   # settings bundle (doc/bundles.md)
+cargo run -p nerka-cli -- --pack examples/packs/ expand -l ota -p cam=CAM1 --parts   # pack picks -> NFD
+cargo run -p nerka-cli -- --pack examples/packs/ search --in 'level >= WARN' -l ota -p cam=CAM1 app.log
+cargo run -p nerka-cli -- export -o mine.nerka-bundle --only packs   # settings bundle (docs/dev/bundles.md)
 cargo run -p nerka-cli -- import --dry-run mine.nerka-bundle         # its plan; --conflicts both|theirs|mine
 cargo run --release -p nerka-core --example gen_log -- big.log 1024   # 1 GiB test log
 cargo run --release -p nerka-cli -- search -c --stats ERROR big.log  # benchmark
@@ -42,23 +42,42 @@ cargo run --release -p nerka-core --example dlt_to_mf4 -- big.dlt big_z.mf4 --de
 cargo run --release -p nerka-cli -- --unpack-dir cache filter -c --stats 'apid == NAV AND level >= WARN' big_z.mf4  # 1st run unpacks, then cached
 cargo run --release -p nerka-core --example probe_capture -- trace.pcapng log.mf4   # structure of real captures, no payload
 powershell -ExecutionPolicy Bypass -File tools/screenshot.ps1 -Out shot.png -AppArgs app.log  # GUI screenshot (Windows)
-bash tools/review-gate.sh --full                      # review gate: build gates, fuzz, metrics (doc/review/)
+bash tools/review-gate.sh --full                      # review gate: build gates, fuzz, metrics (docs/dev/review/)
 bash tools/bench.sh target/bench 1024 5 > bench.tsv   # the benchmark above as TSV; `tools/bench.sh compare a.tsv b.tsv`
 KSY=1 bash tools/bench.sh target/bench 1024 5 > bench.tsv   # + the DLT definition against native DLT (NERKA_BIN: binaries elsewhere)
 ```
 
-Reviews (a gate before a merge or release, a deep review each cycle): `doc/review/README.md`,
-checklist `doc/review/checklist.md`, latest findings `doc/review/*-findings.md`.
+Reviews (a gate before a merge or release, a deep review each cycle): `docs/dev/review/README.md`,
+checklist `docs/dev/review/checklist.md`, latest findings `docs/dev/review/*-findings.md`.
 
 CI (`.github/workflows/ci.yml`) runs fmt, clippy and tests on Linux and Windows, `cargo deny`, and a DCO sign-off check on pull requests (`CONTRIBUTING.md`; commit with `git commit -s`); `release.yml`
 builds Linux/Windows archives and publishes a pre-release on a `v*` tag.
 
-`doc/status.md` records the current state, the decisions pending with the owner
+`docs/dev/status.md` records the current state, the decisions pending with the owner
 and the next steps; read it first, and update it (with a dated line at the top of
-`doc/history.md`) when the state changes. `doc/gui-decisions.md` holds the owner's
+`docs/dev/history.md`) when the state changes. `docs/dev/gui-decisions.md` holds the owner's
 GUI decisions: read it before changing the UI, and record new ones there.
-`doc/features.md` describes each built feature and the owner's decisions about it;
-`doc/history.md` is the dated log (read on demand).
+`docs/dev/features.md` describes each built feature and the owner's decisions about it;
+`docs/dev/history.md` is the dated log (read on demand).
+
+## Documentation: the guide and the ledger
+- `docs/user/` (home `docs/index.md`) is the **user guide**: how nerka works
+  now, no dates, owner tags or review IDs. It ships in the release archives
+  and on GitHub Pages (`docs/_config.yml` leaves `docs/dev/` out; Liquid runs
+  on these pages, so wrap a literal `{{` or `{%` in `<!-- {% raw %} -->` …
+  `<!-- {% endraw %} -->`). A user-visible change updates its page in the
+  same change.
+- `docs/dev/` is the **ledger** for working on nerka: status, history,
+  decisions, designs, reviews. **What gets an entry** (owner, 2026-11-11):
+  a decision of the owner's that constrains later work (in the feature's
+  design doc, or `gui-decisions.md`), a state change (a release, a feature
+  built, an open question added or closed: `status.md` plus a dated line in
+  `history.md`) and review findings. Fixes, refactors, tests, docs and small
+  tweaks get none: the commit message is the record. A request that says
+  `no-ledger` gets no entry; `record this` gets one.
+- Keep the ledger current, not cumulative: when a decision is settled or
+  replaced, delete what no longer applies (git keeps it) instead of
+  striking it through or keeping the alternatives.
 
 ## Rules
 - Line numbers are 0-based `LineNo` (u64) internally; add 1 only for display.
@@ -68,7 +87,7 @@ GUI decisions: read it before changing the UI, and record new ones there.
   a UDP port list in `CaptureOptions`; DLT is one of them.
 - Protocol definitions (`input/proto/ksy`): `core/tests/ksy_dlt.rs` checks the
   DLT definition (`examples/protocols/dlt.ksy`) against native DLT; keep it
-  passing, and keep the language subset in `doc/protocol-definitions.md` current.
+  passing, and keep the language subset in `docs/user/protocol-definitions.md` current.
 - Long operations take `&Progress` and check `is_cancelled()` per chunk.
 - Search changes: every engine test runs the fast path against the naive
   per-line path (`run_filter` in `engine/search.rs`). Keep that invariant and
@@ -79,4 +98,4 @@ GUI decisions: read it before changing the UI, and record new ones there.
 - Keep dependencies few and justified in the PR description (spec §3.1).
 - A breaking change to a saved file's format (packs, presets, plots, checks,
   signals) adds a migration step to `bundle::STEPS` and a test on a sample
-  of the old format (`doc/bundles.md`); never change a format silently.
+  of the old format (`docs/dev/bundles.md`); never change a format silently.

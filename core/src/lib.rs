@@ -2,7 +2,7 @@
 //!
 //! The engine is UI-agnostic: the CLI, the desktop UI and (later) a server
 //! all sit on top of the same building blocks (layout follows
-//! `doc/nerka_architecture_implementation_spec_v_0.md` §10):
+//! `docs/dev/nerka_architecture_implementation_spec_v_0.md` §10):
 //!
 //! * [`input`] — [`LogSource`]: random access to rows whatever the on-disk
 //!   format: plain text, text records and JSON, DLT files, and DLT / SOME/IP

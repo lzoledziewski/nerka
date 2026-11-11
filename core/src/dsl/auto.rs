@@ -1,4 +1,4 @@
-//! Auto mode of the search boxes (`doc/search-modes.md`): plain words are
+//! Auto mode of the search boxes (`docs/dev/search-modes.md`): plain words are
 //! an exact phrase, NFD syntax is a query, and they mix. The box is
 //! rewritten into plain NFD (the language itself doesn't change); a box that
 //! isn't a valid query is literal text.

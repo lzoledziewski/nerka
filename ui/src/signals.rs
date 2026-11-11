@@ -1,4 +1,4 @@
-//! The Signals panel: the tab's signals (`doc/sources-and-signals.md` →
+//! The Signals panel: the tab's signals (`docs/dev/sources-and-signals.md` →
 //! "What a signal is"), each with its state on the current line. They come
 //! from the file (`@time`), from the user's saved definitions (edited
 //! here) and from the named groups of the selection's queries (kind and
@@ -7,7 +7,7 @@
 //! capturing and decoding; the panel only edits definitions and shows
 //! values.
 //!
-//! Lifecycles (`doc/lifecycles.md`) are defined here too (a lifecycle is a
+//! Lifecycles (`docs/dev/lifecycles.md`) are defined here too (a lifecycle is a
 //! signal: `@boot`), signals are bound to one (`per`) with a default, and
 //! the lifecycles found are listed under the signals, with their findings.
 
@@ -49,7 +49,7 @@ struct Draft {
     /// The lifecycle it resets with (empty: none) and its default.
     per: String,
     default: String,
-    /// A lifecycle's rules (`doc/lifecycles.md`): its lines, what starts
+    /// A lifecycle's rules (`docs/dev/lifecycles.md`): its lines, what starts
     /// one, how one ends. Queries are NFD or `{pack.query}`.
     life_form: LifeForm,
     error: Option<String>,

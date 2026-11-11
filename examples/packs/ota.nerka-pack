@@ -1,0 +1,6 @@
+# Sample pack for the examples in CLAUDE.md and README.md (`--pack examples/packs/`).
+pack ota
+
+## Over-the-air update messages that name a camera.
+query update(cam)  labels: ota
+    raw ~ /OTA/ AND raw ~ /$cam/

@@ -4,6 +4,8 @@
 # release (a tag with a '-' suffix, like v0.1.0-alpha.1, is a pre-release).
 # Run it by hand (Actions tab, "Run workflow") to only build: the archives
 # are kept as workflow artifacts, nothing is published.
+# Actions are pinned by commit, the release as a comment (review 2026-11-07
+# R16): to update one, `gh api repos/OWNER/ACTION/commits/TAG --jq .sha`.
 name: Release
 
 on:
@@ -32,14 +34,14 @@ jobs:
           - name: windows-x86_64
             os: windows-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
       - name: Linux GUI build dependencies
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
           sudo apt-get install -y pkg-config libxkbcommon-dev libwayland-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libgl1-mesa-dev
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       # --locked: build exactly the dependencies in Cargo.lock.
       - name: Test
         run: cargo test --workspace --release --locked
@@ -53,6 +55,8 @@ jobs:
           mkdir "$dir"
           cp target/release/nerka target/release/nerka-gui README.md LICENSE-MIT LICENSE-APACHE "$dir/"
           cp -r licenses examples "$dir/"
+          # The user guide (docs/user/, its home docs/index.md); not docs/dev/.
+          mkdir "$dir/docs" && cp docs/index.md "$dir/docs/" && cp -r docs/user "$dir/docs/"
           tar czf "$dir.tar.gz" "$dir"
           echo "ASSET=$dir.tar.gz" >> "$GITHUB_ENV"
       - name: Package (Windows)
@@ -64,9 +68,13 @@ jobs:
           New-Item -ItemType Directory $dir | Out-Null
           Copy-Item target/release/nerka.exe, target/release/nerka-gui.exe, README.md, LICENSE-MIT, LICENSE-APACHE $dir
           Copy-Item -Recurse licenses, examples $dir
+          # The user guide (docs/user/, its home docs/index.md); not docs/dev/.
+          New-Item -ItemType Directory "$dir/docs" | Out-Null
+          Copy-Item docs/index.md "$dir/docs"
+          Copy-Item -Recurse docs/user "$dir/docs"
           Compress-Archive -Path $dir -DestinationPath "$dir.zip"
           "ASSET=$dir.zip" | Out-File -FilePath $env:GITHUB_ENV -Append
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: ${{ matrix.name }}
           path: ${{ env.ASSET }}
@@ -80,14 +88,14 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           path: dist
           merge-multiple: true
       # Checksums of the archives, published with them: `sha256sum -c SHA256SUMS`.
       - name: Checksums
         run: cd dist && sha256sum -- * > SHA256SUMS && cat SHA256SUMS
-      - uses: softprops/action-gh-release@v2
+      - uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
         with:
           files: dist/*
           prerelease: ${{ contains(github.ref_name, '-') }}

@@ -1,4 +1,4 @@
-//! Protocols in captures, in the GUI (doc/protocol-definitions.md):
+//! Protocols in captures, in the GUI (docs/dev/protocol-definitions.md):
 //! definitions kept in `<config>/nerka/protocols`; the Settings section that
 //! turns protocols on and off and edits, rule by rule, which UDP datagrams
 //! are theirs; and the protocols of each capture of a tab, in its Files

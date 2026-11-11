@@ -1,6 +1,6 @@
 //! Protocols described in a file: a Kaitai Struct (`.ksy`) structure and a
 //! `-nerka:` section saying what Nerka shows of it. Design, the language
-//! subset and the section: `doc/protocol-definitions.md`.
+//! subset and the section: `docs/user/protocol-definitions.md` (design: `docs/dev/`).
 //!
 //! [`KsyProtocol`] is a [`Protocol`] like the native ones: captures route
 //! UDP ports to it ([`super::LoadedProtocol`]), and its fields, level and
@@ -235,6 +235,24 @@ impl KsyProtocol {
                             err(c.line, c.col, format!("there is no field `{col_name}`; give `from:`"))
                         })?;
                         Cell::Field(id)
+                    } else if !rest.iter().any(|(k, _)| k.text == "from") {
+                        // `decimals` (or `map`, …) without `from`: say what the
+                        // column is (review 2026-11-08 R11: "a value needs from").
+                        let k = &rest[0].0;
+                        let named = schema.iter().any(|f| f.name == col_name.as_str());
+                        return Err(err(
+                            k.line,
+                            k.col,
+                            if named {
+                                format!(
+                                    "column `{col_name}` shows the field `{col_name}` and takes only `width`; \
+                                     `{}` needs a value of its own: give `from:`",
+                                    k.text
+                                )
+                            } else {
+                                format!("column `{col_name}` needs `from:` (no field is named `{col_name}`)")
+                            },
+                        ));
                     } else {
                         let node = Node { value: Value::Map(rest), line: c.line, col: c.col };
                         Cell::Own(spec(&node, &mut bind, &[])?.0)

@@ -1,5 +1,5 @@
 //! Lifecycles: the boots (runs, sessions) of one entity a log is about,
-//! when each starts and how it ends (`doc/lifecycles.md`).
+//! when each starts and how it ends (`docs/dev/lifecycles.md`).
 //!
 //! A [`LifecycleDef`] is about one entity (owner, 2026-11-07: one ECU, one
 //! application, each with rules of its own): **its lines** (a query, e.g.
@@ -100,11 +100,27 @@ impl Rule {
         let Some(inner) = inner.strip_suffix('}') else {
             return Err(DslError { msg: "expected '}' after the library query".into(), pos: lead + t.len() });
         };
+        let body = inner.trim();
+        let body_at = lead + 1 + (inner.len() - inner.trim_start().len());
         // Its name may hold spaces (owner, 2026-11-07: `{Aurix_logs.Fusa
-        // Fault}`): the parameters are the `NAME=VALUE` words after it.
-        let words: Vec<&str> = inner.split_whitespace().collect();
-        let first_param = words.iter().position(|w| w.contains('=')).unwrap_or(words.len());
-        let id = words[..first_param].join(" ");
+        // Fault}`), kept as written (two spaces too): it runs up to the
+        // first `NAME=VALUE` word. A name holding such a word, or `{` `}`,
+        // is quoted: `{"pack.a=b" x=1}`.
+        let (id, rest, rest_at) = if let Some(q) = body.strip_prefix('"') {
+            let Some(end) = q.find('"') else {
+                return Err(DslError { msg: "expected '\"' after the query's name".into(), pos: body_at });
+            };
+            (q[..end].to_owned(), &q[end + 1..], body_at + end + 2)
+        } else {
+            let mut cut = body.len();
+            for (at, w) in words_at(body) {
+                if is_param(w) {
+                    cut = at;
+                    break;
+                }
+            }
+            (body[..cut].trim_end().to_owned(), &body[cut..], body_at + cut)
+        };
         if !id.contains('.') {
             return Err(DslError {
                 msg: format!("expected a library query (pack.query) but found '{id}'"),
@@ -112,12 +128,9 @@ impl Rule {
             });
         }
         let mut params = Vec::new();
-        for &w in &words[first_param..] {
-            let Some((k, v)) = w.split_once('=') else {
-                return Err(DslError {
-                    msg: format!("expected NAME=VALUE but found '{w}'"),
-                    pos: lead + 1 + inner.find(w).unwrap_or(0),
-                });
+        for (at, w) in words_at(rest) {
+            let Some((k, v)) = w.split_once('=').filter(|_| is_param(w)) else {
+                return Err(DslError { msg: format!("expected NAME=VALUE but found '{w}'"), pos: rest_at + at });
             };
             params.push((k.to_owned(), v.to_owned()));
         }
@@ -134,7 +147,13 @@ impl Rule {
         match self {
             Rule::Nfd(q) => q.source().to_owned(),
             Rule::Library { id, params, .. } => {
-                let mut s = format!("{{{id}");
+                // Quoted where it wouldn't read back as written.
+                let plain = !id.is_empty()
+                    && id.trim() == id
+                    && !id.starts_with('"')
+                    && !id.contains(['{', '}'])
+                    && !words_at(id).any(|(_, w)| is_param(w));
+                let mut s = if plain { format!("{{{id}") } else { format!("{{\"{id}\"") };
                 for (k, v) in params {
                     s += &format!(" {k}={v}");
                 }
@@ -169,6 +188,53 @@ impl Rule {
         let q = Query::compile(&e.nfd).map_err(|e| format!("{id}: {}", e.msg))?;
         Ok(Rule::Library { id: id.clone(), params: params.clone(), query: Some(q) })
     }
+}
+
+/// A spec's clauses: its text split at each `;` that isn't inside a library
+/// query `{…}`, a string `"…"` or a regex `/…/` (a `;` in a regex or in a
+/// query's name cut the clause; checks use it too).
+pub(crate) fn clauses(text: &str) -> Vec<&str> {
+    let (mut out, mut start, mut braces) = (Vec::new(), 0, 0usize);
+    let (mut quote, mut escaped, mut prev) = (None::<char>, false, ' ');
+    for (i, c) in text.char_indices() {
+        let before = std::mem::replace(&mut prev, c);
+        if let Some(q) = quote {
+            if escaped {
+                escaped = false;
+            } else if c == '\\' {
+                escaped = true;
+            } else if c == q {
+                quote = None;
+            }
+            continue;
+        }
+        match c {
+            '"' => quote = Some('"'),
+            // A regex starts where a value does: a `/` inside `{…}` is a
+            // parameter's value (`path=/a/b`), one after a word a label's
+            // level (`labels system/vision`).
+            '/' if braces == 0 && (before.is_whitespace() || "(~!=&|<>".contains(before)) => quote = Some('/'),
+            '{' => braces += 1,
+            '}' => braces = braces.saturating_sub(1),
+            ';' if braces == 0 => {
+                out.push(&text[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    out.push(&text[start..]);
+    out
+}
+
+/// The words of `text` with their byte offsets.
+fn words_at(text: &str) -> impl Iterator<Item = (usize, &str)> {
+    text.split_whitespace().map(move |w| (w.as_ptr() as usize - text.as_ptr() as usize, w))
+}
+
+/// A library query's parameter: `NAME=VALUE`, NAME a pack parameter name.
+fn is_param(word: &str) -> bool {
+    word.split_once('=').is_some_and(|(k, _)| crate::pack::is_name(k))
 }
 
 #[derive(Debug, Clone)]
@@ -404,7 +470,7 @@ impl LifecycleDef {
         let lead = spec.len() - spec.trim_start().len();
         let mut def = LifecycleDef::new(&spec[..colon]).map_err(|m| err(m, lead))?;
         let mut at = colon + 1;
-        for clause in spec[colon + 1..].split(';') {
+        for clause in clauses(&spec[colon + 1..]) {
             let start = at + clause.len() - clause.trim_start().len();
             at += clause.len() + 1;
             let c = clause.trim();
