@@ -1,6 +1,6 @@
 //! Protocols described in a file: a Kaitai Struct (`.ksy`) structure and a
 //! `-nerka:` section saying what Nerka shows of it. Design, the language
-//! subset and the section: `doc/protocol-definitions.md`.
+//! subset and the section: `docs/dev/protocol-definitions.md`.
 //!
 //! [`KsyProtocol`] is a [`Protocol`] like the native ones: captures route
 //! UDP ports to it ([`super::LoadedProtocol`]), and its fields, level and

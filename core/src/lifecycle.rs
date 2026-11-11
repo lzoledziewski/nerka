@@ -1,5 +1,5 @@
 //! Lifecycles: the boots (runs, sessions) of one entity a log is about,
-//! when each starts and how it ends (`doc/lifecycles.md`).
+//! when each starts and how it ends (`docs/dev/lifecycles.md`).
 //!
 //! A [`LifecycleDef`] is about one entity (owner, 2026-11-07: one ECU, one
 //! application, each with rules of its own): **its lines** (a query, e.g.

@@ -176,7 +176,7 @@ nerka/
                                       plots, checks, protocols, bundles, instances, config sync)
   examples/             protocols/ (.ksy definitions: dlt, sensor), packs/ (sample packs for the docs)
   tools/                screenshot.ps1 (GUI screenshot, Windows), review-gate.sh, bench.sh
-  doc/                  spec, this analysis, status / features / GUI decisions / history, designs, review/
+  docs/dev/                  spec, this analysis, status / features / GUI decisions / history, designs, review/
   .github/workflows/    ci.yml: fmt, clippy -D warnings, tests on Linux + Windows, cargo deny, DCO;
                         release.yml: Linux + Windows archives, pre-release on a v* tag (actions pinned by commit)
 ```

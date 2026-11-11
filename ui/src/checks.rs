@@ -1,4 +1,4 @@
-//! The Checks pane (`doc/checks.md`): the user's checks grouped by label,
+//! The Checks pane (`docs/dev/checks.md`): the user's checks grouped by label,
 //! their results on the tab's file (overall and per lifecycle) and the
 //! evidence, and a form to define one. Core runs them
 //! ([`nerka_core::check`]); the pane shows results and edits definitions

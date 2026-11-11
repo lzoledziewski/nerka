@@ -5,7 +5,7 @@
 //! same lines for `proto == DLT` and `proto == DLTK`.
 //!
 //! A test of the protocol definitions, not a feature: it uses the public
-//! API only (doc/protocol-definitions.md).
+//! API only (docs/dev/protocol-definitions.md).
 
 use nerka_core::input::capture::route::Match;
 use nerka_core::input::capture::{self, CaptureOptions};

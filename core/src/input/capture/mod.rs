@@ -1,6 +1,6 @@
 //! DLT inside captures: pcap / pcapng network captures and MF4 bus logs.
 //!
-//! The layers of `doc/sources-and-signals.md`: a **container** turns the file
+//! The layers of `docs/dev/sources-and-signals.md`: a **container** turns the file
 //! into frames ([`pcap`], [`mf4`]), the **transport** turns frames into UDP
 //! payloads ([`net`]: VLAN, IPv4 / IPv6 with reassembly), a **router**
 //! picks each payload's protocol by rules over its ports, addresses and

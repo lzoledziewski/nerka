@@ -11,7 +11,7 @@ problems, and plot the values your logs carry. Everything runs on your
 machine: a desktop viewer (`nerka-gui`) and a command-line tool (`nerka`) on
 one UI-free engine (`nerka-core`).
 
-![nerka on a synthetic DLT drive: warnings filtered from a query pack, speed, temperature and battery voltage plotted with a throttling threshold, a text search (regex, ignoring case) for throttling messages in the bottom pane, and the library and selection panes on the right](doc/img/nerka.png)
+![nerka on a synthetic DLT drive: warnings filtered from a query pack, speed, temperature and battery voltage plotted with a throttling threshold, a text search (regex, ignoring case) for throttling messages in the bottom pane, and the library and selection panes on the right](docs/user/img/nerka.png)
 
 > Status: **0.2.0-alpha.4**. Windows is the main platform;
 > Linux builds come from CI; macOS isn't built yet. While nerka is at 0.x,
@@ -74,7 +74,7 @@ own kind.
 
 ### Your own protocols
 
-![a capture holding DLT and a custom SENSOR protocol, filtered by level, "fan on" found in the sensor notes, and Settings showing the SENSOR protocol's rule](doc/img/protocols.png)
+![a capture holding DLT and a custom SENSOR protocol, filtered by level, "fan on" found in the sensor notes, and Settings showing the SENSOR protocol's rule](docs/user/img/protocols.png)
 
 A protocol inside captures can be described in a `.ksy` file:
 [Kaitai Struct](https://kaitai.io), plus a `-nerka:` section that says
@@ -110,16 +110,16 @@ nerka --route 'DLT:port=3490,vlan=5' --disable-protocol syslog filter 'level >= 
 [`examples/protocols/dlt.ksy`](examples/protocols/dlt.ksy) describes all of
 DLT, payloads included. It gives the same results as the built-in reader,
 and a test checks that. Language and rules:
-[doc/protocol-definitions.md](doc/protocol-definitions.md).
+[docs/dev/protocol-definitions.md](docs/dev/protocol-definitions.md).
 
 ### Lifecycles and checks
 
-![a DLT trace of a drive: ECU1's three boots listed with their outcomes (planned, crash, open) and what checks found in each; the Checks pane with issues and facts, the crash's evidence; speed, temperature and an OTA state plotted with the boots' boundaries](doc/img/lifecycles-checks.png)
+![a DLT trace of a drive: ECU1's three boots listed with their outcomes (planned, crash, open) and what checks found in each; the Checks pane with issues and facts, the crash's evidence; speed, temperature and an OTA state plotted with the boots' boundaries](docs/user/img/lifecycles-checks.png)
 
 A trace of several devices holds many boots. A **lifecycle** says which
 lines belong to one device and what starts and ends its boots. Each boot
 then becomes its own span, with an outcome (planned, crash, lost), and
-signals can reset with it ([doc/lifecycles.md](doc/lifecycles.md)).
+signals can reset with it ([docs/dev/lifecycles.md](docs/dev/lifecycles.md)).
 
 **Checks** are known problems written as small rules:
 - a line that shows up, or a count;
@@ -130,7 +130,7 @@ signals can reset with it ([doc/lifecycles.md](doc/lifecycles.md)).
 A check runs over the whole trace or per lifecycle. Its results are issues
 or facts with their evidence lines, shown in a pane of their own, next to
 each boot and on the command line. A check can feed another
-([doc/checks.md](doc/checks.md)).
+([docs/dev/checks.md](docs/dev/checks.md)).
 
 ```
 nerka --lifecycle 'ecu1: lines ecu == ECU1; reset uptime; planned payload ~ /shutdown/' lifecycles trace.dlt
@@ -166,7 +166,7 @@ nerka-gui app.log --signal 't:time=/^(?<t>\S+ \S+)/' --signal 'lat=/latency_us=(
 - **Settings bundles:** packs, presets, plots, checks and signals travel as
   one readable `.nerka-bundle` file. An import shows a preview of what it
   would change, and later versions of nerka upgrade what earlier ones wrote
-  ([doc/bundles.md](doc/bundles.md)).
+  ([docs/dev/bundles.md](docs/dev/bundles.md)).
 - **Tabs and windows:** there is one tab per file or set of files. A file
   opened from the shell goes to the nerka window focused last, and windows
   can be named.
@@ -249,19 +249,19 @@ nerka --local-time lines trace.dlt 1 20                  # local time (CLI: UTC 
 
 ## Documentation
 
-- [doc/status.md](doc/status.md): current state, pending decisions and next steps.
-- [doc/gui-decisions.md](doc/gui-decisions.md): the owner's decisions about the GUI.
-- [doc/features.md](doc/features.md): built features and the decisions about them.
-- [doc/history.md](doc/history.md): the dated log.
-- [doc/architecture-analysis.md](doc/architecture-analysis.md): architecture, decisions and deviations from the
-  [original spec](doc/nerka_architecture_implementation_spec_v_0.md).
-- [doc/search-manager.md](doc/search-manager.md): query packs, expansion, library and selection.
-- [doc/search-modes.md](doc/search-modes.md): Auto, Text and NFD modes.
-- [doc/sources-and-signals.md](doc/sources-and-signals.md): input formats and signals.
-- [doc/protocol-definitions.md](doc/protocol-definitions.md): protocols described in `.ksy` files, matching rules.
-- [doc/lifecycles.md](doc/lifecycles.md) and [doc/checks.md](doc/checks.md): boots per device, and checks over them.
-- [doc/bundles.md](doc/bundles.md): settings bundles (export, import) and how formats are upgraded.
-- [doc/text-profiles.md](doc/text-profiles.md): text profiles (records, level, time per kind of file) and adjusting a file's time: a design, not built yet.
+- [docs/dev/status.md](docs/dev/status.md): current state, pending decisions and next steps.
+- [docs/dev/gui-decisions.md](docs/dev/gui-decisions.md): the owner's decisions about the GUI.
+- [docs/dev/features.md](docs/dev/features.md): built features and the decisions about them.
+- [docs/dev/history.md](docs/dev/history.md): the dated log.
+- [docs/dev/architecture-analysis.md](docs/dev/architecture-analysis.md): architecture, decisions and deviations from the
+  [original spec](docs/dev/nerka_architecture_implementation_spec_v_0.md).
+- [docs/dev/search-manager.md](docs/dev/search-manager.md): query packs, expansion, library and selection.
+- [docs/dev/search-modes.md](docs/dev/search-modes.md): Auto, Text and NFD modes.
+- [docs/dev/sources-and-signals.md](docs/dev/sources-and-signals.md): input formats and signals.
+- [docs/dev/protocol-definitions.md](docs/dev/protocol-definitions.md): protocols described in `.ksy` files, matching rules.
+- [docs/dev/lifecycles.md](docs/dev/lifecycles.md) and [docs/dev/checks.md](docs/dev/checks.md): boots per device, and checks over them.
+- [docs/dev/bundles.md](docs/dev/bundles.md): settings bundles (export, import) and how formats are upgraded.
+- [docs/dev/text-profiles.md](docs/dev/text-profiles.md): text profiles (records, level, time per kind of file) and adjusting a file's time: a design, not built yet.
 - [CLAUDE.md](CLAUDE.md): guide for contributors and AI agents (commands, rules).
 
 ## Contributing

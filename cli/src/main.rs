@@ -55,7 +55,7 @@ struct Cli {
     syslog_port: Vec<u16>,
     /// A protocol definition (`.ksy`: a Kaitai Struct structure with a
     /// `-nerka:` section; repeatable) for messages in captures; give it
-    /// ports with --protocol-port. See doc/protocol-definitions.md.
+    /// ports with --protocol-port. See docs/dev/protocol-definitions.md.
     #[arg(long, global = true, value_name = "FILE")]
     protocol: Vec<PathBuf>,
     /// UDP destination port of a protocol, by its name (repeatable):

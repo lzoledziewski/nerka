@@ -4,13 +4,13 @@ Snapshot of where the project stands. Update this file whenever the state change
 
 Kept short, so that it reads in one go (review 2026-11-09, R4: the read stopped before "Decisions pending"). When the state changes, update it here and add a dated line at the top of `history.md`.
 
-_Last update: 2026-11-11 (0.2.0-alpha.4, a pre-release; text profiles designed with the owner, not built: `text-profiles.md`; the 1 GiB benchmark of 0.2.0-alpha.3; review findings fixed on `claude/fixes-2026-11-11`: R15, 11-07 R8, R16, R17, R18, R19, 11-08 R5, R11). Before: 2026-11-10 (0.2.0-alpha.3: review 2026-11-09's fixes; `doc/review/2026-11-09-findings.md`)._
+_Last update: 2026-11-11 (0.2.0-alpha.4, a pre-release; text profiles designed with the owner, not built: `text-profiles.md`; the 1 GiB benchmark of 0.2.0-alpha.3; review findings fixed on `claude/fixes-2026-11-11`: R15, 11-07 R8, R16, R17, R18, R19, 11-08 R5, R11). Before: 2026-11-10 (0.2.0-alpha.3: review 2026-11-09's fixes; `docs/dev/review/2026-11-09-findings.md`)._
 
 **Where the rest is:**
-- `doc/gui-decisions.md`: the owner's GUI decisions ("GUI as of now"), deliberate choices to keep. **Read it before changing the UI.**
-- `doc/features.md`: each built feature as it stands, with the owner's decisions about it (DLT and captures, signals, FIBEX, protocol definitions, search manager).
-- `doc/history.md`: the dated log of updates and the earlier "Next steps", newest first, append-only.
-- Design: `sources-and-signals.md`, `search-manager.md`, `lifecycles.md`, `checks.md`, `protocol-definitions.md`, `bundles.md`, `text-profiles.md` (not built); reviews: `doc/review/`.
+- `docs/dev/gui-decisions.md`: the owner's GUI decisions ("GUI as of now"), deliberate choices to keep. **Read it before changing the UI.**
+- `docs/dev/features.md`: each built feature as it stands, with the owner's decisions about it (DLT and captures, signals, FIBEX, protocol definitions, search manager).
+- `docs/dev/history.md`: the dated log of updates and the earlier "Next steps", newest first, append-only.
+- Design: `sources-and-signals.md`, `search-manager.md`, `lifecycles.md`, `checks.md`, `protocol-definitions.md`, `bundles.md`, `text-profiles.md` (not built); reviews: `docs/dev/review/`.
 
 ## Decisions pending with the owner
 
@@ -36,7 +36,7 @@ Don't settle these silently: ask.
 
 ## Next steps
 
-The open work, in no fixed order; what was done before is in `history.md`, the open review findings in `doc/review/2026-11-09-findings.md`.
+The open work, in no fixed order; what was done before is in `history.md`, the open review findings in `docs/dev/review/2026-11-09-findings.md`.
 
 - **Benchmark:** 0.2.0-alpha.3 measured on 2026-11-11 (every query within 15 % of 2026-11-09, the same counts; `history.md`). The mixed-view cases are measured by hand and not yet in `tools/bench.sh`.
 - **Decisions pending** above: 2 (text profiles, `text-profiles.md`'s open questions), 8, 10.

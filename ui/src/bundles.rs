@@ -1,4 +1,4 @@
-//! Settings bundles in the GUI (owner, 2026-11-07; `doc/bundles.md`):
+//! Settings bundles in the GUI (owner, 2026-11-07; `docs/dev/bundles.md`):
 //! ⚙ Settings → Settings bundle → Export… lists the analysis setup of the
 //! config folder with a checkbox each, then saves the ticked ones; Import…
 //! reads a bundle and shows the plan, a row per item with its status and a

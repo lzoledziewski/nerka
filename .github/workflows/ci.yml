@@ -1,6 +1,6 @@
 # Checks on every push to main and every pull request: format, clippy,
 # tests, dependency licences / advisories (cargo deny), DCO sign-offs.
-# Builds and tests on Linux and Windows; macOS isn't built yet (doc/status.md,
+# Builds and tests on Linux and Windows; macOS isn't built yet (docs/dev/status.md,
 # "CI and releases").
 # Actions are pinned by commit, the release as a comment (review 2026-11-07
 # R16): to update one, `gh api repos/OWNER/ACTION/commits/TAG --jq .sha`.
@@ -61,7 +61,7 @@ jobs:
 
   # Every commit of a pull request carries a DCO sign-off by its author
   # (CONTRIBUTING.md). The maintainer's own commits are exempt: they hold
-  # the copyright (doc/status.md, "Licensing").
+  # the copyright (docs/dev/status.md, "Licensing").
   dco:
     name: DCO sign-off
     if: github.event_name == 'pull_request'

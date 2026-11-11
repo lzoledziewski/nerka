@@ -257,7 +257,7 @@ pub struct Highlight<'a> {
     /// Where the bookmarks' notes show.
     pub notes: NoteMode,
     /// Where lifecycles start (file lines, ascending): a line above the row,
-    /// labelled, red after one that ended badly (`doc/lifecycles.md`).
+    /// labelled, red after one that ended badly (`docs/dev/lifecycles.md`).
     pub lifecycles: Option<&'a [Boundary]>,
 }
 

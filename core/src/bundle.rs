@@ -1,7 +1,7 @@
 //! Settings bundles: the user's analysis setup (packs, presets, plots,
 //! checks, signals) as one text file to export, share and import, and the
 //! format numbers and migration steps that let a later nerka read what an
-//! earlier one wrote. Design: `doc/bundles.md`.
+//! earlier one wrote. Design: `docs/dev/bundles.md`.
 //!
 //! File format (`*.nerka-bundle`, UTF-8):
 //!
@@ -490,7 +490,7 @@ impl Store {
 
     fn write_formats(&self, formats: &BTreeMap<Kind, u32>) -> Result<(), String> {
         let mut text =
-            String::from("# The formats of nerka's files in this folder (doc/bundles.md); nerka keeps it.\n");
+            String::from("# The formats of nerka's files in this folder (docs/dev/bundles.md); nerka keeps it.\n");
         for (k, n) in formats {
             text += &format!("{k} {n}\n");
         }

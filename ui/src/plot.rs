@@ -1,5 +1,5 @@
 //! The signal plot: one lane per plotted signal on the tab's time axis
-//! (`doc/sources-and-signals.md` → "What a signal is"). A number is drawn
+//! (`docs/dev/sources-and-signals.md` → "What a signal is"). A number is drawn
 //! as its state, a step line; an enum as coloured bands. Each lane can show
 //! its events (when the value was received). The cursor is the current
 //! line. Wheel zooms, drag pans, double-click shows everything, a click

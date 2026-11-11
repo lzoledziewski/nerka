@@ -11,7 +11,7 @@
 - [ ] Query language changes: grammar comment in `core/src/dsl/mod.rs` and parser tests (with error positions)
 - [ ] Performance-sensitive changes: before / after `--stats` numbers on a 1 GiB file below
 - [ ] New dependencies: justified below (what, why not our own code, licence)
-- [ ] Docs in `doc/` and `README.md` updated where behaviour changed
+- [ ] Docs in `docs/dev/` and `README.md` updated where behaviour changed
 - [ ] No real logs or captures added (test data is synthetic)
 
 ## Numbers / dependencies

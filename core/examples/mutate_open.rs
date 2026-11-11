@@ -5,7 +5,7 @@
 //!     cargo run --release -p nerka-core --example mutate_open -- SEEDS_DIR [ROUNDS] [SEED]
 //!
 //! SEEDS_DIR holds any files nerka opens (`.dlt`, `.pcap`, `.pcapng`, `.mf4`,
-//! `.log`, `.json`); `doc/review/README.md` says how to make them. Each round
+//! `.log`, `.json`); `docs/dev/review/README.md` says how to make them. Each round
 //! picks a seed and one mutation (flip bytes, overwrite with 0x00 / 0xff,
 //! truncate, duplicate a slice, splice two seeds) and opens the result with
 //! the default options. Failing inputs are kept as `SEEDS_DIR/crash-*.bin`

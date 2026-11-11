@@ -2,7 +2,7 @@
 # extended headers and the payload (verbose arguments, control messages,
 # non-verbose ids; no FIBEX). An example of a full definition, and a test:
 # core/tests/ksy_dlt.rs compares it with nerka's native DLT reader, and
-# tools/bench.sh (KSY=1) benchmarks the two (doc/protocol-definitions.md).
+# tools/bench.sh (KSY=1) benchmarks the two (docs/dev/protocol-definitions.md).
 # Messages start at their standard header (DLT over UDP has no storage
 # header). Its name is DLTK, so it can run next to native DLT:
 #

@@ -1,6 +1,6 @@
 //! Time a protocol definition against native DLT, per message and on one
 //! thread: each field, the whole line, splitting; and the allocations of
-//! each. For work on the definition reader (doc/protocol-definitions.md).
+//! each. For work on the definition reader (docs/dev/protocol-definitions.md).
 //!
 //!     cargo run --release -p nerka-core --example ksy_cells -- trace.dlt examples/protocols/dlt.ksy
 use nerka_core::input::proto::ksy::KsyProtocol;

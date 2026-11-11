@@ -22,7 +22,7 @@
 //! searches in `<config dir>/nerka/search-history`; the 🕘 button next to
 //! each box lists them, and ↑ / ↓ in the box steps through them.
 //!
-//! Search manager (`doc/search-manager.md`): the Library pane lists the
+//! Search manager (`docs/dev/search-manager.md`): the Library pane lists the
 //! queries of the packs in `<config dir>/nerka/packs` (and `--pack`); the
 //! Selection pane holds the ones in use, in order, editable. Apply expands
 //! them (in core) into plain NFD in the Filter and Search boxes. The
@@ -395,7 +395,7 @@ fn wgpu_options() -> eframe::WgpuConfiguration {
     options
 }
 
-/// How a Filter or Search box reads its text (`doc/search-modes.md`).
+/// How a Filter or Search box reads its text (`docs/dev/search-modes.md`).
 #[derive(Debug, Default, PartialEq, Clone, Copy)]
 enum Mode {
     /// Plain words are an exact phrase, NFD syntax a query, mixed; a box

@@ -9,7 +9,7 @@
 //! `--copy` each datagram goes to every port (the file grows that many
 //! times): the same messages for two readers in one capture, e.g. native
 //! DLT on one port and a protocol definition on the other
-//! (doc/protocol-definitions.md).
+//! (docs/dev/protocol-definitions.md).
 
 use std::io::{BufWriter, Write};
 
