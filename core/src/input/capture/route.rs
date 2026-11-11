@@ -1,5 +1,5 @@
 //! Which protocol a UDP datagram is: rules over its ports, addresses and
-//! VLAN tags (docs/dev/protocol-definitions.md → "Matching").
+//! VLAN tags (docs/user/protocol-definitions.md → "Matching").
 //!
 //! A rule names only what it cares about; the rest matches anything.
 //! Written as text (CLI, settings): `3490`, `30000-30100`, or

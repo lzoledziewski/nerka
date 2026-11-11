@@ -7,6 +7,7 @@ Kept short, so that it reads in one go (review 2026-11-09, R4: the read stopped 
 _Last update: 2026-11-11 (0.2.0-alpha.4, a pre-release; text profiles designed with the owner, not built: `text-profiles.md`; the 1 GiB benchmark of 0.2.0-alpha.3; review findings fixed on `claude/fixes-2026-11-11`: R15, 11-07 R8, R16, R17, R18, R19, 11-08 R5, R11)._
 
 **Where the rest is:**
+- `docs/user/` (home `docs/index.md`): the user guide, shipped and on GitHub Pages; this folder (`docs/dev/`) is the ledger. What goes where: CLAUDE.md → "Documentation".
 - `docs/dev/gui-decisions.md`: the owner's GUI decisions ("GUI as of now"), deliberate choices to keep. **Read it before changing the UI.**
 - `docs/dev/features.md`: each built feature as it stands, with the owner's decisions about it (DLT and captures, signals, FIBEX, protocol definitions, search manager).
 - `docs/dev/history.md`: the dated log of updates and the earlier "Next steps", newest first, append-only.

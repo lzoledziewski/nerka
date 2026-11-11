@@ -55,6 +55,8 @@ jobs:
           mkdir "$dir"
           cp target/release/nerka target/release/nerka-gui README.md LICENSE-MIT LICENSE-APACHE "$dir/"
           cp -r licenses examples "$dir/"
+          # The user guide (docs/user/, its home docs/index.md); not docs/dev/.
+          mkdir "$dir/docs" && cp docs/index.md "$dir/docs/" && cp -r docs/user "$dir/docs/"
           tar czf "$dir.tar.gz" "$dir"
           echo "ASSET=$dir.tar.gz" >> "$GITHUB_ENV"
       - name: Package (Windows)
@@ -66,6 +68,10 @@ jobs:
           New-Item -ItemType Directory $dir | Out-Null
           Copy-Item target/release/nerka.exe, target/release/nerka-gui.exe, README.md, LICENSE-MIT, LICENSE-APACHE $dir
           Copy-Item -Recurse licenses, examples $dir
+          # The user guide (docs/user/, its home docs/index.md); not docs/dev/.
+          New-Item -ItemType Directory "$dir/docs" | Out-Null
+          Copy-Item docs/index.md "$dir/docs"
+          Copy-Item -Recurse docs/user "$dir/docs"
           Compress-Archive -Path $dir -DestinationPath "$dir.zip"
           "ASSET=$dir.zip" | Out-File -FilePath $env:GITHUB_ENV -Append
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2

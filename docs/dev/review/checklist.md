@@ -122,4 +122,5 @@ regression over 15 %; **S3** debt that makes the next change harder;
 | DOC-1 🤖 | `CLAUDE.md` names only paths that exist | the script |
 | DOC-2 🤖 | `status.md` has a current date and its "Next steps" match the open work | read it |
 | DOC-3 | Module docs (`//!`) match what the module does now | read the changed modules |
-| DOC-4 | A user-visible change is in README or `docs/dev/` | diff |
+| DOC-4 | A user-visible change is in README or the user guide (`docs/user/`); the ledger (`docs/dev/`) only gets decisions and state (CLAUDE.md) | diff |
+| DOC-5 🤖 | The user guide builds on GitHub Pages: no Liquid `{{` / `{%` outside a raw block | `tools/review-gate.sh` |

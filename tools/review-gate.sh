@@ -141,7 +141,7 @@ req=$(wc -c < CLAUDE.md); for f in docs/dev/nerka_architecture_implementation_sp
 tok=$((req * 10 / 33))
 if [ $tok -gt 25000 ]; then warn DOC-2 "required reading is ~${tok} tokens (budget 25000): split status.md"; else pass DOC-2 "required reading ~${tok} tokens"; fi
 # DOC-3: very long lines make docs hard to diff and to edit by exact match.
-long=$(awk 'length($0) > 1500 { n++ } END { print n + 0 }' docs/dev/*.md)
+long=$(awk 'length($0) > 1500 { n++ } END { print n + 0 }' docs/dev/*.md docs/user/*.md docs/index.md)
 [ "$long" -gt 0 ] && warn DOC-3 "$long doc lines over 1500 characters" || pass DOC-3 "no doc line over 1500 characters"
 # AIX-8: each doc an agent reads fits one read (~4 bytes a token; 20k tokens).
 for f in docs/dev/status.md docs/dev/gui-decisions.md docs/dev/features.md docs/dev/history.md; do
@@ -149,6 +149,11 @@ for f in docs/dev/status.md docs/dev/gui-decisions.md docs/dev/features.md docs/
   t=$(( $(wc -c < "$f") / 4 ))
   if [ $t -gt 20000 ]; then warn AIX-8 "$f is ~${t} tokens: more than one read"; else pass AIX-8 "$f ~${t} tokens"; fi
 done
+# DOC-5: the user guide builds on GitHub Pages: Jekyll's Liquid reads `{{` and
+# `{%` outside a raw block as template code.
+liq=$(awk '/\{% raw %\}/ { r = 1 } /\{% endraw %\}/ { r = 0; next } !r && /\{\{|\{%/ { print FILENAME ":" FNR }' docs/index.md docs/user/*.md | tr '
+' ' ')
+[ -n "$liq" ] && warn DOC-5 "Liquid markup outside a raw block (wrap it, CLAUDE.md): $liq" || pass DOC-5 "user guide has no stray Liquid markup"
 # DOC-4: status.md is dated.
 d=$(sed -nE 's/^_Last update: ([0-9-]{10}).*/\1/p' docs/dev/status.md)
 pass DOC-4 "status.md last update: ${d:-none}"

@@ -110,7 +110,7 @@ nerka --route 'DLT:port=3490,vlan=5' --disable-protocol syslog filter 'level >= 
 [`examples/protocols/dlt.ksy`](examples/protocols/dlt.ksy) describes all of
 DLT, payloads included. It gives the same results as the built-in reader,
 and a test checks that. Language and rules:
-[docs/dev/protocol-definitions.md](docs/dev/protocol-definitions.md).
+[docs/user/protocol-definitions.md](docs/user/protocol-definitions.md).
 
 ### Lifecycles and checks
 
@@ -166,7 +166,7 @@ nerka-gui app.log --signal 't:time=/^(?<t>\S+ \S+)/' --signal 'lat=/latency_us=(
 - **Settings bundles:** packs, presets, plots, checks and signals travel as
   one readable `.nerka-bundle` file. An import shows a preview of what it
   would change, and later versions of nerka upgrade what earlier ones wrote
-  ([docs/dev/bundles.md](docs/dev/bundles.md)).
+  ([docs/user/bundles.md](docs/user/bundles.md)).
 - **Tabs and windows:** there is one tab per file or set of files. A file
   opened from the shell goes to the nerka window focused last, and windows
   can be named.
@@ -249,20 +249,19 @@ nerka --local-time lines trace.dlt 1 20                  # local time (CLI: UTC 
 
 ## Documentation
 
-- [docs/dev/status.md](docs/dev/status.md): current state, pending decisions and next steps.
-- [docs/dev/gui-decisions.md](docs/dev/gui-decisions.md): the owner's decisions about the GUI.
-- [docs/dev/features.md](docs/dev/features.md): built features and the decisions about them.
-- [docs/dev/history.md](docs/dev/history.md): the dated log.
-- [docs/dev/architecture-analysis.md](docs/dev/architecture-analysis.md): architecture, decisions and deviations from the
-  [original spec](docs/dev/nerka_architecture_implementation_spec_v_0.md).
-- [docs/dev/search-manager.md](docs/dev/search-manager.md): query packs, expansion, library and selection.
-- [docs/dev/search-modes.md](docs/dev/search-modes.md): Auto, Text and NFD modes.
-- [docs/dev/sources-and-signals.md](docs/dev/sources-and-signals.md): input formats and signals.
-- [docs/dev/protocol-definitions.md](docs/dev/protocol-definitions.md): protocols described in `.ksy` files, matching rules.
-- [docs/dev/lifecycles.md](docs/dev/lifecycles.md) and [docs/dev/checks.md](docs/dev/checks.md): boots per device, and checks over them.
-- [docs/dev/bundles.md](docs/dev/bundles.md): settings bundles (export, import) and how formats are upgraded.
-- [docs/dev/text-profiles.md](docs/dev/text-profiles.md): text profiles (records, level, time per kind of file) and adjusting a file's time: a design, not built yet.
+**User guide:** [docs/index.md](docs/index.md): getting started, the
+desktop viewer, the command line, the query language, formats, query packs,
+signals and plots, lifecycles, checks, protocol definitions, settings
+bundles. It ships in the release archives (`docs/`).
+
+**For contributors** (the project's working notes, in `docs/dev/`):
+
 - [CLAUDE.md](CLAUDE.md): guide for contributors and AI agents (commands, rules).
+- [docs/dev/status.md](docs/dev/status.md): current state, pending decisions and next steps.
+- [docs/dev/gui-decisions.md](docs/dev/gui-decisions.md) and [docs/dev/features.md](docs/dev/features.md): the decisions behind the GUI and the features.
+- [docs/dev/architecture-analysis.md](docs/dev/architecture-analysis.md): architecture and the [original spec](docs/dev/nerka_architecture_implementation_spec_v_0.md).
+- Designs: [search manager](docs/dev/search-manager.md), [search modes](docs/dev/search-modes.md), [sources and signals](docs/dev/sources-and-signals.md), [protocol definitions](docs/dev/protocol-definitions.md), [lifecycles](docs/dev/lifecycles.md), [checks](docs/dev/checks.md), [bundles](docs/dev/bundles.md), [text profiles](docs/dev/text-profiles.md) (not built).
+- [docs/dev/history.md](docs/dev/history.md): the dated log; reviews in [docs/dev/review/](docs/dev/review/).
 
 ## Contributing
 

@@ -60,6 +60,25 @@ GUI decisions: read it before changing the UI, and record new ones there.
 `docs/dev/features.md` describes each built feature and the owner's decisions about it;
 `docs/dev/history.md` is the dated log (read on demand).
 
+## Documentation: the guide and the ledger
+- `docs/user/` (home `docs/index.md`) is the **user guide**: how nerka works
+  now, no dates, owner tags or review IDs. It ships in the release archives
+  and on GitHub Pages (`docs/_config.yml` leaves `docs/dev/` out; Liquid runs
+  on these pages, so wrap a literal `{{` or `{%` in `<!-- {% raw %} -->` …
+  `<!-- {% endraw %} -->`). A user-visible change updates its page in the
+  same change.
+- `docs/dev/` is the **ledger** for working on nerka: status, history,
+  decisions, designs, reviews. **What gets an entry** (owner, 2026-11-11):
+  a decision of the owner's that constrains later work (in the feature's
+  design doc, or `gui-decisions.md`), a state change (a release, a feature
+  built, an open question added or closed: `status.md` plus a dated line in
+  `history.md`) and review findings. Fixes, refactors, tests, docs and small
+  tweaks get none: the commit message is the record. A request that says
+  `no-ledger` gets no entry; `record this` gets one.
+- Keep the ledger current, not cumulative: when a decision is settled or
+  replaced, delete what no longer applies (git keeps it) instead of
+  striking it through or keeping the alternatives.
+
 ## Rules
 - Line numbers are 0-based `LineNo` (u64) internally; add 1 only for display.
 - Never lose or modify the original line (`raw`); normalized fields are lazy.
@@ -68,7 +87,7 @@ GUI decisions: read it before changing the UI, and record new ones there.
   a UDP port list in `CaptureOptions`; DLT is one of them.
 - Protocol definitions (`input/proto/ksy`): `core/tests/ksy_dlt.rs` checks the
   DLT definition (`examples/protocols/dlt.ksy`) against native DLT; keep it
-  passing, and keep the language subset in `docs/dev/protocol-definitions.md` current.
+  passing, and keep the language subset in `docs/user/protocol-definitions.md` current.
 - Long operations take `&Progress` and check `is_cancelled()` per chunk.
 - Search changes: every engine test runs the fast path against the naive
   per-line path (`run_filter` in `engine/search.rs`). Keep that invariant and
