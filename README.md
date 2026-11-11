@@ -202,6 +202,7 @@ nerka-gui app.log                              # open a file (several: one view)
 nerka-gui trace.pcapng --query 'apid == NAV'   # open and filter
 nerka-gui app.log --new-window --name triage   # a separate, named window
 nerka-gui app.log --signal 'lat=/latency_us=(?<lat>\d+)/' --query '@lat > 9000'   # a signal
+nerka-gui trace.dlt --lifecycle 'ecu1: lines ecu == ECU1; reset uptime' --query '@ecu1 == 2'   # a lifecycle (as the CLI's)
 ```
 
 | Keys | |

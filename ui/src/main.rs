@@ -89,6 +89,7 @@ Options:
       --param NAME=VALUE   A library parameter's value
       --library            Show the library
       --signal SPEC        A signal for this session (as `nerka --signal`)
+      --lifecycle SPEC     A lifecycle for this session (as `nerka --lifecycle`)
       --check SPEC         A check for this session (as `nerka --check`)
       --plot NAME          Plot a signal
       --plot-window        The plot in a window of its own
@@ -117,6 +118,10 @@ fn main() -> eframe::Result {
     let mut signals = Signals::default();
     // Checks given with --check: this session only (not saved unless edited).
     let mut startup_checks = nerka_core::check::Checks::default();
+    // A --signal, --lifecycle or --check that doesn't parse: said on the
+    // terminal and in a window (a release build on Windows has no console
+    // of its own, so eprintln! went nowhere; a tab's status hid the app's).
+    let mut spec_errors: Vec<String> = Vec::new();
     // `--plot NAME`: plot these signals.
     let mut plotted: Vec<String> = Vec::new();
     // `--fibex FILE`: FIBEX files for DLT non-verbose messages.
@@ -219,7 +224,18 @@ fn main() -> eframe::Result {
                 let spec = value();
                 match nerka_core::SignalDef::parse_spec(&spec) {
                     Ok(d) => signals.set(d),
-                    Err(e) => eprintln!("nerka-gui: --signal {spec}: {e}"),
+                    Err(e) => spec_errors.push(format!("--signal {spec}: {e}")),
+                }
+                continue;
+            }
+            // A lifecycle is a signal (`@name`): this session's, as with
+            // --signal, so a CLI command line's `per(NAME)` works here too
+            // (review 2026-11-09 R7 e; owner, 2026-11-11: --lifecycle only).
+            Some("--lifecycle") => {
+                let spec = value();
+                match nerka_core::lifecycle::LifecycleDef::parse_spec(&spec) {
+                    Ok(d) => signals.set(nerka_core::SignalDef::lifecycle(d)),
+                    Err(e) => spec_errors.push(format!("--lifecycle {spec}: {}", e.at(&spec))),
                 }
                 continue;
             }
@@ -227,7 +243,7 @@ fn main() -> eframe::Result {
                 let spec = value();
                 match nerka_core::check::CheckDef::parse_spec(&spec) {
                     Ok(c) => startup_checks.set(c),
-                    Err(e) => eprintln!("nerka-gui: --check {spec}: {}", e.at(&spec)),
+                    Err(e) => spec_errors.push(format!("--check {spec}: {}", e.at(&spec))),
                 }
                 continue;
             }
@@ -261,6 +277,9 @@ fn main() -> eframe::Result {
             }
         };
         preset = args.next().map(|v| (tag, v.to_string_lossy().into_owned()));
+    }
+    for e in &spec_errors {
+        console::error(&format!("nerka-gui: {e}\n"));
     }
     // Plain `nerka-gui FILE…`: the window focused last opens them.
     if options_given == 0 && !initial.is_empty() && instance::hand_off(&initial) {
@@ -305,6 +324,7 @@ fn main() -> eframe::Result {
             if let Some(m) = upgraded {
                 app.status = m;
             }
+            app.option_errors = spec_errors;
             let mut picks = Picks::default();
             picks.params = params;
             for (role, id) in &startup {
@@ -3005,6 +3025,9 @@ struct App {
     /// Why files couldn't be opened, in a window until OK (review
     /// 2026-11-09, R7: the reason was the cut-off end of the status line).
     open_errors: Vec<String>,
+    /// Options that didn't parse (`--signal`, `--lifecycle`, `--check`), in a
+    /// window until OK.
+    option_errors: Vec<String>,
     focus_search: bool,
     window_title: String,
     /// Query packs (search manager) and where they come from besides the
@@ -4487,19 +4510,26 @@ impl App {
     }
 
     /// F1 / the About button: name, version, licence and where to find it.
-    /// Files that couldn't be opened: each with its whole reason, wrapped.
+    /// Files that couldn't be opened, and options that weren't used: each
+    /// with its whole reason, wrapped.
     fn open_errors_dialog(&mut self, ctx: &egui::Context) {
-        if self.open_errors.is_empty() {
+        Self::errors_window(ctx, "Cannot open", &mut self.open_errors);
+        Self::errors_window(ctx, "Options not used", &mut self.option_errors);
+    }
+
+    /// `errors` in a window titled `title` until OK; then emptied.
+    fn errors_window(ctx: &egui::Context, title: &str, errors: &mut Vec<String>) {
+        if errors.is_empty() {
             return;
         }
         let mut ok = false;
-        egui::Window::new("Cannot open")
+        egui::Window::new(title)
             .collapsible(false)
             .resizable(false)
             .default_width(520.0)
             .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
             .show(ctx, |ui| {
-                for why in &self.open_errors {
+                for why in errors.iter() {
                     ui.add(egui::Label::new(egui::RichText::new(why).color(ui.visuals().error_fg_color)).wrap());
                 }
                 ui.add_space(4.0);
@@ -4510,7 +4540,7 @@ impl App {
                 ok = ui.button("OK").clicked() || keys;
             });
         if ok {
-            self.open_errors.clear();
+            errors.clear();
         }
     }
 
