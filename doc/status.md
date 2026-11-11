@@ -4,20 +4,20 @@ Snapshot of where the project stands. Update this file whenever the state change
 
 Kept short, so that it reads in one go (review 2026-11-09, R4: the read stopped before "Decisions pending"). When the state changes, update it here and add a dated line at the top of `history.md`.
 
-_Last update: 2026-11-10 (0.2.0-alpha.3: review 2026-11-09's fixes; `doc/review/2026-11-09-findings.md`)._
+_Last update: 2026-11-11 (text profiles designed with the owner, not built: `text-profiles.md`; the 1 GiB benchmark of 0.2.0-alpha.3). Before: 2026-11-10 (0.2.0-alpha.3: review 2026-11-09's fixes; `doc/review/2026-11-09-findings.md`)._
 
 **Where the rest is:**
 - `doc/gui-decisions.md`: the owner's GUI decisions ("GUI as of now"), deliberate choices to keep. **Read it before changing the UI.**
 - `doc/features.md`: each built feature as it stands, with the owner's decisions about it (DLT and captures, signals, FIBEX, protocol definitions, search manager).
 - `doc/history.md`: the dated log of updates and the earlier "Next steps", newest first, append-only.
-- Design: `sources-and-signals.md`, `search-manager.md`, `lifecycles.md`, `checks.md`, `protocol-definitions.md`, `bundles.md`; reviews: `doc/review/`.
+- Design: `sources-and-signals.md`, `search-manager.md`, `lifecycles.md`, `checks.md`, `protocol-definitions.md`, `bundles.md`, `text-profiles.md` (not built); reviews: `doc/review/`.
 
 ## Decisions pending with the owner
 
 Don't settle these silently: ask.
 
 1. **UI framework:** egui was chosen instead of the spec's Tauri, because the owner asked for "not heavy" (they originally considered Qt/C++). Not yet confirmed.
-2. **Level detection:** only upper-case tokens (`ERROR`, `[WARN]`, `level=INFO`) in the first 160 bytes are recognised. This needs more log samples (own or public).
+2. **Level detection and text profiles** (review 2026-11-09, R11; owner, 2026-11-11: a profile per pattern): only upper-case tokens (`ERROR`, `[WARN]`, `level=INFO`) in the first 160 bytes are recognised; JSON without a level key falls back to that scan. The design, measurements and open questions are in `text-profiles.md`: a profile (records, level rule, time, fields) chosen by forced choice (remembered in `records`), file name, first line, or the default; JSON has no level without a key; protocol level maps are a choice.
 3. **Bookmark storage:** currently a sidecar `<log>.nerka-marks` next to the log. The alternative is a central app-data folder when the log's directory is read-only.
 4. **DLT column widths:** resizable per tab but not saved. Save them (globally or per file)?
 5. **Releases / downloads:** `release.yml` (Linux + Windows pre-releases on `v*` tags, archives with the README and both licence files) is in place; open: macOS builds (unsigned binaries warn; 10x runner minutes).
@@ -38,8 +38,8 @@ Don't settle these silently: ask.
 
 The open work, in no fixed order; what was done before is in `history.md`, the open review findings in `doc/review/2026-11-09-findings.md`.
 
-- **Benchmark** the branch on the 1 GiB files (`tools/bench.sh`) and add a mixed-view case (DLT + a capture of another protocol, now possible from the CLI).
-- **Decisions pending** above: 2 (levels in lower case, review R11: measure first), 8, 9, 10.
+- **Benchmark:** 0.2.0-alpha.3 measured on 2026-11-11 (every query within 15 % of 2026-11-09, the same counts; `history.md`). The mixed-view cases are measured by hand and not yet in `tools/bench.sh`.
+- **Decisions pending** above: 2 (text profiles, `text-profiles.md`'s open questions), 8, 10.
 - **Postponed by the owner (2026-11-10):** the CLI for scripts and agents (`--json`, exit codes, `-m`, context, stdin; review R10, before the MCP server); `ui/src/main.rs`'s size, with other refactoring (11-08 R6).
 - **Later, with the MCP server:** local time per session instead of per process (R12); files opened in parallel with one progress total (R18); follow / tail mode (a file truncated while mapped can fault, 11-07 R13); DLT `raw ~` without rendering every message (11-07 R14).
 

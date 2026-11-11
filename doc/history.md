@@ -2,6 +2,12 @@
 
 The dated log of the project, newest first; append-only: add an entry at the top when `status.md` changes. Moved from `status.md` on 2026-11-10, word for word: its "Last update" line (each update with the ones before it) and its "Next steps" as they stood then, which tell what was built when and why. Where the moved text says "above", "below" or "this file", it means the old `status.md`: its sections are now `status.md` (state, pending decisions, limitations, licensing), `gui-decisions.md`, `features.md` and `history.md`.
 
+## 2026-11-11
+
+Text profiles designed with the owner, not built (`text-profiles.md`; review 2026-11-09 R11, "Decisions pending" 2): a profile per pattern (records, level rule, time, fields), chosen by a forced choice remembered in `records`, the file's name, its first line, or the default; JSON has no level without a key (today it falls back to the text scan: seen); a protocol's level map is a choice. Measured for it on the 1 GiB log: levels in any case cost +0–7 % where lines carry a level, 33 → 78 ms where none does; a level taken out of each line by a regex ~1 s.
+
+Benchmark of 0.2.0-alpha.3 (`tools/bench.sh`, `KSY=1`, 5 runs, against `baseline/bench-2026-11-09.tsv`): every query within 15 %, the same match counts. Mixed views by hand (search, median of 3): `apid == NAV AND level >= WARN` on `big.dlt` 30 ms, `big.dlt big.pcap` 61 ms (open 0.65 s), with `--merge` 83 ms (open 1.2 s), `big.dlt` with `big2.pcap` read as DLT and DLTK (the mixed layout) 146 ms against 139 ms for the two apart (open 4.9 s); `raw ~ /timeout/` 300 ms, 603 ms, 656 ms and 4.82 s against 4.45 s apart (the DLT file's rows converted for the mixed layout: about 370 ms).
+
 ## 2026-11-10
 
 0.2.0-alpha.3 (a pre-release; 0.1.0 stays GitHub's Latest, owner): review 2026-11-09's fixes. The owner's findings: every plotted lifecycle labelled (U1); checks on / off and Auto / ▶ Run per tab (U2); windows notice configuration changed elsewhere and saves merge it (U3); a kept plot changes only on Keep / Save (U5); U4 cancelled, U6 and U7 postponed. The review's: what readers skip is said (R3), `net.*` past the sender cap warns (R2), one field merge with `dlt.type` / `sens.type` for a clash (R9), several files in the CLI with `--merge` (R6), checks warn when time goes backward (11-07 R4), `nerka-gui --help` and open errors that name their file (R7), a failed filter and a panicking job said (R5, R8), CLI messages (R13). Proofs: screenshots, CLI output and tests per fix.

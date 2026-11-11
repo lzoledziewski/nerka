@@ -260,6 +260,7 @@ nerka --local-time lines trace.dlt 1 20                  # local time (CLI: UTC 
 - [doc/protocol-definitions.md](doc/protocol-definitions.md): protocols described in `.ksy` files, matching rules.
 - [doc/lifecycles.md](doc/lifecycles.md) and [doc/checks.md](doc/checks.md): boots per device, and checks over them.
 - [doc/bundles.md](doc/bundles.md): settings bundles (export, import) and how formats are upgraded.
+- [doc/text-profiles.md](doc/text-profiles.md): text profiles (records, level, time per kind of file): a design, not built yet.
 - [CLAUDE.md](CLAUDE.md): guide for contributors and AI agents (commands, rules).
 
 ## Contributing
