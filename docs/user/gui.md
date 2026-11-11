@@ -1,3 +1,8 @@
+---
+title: "The desktop viewer"
+description: "The nerka desktop viewer: tabs, the Filter and Search boxes, the line window, bookmarks with notes, several files as one view, keyboard shortcuts and startup options."
+---
+
 # The desktop viewer
 
 `nerka-gui` shows one **tab** per file, or per set of files opened as one

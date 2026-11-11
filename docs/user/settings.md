@@ -1,3 +1,8 @@
+---
+title: "Settings and where things are kept"
+description: "nerka's settings and where it keeps them: time zones, capture protocols and UDP ports, the MF4 unpack cache, the configuration folder and several windows."
+---
+
 # Settings and where things are kept
 
 ⚙ **Settings** (`Ctrl+,`) holds what applies to every tab:

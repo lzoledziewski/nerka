@@ -17,6 +17,8 @@ one UI-free engine (`nerka-core`).
 > Linux builds come from CI; macOS isn't built yet. While nerka is at 0.x,
 > file formats, the filter language and the GUI can still change.
 
+**User guide:** [lzoledziewski.github.io/nerka](https://lzoledziewski.github.io/nerka/) · **Download:** [latest release](https://github.com/lzoledziewski/nerka/releases/latest)
+
 ## Features
 
 ### Big files, opened fast
@@ -249,10 +251,11 @@ nerka --local-time lines trace.dlt 1 20                  # local time (CLI: UTC 
 
 ## Documentation
 
-**User guide:** [docs/index.md](docs/index.md): getting started, the
-desktop viewer, the command line, the query language, formats, query packs,
-signals and plots, lifecycles, checks, protocol definitions, settings
-bundles. It ships in the release archives (`docs/`).
+**User guide:** [lzoledziewski.github.io/nerka](https://lzoledziewski.github.io/nerka/)
+(the same pages are in [docs/index.md](docs/index.md) and in the release
+archives' `docs/`): getting started, the desktop viewer, the command line,
+the query language, formats, query packs, signals and plots, lifecycles,
+checks, protocol definitions, settings bundles.
 
 **For contributors** (the project's working notes, in `docs/dev/`):
 

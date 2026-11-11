@@ -1,3 +1,8 @@
+---
+title: "Getting started"
+description: "Install nerka on Windows or Linux, open a log, a DLT file or a capture, and run a first filter and search in the desktop viewer or on the command line."
+---
+
 # Getting started
 
 ## Install

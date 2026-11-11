@@ -1,3 +1,8 @@
+---
+title: "Protocol definitions"
+description: "Describe your own protocol in a Kaitai Struct (.ksy) file so nerka decodes it from UDP datagrams in pcap, pcapng and MF4 captures."
+---
+
 # Protocol definitions
 
 A protocol nerka doesn't know can be described in a `.ksy` file: a

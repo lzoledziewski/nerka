@@ -1,3 +1,8 @@
+---
+title: "Query packs and presets"
+description: "Query packs: reusable log filters in plain-text .nerka-pack files, with parent queries, labels, parameters and colours; the library, the selection and presets."
+---
+
 # Query packs and presets
 
 Queries you use again live in **packs**: plain-text `.nerka-pack` files

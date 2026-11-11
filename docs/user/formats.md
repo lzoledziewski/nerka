@@ -1,3 +1,8 @@
+---
+title: "Files and formats"
+description: "Log formats nerka reads: text logs and multi-line records, JSON Lines, AUTOSAR DLT with FIBEX, and pcap, pcapng and MF4 captures carrying DLT, SOME/IP and syslog."
+---
+
 # Files and formats
 
 nerka recognises a file by its **content**, not its name. Files are

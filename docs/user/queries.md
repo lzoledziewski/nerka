@@ -1,3 +1,8 @@
+---
+title: "Queries (NFD)"
+description: "NFD, nerka's filter language: fields, operators, regexes, log levels, signals and bookmarks, and how the search boxes read plain words."
+---
+
 # Queries (NFD)
 
 **NFD** is nerka's filter language. The same query works in the GUI's boxes,
