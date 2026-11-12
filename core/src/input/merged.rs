@@ -1,5 +1,6 @@
 //! Several files' lines interleaved by time: a [`Concat`] read in the order
-//! of the lines' times, each file's own order kept.
+//! of the lines' times, each file's own order kept ([`Merged::new`]); or
+//! one source's lines sorted by time ([`Merged::sorted`], [`sort_by_time`]).
 //!
 //! Rows are the concatenation's lines in another order, so the engine
 //! scans the concatenation (each file on its fast path) and maps the hits
@@ -17,7 +18,9 @@ use std::collections::BinaryHeap;
 
 pub struct Merged {
     name: String,
-    inner: Concat,
+    inner: Box<dyn LogSource>,
+    /// Sorted by time ([`Merged::sorted`]), else files interleaved.
+    sorted: bool,
     /// Row -> line of `inner`.
     line_of: Vec<LineNo>,
     /// Line of `inner` -> row.
@@ -86,12 +89,41 @@ impl Merged {
                 heap.push(Reverse(Next(x, k, l + 1)));
             }
         }
-        let mut row_of = vec![0; total as usize];
+        Ok(Self::of(Box::new(inner), line_of, false))
+    }
+
+    /// `inner`'s lines sorted by their times, lines of the same time in
+    /// their order (a stable sort). A line without a time goes with the
+    /// line before it; lines before the first time go first. Unlike
+    /// [`Merged::new`], lines whose times go back move.
+    pub fn sorted(inner: Box<dyn LogSource>, progress: &Progress) -> Result<Merged> {
+        let total = inner.line_count();
+        progress.set_total(total);
+        let mut times = Vec::with_capacity(total as usize);
+        let mut last = f64::NEG_INFINITY;
+        for l in 0..total {
+            if l % 65_536 == 0 && progress.is_cancelled() {
+                return Err(Error::Cancelled);
+            }
+            if let Some(x) = inner.time(l) {
+                last = x;
+            }
+            times.push(last);
+        }
+        progress.add(total);
+        let mut line_of: Vec<LineNo> = (0..total).collect();
+        // Stable, and quick on runs already in order (most of a log).
+        line_of.sort_by(|&a, &b| times[a as usize].total_cmp(&times[b as usize]));
+        Ok(Self::of(inner, line_of, true))
+    }
+
+    fn of(inner: Box<dyn LogSource>, line_of: Vec<LineNo>, sorted: bool) -> Merged {
+        let mut row_of = vec![0; line_of.len()];
         for (row, &line) in line_of.iter().enumerate() {
             row_of[line as usize] = row as LineNo;
         }
         let name = inner.name().to_owned();
-        Ok(Merged { name, inner, line_of, row_of, data_id: super::new_data_id() })
+        Merged { name, inner, sorted, line_of, row_of, data_id: super::new_data_id() }
     }
 
     fn line(&self, row: LineNo) -> Option<LineNo> {
@@ -129,7 +161,8 @@ impl LogSource for Merged {
     }
 
     fn format(&self) -> String {
-        format!("{}, merged by time", self.inner.format())
+        let how = if self.sorted { "sorted" } else { "merged" };
+        format!("{}, {how} by time", self.inner.format())
     }
 
     fn columns(&self) -> &[ColumnDef] {
@@ -174,12 +207,21 @@ impl LogSource for Merged {
     }
 
     fn reordered(&self) -> Option<Reorder<'_>> {
-        Some(Reorder { inner: &self.inner, line_of: &self.line_of, row_of: &self.row_of })
+        Some(Reorder { inner: &*self.inner, line_of: &self.line_of, row_of: &self.row_of })
     }
 
     fn data_id(&self) -> usize {
         self.data_id
     }
+}
+
+/// `source` with its lines sorted by time ([`Merged::sorted`]), or as it is
+/// if it doesn't know its lines' times (a text log).
+pub fn sort_by_time(source: Box<dyn LogSource>, progress: &Progress) -> Result<Box<dyn LogSource>> {
+    if super::concat::start_time(source.as_ref()).is_none() {
+        return Ok(source);
+    }
+    Ok(Box::new(Merged::sorted(source, progress)?))
 }
 
 #[cfg(test)]

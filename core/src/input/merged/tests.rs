@@ -135,3 +135,29 @@ fn opening_merged_falls_back_where_times_are_missing() {
     assert_eq!(s.line_text(0).unwrap(), "two");
     std::fs::remove_dir_all(&dir).ok();
 }
+
+#[test]
+fn one_file_sorted_by_time_moves_lines_that_go_back() {
+    // 20, 40, 35 (goes back), 35 (same time: kept in order), 60.
+    let b = dlt("b.dlt", &[(20, "B", "b0"), (40, "B", "b1"), (35, "B", "b2"), (35, "B", "b3"), (60, "B", "b4")]);
+    let s = Merged::sorted(b, &Progress::new()).unwrap();
+    assert_eq!(texts(&s), ["b0", "b2", "b3", "b1", "b4"]);
+    assert!(s.format().ends_with("sorted by time"), "{}", s.format());
+    let r = s.reordered().unwrap();
+    assert_eq!(r.line_of, [0, 2, 3, 1, 4]);
+    assert_eq!(r.row_of, [0, 3, 1, 2, 4]);
+    // Filters scan the file and map its lines to rows, fast and naive alike.
+    assert_eq!(run_on(&s, &q(&s, "/b1/ OR /b3/")), [2, 3]);
+    let re = Filter::Regex(Matcher::new("b[24]", MatcherOptions::default()).unwrap());
+    assert_eq!(run_on(&s, &re), [1, 4]);
+}
+
+#[test]
+fn sorting_a_file_without_times_leaves_it_as_it_is() {
+    let text: Box<dyn LogSource> = Box::new(crate::TextFile::from_bytes("a.log", b"two\none\n".to_vec()));
+    let s = crate::sort_by_time(text, &Progress::new()).unwrap();
+    assert!(s.reordered().is_none());
+    assert_eq!(s.line_text(0).unwrap(), "two");
+    let d = crate::sort_by_time(dlt("d.dlt", &[(9, "D", "d0"), (3, "D", "d1")]), &Progress::new()).unwrap();
+    assert_eq!(texts(&*d), ["d1", "d0"]);
+}

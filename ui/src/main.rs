@@ -1195,7 +1195,9 @@ impl Tab {
         options.fibex = fibex;
         // As the first file was read last time: lines or records.
         let split = records::remembered(&paths[0]);
-        let merge = prefs.merge_by_time;
+        // The last choice is for several files; one file starts unsorted
+        // (its menu's Sort by time).
+        let merge = prefs.merge_by_time && paths.len() > 1;
         options.records = split.clone();
         Self {
             path: paths[0].clone(),
@@ -1478,8 +1480,15 @@ impl Tab {
         self.loading = Some(self.open_job(ctx, ps, options));
     }
 
-    /// Read `paths` again: in this order, or merged by time.
+    /// Read `paths` again: in this order, or merged by time (one file:
+    /// sorted by time).
     fn open_job(&self, ctx: &egui::Context, ps: Vec<PathBuf>, options: nerka_core::OpenOptions) -> Job<Opened> {
+        if self.merge && ps.len() == 1 {
+            return Job::spawn(ctx, move |prog| {
+                let f = nerka_core::open_many(&ps, &options, prog)?;
+                Ok((nerka_core::sort_by_time(f, prog)?, ps))
+            });
+        }
         if self.merge {
             return Job::spawn(ctx, move |prog| nerka_core::open_merged_by_time(&ps, &options, prog));
         }
@@ -1728,6 +1737,12 @@ impl Tab {
                                 );
                             }
                             self.status = match self.paths.len() {
+                                1 if f.reordered().is_some() => {
+                                    format!("Sorted {} lines by time in {took:.2?}", f.line_count())
+                                }
+                                1 if self.merge => {
+                                    format!("Indexed {} lines; not sorted: its lines have no times", f.line_count())
+                                }
                                 1 => format!("Indexed {} lines in {took:.2?}", f.line_count()),
                                 n if f.reordered().is_some() => {
                                     format!("Merged {} lines of {n} files by time in {took:.2?}", f.line_count())
@@ -3095,6 +3110,8 @@ struct SettingsChange {
     import: bool,
     /// Reload configuration clicked.
     reload: bool,
+    /// The theme changed.
+    theme: bool,
 }
 
 /// What the Settings window shows: this window's name, the unpack cache
@@ -3102,6 +3119,7 @@ struct SettingsChange {
 /// [`protocols::settings_section`]).
 struct SettingsFields<'a> {
     name: &'a mut String,
+    theme: &'a mut egui::ThemePreference,
     limit: &'a mut String,
     local_time: &'a mut bool,
     mf4_local_time: &'a mut bool,
@@ -3109,9 +3127,26 @@ struct SettingsFields<'a> {
 
 /// The Settings window's fields ([`SettingsFields`]).
 fn settings_ui(ui: &mut egui::Ui, f: SettingsFields<'_>) -> SettingsChange {
-    let SettingsFields { name, limit, local_time, mf4_local_time } = f;
+    let SettingsFields { name, theme, limit, local_time, mf4_local_time } = f;
     let mut save = SettingsChange::default();
     egui::Grid::new("settings-grid").num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| {
+        ui.label(RichText::new("Look").strong());
+        ui.end_row();
+        ui.label("Theme");
+        ui.horizontal(|ui| {
+            let mut changed = false;
+            for (t, label) in [
+                (egui::ThemePreference::System, "System"),
+                (egui::ThemePreference::Light, "Light"),
+                (egui::ThemePreference::Dark, "Dark"),
+            ] {
+                changed |= ui.radio_value(theme, t, label).changed();
+            }
+            save.theme = changed;
+        })
+        .response
+        .on_hover_text("System: as the desktop says; where it doesn't say (many Linux desktops), dark");
+        ui.end_row();
         ui.label(RichText::new("Times").strong());
         ui.end_row();
         ui.label("Show");
@@ -3818,6 +3853,7 @@ impl App {
                     ui,
                     SettingsFields {
                         name: self.window_name.get_or_insert_with(String::new),
+                        theme: &mut self.prefs.theme,
                         limit,
                         local_time: &mut self.prefs.local_time,
                         mf4_local_time: &mut self.prefs.mf4_local_time,
@@ -3864,7 +3900,7 @@ impl App {
                 n => format!("Removed {removed} unpacked files; {n} in use stay"),
             };
         }
-        let mut changed = protocols::apply(&mut self.prefs, &proto_change);
+        let mut changed = protocols::apply(&mut self.prefs, &proto_change) | save.theme;
         let mut reload = proto_change.reload;
         if proto_change.add
             && let Some(dir) = protocols::folder()
@@ -3929,6 +3965,7 @@ impl App {
             mf4_local_time: self.prefs.mf4_local_time,
             bookmark_notes: self.prefs.bookmark_notes,
             merge_by_time: self.prefs.merge_by_time,
+            theme: self.prefs.theme,
             routes: self.prefs.routes.clone(),
             disabled_protocols: self.prefs.disabled_protocols.clone(),
             protocols: self.prefs.protocols.clone(),
@@ -4234,7 +4271,7 @@ impl App {
 
     fn tab_bar(&mut self, ui: &mut egui::Ui) {
         let (mut select, mut close, mut close_others, mut moved, mut split) = (None, None, None, None, None);
-        let (mut files, mut records_edit, mut unfold, mut merge) = (None, None, None, None);
+        let (mut files, mut records_edit, mut unfold, mut merge, mut reload) = (None, None, None, None, None);
         egui::ScrollArea::horizontal().show(ui, |ui| {
             ui.horizontal(|ui| {
                 for (i, t) in self.tabs.iter().enumerate() {
@@ -4266,11 +4303,32 @@ impl App {
                         if t.paths.len() > 1 && ui.button("Open the files as separate tabs").clicked() {
                             split = Some(i);
                         }
+                        if ui
+                            .add_enabled(t.loading.is_none(), egui::Button::new("Reload"))
+                            .on_hover_text("Read the files again from disk; filter, search and selection stay")
+                            .clicked()
+                        {
+                            reload = Some(i);
+                        }
                         if t.paths.len() > 1 {
                             let mut on = t.merge;
                             let tip = "Lines of all files in the order of their times (DLT, captures), each file's \
                                        own order kept; off: one file after another";
                             if ui.checkbox(&mut on, "Merge by time").on_hover_text(tip).changed() {
+                                merge = Some(i);
+                                ui.close();
+                            }
+                        } else {
+                            let mut on = t.merge;
+                            let timed = t.file.as_ref().is_some_and(|f| nerka_core::start_time(f.as_ref()).is_some());
+                            let r = ui
+                                .add_enabled(timed || on, egui::Checkbox::new(&mut on, "Sort by time"))
+                                .on_hover_text(
+                                    "Lines in the order of their times (DLT, captures); lines of the same time \
+                                     keep their order; off: as in the file",
+                                )
+                                .on_disabled_hover_text("Its lines have no times");
+                            if r.changed() {
                                 merge = Some(i);
                                 ui.close();
                             }
@@ -4316,17 +4374,24 @@ impl App {
             let t = &mut self.tabs[i];
             t.files_edit = Some(FilesEdit::of(&t.paths, &t.disabled_for));
         }
+        if let Some(i) = reload {
+            self.active = i;
+            self.tabs[i].reopen(&ui.ctx().clone(), &self.prefs, self.fibex.clone());
+        }
         if let Some(i) = merge {
             self.active = i;
             let t = &mut self.tabs[i];
             t.merge = !t.merge;
             t.reopen(&ui.ctx().clone(), &self.prefs, self.fibex.clone());
-            // New tabs of several files follow the last choice.
-            self.prefs.merge_by_time = t.merge;
-            if let Some(path) = prefs_path()
-                && let Err(e) = sync::save_prefs(&mut self.prefs, &mut self.prefs_base, &path)
-            {
-                self.status = format!("Could not save preferences: {e}");
+            // New tabs of several files follow the last choice; sorting one
+            // file isn't that choice.
+            if t.paths.len() > 1 {
+                self.prefs.merge_by_time = t.merge;
+                if let Some(path) = prefs_path()
+                    && let Err(e) = sync::save_prefs(&mut self.prefs, &mut self.prefs_base, &path)
+                {
+                    self.status = format!("Could not save preferences: {e}");
+                }
             }
         }
         if let Some(i) = unfold {
@@ -4622,6 +4687,9 @@ impl App {
     /// One frame of the whole window (also driven by tests).
     fn frame(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
+        if ctx.options(|o| o.theme_preference) != self.prefs.theme {
+            ctx.set_theme(self.prefs.theme);
+        }
         self.follow_focus(&ctx);
         self.poll_instance(&ctx);
         self.poll_jobs(&ctx);
@@ -6064,6 +6132,52 @@ gear=D
     }
 
     #[test]
+    fn one_dlt_file_sorted_by_time_keeps_its_bookmarks_on_its_lines() {
+        use nerka_core::input::dlt::writer::{Msg, Value};
+        let dir = std::env::temp_dir().join(format!("nerka-gui-sort-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let a = dir.join("a.dlt");
+        let mut buf = Vec::new();
+        for (secs, text) in [(10, "a0"), (40, "a1 boom"), (20, "a2"), (30, "a3 boom")] {
+            let mut m = Msg::log(nerka_core::Level::Warn, "ECU1", "NAV", "CTX", vec![Value::Str(text.into()).into()]);
+            m.secs = secs;
+            m.encode(&mut buf);
+        }
+        std::fs::write(&a, buf).unwrap();
+        let ctx = egui::Context::default();
+        // The last merge choice is for several files: one file opens as it is.
+        let prefs = SearchPrefs { merge_by_time: true, ..SearchPrefs::default() };
+        let mut tab = Tab::open_many(&ctx, vec![a.clone()], &prefs, None);
+        settle(&mut tab, &ctx);
+        assert!(!tab.merge && tab.file.as_ref().unwrap().reordered().is_none());
+        tab.merge = true;
+        tab.reopen(&ctx, &prefs, None);
+        settle(&mut tab, &ctx);
+        let file = tab.file.clone().unwrap();
+        let last = |r: LineNo| file.line_text(r).unwrap().rsplit('\t').next().unwrap().to_owned();
+        assert_eq!((0..4).map(last).collect::<Vec<_>>(), ["a0", "a2", "a3 boom", "a1 boom"]);
+        assert!(tab.status.starts_with("Sorted 4 lines by time"), "{}", tab.status);
+        tab.mode = Mode::Text;
+        tab.pattern = "boom".into();
+        tab.start_search(&ctx);
+        settle(&mut tab, &ctx);
+        assert_eq!(tab.result().unwrap().lines, [2, 3]);
+        // A bookmark on a1 (row 3) is the file's line 1 in the sidecar.
+        tab.toggle_bookmark_at(3);
+        let sidecar = std::fs::read_to_string(Bookmarks::sidecar_path(&a)).unwrap();
+        assert!(sidecar.starts_with("2\t\tB1\t@"), "1-based: {sidecar:?}");
+        // Reload keeps it sorted; unsorted, the bookmark is on line 1.
+        tab.reopen(&ctx, &prefs, None);
+        settle(&mut tab, &ctx);
+        assert!(tab.bookmarks.contains(3));
+        tab.merge = false;
+        tab.reopen(&ctx, &prefs, None);
+        settle(&mut tab, &ctx);
+        assert!(tab.bookmarks.contains(1));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn files_opened_together_are_one_view_with_bookmarks_per_file() {
         let dir = std::env::temp_dir().join(format!("nerka-gui-concat-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -6255,6 +6369,7 @@ gear=D
                     egui::Window::new("Settings").show(ui.ctx(), |ui| {
                         let fields = SettingsFields {
                             name,
+                            theme: &mut egui::ThemePreference::System,
                             limit: &mut "8".to_owned(),
                             local_time: &mut true,
                             mf4_local_time: &mut true,

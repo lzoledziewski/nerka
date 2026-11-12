@@ -2,6 +2,8 @@
 
 ⚙ **Settings** (`Ctrl+,`) holds what applies to every tab:
 
+- **Theme:** System (the default), Light or Dark. Where the desktop doesn't
+  say which it uses (many Linux desktops), System is dark.
 - **Times:** show local time (the GUI's default) or UTC; read an MF4 start
   time marked as local in this computer's zone.
 - **Protocols:** which protocols are read in captures, and which datagrams
@@ -13,8 +15,9 @@
   preferences again (after editing a file by hand, or after another window
   changed them).
 
-Each tab's menu has **Records…** (how its text files are split into rows)
-and **Files…** (its files, their order, protocols, Merge by time).
+Each tab's menu has **Records…** (how its text files are split into rows),
+**Files…** (its files, their order, protocols), **Reload**, and
+**Merge by time** (several files) or **Sort by time** (one file).
 
 ## Where things are kept
 

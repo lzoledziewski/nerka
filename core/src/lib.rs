@@ -9,7 +9,8 @@
 //!   / syslog inside pcap, pcapng and MF4 captures (`input::proto`), and
 //!   protocols described by a definition (`.ksy`, `input::proto::ksy`);
 //!   several files one after another or merged by time ([`open_many`],
-//!   [`open_merged_by_time`]), messages of different protocols in one
+//!   [`open_merged_by_time`]), one file sorted by time ([`sort_by_time`]),
+//!   messages of different protocols in one
 //!   table (the mixed layout). [`open`] picks the reader from the content.
 //! * [`engine`] — [`LineIndex`] (parallel line indexing) and [`search`]:
 //!   filtering that yields the set of matching lines; [`search_within`]:
@@ -55,9 +56,10 @@ pub use engine::search::{Filter, Highlighter, Matcher, MatcherOptions, SearchRes
 pub use engine::within::{SearchHits, SearchSet, search_within};
 pub use event::{Event, FieldDef, FieldId, FieldKind, FieldValue, Level};
 pub use history::SearchHistory;
-pub use input::concat::{open_many, open_many_by_time, open_merged_by_time};
+pub use input::concat::{open_many, open_many_by_time, open_merged_by_time, start_time};
 pub use input::dlt::DltFile;
 pub use input::dlt::fibex::{ArgType, Argument, Fibex, FibexError};
+pub use input::merged::sort_by_time;
 pub use input::text::TextFile;
 pub use input::{Anchor, ColumnDef, LogSource, OpenOptions, SourceInfo, open, open_with, query_warnings};
 pub use pack::{Library, Pack, PackError, PackQuery};

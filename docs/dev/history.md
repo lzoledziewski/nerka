@@ -2,6 +2,10 @@
 
 The dated log of the project, newest first; append-only: add an entry at the top when `status.md` changes. Moved from `status.md` on 2026-11-10, word for word: its "Last update" line (each update with the ones before it) and its "Next steps" as they stood then, which tell what was built when and why. Where the moved text says "above", "below" or "this file", it means the old `status.md`: its sections are now `status.md` (state, pending decisions, limitations, licensing), `gui-decisions.md`, `features.md` and `history.md`.
 
+## 2026-11-12
+
+From the owner's use on Linux: ⚙ Settings → **Theme** (System, Light, Dark; pref `theme`; egui shows dark where the desktop doesn't say, as on the owner's Linux); a tab's menu → **Reload** reads its files again; **Sort by time** for a tab of one file that knows its times (`nerka_core::sort_by_time`, `Merged::sorted`: a stable sort, unlike Merge by time's interleave that keeps each file's order).
+
 ## 2026-11-11
 
 `nerka-gui --lifecycle SPEC` (review 2026-11-09 R7 e; owner: `--lifecycle` only): a lifecycle for the session, as `--signal`, so the CLI's command lines with `per(NAME)` work in the GUI; options that don't parse are listed in an "Options not used" window (in a Windows release build `eprintln!` went nowhere).

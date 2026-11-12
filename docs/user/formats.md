@@ -87,7 +87,10 @@ nerka-gui ecu1.dlt ecu2.dlt bus.pcap
   own protocol). Text and JSON don't mix with the others; the GUI opens them
   as separate tabs and says why.
 - **Merge by time** interleaves lines by their time, for files that all
-  know it (DLT, captures); GUI: the tab's menu → **Files…**.
+  know it (DLT, captures), each file keeping its own order; GUI: the tab's
+  menu. A tab of one such file has **Sort by time** there instead: its
+  lines in the order of their times (lines of the same time keep their
+  order).
 - **`file`** tells the files apart in queries ([Queries](queries.md#file-in-a-view-of-several-files)).
 - Bookmarks stay in each file's own `.nerka-marks`.
 

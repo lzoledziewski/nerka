@@ -4,7 +4,7 @@ Snapshot of where the project stands. Update this file whenever the state change
 
 Kept short, so that it reads in one go (review 2026-11-09, R4: the read stopped before "Decisions pending"). When the state changes, update it here and add a dated line at the top of `history.md`.
 
-_Last update: 2026-11-11 (0.2.0-alpha.4, a pre-release: review findings fixed, `nerka-gui --lifecycle`, library query names, the user guide in `docs/user/` and the ledger in `docs/dev/`; text profiles designed, not built: `text-profiles.md`)._
+_Last update: 2026-11-12 (Settings → Theme, a tab's Reload, Sort by time for one file; before: 2026-11-11, 0.2.0-alpha.4, a pre-release: review findings fixed, `nerka-gui --lifecycle`, library query names, the user guide in `docs/user/` and the ledger in `docs/dev/`; text profiles designed, not built: `text-profiles.md`)._
 
 **Where the rest is:**
 - `docs/user/` (home `docs/index.md`): the user guide, shipped and on GitHub Pages; this folder (`docs/dev/`) is the ledger. What goes where: CLAUDE.md → "Documentation".

@@ -2,13 +2,14 @@
 //! the user picked become the default for new tabs; which protocols are
 //! read in captures and the rules saying which datagrams are theirs; the
 //! unpack cache's size limit; local time or UTC; whether tabs of several
-//! files are merged by time.
+//! files are merged by time; the colour theme.
 //!
 //! Stored as `key=value` lines in `<config>/nerka/prefs`. Unknown keys and
 //! bad values are ignored, so an old or hand-edited file never fails.
 
 use crate::Mode;
 use crate::view::NoteMode;
+use eframe::egui;
 use nerka_core::MatcherOptions;
 use std::path::Path;
 
@@ -43,6 +44,9 @@ pub struct SearchPrefs {
     /// only on ▶ Run (the last choice in a tab's Checks pane; owner,
     /// 2026-11-09, U2).
     pub checks_auto: bool,
+    /// Light, dark, or as the system says (egui falls back to dark where
+    /// it can't tell, as on many Linux desktops).
+    pub theme: egui::ThemePreference,
     /// Rules for protocols in captures (`NAME:RULE`, as `--route` takes
     /// them): a protocol given rules uses these instead of its defaults.
     pub routes: Vec<String>,
@@ -72,6 +76,7 @@ impl Default for SearchPrefs {
             bookmark_notes: NoteMode::default(),
             merge_by_time: false,
             checks_auto: true,
+            theme: egui::ThemePreference::System,
             routes: Vec::new(),
             disabled_protocols: Vec::new(),
             protocols: Vec::new(),
@@ -117,6 +122,11 @@ impl SearchPrefs {
                         && let Some(m) = NoteMode::parse(v)
                     {
                         p.bookmark_notes = m;
+                    }
+                    if key.trim() == "theme"
+                        && let Some(t) = parse_theme(v)
+                    {
+                        p.theme = t;
                     }
                     let mode = match v {
                         "auto" => Some(Mode::Auto),
@@ -173,6 +183,7 @@ impl SearchPrefs {
             self.merge_by_time
         );
         out.push_str(&format!("checks_auto={}\n", self.checks_auto));
+        out.push_str(&format!("theme={}\n", theme_key(self.theme)));
         for r in &self.routes {
             out.push_str(&format!("route={r}\n"));
         }
@@ -203,6 +214,20 @@ impl SearchPrefs {
             Err(e) => Err(e),
         }
     }
+}
+
+fn theme_key(t: egui::ThemePreference) -> &'static str {
+    match t {
+        egui::ThemePreference::System => "system",
+        egui::ThemePreference::Light => "light",
+        egui::ThemePreference::Dark => "dark",
+    }
+}
+
+fn parse_theme(s: &str) -> Option<egui::ThemePreference> {
+    [egui::ThemePreference::System, egui::ThemePreference::Light, egui::ThemePreference::Dark]
+        .into_iter()
+        .find(|&t| theme_key(t) == s)
 }
 
 /// Ports as typed: numbers separated by spaces or commas; at least one,
@@ -252,6 +277,7 @@ mod tests {
             bookmark_notes: NoteMode::Column,
             merge_by_time: true,
             checks_auto: false,
+            theme: egui::ThemePreference::Light,
             routes: vec!["DLT:port=3490,vlan=5".into()],
             disabled_protocols: vec!["syslog".into()],
             protocols: Vec::new(),
@@ -278,6 +304,8 @@ mod tests {
         assert_eq!(parse_ports("70000"), None);
         assert_eq!(SearchPrefs::parse("unpack_limit_gib=0\n").unpack_limit_gib, 8);
         assert_eq!(SearchPrefs::parse("unpack_limit_gib= 2\n").unpack_limit_gib, 2);
+        assert_eq!(SearchPrefs::parse("theme=dark\n").theme, egui::ThemePreference::Dark);
+        assert_eq!(SearchPrefs::parse("theme=purple\n").theme, egui::ThemePreference::System);
     }
 }
 
