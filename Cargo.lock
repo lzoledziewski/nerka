@@ -2032,7 +2032,7 @@ dependencies = [
 
 [[package]]
 name = "nerka-cli"
-version = "0.2.0-alpha.4"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -2041,7 +2041,7 @@ dependencies = [
 
 [[package]]
 name = "nerka-core"
-version = "0.2.0-alpha.4"
+version = "0.2.0"
 dependencies = [
  "memchr",
  "memmap2",
@@ -2054,7 +2054,7 @@ dependencies = [
 
 [[package]]
 name = "nerka-gui"
-version = "0.2.0-alpha.4"
+version = "0.2.0"
 dependencies = [
  "eframe",
  "nerka-core",
