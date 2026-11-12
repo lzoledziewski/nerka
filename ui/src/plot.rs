@@ -50,6 +50,8 @@ pub struct Detached {
     pub out: Output,
     /// The window was closed (its ✖).
     pub closed: bool,
+    /// The theme the window last drew with.
+    theme: Option<egui::ThemePreference>,
 }
 
 pub struct WindowInput {
@@ -158,7 +160,15 @@ impl Bookmark {
 /// Paint the plot's own window (the deferred viewport's callback).
 pub fn window_ui(ui: &mut egui::Ui, shared: &Mutex<Detached>) {
     let mut d = shared.lock().unwrap_or_else(|e| e.into_inner());
-    let Detached { input, views, out, closed } = &mut *d;
+    let Detached { input, views, out, closed, theme } = &mut *d;
+    // egui tells the window's frame (title bar) the theme at the end of a
+    // pass, and the frame takes it at the window's next pass: draw one more
+    // after a change, else the frame stays a theme behind.
+    let now = ui.ctx().options(|o| o.theme_preference);
+    if *theme != Some(now) {
+        *theme = Some(now);
+        ui.ctx().request_repaint();
+    }
     let Some(i) = input else { return };
     let mut series_of = |def: &SignalDef| views.series(def, &*i.file, i.kept.as_ref(), i.generation);
     let src = Source {
@@ -506,16 +516,24 @@ pub fn plot_panel(ui: &mut egui::Ui, state: &mut PlotState, src: Source<'_>) -> 
     }
     let panel = ui.max_rect();
     ui.horizontal(|ui| {
-        // ✖ first, at the right, so it stays in view however narrow.
+        // ✖ first, at the right, so it stays in view however narrow. In
+        // its own window the window's ✖ closes the plot: one close only
+        // (owner, 2026-11-12).
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            let tip = "Close the plot (its lanes are kept: 📈 Plot in the Signals panel shows it again)";
-            out.close = crate::close_button(ui).on_hover_text(tip).clicked();
+            if !in_window {
+                let tip = "Close the plot (its lanes are kept: 📈 Plot in the Signals panel shows it again)";
+                out.close = crate::close_button(ui).on_hover_text(tip).clicked();
+            }
             ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
                 if let Some(a) = plots_list(ui, state, saved) {
                     out.plots = Some(a);
                 }
-                let label = if in_window { "⧉ Back into the main window" } else { "⧉ Own window" };
-                out.toggle_window = ui.small_button(label).clicked();
+                let (label, tip) = if in_window {
+                    ("⧉ Dock", "Put the plot back into the main window, under the views")
+                } else {
+                    ("⧉ Own window", "Move the plot into a window of its own")
+                };
+                out.toggle_window = ui.small_button(label).on_hover_text(tip).clicked();
                 if ui.small_button("📷").on_hover_text("Screenshot of the plot to the clipboard").clicked() {
                     state.capture = Some(Capture { back_to: state.scroll, settle: 2, ..Default::default() });
                     state.scroll = 0.0;

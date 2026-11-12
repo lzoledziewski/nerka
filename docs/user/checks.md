@@ -1,3 +1,8 @@
+---
+title: "Checks"
+description: "Checks: find known issues and measure facts in logs, overall and per boot: counts, bursts, gaps, missing answers and sequences, in the GUI or the CLI."
+---
+
 # Checks
 
 A **check** looks for a known problem (an **issue**) or measures something

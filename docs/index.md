@@ -1,3 +1,8 @@
+---
+title: "nerka: a fast log viewer for DLT, pcap and text logs"
+description: "nerka opens big log files fast: filter, search, plot signals, follow boots and run checks over text, JSON, AUTOSAR DLT and pcap, pcapng or MF4 captures. Windows and Linux."
+---
+
 # nerka
 
 Fast log analysis for big files: filter, search, plot signals, follow

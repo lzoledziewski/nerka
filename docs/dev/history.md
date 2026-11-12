@@ -2,6 +2,14 @@
 
 The dated log of the project, newest first; append-only: add an entry at the top when `status.md` changes. Moved from `status.md` on 2026-11-10, word for word: its "Last update" line (each update with the ones before it) and its "Next steps" as they stood then, which tell what was built when and why. Where the moved text says "above", "below" or "this file", it means the old `status.md`: its sections are now `status.md` (state, pending decisions, limitations, licensing), `gui-decisions.md`, `features.md` and `history.md`.
 
+## 2026-11-12
+
+0.2.0 (a release, GitHub's Latest; the first since 0.1.0 of 2026-11-02, after four pre-releases). Its major changes since 0.1.0: lifecycles (boots and sessions per ECU or app, signals per lifecycle, `@uptime`); checks (issues and facts, overall and per lifecycle, a check feeding another, `nerka check`); protocol definitions (a Kaitai Struct subset read from captures, with rules over ports, addresses and VLANs); several files as one view (merged by time, messages of different protocols in one table, `net.*` fields, a tab's Files window; one file sorted by time); settings bundles (export, import, format upgrades); windows sharing one configuration, a tab moved to another window; the theme setting and Reload; the user guide on GitHub Pages; the review gate (build checks, fuzzing every reader, the benchmark). Before the bump the review gate passed (`--full --bench`) and every 1 GiB benchmark query was within 15 % of the 2026-11-09 baseline with the same match counts: DLT `apid == NAV AND level >= WARN` 30.6 ms (was 30.2), pcap the same 29.7 ms (30.2), text `search ERROR` 32.3 ms (32.6); the largest change `level >= WARN AND raw ~ /timeout/` on text, 35.4 ms (31.6, +12 %).
+
+A tab's menu → **Move to window ▸** (New window, or another open window by its name and active tab) replaces Move to new window (owner: the cheaper step before dragging tabs across windows, which would be a day or two and not work on Wayland).
+
+From the owner's use on Linux: ⚙ Settings → **Theme** (System, Light, Dark; pref `theme`; egui shows dark where the desktop doesn't say, as on the owner's Linux); a tab's menu → **Reload** reads its files again; **Sort by time** for a tab of one file that knows its times (`nerka_core::sort_by_time`, `Merged::sorted`: a stable sort, unlike Merge by time's interleave that keeps each file's order).
+
 ## 2026-11-11
 
 `nerka-gui --lifecycle SPEC` (review 2026-11-09 R7 e; owner: `--lifecycle` only): a lifecycle for the session, as `--signal`, so the CLI's command lines with `per(NAME)` work in the GUI; options that don't parse are listed in an "Options not used" window (in a Windows release build `eprintln!` went nowhere).

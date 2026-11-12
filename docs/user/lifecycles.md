@@ -1,3 +1,8 @@
+---
+title: "Lifecycles"
+description: "Lifecycles: find each boot or run of an ECU or an app in a log, how it ended (planned, crash, lost) and where the uptime and the log disagree."
+---
+
 # Lifecycles
 
 A **lifecycle** is one run of something: a boot of an ECU, a start of an

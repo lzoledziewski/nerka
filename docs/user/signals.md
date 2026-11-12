@@ -1,3 +1,8 @@
+---
+title: "Signals and plots"
+description: "Signals and plots in nerka: values captured from log lines with regex groups, events and states, time signals, and plots with cursors, markers and bookmarks."
+---
+
 # Signals and plots
 
 A **signal** is a named value that lines carry: a speed, a gear, a state, a
@@ -87,7 +92,9 @@ current line is a cursor.
   files with all its lanes. Changes to a kept plot are kept only with
   **Keep changes** / **Save**.
 - **⧉ Own window** moves the plot into a window of its own
-  (`--plot-window`); 📷 in its header copies it as an image.
+  (`--plot-window`), titled with the window's name; **⧉ Dock** puts it
+  back, and closing that window closes the plot (📈 Plot opens it there
+  again). 📷 in its header copies it as an image.
 - [Lifecycles](lifecycles.md) show as labelled spans on the plot.
 
 ```

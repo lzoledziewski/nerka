@@ -1,3 +1,8 @@
+---
+title: "nerka user guide"
+sitemap: false
+---
+
 # nerka user guide
 
 The guide's contents are on [the documentation home](../index.md), which is

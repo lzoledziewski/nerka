@@ -1,3 +1,8 @@
+---
+title: "The command line"
+description: "The nerka command line: filter, search, open, lines, check, lifecycles, export and import, with every option for DLT, pcap, MF4, JSON and text logs."
+---
+
 # The command line
 
 ```

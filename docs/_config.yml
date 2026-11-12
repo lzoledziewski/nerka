@@ -1,8 +1,26 @@
-# GitHub Pages (Jekyll) for docs/: the user guide. Publish it in the
+# GitHub Pages (Jekyll) for docs/: the user guide. Published from the
 # repository's Settings → Pages → Deploy from a branch: main, /docs.
 # docs/dev/ is the project's working ledger, not part of the site.
 title: nerka
-description: Fast log analysis for text, JSON, DLT and captures
+description: >-
+  Fast log viewer and analyzer for big files: AUTOSAR DLT, pcap, pcapng and
+  MF4 captures, text and JSON logs. Filter, search, plot signals, follow
+  boots and run checks. Windows and Linux.
+lang: en
 theme: jekyll-theme-cayman
+# Both are supported on GitHub Pages: the SEO tags (titles, descriptions,
+# canonical URLs, link previews) and /sitemap.xml for search engines.
+plugins:
+  - jekyll-seo-tag
+  - jekyll-sitemap
+# Every page's front matter has its own title and description; the image
+# is what link previews show.
+defaults:
+  - scope:
+      path: ""
+    values:
+      image: /user/img/nerka.png
 exclude:
   - dev
+# google500f8e5470984cd6.html: Google Search Console's verification of
+# https://lzoledziewski.github.io/nerka/ (keep it here).

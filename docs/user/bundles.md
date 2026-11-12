@@ -1,3 +1,8 @@
+---
+title: "Settings bundles"
+description: "Settings bundles: export and import nerka's query packs, presets, plots, checks and signals as one readable file, upgraded across versions."
+---
+
 # Settings bundles
 
 A **settings bundle** is one readable text file (`.nerka-bundle`) holding

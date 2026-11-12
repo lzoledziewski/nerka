@@ -1,3 +1,8 @@
+---
+title: "The desktop viewer"
+description: "The nerka desktop viewer: tabs, the Filter and Search boxes, the line window, bookmarks with notes, several files as one view, keyboard shortcuts and startup options."
+---
+
 # The desktop viewer
 
 `nerka-gui` shows one **tab** per file, or per set of files opened as one
@@ -59,9 +64,13 @@ they find their lines again in a changed file (one that can't is marked
 Files opened together (multi-select in **Open…**, dropping several,
 `nerka-gui a.dlt b.pcap`) become **one tab**, one after another in the
 order given. The tab's menu → **Files…** lists them: move, remove or add
-files, turn protocols on or off per capture, and **Merge by time**
-(interleave lines by their time, for files that know it). A field `file`
-tells the files apart in queries. See [Files and formats](formats.md).
+files, turn protocols on or off per capture. **Merge by time** in the
+menu interleaves lines by their time, for files that know it; a tab of one
+such file has **Sort by time** instead. A field `file` tells the files
+apart in queries. See [Files and formats](formats.md).
+
+A tab's menu → **Reload** reads its files again from disk, keeping
+the filter, search, selection and the line you are on.
 
 ## Panels and windows
 
@@ -82,7 +91,10 @@ focused last, which opens them as tabs. `--new-window` starts a window of
 its own; `--name NAME` names it. Windows share one configuration: when
 another window changed packs, presets, plots, checks or signals, a bar
 says what, with **Reload** and **Not now**; nothing is changed under you.
-A tab can move to another window (its menu).
+A tab's menu → **Move to window** moves it, with its filter, search and
+selection: to a **New window**, or to one of the other open windows, listed
+by name and active tab. Name windows (⚙ Settings → Name) to tell them
+apart.
 
 ## Keys
 

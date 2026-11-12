@@ -6,7 +6,12 @@
 //! random token, in `<config>/nerka/instances/<pid>`; it rewrites that file
 //! when it gains focus, so the newest file is the window focused last. A
 //! request is one connection: `nerka1 <token>`, then `open\t<path>` lines,
-//! then `end`; the window answers `ok`. Only std, no dependency.
+//! an optional `preset\t<path>` (a tab moved here: its filter, search and
+//! selection), then `end`; the window answers `ok`. Only std, no dependency.
+//!
+//! Next to the registration, `<pid>.label` says what the window shows (its
+//! name, its active tab), so a tab's menu can list the other windows to
+//! move it to.
 //!
 //! Each connection is served on its own thread (at most [`MAX_SERVING`] at
 //! once) and has [`REQUEST_TIME`] for its whole request, so a client that
@@ -51,6 +56,12 @@ fn new_token() -> String {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Request {
     Open(Vec<PathBuf>),
+    /// A tab moved here: its files, and a preset file with its filter,
+    /// search and selection (for the receiver to read and remove).
+    Move {
+        files: Vec<PathBuf>,
+        preset: PathBuf,
+    },
 }
 
 /// This window's listener and registration.
@@ -59,6 +70,14 @@ pub struct Server {
     file: PathBuf,
     line: String,
     focused: bool,
+    label: String,
+}
+
+/// Another running window, as its label file describes it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Window {
+    pub label: String,
+    registration: PathBuf,
 }
 
 impl Server {
@@ -75,7 +94,16 @@ impl Server {
         nerka_core::write_atomic(&file, &line).ok()?;
         let (tx, rx) = mpsc::channel();
         std::thread::spawn(move || listen(listener, token, tx, wake));
-        Some(Server { rx, file, line, focused: true })
+        Some(Server { rx, file, line, focused: true, label: String::new() })
+    }
+
+    /// Say what this window shows, for other windows' Move to window list.
+    pub fn set_label(&mut self, label: &str) {
+        let label: String = label.chars().map(|c| if c.is_control() { ' ' } else { c }).collect();
+        if label != self.label {
+            let _ = nerka_core::write_atomic(label_file(&self.file), &label);
+            self.label = label;
+        }
     }
 
     /// Requests that arrived since the last call.
@@ -96,6 +124,49 @@ impl Server {
 impl Drop for Server {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.file);
+        let _ = std::fs::remove_file(label_file(&self.file));
+    }
+}
+
+fn label_file(registration: &Path) -> PathBuf {
+    registration.with_extension("label")
+}
+
+/// The other windows running, by label.
+pub fn others() -> Vec<Window> {
+    dir().map(|d| others_in(&d, std::process::id())).unwrap_or_default()
+}
+
+fn others_in(dir: &Path, own: u32) -> Vec<Window> {
+    let Ok(rd) = std::fs::read_dir(dir) else { return Vec::new() };
+    let mut out: Vec<Window> = rd
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| {
+            p.file_name().and_then(|n| n.to_str()).and_then(|n| n.parse::<u32>().ok()).is_some_and(|n| n != own)
+        })
+        .map(|registration| {
+            let label = std::fs::read_to_string(label_file(&registration)).unwrap_or_default();
+            let label = if label.trim().is_empty() { "nerka".to_owned() } else { label.trim().to_owned() };
+            Window { label, registration }
+        })
+        .collect();
+    out.sort_by(|a, b| a.label.cmp(&b.label));
+    out
+}
+
+/// Give a tab to `window`: its files and the preset file of its filter,
+/// search and selection. An error says why it didn't take them; a window
+/// that is gone is dropped from the list.
+pub fn move_to(window: &Window, files: &[PathBuf], preset: &Path) -> Result<(), String> {
+    match send(&window.registration, files, Some(preset)) {
+        Some(true) => Ok(()),
+        Some(false) => Err(format!("{} didn't take it (an older nerka?)", window.label)),
+        None => {
+            let _ = std::fs::remove_file(&window.registration);
+            let _ = std::fs::remove_file(label_file(&window.registration));
+            Err(format!("{} is gone", window.label))
+        }
     }
 }
 
@@ -154,14 +225,18 @@ fn serve_until(stream: TcpStream, token: &str, deadline: Instant) -> Option<Requ
     if magic != MAGIC || !same {
         return None;
     }
-    let mut files = Vec::new();
+    let (mut files, mut preset) = (Vec::new(), None);
     for line in lines {
         let line = line.ok()?;
         match line.split_once('\t') {
             Some(("open", path)) if !path.is_empty() => files.push(PathBuf::from(path)),
+            Some(("preset", path)) if !path.is_empty() && preset.is_none() => preset = Some(PathBuf::from(path)),
             _ if line == "end" => {
                 let _ = out.write_all(b"ok\n");
-                return Some(Request::Open(files));
+                return Some(match preset {
+                    Some(preset) => Request::Move { files, preset },
+                    None => Request::Open(files),
+                });
             }
             _ => return None,
         }
@@ -183,12 +258,13 @@ pub fn hand_off(files: &[PathBuf]) -> bool {
     // Absolute paths: the window runs in another directory.
     let files: Vec<PathBuf> = files.iter().map(|f| std::path::absolute(f).unwrap_or_else(|_| f.clone())).collect();
     for (_, path) in entries {
-        match send(&path, &files) {
+        match send(&path, &files, None) {
             Some(true) => return true,
             Some(false) => {}
             // Nothing listens there: a window that didn't close cleanly.
             None => {
                 let _ = std::fs::remove_file(&path);
+                let _ = std::fs::remove_file(label_file(&path));
             }
         }
     }
@@ -196,9 +272,9 @@ pub fn hand_off(files: &[PathBuf]) -> bool {
 }
 
 /// `None`: nobody listens; `Some(false)`: it didn't accept.
-fn send(registration: &Path, files: &[PathBuf]) -> Option<bool> {
+fn send(registration: &Path, files: &[PathBuf], preset: Option<&Path>) -> Option<bool> {
     let text = std::fs::read_to_string(registration).ok()?;
-    let (port, token) = text.trim().split_once(' ')?;
+    let (port, token) = text.lines().next()?.trim().split_once(' ')?;
     let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, port.parse::<u16>().ok()?));
     let mut s = TcpStream::connect_timeout(&addr, Duration::from_millis(300)).ok()?;
     s.set_read_timeout(Some(Duration::from_secs(3))).ok()?;
@@ -209,6 +285,13 @@ fn send(registration: &Path, files: &[PathBuf]) -> Option<bool> {
             return Some(false);
         }
         msg += &format!("open\t{p}\n");
+    }
+    if let Some(preset) = preset {
+        let p = preset.display().to_string();
+        if p.contains(['\n', '\r']) {
+            return Some(false);
+        }
+        msg += &format!("preset\t{p}\n");
     }
     msg += "end\n";
     if s.write_all(msg.as_bytes()).is_err() {
@@ -243,6 +326,12 @@ mod tests {
                 Some(Request::Open(vec!["/a.log".into(), "/b b.dlt".into()])),
                 "ok\n",
             ),
+            (
+                "nerka1 secret\nopen\t/a.log\npreset\t/tmp/m.nerka-preset\nend\n",
+                Some(Request::Move { files: vec!["/a.log".into()], preset: "/tmp/m.nerka-preset".into() }),
+                "ok\n",
+            ),
+            ("nerka1 secret\nopen\t/a.log\npreset\t/x\npreset\t/y\nend\n", None, ""),
             ("nerka1 wrong!\nopen\t/a.log\nend\n", None, ""),
             ("nerka1 secret\nopen\t/a.log\n", None, ""),
             ("nerka1 secret\nrm\t/a.log\nend\n", None, ""),
@@ -276,6 +365,24 @@ mod tests {
         let took = start.elapsed();
         assert!(took < Duration::from_millis(1000), "served for {took:?}");
         client.join().unwrap();
+    }
+
+    /// Other windows are listed by their labels; this one and label files
+    /// themselves are not windows.
+    #[test]
+    fn other_windows_by_label() {
+        let dir = std::env::temp_dir().join(format!("nerka-instances-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        for (pid, label) in [("10", Some("OTA crash · a.dlt")), ("11", Some("b.log")), ("12", None), ("13", Some("me"))]
+        {
+            std::fs::write(dir.join(pid), "1 t\n").unwrap();
+            if let Some(l) = label {
+                std::fs::write(dir.join(format!("{pid}.label")), l).unwrap();
+            }
+        }
+        let labels: Vec<String> = others_in(&dir, 13).into_iter().map(|w| w.label).collect();
+        assert_eq!(labels, ["OTA crash · a.dlt", "b.log", "nerka"]);
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// While one client holds a connection open, another is served.
