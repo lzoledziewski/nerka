@@ -4746,6 +4746,10 @@ impl App {
         let ctx = ui.ctx().clone();
         if ctx.options(|o| o.theme_preference) != self.prefs.theme {
             ctx.set_theme(self.prefs.theme);
+            // The windows' frames take a theme at their next pass: one more
+            // here, and the plot's window draws in it (`plot::window_ui`).
+            ctx.request_repaint();
+            ctx.request_repaint_of(egui::ViewportId::from_hash_of("nerka-plot"));
         }
         self.follow_focus(&ctx);
         self.poll_instance(&ctx);
@@ -5184,13 +5188,22 @@ impl App {
                 asked
             };
             let shared = self.plot_win.clone();
-            let builder = egui::ViewportBuilder::default()
-                .with_title(format!("Plot — {} — nerka", tab.title()))
-                .with_inner_size([1100.0, 460.0]);
+            // The window's name first, as in the main window's title.
+            let title = match self.window_name.as_deref().map(str::trim).filter(|n| !n.is_empty()) {
+                Some(n) => format!("{n} · Plot · {} — nerka", tab.title()),
+                None => format!("Plot · {} — nerka", tab.title()),
+            };
+            let builder = egui::ViewportBuilder::default().with_title(title).with_inner_size([1100.0, 460.0]);
             let id = egui::ViewportId::from_hash_of("nerka-plot");
             ctx.show_viewport_deferred(id, builder, move |ui, _| plot::window_ui(ui, &shared));
-            if toggle || closed {
+            if toggle {
                 self.plot_window = false;
+                self.plot_win_key = None;
+            }
+            // Its window closed: the plot closes (owner, 2026-11-12: it
+            // docked before); 📈 Plot shows it in its own window again.
+            if closed {
+                plot_out.close = true;
                 self.plot_win_key = None;
             }
             if let Some(line) = goto {

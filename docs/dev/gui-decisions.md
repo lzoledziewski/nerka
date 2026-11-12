@@ -37,6 +37,8 @@ Owner feedback is driving this; these are deliberate choices, keep them:
 
 - **Theme, Reload, sorting one file (owner, 2026-11-12, from use on Linux):** ⚙ Settings → **Theme**: System (default), Light, Dark, saved in `prefs` (`theme`). A tab's menu → **Reload** reads its files again from disk, as a change of times does (filter, search, selection and line stay). A tab of one file that knows its times (DLT, captures) has **Sort by time** where several files have Merge by time: a stable sort of all its lines by time (a line without a time goes with the one before it), so lines whose times go back move; Merge by time still keeps each file's own order. Sorting one file is not the remembered Merge by time choice: new one-file tabs open unsorted.
 
+- **The plot's own window (owner, 2026-11-12):** its title starts with the window's name (`OTA crash · Plot · trace.dlt — nerka`), as the main window's does. One close only: the window's ✖ closes the plot (it docked before; the header's ✖ shows only when docked), and 📈 Plot opens it in its own window again; **⧉ Dock** puts it back under the views.
+
 ## Checking the GUI visually
 
 `tools/screenshot.ps1` launches the debug build, captures its window to a PNG and closes it again. Read the PNG to check layout and rendering. This is how the off-screen scrollbar was found. `-Keys` sends keystrokes before the capture (SendKeys syntax), e.g. `-Keys '{F1}'` for the About dialog. Don't close or kill nerka-gui windows the owner has open; if the exe is locked by one of them, build with `--target-dir target/<name>` and pass `-Exe`.
