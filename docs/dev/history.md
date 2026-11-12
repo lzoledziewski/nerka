@@ -4,6 +4,8 @@ The dated log of the project, newest first; append-only: add an entry at the top
 
 ## 2026-11-12
 
+A tab's menu → **Move to window ▸** (New window, or another open window by its name and active tab) replaces Move to new window (owner: the cheaper step before dragging tabs across windows, which would be a day or two and not work on Wayland).
+
 From the owner's use on Linux: ⚙ Settings → **Theme** (System, Light, Dark; pref `theme`; egui shows dark where the desktop doesn't say, as on the owner's Linux); a tab's menu → **Reload** reads its files again; **Sort by time** for a tab of one file that knows its times (`nerka_core::sort_by_time`, `Merged::sorted`: a stable sort, unlike Merge by time's interleave that keeps each file's order).
 
 ## 2026-11-11

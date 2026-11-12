@@ -4235,35 +4235,68 @@ impl App {
         server.set_focused(ctx.input(|i| i.viewport().focused).unwrap_or(false));
         let requests = server.poll();
         for r in requests {
-            let instance::Request::Open(files) = r;
-            self.open_files(ctx, files);
+            match r {
+                instance::Request::Open(files) => self.open_files(ctx, files),
+                instance::Request::Move { files, preset } => self.take_tab(ctx, files, &preset),
+            }
             ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
             ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
         }
     }
 
-    /// Open tab `i`'s file in a new window, with its filter, search and
-    /// selection (as a preset file), and close it here.
-    fn move_tab(&mut self, i: usize) {
+    /// A tab moved here from another window: its files, then its filter,
+    /// search and selection from the preset file (removed once read). If
+    /// the files are open here already, that tab takes them.
+    fn take_tab(&mut self, ctx: &egui::Context, files: Vec<PathBuf>, preset: &Path) {
+        let text = std::fs::read_to_string(preset);
+        let _ = std::fs::remove_file(preset);
+        self.open_files(ctx, files);
+        let Some(t) = self.tabs.get_mut(self.active) else { return };
+        match text
+            .map_err(|e| e.to_string())
+            .and_then(|t| nerka_core::preset::parse_preset("moved tab", &t).map_err(|e| e.to_string()))
+        {
+            Ok(p) => {
+                t.use_preset(ctx, &self.library, &p);
+                t.preset = None;
+                t.status = "Moved here from another window".into();
+            }
+            Err(e) => t.status = format!("Moved here without its filter and search: {e}"),
+        }
+    }
+
+    /// Move tab `i` to `to` (another window), or to a new window, with its
+    /// filter, search and selection (as a preset file), and close it here.
+    fn move_tab(&mut self, i: usize, to: Option<&instance::Window>) {
         let Some(t) = self.tabs.get(i) else { return };
         let paths = t.paths.clone();
         let file = std::env::temp_dir().join(format!("nerka-move-{}-{}.nerka-preset", std::process::id(), self.moves));
         self.moves += 1;
-        let res = std::env::current_exe().and_then(|exe| {
-            nerka_core::write_atomic(&file, t.to_preset("moved tab").serialize())?;
-            let mut cmd = std::process::Command::new(exe);
-            cmd.arg("--new-window").arg("--preset-file").arg(&file);
-            for p in &self.pack_paths {
-                cmd.arg("--pack").arg(p);
+        if let Err(e) = nerka_core::write_atomic(&file, t.to_preset("moved tab").serialize()) {
+            if let Some(t) = self.tabs.get_mut(i) {
+                t.status = format!("Could not move the tab: {e}");
             }
-            cmd.args(&paths).spawn().map(|_| ())
-        });
+            return;
+        }
+        let res = match to {
+            Some(w) => instance::move_to(w, &paths, &file),
+            None => std::env::current_exe()
+                .and_then(|exe| {
+                    let mut cmd = std::process::Command::new(exe);
+                    cmd.arg("--new-window").arg("--preset-file").arg(&file);
+                    for p in &self.pack_paths {
+                        cmd.arg("--pack").arg(p);
+                    }
+                    cmd.args(&paths).spawn().map(|_| ())
+                })
+                .map_err(|e| format!("Could not open a new window: {e}")),
+        };
         match res {
             Ok(()) => self.close(i),
             Err(e) => {
                 let _ = std::fs::remove_file(&file);
                 if let Some(t) = self.tabs.get_mut(i) {
-                    t.status = format!("Could not open a new window: {e}");
+                    t.status = e;
                 }
             }
         }
@@ -4290,13 +4323,21 @@ impl App {
                         if ui.button("Close other tabs").clicked() {
                             close_others = Some(i);
                         }
-                        if ui
-                            .button("Move to new window")
-                            .on_hover_text("With its filter, search and selection")
-                            .clicked()
-                        {
-                            moved = Some(i);
-                        }
+                        ui.menu_button("Move to window", |ui| {
+                            let tip = "With its filter, search and selection";
+                            if ui.button("New window").on_hover_text(tip).clicked() {
+                                moved = Some((i, None));
+                            }
+                            let others = instance::others();
+                            if !others.is_empty() {
+                                ui.separator();
+                            }
+                            for w in others {
+                                if ui.button(&w.label).on_hover_text(tip).clicked() {
+                                    moved = Some((i, Some(w)));
+                                }
+                            }
+                        });
                         if ui.button(if t.paths.len() > 1 { "Copy full paths" } else { "Copy full path" }).clicked() {
                             ui.ctx().copy_text(t.files_text());
                         }
@@ -4411,8 +4452,8 @@ impl App {
             self.close(i);
         } else if let Some(i) = close_others {
             self.close_others(i);
-        } else if let Some(i) = moved {
-            self.move_tab(i);
+        } else if let Some((i, to)) = moved {
+            self.move_tab(i, to.as_ref());
         } else if let Some(i) = split {
             let ctx = ui.ctx().clone();
             self.split_tab(&ctx, i);
@@ -4673,6 +4714,22 @@ impl App {
         if title != self.window_title {
             ctx.send_viewport_cmd(egui::ViewportCommand::Title(title.clone()));
             self.window_title = title;
+        }
+        // What other windows' Move to window lists call this one: its
+        // name, its active tab, how many more tabs it has.
+        if let Some(server) = &mut self.server {
+            let name = self.window_name.as_deref().map(str::trim).filter(|n| !n.is_empty());
+            let tab = self.tabs.get(self.active).map(Tab::title);
+            let mut label = match (name, tab) {
+                (Some(n), Some(t)) => format!("{n} · {t}"),
+                (Some(n), None) => n.to_owned(),
+                (None, Some(t)) => t,
+                (None, None) => "nerka (no tabs)".to_owned(),
+            };
+            if self.tabs.len() > 1 {
+                label += &format!(" (+{} tabs)", self.tabs.len() - 1);
+            }
+            server.set_label(&label);
         }
     }
 }

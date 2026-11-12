@@ -91,7 +91,10 @@ focused last, which opens them as tabs. `--new-window` starts a window of
 its own; `--name NAME` names it. Windows share one configuration: when
 another window changed packs, presets, plots, checks or signals, a bar
 says what, with **Reload** and **Not now**; nothing is changed under you.
-A tab can move to another window (its menu).
+A tab's menu → **Move to window** moves it, with its filter, search and
+selection: to a **New window**, or to one of the other open windows, listed
+by name and active tab. Name windows (⚙ Settings → Name) to tell them
+apart.
 
 ## Keys
 
