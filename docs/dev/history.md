@@ -2,6 +2,10 @@
 
 The dated log of the project, newest first; append-only: add an entry at the top when `status.md` changes. Moved from `status.md` on 2026-11-10, word for word: its "Last update" line (each update with the ones before it) and its "Next steps" as they stood then, which tell what was built when and why. Where the moved text says "above", "below" or "this file", it means the old `status.md`: its sections are now `status.md` (state, pending decisions, limitations, licensing), `gui-decisions.md`, `features.md` and `history.md`.
 
+## 2026-11-15
+
+Instances of a parameterised query designed (owner): a pick holds argument sets, + instance adds one, instances share the query's settings (never conflict; the same values twice refused), each instance is a part of its own, signals per instance follow the pack's group names, `signals:` lines take parameters (`query-instances.md`); in 0.2.2. Signals merge across packs (no namespaces); options that disagree show a warning and the first picked query's win. A `signals:` entry for a group its query no longer captures is removed when the query is saved, with a warning in the status bar and listed in full at the top of the Library panel.
+
 ## 2026-11-14
 
 Signal options of pack queries built (0.2.2, owner's plan): a query's `signals:` attribute gives its groups a saved signal's options (`s:enum:per(ecu1):default(idle)`), the Signals panel changes them for the tab (kind, scope, ⚙ lifecycle and default), and **Save to pack** writes them into the pack; never by itself.
