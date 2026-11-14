@@ -95,7 +95,7 @@ impl SignalOptions {
                 lower.starts_with(key).then(|| w[key.len()..].strip_suffix(')')).flatten().map(str::to_owned)
             };
             if let Some(p) = arg("per(") {
-                if !is_name(p.trim()) {
+                if !crate::pack::is_name_with_params(p.trim()) {
                     return Err(SignalError::Spec(format!("per({p}): not a lifecycle's name")));
                 }
                 o.per = Some(p.trim().to_owned());

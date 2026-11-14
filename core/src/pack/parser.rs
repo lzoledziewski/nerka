@@ -1,6 +1,6 @@
 //! Pack file parser (format in `pack/mod.rs`).
 
-use super::{Ctx, Pack, PackError, PackQuery, is_name, is_query_name, render};
+use super::{Ctx, Pack, PackError, PackQuery, is_name, is_name_with_params, is_query_name, params_in, render};
 use crate::signal::SignalOptions;
 use std::ops::Range;
 
@@ -262,8 +262,12 @@ fn header(line: &str, content: &str, ln: usize) -> Result<PackQuery, (usize, Str
                     let start = p + part.len() - part.trim_start().len();
                     p += part.len() + 1;
                     let s = part.trim();
-                    let parsed =
-                        s.split_once(':').filter(|(g, _)| is_name(g)).map(|(g, o)| (g, SignalOptions::parse(o)));
+                    // A name may use the query's parameters (`drops_$cam`):
+                    // an instance each (`query-instances.md`).
+                    let parsed = s
+                        .split_once(':')
+                        .filter(|(g, _)| is_name_with_params(g))
+                        .map(|(g, o)| (g, SignalOptions::parse(o)));
                     let (g, options) = match parsed {
                         Some((g, Ok(o))) if !o.is_empty() => (g, o),
                         Some((_, Err(e))) => return at(start, format!("invalid signal '{s}': {e}")),
@@ -276,6 +280,25 @@ fn header(line: &str, content: &str, ln: usize) -> Result<PackQuery, (usize, Str
                             );
                         }
                     };
+                    let own = params_in(g);
+                    let in_options: Vec<String> =
+                        [&options.per, &options.default].into_iter().flatten().flat_map(|v| params_in(v)).collect();
+                    if let Some(p) = own.iter().chain(&in_options).find(|p| !q.params.contains(p)) {
+                        return at(
+                            start,
+                            format!("signal '{s}': parameter '${p}' is not declared (query {}({p}))", q.id),
+                        );
+                    }
+                    // Instances that share a signal share its options.
+                    if let Some(p) = in_options.iter().find(|p| !own.contains(p)) {
+                        return at(
+                            start,
+                            format!(
+                                "signal '{s}': an option uses '${p}' but the name '{g}' doesn't (instances with \
+                                 one name share its options)"
+                            ),
+                        );
+                    }
                     q.signals.retain(|(x, _)| x != g);
                     q.signals.push((g.to_owned(), options));
                 }

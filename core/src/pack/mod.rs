@@ -267,7 +267,10 @@ impl Library {
             groups.extend(captured_groups(&pq.text));
             parent = p.parent_of(pq);
         }
-        q.signals.iter().map(|(g, _)| g).filter(|g| !groups.contains(g)).cloned().collect()
+        // `$cam` and `${cam}` are one parameter.
+        let same = |s: &str| render(s, false, |n, _, _| Ok::<_, ()>(format!("${{{n}}}")), |_| ()).unwrap_or_default();
+        let groups: Vec<String> = groups.iter().map(|g| same(g)).collect();
+        q.signals.iter().map(|(g, _)| g).filter(|g| !groups.contains(&same(g))).cloned().collect()
     }
 
     /// [`stale_signals`](Self::stale_signals) of every loaded query:
@@ -415,6 +418,38 @@ pub fn is_query_name(s: &str) -> bool {
 pub fn is_name(s: &str) -> bool {
     let mut cs = s.chars();
     cs.next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_') && cs.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// `s` (a signal's name or an option's value from a `signals:` line) with
+/// its parameters filled in as written (`$$` is `$`); `None` if one has no
+/// value.
+pub fn fill_params(s: &str, params: &Params) -> Option<String> {
+    render(s, false, |name, _, _| params.get(name).map(|v| v.value.clone()).ok_or(()), |_| ()).ok()
+}
+
+/// Is `s` a name once its parameters are filled in with a name's
+/// characters (`drops_$cam`, `ecu_${n}`)?
+pub fn is_name_with_params(s: &str) -> bool {
+    render(s, false, |_, _, _| Ok::<_, ()>("x".to_owned()), |_| ()).is_ok_and(|t| is_name(&t))
+}
+
+/// A `signals:` entry (`drops_$cam` with its options) for one instance:
+/// its parameters filled in from `params`. `None` if one has no value or
+/// the name filled in isn't a name (the query's own group then fails to
+/// compile, and says so).
+pub fn fill_signal(
+    group: &str,
+    options: &crate::signal::SignalOptions,
+    params: &Params,
+) -> Option<(String, crate::signal::SignalOptions)> {
+    let name = fill_params(group, params).filter(|n| is_name(n))?;
+    let fill = |v: &Option<String>| match v {
+        Some(v) => fill_params(v, params).map(Some),
+        None => Some(None),
+    };
+    let per = fill(&options.per)?;
+    let default = fill(&options.default)?;
+    Some((name, crate::signal::SignalOptions { per, default, ..options.clone() }))
 }
 
 /// The names of the groups a query's text captures (`(?<name>…)`,

@@ -7490,6 +7490,38 @@ query clock  signals: t:time
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
+    /// Owner, 2026-11-15: a `signals:` line with parameters gives each
+    /// instance its signal (`drops_CAM1`); Save to pack writes the line as
+    /// written (`drops_$cam`, `per(ecu_$cam)` kept).
+    #[test]
+    fn signals_entries_with_parameters_are_filled_in_and_saved_as_written() {
+        let dir = std::env::temp_dir().join(format!("nerka-gui-sigparams-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("app.log");
+        std::fs::write(&log, "CAM1 drop 3\nCAM2 drop 4\nCAM1 drop 5\n").unwrap();
+        let pack_file = dir.join("cam.nerka-pack");
+        let text = "pack cam\nquery drops(cam)  signals: drops_$cam:num:per(ecu_$cam):default(0)\n    /$cam drop (?<drops_$cam>\\d+)/\n";
+        std::fs::write(&pack_file, text).unwrap();
+        let mut lib = Library::new();
+        lib.load(&pack_file).unwrap();
+        let ctx = egui::Context::default();
+        let mut tab = Tab::open(&ctx, log, &SearchPrefs::default());
+        settle(&mut tab, &ctx);
+        let saved = Signals::default();
+        tab.picks.add(&lib, "cam.drops", Use::Signal, None);
+        tab.picks.params.insert("cam".into(), ("CAM1".into(), false));
+        tab.refresh_signals(&ctx, &lib, &saved, 0);
+        let d = tab.signals.get("drops_CAM1").expect("filled in");
+        assert_eq!((d.kind(), d.per()), (SignalKind::Num, Some("ecu_cam1")));
+        assert_eq!(tab.pack_options["drops_CAM1"].spec(), "num:per(ecu_CAM1):default(0)");
+
+        tab.choose_option("drops_CAM1", |o| o.kind = Some(SignalKind::Enum));
+        tab.save_options_to_pack(&mut lib, "drops_CAM1").unwrap();
+        let file = std::fs::read_to_string(&pack_file).unwrap();
+        assert!(file.contains("signals: drops_$cam:enum:per(ecu_$cam):default(0)"), "{file}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     /// Owner, 2026-11-15: queries that give one signal different options
     /// are a conflict, shown; the first picked query's options are used;
     /// Save to pack makes them agree.

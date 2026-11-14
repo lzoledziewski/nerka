@@ -427,29 +427,36 @@ impl Picks {
             default: options.default.clone().filter(|d| !d.trim().is_empty()),
             ..options.clone()
         };
-        let set = |signals: &mut Vec<(String, SignalOptions)>| {
-            signals.retain(|(g, _)| g != group);
-            if !options.is_empty() {
-                signals.push((group.to_owned(), options.clone()));
-            }
-        };
         let applied = self.expand(lib)?;
+        let shared = self.params();
         let wanted = format!("<{group}>");
-        let keys: Vec<u64> = applied
-            .exp
-            .parts
-            .iter()
-            .enumerate()
-            .filter(|(_, p)| p.role != pack::Role::Exclude && applied.exp.part_nfd(p).contains(&wanted))
-            .map(|(i, _)| applied.keys[i])
-            .collect();
-        if keys.is_empty() {
+        // Each query once, with the arguments of its first part that has it.
+        let mut targets: Vec<(u64, Params)> = Vec::new();
+        for (i, p) in applied.exp.parts.iter().enumerate() {
+            if p.role != pack::Role::Exclude
+                && applied.exp.part_nfd(p).contains(&wanted)
+                && !targets.iter().any(|(k, _)| *k == applied.keys[i])
+            {
+                targets.push((applied.keys[i], effective(&shared, &p.args)));
+            }
+        }
+        if targets.is_empty() {
             return Err(format!("no picked query has the group (?<{group}>…)"));
         }
         let (mut packs, mut locals) = (Vec::new(), 0);
-        for key in keys {
+        for (key, args) in targets {
             let Some(n) = self.node_mut(key) else { continue };
             let from_library = n.source.clone().filter(|_| !n.edited && !n.detached);
+            // The entry as written in the query: `drops_$cam` for
+            // `drops_CAM1`, its values with parameters kept where they
+            // still give what is saved (owner, 2026-11-15).
+            let (name, write) = as_written(&n.signals, &n.text, group, &options, &args);
+            let set = |signals: &mut Vec<(String, SignalOptions)>| {
+                signals.retain(|(g, _)| *g != name);
+                if !write.is_empty() {
+                    signals.push((name.clone(), write.clone()));
+                }
+            };
             set(&mut n.signals);
             match from_library.as_deref().and_then(|id| lib.get(id)) {
                 Some((p, q)) => {
@@ -501,14 +508,17 @@ impl Picks {
             }
             by_id.push((id, n));
         }
-        let exp = pack::expand(&sel, &full, &self.params()).map_err(|e| e.to_string())?;
+        let shared = self.params();
+        let exp = pack::expand(&sel, &full, &shared).map_err(|e| e.to_string())?;
         let (mut keys, mut names, mut colors, mut pins) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
         for p in &exp.parts {
             let n = by_id.iter().find(|(id, _)| *id == p.query).map(|(_, n)| *n).expect("expanded from these nodes");
             keys.push(n.key);
             names.push(n.display_name());
             colors.push(n.color());
-            pins.push(n.signals.clone());
+            // `drops_$cam` filled in with this part's arguments.
+            let args = effective(&shared, &p.args);
+            pins.push(n.signals.iter().filter_map(|(g, o)| pack::fill_signal(g, o, &args)).collect());
         }
         Ok(Applied { exp, keys, names, colors, pins })
     }
@@ -1615,6 +1625,46 @@ fn node_editor(
         });
     });
     action
+}
+
+/// A part's parameter values: its own arguments over the shared ones.
+fn effective(shared: &Params, own: &Params) -> Params {
+    let mut p = shared.clone();
+    p.extend(own.iter().map(|(k, v)| (k.clone(), v.clone())));
+    p
+}
+
+/// Signal `group` (as filled in with `args`) and the `options` to save
+/// for it, as a query's `signals:` line writes them: the entry or regex
+/// group whose name fills in to `group` (`drops_$cam`), and its values
+/// with parameters where they still fill in to what is saved
+/// (`per(ecu_$cam)`), so the other instances keep theirs.
+fn as_written(
+    signals: &[(String, SignalOptions)],
+    text: &str,
+    group: &str,
+    options: &SignalOptions,
+    args: &Params,
+) -> (String, SignalOptions) {
+    let fills = |raw: &str| pack::fill_params(raw, args).as_deref() == Some(group);
+    let name = signals
+        .iter()
+        .map(|(g, _)| g.clone())
+        .chain(pack::captured_groups(text))
+        .find(|g| fills(g))
+        .unwrap_or_else(|| group.to_owned());
+    let raw = signals.iter().find(|(g, _)| *g == name).map(|(_, o)| o.clone()).unwrap_or_default();
+    let keep = |raw: &Option<String>, new: &Option<String>, same: fn(&str, &str) -> bool| match (raw, new) {
+        (Some(r), Some(n)) if pack::fill_params(r, args).is_some_and(|f| same(&f, n)) => Some(r.clone()),
+        _ => new.clone(),
+    };
+    // Lifecycle names don't care about case.
+    let write = SignalOptions {
+        per: keep(&raw.per, &options.per, |a, b| a.eq_ignore_ascii_case(b)),
+        default: keep(&raw.default, &options.default, |a, b| a == b),
+        ..options.clone()
+    };
+    (name, write)
 }
 
 /// Drop the `signals:` entries of `q` (to be saved in `pack`) for groups

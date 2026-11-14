@@ -41,6 +41,47 @@ query speed  parent: base  signals: speed:num, ecu:enum, sped:num
     assert_eq!(lib.all_stale_signals(), [("p.speed".to_owned(), "sped".to_owned())]);
 }
 
+/// Owner, 2026-11-15: a `signals:` line takes the query's parameters, an
+/// entry filled in per instance; an option may use only the parameters its
+/// name does (instances with one name share its options).
+#[test]
+fn signals_entries_take_parameters() {
+    let text = "pack cam
+query drops(cam, ecu)  signals: drops_${cam}:num:per(ecu_${cam}):default(0), total:num
+    /$cam drop (?<drops_$cam>\\d+) total (?<total>\\d+) $ecu/
+";
+    let p = parse_pack("cam.nerka-pack", text).unwrap();
+    let q = p.query("drops").unwrap();
+    assert_eq!(q.signals[0].0, "drops_${cam}");
+    assert_eq!(q.signals[0].1.spec(), "num:per(ecu_${cam}):default(0)");
+    // Written back as it was.
+    let again = parse_pack("cam.nerka-pack", &format!("pack cam\n{}", format_query(q))).unwrap();
+    assert_eq!(again.query("drops").unwrap().signals, q.signals);
+    // Filled in for an instance.
+    let params: Params = [("cam".to_owned(), ParamValue::literal("CAM1"))].into();
+    let (name, o) = fill_signal(&q.signals[0].0, &q.signals[0].1, &params).unwrap();
+    assert_eq!((name.as_str(), o.spec().as_str()), ("drops_CAM1", "num:per(ecu_CAM1):default(0)"));
+    assert!(fill_signal("drops_$cam", &q.signals[0].1, &Params::new()).is_none(), "no value");
+    let dash: Params = [("cam".to_owned(), ParamValue::literal("CAM-1"))].into();
+    assert!(fill_signal("drops_$cam", &q.signals[0].1, &dash).is_none(), "not a name");
+    // Captured groups count with parameters: nothing is stale.
+    let mut lib = Library::new();
+    lib.add(p).unwrap();
+    assert!(lib.all_stale_signals().is_empty());
+
+    let err = |line: &str| parse_pack("t.nerka-pack", &format!("pack t\n{line}\n    /x/\n")).unwrap_err().to_string();
+    assert!(
+        err("query a(cam)  signals: d_$x:num").contains("'$x' is not declared"),
+        "{}",
+        err("query a(cam)  signals: d_$x:num")
+    );
+    let e = err("query a(ecu)  signals: drops:num:per(ecu_$ecu)");
+    assert!(
+        e.contains("an option uses '$ecu' but the name 'drops' doesn't") && e.starts_with("t.nerka-pack:2:"),
+        "{e}"
+    );
+}
+
 #[test]
 fn signals_attribute_pins_kinds() {
     use crate::signal::{SignalKind, SignalOptions};
