@@ -726,6 +726,9 @@ struct Tab {
     query_options: std::collections::HashMap<String, nerka_core::SignalOptions>,
     /// What the picked queries' packs give each named group (`signals:`).
     pack_options: std::collections::HashMap<String, nerka_core::SignalOptions>,
+    /// Groups whose picked queries give different options (each query and
+    /// what it gives, in pick order: the first wins).
+    option_conflicts: std::collections::HashMap<String, Vec<(String, nerka_core::SignalOptions)>>,
     choices_gen: u64,
     /// The events each signal shows (filtered ones per filter result).
     views: signals::Views,
@@ -1284,6 +1287,7 @@ impl Tab {
             signals_key: None,
             query_options: Default::default(),
             pack_options: Default::default(),
+            option_conflicts: Default::default(),
             choices_gen: 0,
             views: signals::Views::default(),
             reopen_at: None,
@@ -1602,6 +1606,7 @@ impl Tab {
             }
         }
         self.pack_options.clear();
+        self.option_conflicts.clear();
         if let Ok(a) = self.picks.expand(lib) {
             let parts: Vec<nerka_core::QueryPart<'_>> = a
                 .exp
@@ -1611,11 +1616,23 @@ impl Tab {
                 .filter(|(_, p)| p.role != Role::Exclude)
                 .map(|(i, p)| nerka_core::QueryPart { name: &a.names[i], nfd: a.exp.part_nfd(p), pins: &a.pins[i] })
                 .collect();
-            // The first query that gives a group an option wins, as in core.
-            for (g, o) in parts.iter().flat_map(|p| p.pins.iter()) {
-                let e = self.pack_options.entry(g.clone()).or_default();
-                *e = e.over(o);
+            // The first query that gives a group an option wins, as in core;
+            // queries that give one differently are a conflict, shown
+            // (owner, 2026-11-15).
+            let mut given: std::collections::HashMap<&str, Vec<(String, nerka_core::SignalOptions)>> =
+                Default::default();
+            for p in &parts {
+                for (g, o) in p.pins.iter().filter(|(g, _)| p.nfd.contains(&format!("<{g}>"))) {
+                    let e = self.pack_options.entry(g.clone()).or_default();
+                    *e = e.over(o);
+                    given.entry(g).or_default().push((p.name.to_owned(), o.clone()));
+                }
             }
+            self.option_conflicts = given
+                .into_iter()
+                .filter(|(_, list)| list.iter().any(|(_, a)| list.iter().any(|(_, b)| disagree(a, b))))
+                .map(|(g, list)| (g.to_owned(), list))
+                .collect();
             let chosen = |g: &str| self.query_options.get(g).cloned();
             for d in nerka_core::query_signals(&parts, &*file, &chosen) {
                 // A saved signal of the same name wins.
@@ -3382,6 +3399,15 @@ fn prefs_path() -> Option<PathBuf> {
         return None;
     }
     nerka_core::config_dir().map(|d| d.join("prefs"))
+}
+
+/// Whether two queries give a signal different options: one that both give
+/// with different values.
+fn disagree(a: &nerka_core::SignalOptions, b: &nerka_core::SignalOptions) -> bool {
+    fn differ<T: PartialEq>(a: &Option<T>, b: &Option<T>) -> bool {
+        matches!((a, b), (Some(x), Some(y)) if x != y)
+    }
+    differ(&a.kind, &b.kind) || differ(&a.scope, &b.scope) || differ(&a.per, &b.per) || differ(&a.default, &b.default)
 }
 
 /// The library's warnings: `signals:` entries for groups their query no
@@ -5191,6 +5217,7 @@ impl App {
                         check_results: &tab.check_results,
                         chosen: &tab.query_options,
                         pack_options: &tab.pack_options,
+                        conflicts: &tab.option_conflicts,
                     };
                     signals::signals_panel(ui, &mut tab.signals_ui, input)
                 })
@@ -5898,6 +5925,7 @@ query timeouts  labels: vision
                         check_results: &[],
                         chosen: &tab.query_options,
                         pack_options: &tab.pack_options,
+                        conflicts: &tab.option_conflicts,
                     };
                     changed = signals::signals_panel(ui, &mut tab.signals_ui, input).args_changed;
                 });
@@ -7460,6 +7488,41 @@ query clock  signals: t:time
         assert!(!tab.start_search(&ctx));
         assert!(tab.status.contains("filtered lines only"), "{}", tab.status);
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Owner, 2026-11-15: queries that give one signal different options
+    /// are a conflict, shown; the first picked query's options are used;
+    /// Save to pack makes them agree.
+    #[test]
+    fn queries_giving_a_signal_different_options_are_a_conflict() {
+        let dir = std::env::temp_dir().join(format!("nerka-gui-conflict-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("app.log");
+        std::fs::write(&log, "v=1\nw v=2\n").unwrap();
+        let pack_file = dir.join("p.nerka-pack");
+        let text = "pack p\nquery a  signals: v:num\n    /v=(?<v>\\d)/\nquery b  signals: v:enum, w:enum\n    /w v=(?<v>\\d)/\n";
+        std::fs::write(&pack_file, text).unwrap();
+        let mut lib = Library::new();
+        lib.load(&pack_file).unwrap();
+        let ctx = egui::Context::default();
+        let mut tab = Tab::open(&ctx, log, &SearchPrefs::default());
+        settle(&mut tab, &ctx);
+        let saved = Signals::default();
+        tab.picks.add(&lib, "p.a", Use::Signal, None);
+        tab.picks.add(&lib, "p.b", Use::Signal, None);
+        tab.refresh_signals(&ctx, &lib, &saved, 0);
+        let given: Vec<String> = tab.option_conflicts["v"].iter().map(|(q, o)| format!("{q} {}", o.spec())).collect();
+        assert_eq!(given, ["a num", "b enum"]);
+        assert_eq!(tab.option_conflicts.len(), 1, "w: b's entry for a group it lacks isn't one");
+        assert_eq!(tab.signals.get("v").unwrap().kind(), SignalKind::Num, "the first query's");
+
+        tab.save_options_to_pack(&mut lib, "v").unwrap();
+        tab.picks.refresh(&lib);
+        tab.refresh_signals(&ctx, &lib, &saved, 0);
+        assert!(tab.option_conflicts.is_empty());
+        let file = std::fs::read_to_string(&pack_file).unwrap();
+        assert_eq!(file.matches("v:num").count(), 2, "{file}");
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// Owner, 2026-11-14: a query signal's options can be written in its

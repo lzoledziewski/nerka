@@ -309,6 +309,9 @@ pub struct Input<'a> {
     /// the packs give the query signals (`signals:`).
     pub chosen: &'a HashMap<String, SignalOptions>,
     pub pack_options: &'a HashMap<String, SignalOptions>,
+    /// Groups whose queries give different options: each query and what it
+    /// gives, the first wins (owner, 2026-11-15: shown, not resolved).
+    pub conflicts: &'a HashMap<String, Vec<(String, SignalOptions)>>,
 }
 
 pub fn signals_panel(ui: &mut egui::Ui, st: &mut SignalsUi, input: Input<'_>) -> Output {
@@ -327,6 +330,7 @@ pub fn signals_panel(ui: &mut egui::Ui, st: &mut SignalsUi, input: Input<'_>) ->
         check_results,
         chosen,
         pack_options,
+        conflicts,
     } = input;
     let lifecycles: Vec<&str> = signals.iter().filter(|d| d.as_lifecycle().is_some()).map(|d| d.name()).collect();
     let mut out = Output::default();
@@ -551,6 +555,15 @@ pub fn signals_panel(ui: &mut egui::Ui, st: &mut SignalsUi, input: Input<'_>) ->
                                 d.queries().join(", "),
                             ));
                             options_menu(ui, st, d, &lifecycles, &mut out);
+                            if let Some(list) = conflicts.get(d.name()) {
+                                let lines: Vec<String> =
+                                    list.iter().map(|(q, o)| format!("  {q}: {}:{}", d.group(), o.spec())).collect();
+                                ui.colored_label(ui.visuals().warn_fg_color, "⚠").on_hover_text(format!(
+                                    "Its queries give it different options:\n{}\nThe first one's are used (where \
+                                     it gives one). Save to pack writes one set into all of them.",
+                                    lines.join("\n")
+                                ));
+                            }
                             let tab = chosen.get(d.name()).filter(|o| !o.is_empty());
                             if let Some(tab) = tab {
                                 let saved = to_save(tab, &pack);
@@ -574,6 +587,18 @@ pub fn signals_panel(ui: &mut egui::Ui, st: &mut SignalsUi, input: Input<'_>) ->
                                 if ui.small_button("↺").on_hover_text("Back to what the pack gives").clicked() {
                                     out.reset_options = Some(d.name().to_owned());
                                 }
+                            } else if conflicts.contains_key(d.name())
+                                && ui
+                                    .small_button("Save to pack")
+                                    .on_hover_text(format!(
+                                        "Write the options in use (signals: {}:{}) into every picked query with this \
+                                         group, so they agree",
+                                        d.group(),
+                                        pack.spec()
+                                    ))
+                                    .clicked()
+                            {
+                                out.save_to_pack = Some(d.name().to_owned());
                             }
                         });
                     }
