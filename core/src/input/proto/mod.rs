@@ -616,11 +616,12 @@ impl LogSource for Records {
             |present: &[ProtoId]| present.iter().map(|&p| self.protos[p].name()).collect::<Vec<_>>().join(" + ");
         match &self.index {
             Index::Stored { .. } => format!("{} file", self.protos[0].name()),
-            Index::Framed { msgs, .. } => {
-                let mut seen = [false; MAX_PROTOCOLS];
-                msgs.iter().for_each(|m| seen[m.proto()] = true);
-                let present: Vec<ProtoId> = (0..self.protos.len()).filter(|&p| seen[p]).collect();
-                let inside = if present.is_empty() { "no messages".to_owned() } else { names(&present) };
+            // The protocols found when it was read: a UI asks every frame
+            // (it walked every message each time: 150 ms a frame on a
+            // 4 GiB capture).
+            Index::Framed { .. } => {
+                let present = &self.present;
+                let inside = if present.is_empty() { "no messages".to_owned() } else { names(present) };
                 format!("{}: {inside}", container(self.data.bytes()))
             }
         }

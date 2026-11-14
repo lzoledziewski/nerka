@@ -6053,10 +6053,83 @@ gear=D
         panic!("jobs still running");
     }
 
-    /// Owner, 2026-10-28: a plot kept in one tab opens in another with all
-    /// its lanes. One whose signal that tab lacks stays (it was dropped when
-    /// the tab's signals were built again); one the loaded FIBEX files
-    /// describe becomes the tab's signal.
+    /// What a frame of the whole window costs on a big file, browsing it:
+    /// idle, scrolling the log, the Signals panel with its FIBEX tree, the
+    /// plot. `NERKA_PERF_FILE=big.pcap NERKA_PERF_FIBEX=big.xml cargo test
+    /// --release -p nerka-gui perf_big_app -- --ignored --nocapture`
+    /// (absolute paths; files from `gen_fibex_dlt`).
+    #[test]
+    #[ignore = "needs a big file"]
+    fn perf_big_app() {
+        let (Ok(path), Ok(fx)) = (std::env::var("NERKA_PERF_FILE"), std::env::var("NERKA_PERF_FIBEX")) else {
+            return;
+        };
+        let ctx = egui::Context::default();
+        // A big file can take longer than `settle_app` waits.
+        let settle = |app: &mut App| {
+            while app.tabs.iter().any(|t| t.is_busy()) {
+                app.poll_jobs(&ctx);
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        };
+        let mut app = App::default();
+        app.set_fibex(&ctx, vec![PathBuf::from(fx)]);
+        let t = std::time::Instant::now();
+        app.open(&ctx, PathBuf::from(path));
+        settle(&mut app);
+        eprintln!("open {:.0} ms", t.elapsed().as_secs_f64() * 1e3);
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1600.0, 1000.0));
+        let mut time = 0.0;
+        let mut run = |app: &mut App, label: &str, events: Vec<egui::Event>| {
+            time += 1.0 / 60.0;
+            let input = egui::RawInput { screen_rect: Some(screen), time: Some(time), events, ..Default::default() };
+            let t = std::time::Instant::now();
+            let mut out = ctx.run_ui(input, |ui| app.frame(ui));
+            out.textures_delta.clear();
+            eprintln!("{label}: {:.1} ms", t.elapsed().as_secs_f64() * 1e3);
+        };
+        let wheel = |y: f32| egui::Event::MouseWheel {
+            unit: egui::MouseWheelUnit::Line,
+            delta: egui::vec2(0.0, y),
+            phase: egui::TouchPhase::Move,
+            source: egui::MouseWheelSource::Wheel,
+            modifiers: egui::Modifiers::NONE,
+        };
+        let over_log = egui::Event::PointerMoved(egui::pos2(600.0, 300.0));
+        for _ in 0..3 {
+            run(&mut app, "idle", vec![]);
+        }
+        run(&mut app, "pointer over the log", vec![over_log.clone()]);
+        for _ in 0..5 {
+            run(&mut app, "scroll the log", vec![wheel(-3.0)]);
+        }
+        // The Signals panel, its FIBEX tree, six arguments plotted.
+        app.show_signals = true;
+        let args = app.fibex_arguments();
+        for a in args.iter().take(6) {
+            app.tabs[0].arg_picks.push(a.clone());
+            plot::lock(&app.tabs[0].plot).toggle(&a.name);
+        }
+        app.tabs[0].choices_gen += 1;
+        let t = std::time::Instant::now();
+        run(&mut app, "signals picked", vec![]);
+        settle(&mut app);
+        eprintln!("events collected {:.0} ms", t.elapsed().as_secs_f64() * 1e3);
+        for _ in 0..3 {
+            run(&mut app, "with signals and plot, idle", vec![]);
+        }
+        for _ in 0..5 {
+            run(&mut app, "with signals and plot, scroll the log", vec![over_log.clone(), wheel(-3.0)]);
+        }
+        let over_panel = egui::Event::PointerMoved(egui::pos2(1450.0, 400.0));
+        for _ in 0..3 {
+            run(&mut app, "pointer over the Signals panel", vec![over_panel.clone()]);
+        }
+        for _ in 0..3 {
+            run(&mut app, "scroll the Signals panel", vec![over_panel.clone(), wheel(-3.0)]);
+        }
+    }
+
     /// Review 2026-11-14, P9: a tab's signals built again (a FIBEX argument
     /// ticked) keep the events collected for the ones that stay; before,
     /// every FIBEX and query signal read the file again.
@@ -6100,6 +6173,10 @@ gear=D
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// Owner, 2026-10-28: a plot kept in one tab opens in another with all
+    /// its lanes. One whose signal that tab lacks stays (it was dropped when
+    /// the tab's signals were built again); one the loaded FIBEX files
+    /// describe becomes the tab's signal.
     #[test]
     fn a_kept_plot_opens_in_another_tab_with_all_its_lanes() {
         let dir = std::env::temp_dir().join(format!("nerka-gui-tabplots-{}", std::process::id()));
