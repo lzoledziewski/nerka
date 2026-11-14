@@ -14,7 +14,9 @@
 use crate::plot::PlotState;
 use eframe::egui::{self, RichText};
 use nerka_core::lifecycle::{self, LifecycleDef};
-use nerka_core::{Library, LineNo, LogSource, SearchResult, SignalDef, SignalKind, SignalScope, SignalSeries, Signals};
+use nerka_core::{
+    Library, LineNo, LogSource, SearchResult, SignalDef, SignalKind, SignalOptions, SignalScope, SignalSeries, Signals,
+};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -37,6 +39,8 @@ pub struct SignalsUi {
     tree: (u64, Option<bool>),
     /// The filter the tree was last opened for.
     tree_filter: String,
+    /// The default typed in a signal's options menu (by signal name).
+    default_edit: Option<(String, String)>,
 }
 
 struct Draft {
@@ -220,6 +224,14 @@ pub struct Output {
     pub kind: Option<(String, SignalKind)>,
     /// A scope chosen for a signal.
     pub scope: Option<(String, SignalScope)>,
+    /// A lifecycle chosen for a query or FIBEX signal (empty: none).
+    pub per: Option<(String, String)>,
+    /// A default typed for a query or FIBEX signal (empty: none).
+    pub default: Option<(String, String)>,
+    /// Write this query signal's options into its packs ("Save to pack").
+    pub save_to_pack: Option<String>,
+    /// Drop the options this tab chose for a signal: the pack's again.
+    pub reset_options: Option<String>,
     /// Go to this line (the event that set a state was clicked).
     pub goto: Option<LineNo>,
     /// Filter by this NFD (a lifecycle's "filter to it").
@@ -291,11 +303,30 @@ pub struct Input<'a> {
     pub library: &'a Library,
     /// The checks' results on this tab's file: shown per lifecycle.
     pub check_results: &'a [(String, crate::checks::Outcome)],
+    /// The options this tab chose for query and FIBEX signals, and what
+    /// the packs give the query signals (`signals:`).
+    pub chosen: &'a HashMap<String, SignalOptions>,
+    pub pack_options: &'a HashMap<String, SignalOptions>,
 }
 
 pub fn signals_panel(ui: &mut egui::Ui, st: &mut SignalsUi, input: Input<'_>) -> Output {
-    let Input { signals, generation, saved, file, line, plot, views, kept, fibex, arg_picks, library, check_results } =
-        input;
+    let Input {
+        signals,
+        generation,
+        saved,
+        file,
+        line,
+        plot,
+        views,
+        kept,
+        fibex,
+        arg_picks,
+        library,
+        check_results,
+        chosen,
+        pack_options,
+    } = input;
+    let lifecycles: Vec<&str> = signals.iter().filter(|d| d.as_lifecycle().is_some()).map(|d| d.name()).collect();
     let mut out = Output::default();
     ui.horizontal(|ui| {
         ui.heading("Signals");
@@ -488,19 +519,61 @@ pub fn signals_panel(ui: &mut egui::Ui, st: &mut SignalsUi, input: Input<'_>) ->
                     } else if d.argument_index().is_some() {
                         ui.horizontal(|ui| {
                             ui.weak("FIBEX").on_hover_text(d.queries()[0].as_str());
+                            options_menu(ui, st, d, &lifecycles, &mut out);
+                            if chosen.get(d.name()).is_some_and(|o| !o.is_empty())
+                                && ui
+                                    .small_button("↺")
+                                    .on_hover_text(
+                                        "Back to what the FIBEX catalog says (kind) and no lifecycle or default",
+                                    )
+                                    .clicked()
+                            {
+                                out.reset_options = Some(d.name().to_owned());
+                            }
                             if ui.small_button("−").on_hover_text("Remove it from this tab's signals").clicked() {
                                 remove_arg = Some(d.name().to_owned());
                             }
                         });
                     } else {
-                        ui.weak("query").on_hover_text(format!(
-                        "From the named group (?<{}>…) of: {}\nIt goes away with the query; pin its kind in the pack \
-                     with signals: {}:{}",
-                        d.group(),
-                        d.queries().join(", "),
-                        d.group(),
-                        d.kind().as_str()
-                    ));
+                        ui.horizontal(|ui| {
+                            let pack = pack_options.get(d.name()).cloned().unwrap_or_default();
+                            let spec = pack.spec();
+                            let in_pack = if spec.is_empty() {
+                                "Its pack gives it no options: the kind comes from its values.".to_owned()
+                            } else {
+                                format!("Its pack gives it: signals: {}:{spec}", d.group())
+                            };
+                            ui.weak("query").on_hover_text(format!(
+                                "From the named group (?<{}>…) of: {}\nIt goes away with the query. {in_pack}",
+                                d.group(),
+                                d.queries().join(", "),
+                            ));
+                            options_menu(ui, st, d, &lifecycles, &mut out);
+                            let tab = chosen.get(d.name()).filter(|o| !o.is_empty());
+                            if let Some(tab) = tab {
+                                let saved = to_save(tab, &pack);
+                                ui.colored_label(ui.visuals().warn_fg_color, "●").on_hover_text(format!(
+                                    "Changed in this tab, not in the pack. {in_pack}\nSave to pack writes: signals: \
+                                     {}:{}",
+                                    d.group(),
+                                    if saved.is_empty() { "(nothing: the line goes)".to_owned() } else { saved.spec() }
+                                ));
+                                if ui
+                                    .small_button("Save to pack")
+                                    .on_hover_text(
+                                        "Write these options into the signals: line of every picked query with this \
+                                         group (library queries: into their pack's file). The tab's choices are \
+                                         never written by themselves.",
+                                    )
+                                    .clicked()
+                                {
+                                    out.save_to_pack = Some(d.name().to_owned());
+                                }
+                                if ui.small_button("↺").on_hover_text("Back to what the pack gives").clicked() {
+                                    out.reset_options = Some(d.name().to_owned());
+                                }
+                            }
+                        });
                     }
                     ui.end_row();
                 }
@@ -1314,6 +1387,70 @@ fn check_hover(check: &str, d: &SignalDef) -> String {
          (@{0}.event, @{0} > 0). Edit or switch it off in the Checks pane.",
         d.name()
     )
+}
+
+/// What "Save to pack" writes for a query signal: the tab's options over
+/// the pack's, an empty `per` or `default` (none, chosen in the tab) left
+/// out.
+pub fn to_save(tab: &SignalOptions, pack: &SignalOptions) -> SignalOptions {
+    let o = tab.over(pack);
+    SignalOptions {
+        per: o.per.clone().filter(|p| !p.trim().is_empty()),
+        default: o.default.clone().filter(|d| !d.trim().is_empty()),
+        ..o
+    }
+}
+
+/// A query or FIBEX signal's lifecycle and default, chosen in this tab.
+fn options_menu(ui: &mut egui::Ui, st: &mut SignalsUi, d: &SignalDef, lifecycles: &[&str], out: &mut Output) {
+    let r = ui.menu_button("⚙", |ui| {
+        ui.set_min_width(220.0);
+        ui.label(RichText::new(format!("@{}", d.name())).monospace().strong());
+        ui.horizontal(|ui| {
+            ui.label("Lifecycle").on_hover_text("Its state resets (to the default) where each lifecycle starts");
+            let now = d.per().unwrap_or("");
+            let mut to = now.to_owned();
+            egui::ComboBox::from_id_salt(("per", d.name()))
+                .selected_text(if now.is_empty() { "none" } else { now })
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut to, String::new(), "none");
+                    for l in lifecycles {
+                        ui.selectable_value(&mut to, (*l).to_owned(), *l);
+                    }
+                    if !now.is_empty() && !lifecycles.contains(&now) {
+                        ui.selectable_value(&mut to, now.to_owned(), format!("{now} (not defined)"));
+                    }
+                });
+            if to != now {
+                out.per = Some((d.name().to_owned(), to));
+            }
+        });
+        if lifecycles.is_empty() && d.per().is_none() {
+            ui.weak("No lifecycle yet: define one with + Lifecycle");
+        }
+        ui.horizontal(|ui| {
+            ui.label("Default").on_hover_text("Its state where no event set it (in each lifecycle, with one)");
+            if d.kind() == SignalKind::Time {
+                ui.weak("none (a time takes none)");
+                return;
+            }
+            let now = d.default_value().map(|v| v.to_string()).unwrap_or_default();
+            if st.default_edit.as_ref().is_none_or(|(n, _)| n != d.name()) {
+                st.default_edit = Some((d.name().to_owned(), now.clone()));
+            }
+            let Some((_, text)) = st.default_edit.as_mut() else { return };
+            let r = ui.add(egui::TextEdit::singleline(text).desired_width(100.0).hint_text("none"));
+            let enter = r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+            if (ui.add_enabled(text.trim() != now, egui::Button::new("Set")).clicked() || enter) && text.trim() != now {
+                out.default = Some((d.name().to_owned(), text.trim().to_owned()));
+            }
+        });
+    });
+    r.response.on_hover_text("Lifecycle and default (in this tab)");
+    // Typed but not set: forgotten when the menu closes.
+    if r.inner.is_none() && st.default_edit.as_ref().is_some_and(|(n, _)| n == d.name()) {
+        st.default_edit = None;
+    }
 }
 
 /// The scope: all lines, or only the lines the filter keeps.

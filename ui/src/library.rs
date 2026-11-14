@@ -23,7 +23,7 @@
 
 use eframe::egui::{self, Color32, RichText};
 use nerka_core::FieldDef;
-use nerka_core::SignalKind;
+use nerka_core::SignalOptions;
 use nerka_core::pack::{
     self, Expansion, Library, Pack, PackQuery, ParamValue, Params, Pick, Selection, format_query, is_query_name,
     params_in, parse_pack, upsert_query,
@@ -121,8 +121,8 @@ pub struct Node {
     pub open: bool,
     /// Last save error.
     pub error: Option<String>,
-    /// Kinds its pack pins for its named groups (`signals:`).
-    pub signals: Vec<(String, SignalKind)>,
+    /// Options its pack gives its named groups (`signals:`).
+    pub signals: Vec<(String, SignalOptions)>,
     /// What it is for (the pack's `##` lines).
     pub note: String,
 }
@@ -238,8 +238,8 @@ pub struct Applied {
     pub keys: Vec<u64>,
     pub names: Vec<String>,
     pub colors: Vec<Color32>,
-    /// Per part: the kinds its pack pins for its named groups.
-    pub pins: Vec<Vec<(String, SignalKind)>>,
+    /// Per part: the options its pack gives its named groups.
+    pub pins: Vec<Vec<(String, SignalOptions)>>,
 }
 
 /// One query of the Search box: its name, NFD and colour.
@@ -397,6 +397,7 @@ impl Picks {
                     n.parent = if n.detached { None } else { p.parent_of(q) };
                     n.labels = q.labels.join(", ");
                     n.color = q.color.clone().unwrap_or_default();
+                    n.signals = q.signals.clone();
                     n.note = q.note.clone();
                 }
                 Some(_) => {}
@@ -406,6 +407,63 @@ impl Picks {
                 }
             }
         }
+    }
+
+    /// Write `options` as what the packs give named group `group`
+    /// (`signals:`), into every picked query that has that group: a library
+    /// query is saved to its pack's file, an edited or local one keeps it
+    /// until it is saved. Only on the user's "Save to pack": the tab's
+    /// choices are never written by themselves (owner, 2026-11-14). An
+    /// empty `per` or `default` means none: left out. Returns the packs
+    /// written to and how many local queries took it.
+    pub fn save_signal_options(
+        &mut self,
+        lib: &mut Library,
+        group: &str,
+        options: &SignalOptions,
+    ) -> Result<(Vec<String>, usize), String> {
+        let options = SignalOptions {
+            per: options.per.clone().filter(|p| !p.trim().is_empty()),
+            default: options.default.clone().filter(|d| !d.trim().is_empty()),
+            ..options.clone()
+        };
+        let set = |signals: &mut Vec<(String, SignalOptions)>| {
+            signals.retain(|(g, _)| g != group);
+            if !options.is_empty() {
+                signals.push((group.to_owned(), options.clone()));
+            }
+        };
+        let applied = self.expand(lib)?;
+        let wanted = format!("<{group}>");
+        let keys: Vec<u64> = applied
+            .exp
+            .parts
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| p.role != pack::Role::Exclude && applied.exp.part_nfd(p).contains(&wanted))
+            .map(|(i, _)| applied.keys[i])
+            .collect();
+        if keys.is_empty() {
+            return Err(format!("no picked query has the group (?<{group}>…)"));
+        }
+        let (mut packs, mut locals) = (Vec::new(), 0);
+        for key in keys {
+            let Some(n) = self.node_mut(key) else { continue };
+            let from_library = n.source.clone().filter(|_| !n.edited && !n.detached);
+            set(&mut n.signals);
+            match from_library.as_deref().and_then(|id| lib.get(id)) {
+                Some((p, q)) => {
+                    let (pack, mut q) = (p.name.clone(), q.clone());
+                    set(&mut q.signals);
+                    lib.save_query(&pack, &q).map_err(|e| e.to_string())?;
+                    if !packs.contains(&pack) {
+                        packs.push(pack);
+                    }
+                }
+                None => locals += 1,
+            }
+        }
+        Ok((packs, locals))
     }
 
     pub fn params(&self) -> Params {

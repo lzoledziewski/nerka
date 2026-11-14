@@ -4,6 +4,8 @@ The dated log of the project, newest first; append-only: add an entry at the top
 
 ## 2026-11-14
 
+Signal options of pack queries built (0.2.2, owner's plan): a query's `signals:` attribute gives its groups a saved signal's options (`s:enum:per(ecu1):default(idle)`), the Signals panel changes them for the tab (kind, scope, ⚙ lifecycle and default), and **Save to pack** writes them into the pack; never by itself.
+
 Release archives for macOS on Apple Silicon from 0.2.2 (owner): `release.yml` builds `macos-aarch64` (unsigned, plain binaries, non-voting); the user guide says how to clear the download mark.
 
 Plan after 0.2.1 (owner): signal options of pack queries next (defaults in the pack's query definition, the tab overrides them, an explicit save into the pack), then time per file, profiles (spec lines in `<config>/nerka/profiles`, switching signals on) and views of several files (text with DLTs and captures; profile and time per file in Files…; a saved view later). The v0.2.1 release page got a summary above the generated list.

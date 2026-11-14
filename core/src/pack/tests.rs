@@ -21,12 +21,23 @@ fn pack(text: &str) -> Pack {
 
 #[test]
 fn signals_attribute_pins_kinds() {
-    use crate::signal::SignalKind;
+    use crate::signal::{SignalKind, SignalOptions};
     let p = pack("pack p\nquery q  signals: v:num, t:time, v:enum\n    /v=(?<v>\\d+)/\n");
-    assert_eq!(p.queries[0].signals, [("t".to_owned(), SignalKind::Time), ("v".to_owned(), SignalKind::Enum)]);
+    let kind = |k| SignalOptions { kind: Some(k), ..Default::default() };
+    assert_eq!(
+        p.queries[0].signals,
+        [("t".to_owned(), kind(SignalKind::Time)), ("v".to_owned(), kind(SignalKind::Enum))]
+    );
     assert!(format_query(&p.queries[0]).starts_with("query q  signals: t:time, v:enum\n"));
     let e = parse_pack("t", "pack p\nquery q  signals: v:big\n    /x/\n").unwrap_err();
     assert!(e.to_string().contains("invalid signal 'v:big'"), "{e}");
+    // Owner, 2026-11-14: a saved signal's options, written back the same.
+    let text = "pack p\nquery q  signals: s:enum:per(ecu1):default(not ready), t:time\n    /s=(?<s>\\w+)/\n";
+    let q = &pack(text).queries[0];
+    assert_eq!(q.signals[0].1, SignalOptions::parse("enum:per(ecu1):default(not ready)").unwrap());
+    assert!(format_query(q).starts_with("query q  signals: s:enum:per(ecu1):default(not ready), t:time\n"));
+    let e = parse_pack("t", "pack p\nquery q  signals: s:per(9)\n    /x/\n").unwrap_err();
+    assert!(e.to_string().contains("not a lifecycle's name"), "{e}");
 }
 
 #[test]

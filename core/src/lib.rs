@@ -65,8 +65,8 @@ pub use input::{Anchor, ColumnDef, LogSource, OpenOptions, SourceInfo, open, ope
 pub use pack::{Library, Pack, PackError, PackQuery};
 pub use session::{QueryContext, Session};
 pub use signal::{
-    Clock, QueryPart, SignalDef, SignalKind, SignalScope, SignalSeries, SignalValue, SignalView, Signals, ValueRef,
-    query_signals,
+    Clock, QueryPart, SignalDef, SignalKind, SignalOptions, SignalScope, SignalSeries, SignalValue, SignalView,
+    Signals, ValueRef, query_signals,
 };
 
 /// Line numbers are 0-based internally; UIs add 1 for display.

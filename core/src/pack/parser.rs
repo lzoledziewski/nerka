@@ -1,6 +1,7 @@
 //! Pack file parser (format in `pack/mod.rs`).
 
 use super::{Ctx, Pack, PackError, PackQuery, is_name, is_query_name, render};
+use crate::signal::SignalOptions;
 use std::ops::Range;
 
 /// Parse the text of a pack file. `file` is used in error messages.
@@ -261,12 +262,22 @@ fn header(line: &str, content: &str, ln: usize) -> Result<PackQuery, (usize, Str
                     let start = p + part.len() - part.trim_start().len();
                     p += part.len() + 1;
                     let s = part.trim();
-                    let kind = s.split_once(':').and_then(|(g, k)| Some((g, crate::signal::SignalKind::parse(k)?)));
-                    let Some((g, kind)) = kind.filter(|(g, _)| is_name(g)) else {
-                        return at(start, format!("invalid signal '{s}' (group:kind, kind num, enum or time)"));
+                    let parsed =
+                        s.split_once(':').filter(|(g, _)| is_name(g)).map(|(g, o)| (g, SignalOptions::parse(o)));
+                    let (g, options) = match parsed {
+                        Some((g, Ok(o))) if !o.is_empty() => (g, o),
+                        Some((_, Err(e))) => return at(start, format!("invalid signal '{s}': {e}")),
+                        _ => {
+                            return at(
+                                start,
+                                format!(
+                                    "invalid signal '{s}' (group:options: num, enum, time, filtered, per(LIFECYCLE), default(VALUE))"
+                                ),
+                            );
+                        }
                     };
                     q.signals.retain(|(x, _)| x != g);
-                    q.signals.push((g.to_owned(), kind));
+                    q.signals.push((g.to_owned(), options));
                 }
             }
             _ => unreachable!(),

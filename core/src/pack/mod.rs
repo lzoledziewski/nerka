@@ -36,7 +36,10 @@
 //!                                                     and QNAMEs
 //!          | "labels:" LABEL ("," LABEL)*          -- LABEL: seg ("/" seg)*
 //!          | "color:" (lowercase name | "#" 6 hex digits)
-//!          | "signals:" GROUP ":" KIND ("," GROUP ":" KIND)*  -- KIND: num, enum, time
+//!          | "signals:" GROUP ":" OPTS ("," GROUP ":" OPTS)*  -- OPTS: a saved signal's
+//!                                                     options, `:`-separated: num, enum,
+//!                                                     time, filtered, per(LIFECYCLE),
+//!                                                     default(VALUE) (no `,` in a VALUE)
 //! body    := indented lines (the NFD text, kept verbatim), up to the next
 //!            line that starts in column 1
 //! note    := "##" [" "] text NEWLINE                -- in column 1, directly
@@ -89,7 +92,7 @@ pub struct PackQuery {
     pub color: Option<String>,
     /// Kinds pinned for the query's named groups (`signals: speed:num`);
     /// other groups get theirs from the values.
-    pub signals: Vec<(String, crate::signal::SignalKind)>,
+    pub signals: Vec<(String, crate::signal::SignalOptions)>,
     /// NFD text with `$param` placeholders, dedented, lines joined by `\n`.
     pub text: String,
     /// What the query is for (its `##` lines, joined by `\n`); empty for none.

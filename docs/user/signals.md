@@ -37,7 +37,8 @@ defaults to the signal's name. Parts:
   in `%APPDATA%\nerka\signals`), `--signal SPEC` (CLI; GUI: for the session);
 - the **named groups of the queries in the selection** (Include or Signal
   role, [Query packs](packs.md)): their kind is guessed from the first
-  values, a pack can pin it (`signals: t:time`), the panel can change it;
+  values; the pack can give them options (`signals: t:time,
+  s:enum:per(ecu1):default(idle)`), the panel can change them for the tab;
 - the file: `@time` for files that know their lines' times (DLT,
   captures);
 - [lifecycles](lifecycles.md) (`@ecu1`, the lifecycle's number) and
@@ -71,6 +72,13 @@ the current line: `• event` when the line itself carries it, else `↑ N`
 (the line of the event that set it; click to go there). ✎ edits, − removes,
 the checkbox switches a saved signal on or off, **New signal or lifecycle**
 adds one. The line window (`Enter`) lists the line's own signals.
+
+A query's or FIBEX signal's kind, scope and ⚙ (lifecycle, default) change
+it **in this tab only**. A query signal changed so shows ●; **Save to
+pack** writes its options into the `signals:` line of the picked queries
+with that group (a library query: into its pack's file; an edited one keeps
+them until it is saved), ↺ goes back to what the pack gives. Nothing is
+written to a pack without that click.
 
 ## Plots
 

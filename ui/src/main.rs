@@ -60,7 +60,7 @@ use nerka_core::preset::{BoxText, Preset};
 use nerka_core::session::{Finished, Output, Session, Stage};
 use nerka_core::{
     Bookmarks, FieldDef, Filter, Highlighter, LineNo, LogSource, Matcher, MatcherOptions, Query, SearchHistory,
-    SearchHits, SearchResult, SearchSet, SignalKind, SignalScope, Signals, text_to_nfd,
+    SearchHits, SearchResult, SearchSet, Signals, text_to_nfd,
 };
 use prefs::SearchPrefs;
 use std::borrow::Cow;
@@ -717,9 +717,13 @@ struct Tab {
     /// What `signals` was built from: (saved signals' generation, choices'
     /// generation, the selection's fingerprint); none: build again.
     signals_key: Option<(u64, u64, String)>,
-    /// Kinds and scopes chosen for query signals, and their generation.
-    query_kind: std::collections::HashMap<String, SignalKind>,
-    query_scope: std::collections::HashMap<String, SignalScope>,
+    /// Options chosen in this tab for query and FIBEX signals, over what
+    /// their pack gives (an empty `per` or `default`: none here), and their
+    /// generation. Never written to the pack by itself: only "Save to
+    /// pack" does (owner, 2026-11-14).
+    query_options: std::collections::HashMap<String, nerka_core::SignalOptions>,
+    /// What the picked queries' packs give each named group (`signals:`).
+    pack_options: std::collections::HashMap<String, nerka_core::SignalOptions>,
     choices_gen: u64,
     /// The events each signal shows (filtered ones per filter result).
     views: signals::Views,
@@ -1275,8 +1279,8 @@ impl Tab {
             own_gen: 0,
             plot: Default::default(),
             signals_key: None,
-            query_kind: Default::default(),
-            query_scope: Default::default(),
+            query_options: Default::default(),
+            pack_options: Default::default(),
             choices_gen: 0,
             views: signals::Views::default(),
             reopen_at: None,
@@ -1504,6 +1508,45 @@ impl Tab {
         Job::spawn(ctx, move |prog| nerka_core::open_many(&ps, &options, prog).map(|f| (f, ps)))
     }
 
+    /// Change what this tab chose for a query or FIBEX signal; a choice
+    /// that leaves it as the pack gives it is dropped.
+    fn choose_option(&mut self, name: &str, change: impl FnOnce(&mut nerka_core::SignalOptions)) {
+        let mut o = self.query_options.get(name).cloned().unwrap_or_default();
+        change(&mut o);
+        let pack = self.pack_options.get(name).cloned().unwrap_or_default();
+        if signals::to_save(&o, &pack) == signals::to_save(&Default::default(), &pack) {
+            self.query_options.remove(name);
+        } else {
+            self.query_options.insert(name.to_owned(), o);
+        }
+        self.choices_gen += 1;
+    }
+
+    /// "Save to pack": write what this tab chose for query signal `name`
+    /// into the `signals:` line of the picked queries with that group, then
+    /// drop the tab's choice (the pack has it now). Never done by itself
+    /// (owner, 2026-11-14). Returns what to say.
+    fn save_options_to_pack(&mut self, lib: &mut Library, name: &str) -> Result<String, String> {
+        let tab = self.query_options.get(name).cloned().unwrap_or_default();
+        let pack = self.pack_options.get(name).cloned().unwrap_or_default();
+        let options = signals::to_save(&tab, &pack);
+        let (packs, locals) = self.picks.save_signal_options(lib, name, &options)?;
+        self.query_options.remove(name);
+        self.choices_gen += 1;
+        let line = if options.is_empty() { "no options".to_owned() } else { format!("{name}:{}", options.spec()) };
+        let mut said = format!("@{name}: {line}");
+        if !packs.is_empty() {
+            said += &format!(", saved in pack {}", packs.join(", "));
+        }
+        if locals > 0 {
+            said += &format!(
+                ", kept in {locals} edited quer{} (save it to write its pack)",
+                if locals == 1 { "y" } else { "ies" }
+            );
+        }
+        Ok(said)
+    }
+
     /// Build the tab's signals again if what they come from changed: the
     /// file's `@time`, the user's `saved` signals, the named groups of the
     /// selection's included and signal queries (with the kinds and scopes
@@ -1542,13 +1585,19 @@ impl Tab {
                 None => format!("mid == {}", a.mid),
             };
             let from = format!("FIBEX message {}: {}", a.mid, a.message);
-            let kind = self.query_kind.get(&a.name).copied().unwrap_or(a.ty.kind());
+            let options = self.query_options.get(&a.name).cloned().unwrap_or_default();
+            let kind = options.kind.unwrap_or(a.ty.kind());
             if s.get(&a.name).is_none()
                 && let Ok(d) = nerka_core::SignalDef::argument(&a.name, kind, &query, a.index, &from)
             {
-                s.set(d.with_scope(self.query_scope.get(&a.name).copied().unwrap_or_default()));
+                // A default that doesn't fit the kind is left out.
+                let without_default = nerka_core::SignalOptions { default: None, ..options.clone() };
+                if let Ok(d) = options.apply(d.clone()).or_else(|_| without_default.apply(d)) {
+                    s.set(d);
+                }
             }
         }
+        self.pack_options.clear();
         if let Ok(a) = self.picks.expand(lib) {
             let parts: Vec<nerka_core::QueryPart<'_>> = a
                 .exp
@@ -1558,12 +1607,16 @@ impl Tab {
                 .filter(|(_, p)| p.role != Role::Exclude)
                 .map(|(i, p)| nerka_core::QueryPart { name: &a.names[i], nfd: a.exp.part_nfd(p), pins: &a.pins[i] })
                 .collect();
-            let chosen = |g: &str| self.query_kind.get(g).copied();
+            // The first query that gives a group an option wins, as in core.
+            for (g, o) in parts.iter().flat_map(|p| p.pins.iter()) {
+                let e = self.pack_options.entry(g.clone()).or_default();
+                *e = e.over(o);
+            }
+            let chosen = |g: &str| self.query_options.get(g).cloned();
             for d in nerka_core::query_signals(&parts, &*file, &chosen) {
                 // A saved signal of the same name wins.
                 if s.get(d.name()).is_none() {
-                    let scope = self.query_scope.get(d.name()).copied().unwrap_or_default();
-                    s.set(d.with_scope(scope));
+                    s.set(d);
                 }
             }
         }
@@ -4980,6 +5033,7 @@ impl App {
         // Saved after the tab is done with (the panel changed them), and
         // FIBEX files chosen there (every DLT tab reads its file again).
         let mut save_signals = false;
+        let mut pack_saved = false;
         let mut save_checks = false;
         // A check renamed or removed: every tab's set follows.
         let mut checks_renamed: Option<(String, Option<String>)> = None;
@@ -5092,6 +5146,8 @@ impl App {
                         arg_picks: &mut tab.arg_picks,
                         library: &self.library,
                         check_results: &tab.check_results,
+                        chosen: &tab.query_options,
+                        pack_options: &tab.pack_options,
                     };
                     signals::signals_panel(ui, &mut tab.signals_ui, input)
                 })
@@ -5100,8 +5156,7 @@ impl App {
                 self.show_signals = false;
             }
             if let Some((name, kind)) = out.kind {
-                tab.query_kind.insert(name, kind);
-                tab.choices_gen += 1;
+                tab.choose_option(&name, |o| o.kind = Some(kind));
             }
             if let Some((name, scope)) = out.scope {
                 match self.saved_signals.get(&name) {
@@ -5110,10 +5165,27 @@ impl App {
                         self.saved_signals.set(d);
                         save_signals = true;
                     }
-                    None => {
-                        tab.query_scope.insert(name, scope);
-                        tab.choices_gen += 1;
+                    None => tab.choose_option(&name, |o| o.scope = Some(scope)),
+                }
+            }
+            if let Some((name, per)) = out.per {
+                tab.choose_option(&name, |o| o.per = Some(per));
+            }
+            if let Some((name, default)) = out.default {
+                tab.choose_option(&name, |o| o.default = Some(default));
+            }
+            if let Some(name) = out.reset_options
+                && tab.query_options.remove(&name).is_some()
+            {
+                tab.choices_gen += 1;
+            }
+            if let Some(name) = out.save_to_pack {
+                match tab.save_options_to_pack(&mut self.library, &name) {
+                    Ok(said) => {
+                        self.status = said;
+                        pack_saved = true;
                     }
+                    Err(e) => self.status = format!("@{name} not saved to the pack: {e}"),
                 }
             }
             if let Some(name) = &out.adopted {
@@ -5350,6 +5422,12 @@ impl App {
         if save_signals {
             self.save_saved_signals();
         }
+        if pack_saved {
+            // Every tab's queries take the pack's new signals: line.
+            for t in &mut self.tabs {
+                t.picks.refresh(&self.library);
+            }
+        }
         if let Some((old, new)) = checks_renamed {
             for t in &mut self.tabs {
                 if let Some(on) = &mut t.checks_on
@@ -5391,6 +5469,7 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use nerka_core::{SignalKind, SignalScope};
 
     /// Owner, 2026-11-07: checks given with --check (test runs) ended up in
     /// the saved file at the next edit. They last the session; one the user
@@ -5739,6 +5818,8 @@ query timeouts  labels: vision
                         arg_picks: &mut tab.arg_picks,
                         library: &Library::new(),
                         check_results: &[],
+                        chosen: &tab.query_options,
+                        pack_options: &tab.pack_options,
                     };
                     changed = signals::signals_panel(ui, &mut tab.signals_ui, input).args_changed;
                 });
@@ -7282,20 +7363,75 @@ query clock  signals: t:time
         assert_eq!(tab.result().unwrap().lines, [3]);
 
         // A chosen kind wins over the values; a saved signal over the query's.
-        tab.query_kind.insert("v".into(), SignalKind::Enum);
-        tab.choices_gen += 1;
+        tab.choose_option("v", |o| o.kind = Some(SignalKind::Enum));
         saved.set(nerka_core::SignalDef::parse_spec(r"gear:enum=/gear=(?<gear>[A-Z])/").unwrap());
         tab.refresh_signals(&ctx, &lib, &saved, 1);
         assert_eq!(tab.signals.get("v").unwrap().kind(), SignalKind::Enum);
         assert!(tab.signals.get("gear").unwrap().queries().is_empty(), "the saved one");
 
         // A filtered signal can't be used in a filter.
-        tab.query_scope.insert("v".into(), SignalScope::Filtered);
-        tab.choices_gen += 1;
+        tab.choose_option("v", |o| o.scope = Some(SignalScope::Filtered));
         tab.refresh_signals(&ctx, &lib, &saved, 1);
         tab.pattern = "@v == 10".into();
         assert!(!tab.start_search(&ctx));
         assert!(tab.status.contains("filtered lines only"), "{}", tab.status);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Owner, 2026-11-14: a query signal's options can be written in its
+    /// pack (`signals:`); what the tab changes stays in the tab until "Save
+    /// to pack", which writes it there.
+    #[test]
+    fn query_signal_options_stay_in_the_tab_until_saved_to_the_pack() {
+        let dir = std::env::temp_dir().join(format!("nerka-gui-qopt-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("app.log");
+        std::fs::write(&log, "boot\ngear=P\ngear=D\nboot\ngear=R\n").unwrap();
+        let pack_file = dir.join("p.nerka-pack");
+        std::fs::write(&pack_file, "pack p\nquery gears  signals: gear:enum\n    /gear=(?<gear>\\w)/\n").unwrap();
+        let mut lib = Library::new();
+        lib.load(&pack_file).unwrap();
+        let ctx = egui::Context::default();
+        let mut tab = Tab::open(&ctx, log, &SearchPrefs::default());
+        settle(&mut tab, &ctx);
+        let mut saved = Signals::default();
+        saved.set(nerka_core::SignalDef::parse_spec("lifecycle run: start raw ~ /boot/").unwrap());
+        tab.picks.add(&lib, "p.gears", Use::Signal, None);
+        tab.refresh_signals(&ctx, &lib, &saved, 0);
+        assert_eq!(tab.pack_options["gear"].spec(), "enum");
+        let gear = tab.signals.get("gear").unwrap();
+        assert_eq!((gear.per(), gear.default_value()), (None, None));
+
+        // Chosen in the tab: used here, the pack's file unchanged.
+        tab.choose_option("gear", |o| o.per = Some("run".into()));
+        tab.choose_option("gear", |o| o.default = Some("N".into()));
+        tab.refresh_signals(&ctx, &lib, &saved, 0);
+        let gear = tab.signals.get("gear").unwrap();
+        assert_eq!(gear.per(), Some("run"));
+        assert_eq!(gear.default_value().map(|v| v.to_string()).as_deref(), Some("N"));
+        assert!(!std::fs::read_to_string(&pack_file).unwrap().contains("per("));
+        // Choosing what the pack gives again leaves no choice behind.
+        tab.choose_option("gear", |o| o.kind = Some(SignalKind::Enum));
+        assert_eq!(tab.query_options["gear"].kind, Some(SignalKind::Enum), "the others are still chosen");
+
+        // Save to pack: the file has it, the tab's choice is gone, the
+        // signal is the same.
+        let said = tab.save_options_to_pack(&mut lib, "gear").unwrap();
+        assert!(said.contains("saved in pack p"), "{said}");
+        let text = std::fs::read_to_string(&pack_file).unwrap();
+        assert!(text.contains("signals: gear:enum:per(run):default(N)"), "{text}");
+        assert!(tab.query_options.is_empty());
+        tab.refresh_signals(&ctx, &lib, &saved, 0);
+        let gear = tab.signals.get("gear").unwrap();
+        assert_eq!((gear.per(), gear.default_value().map(|v| v.to_string())), (Some("run"), Some("N".to_owned())));
+
+        // "none" in the tab drops the pack's lifecycle when saved.
+        tab.choose_option("gear", |o| o.per = Some(String::new()));
+        tab.refresh_signals(&ctx, &lib, &saved, 0);
+        assert_eq!(tab.signals.get("gear").unwrap().per(), None);
+        tab.save_options_to_pack(&mut lib, "gear").unwrap();
+        let text = std::fs::read_to_string(&pack_file).unwrap();
+        assert!(text.contains("signals: gear:enum:default(N)"), "{text}");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

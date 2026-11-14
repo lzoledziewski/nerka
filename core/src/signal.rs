@@ -68,6 +68,97 @@ use std::sync::{Arc, Mutex};
 
 mod collect;
 
+/// How a signal is set up, apart from its name and query: a saved signal's
+/// spec between its name and `=` (`:enum:filtered:per(ecu1):default(idle)`),
+/// and a pack query's `signals:` attribute for a named group (owner,
+/// 2026-11-14: a query signal takes the same options; the pack gives the
+/// defaults, a tab overrides them). `None`: not given.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SignalOptions {
+    pub kind: Option<SignalKind>,
+    pub scope: Option<SignalScope>,
+    /// The lifecycle it is bound to (`per(NAME)`).
+    pub per: Option<String>,
+    /// Its state where no event set it (`default(VALUE)`), as written.
+    pub default: Option<String>,
+}
+
+impl SignalOptions {
+    /// `:`-separated words: a kind (`num`, `enum`, `time`), a scope (`all`,
+    /// `filtered`), `per(LIFECYCLE)`, `default(VALUE)`, in any order.
+    pub fn parse(words: &str) -> Result<SignalOptions, SignalError> {
+        let mut o = SignalOptions::default();
+        for w in words.split(':') {
+            let w = w.trim();
+            let lower = w.to_ascii_lowercase();
+            let arg = |key: &str| {
+                lower.starts_with(key).then(|| w[key.len()..].strip_suffix(')')).flatten().map(str::to_owned)
+            };
+            if let Some(p) = arg("per(") {
+                if !is_name(p.trim()) {
+                    return Err(SignalError::Spec(format!("per({p}): not a lifecycle's name")));
+                }
+                o.per = Some(p.trim().to_owned());
+                continue;
+            }
+            if let Some(d) = arg("default(") {
+                o.default = Some(d);
+                continue;
+            }
+            match lower.as_str() {
+                "all" => o.scope = Some(SignalScope::All),
+                "filtered" => o.scope = Some(SignalScope::Filtered),
+                k => o.kind = Some(SignalKind::parse(k).ok_or_else(|| {
+                    SignalError::Spec(format!(
+                        "unknown kind or scope '{w}' (num, enum, time; all, filtered; per(LIFECYCLE), default(VALUE))"
+                    ))
+                })?),
+            }
+        }
+        Ok(o)
+    }
+
+    /// The words [`Self::parse`] reads back, kind first; empty if none.
+    pub fn spec(&self) -> String {
+        let mut words: Vec<String> = Vec::new();
+        if let Some(k) = self.kind {
+            words.push(k.as_str().to_owned());
+        }
+        if self.scope == Some(SignalScope::Filtered) {
+            words.push("filtered".into());
+        }
+        if let Some(p) = &self.per {
+            words.push(format!("per({p})"));
+        }
+        if let Some(d) = &self.default {
+            words.push(format!("default({d})"));
+        }
+        words.join(":")
+    }
+
+    /// These options where given, `base`'s where not (a tab's over a pack's).
+    pub fn over(&self, base: &SignalOptions) -> SignalOptions {
+        SignalOptions {
+            kind: self.kind.or(base.kind),
+            scope: self.scope.or(base.scope),
+            per: self.per.clone().or_else(|| base.per.clone()),
+            default: self.default.clone().or_else(|| base.default.clone()),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        *self == SignalOptions::default()
+    }
+
+    /// `def` with these options' scope, lifecycle and default (its kind is
+    /// set where it is made: a default is read in it).
+    pub fn apply(&self, def: SignalDef) -> Result<SignalDef, SignalError> {
+        def.with_scope(self.scope.unwrap_or_default())
+            .with_per(self.per.as_deref())
+            .with_default(self.default.as_deref())
+    }
+}
+
 /// Where a signal's events come from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SignalScope {
@@ -832,44 +923,26 @@ impl SignalDef {
         }
         let bad = || SignalError::Spec(format!("'{spec}' isn't NAME[(GROUP)][:KIND][:SCOPE]=QUERY"));
         let (head, query) = spec.split_once('=').ok_or_else(bad)?;
-        let mut it = head.split(':');
-        let head = it.next().unwrap_or_default();
-        let (mut kind, mut scope, mut per, mut default) = (SignalKind::Num, SignalScope::All, None, None);
-        for w in it {
-            let w = w.trim();
-            let lower = w.to_ascii_lowercase();
-            let arg = |key: &str| {
-                lower.starts_with(key).then(|| w[key.len()..].strip_suffix(')')).flatten().map(str::to_owned)
-            };
-            if let Some(p) = arg("per(") {
-                per = Some(p);
-                continue;
-            }
-            if let Some(d) = arg("default(") {
-                default = Some(d);
-                continue;
-            }
-            match lower.as_str() {
-                "all" => scope = SignalScope::All,
-                "filtered" => scope = SignalScope::Filtered,
-                k => kind = SignalKind::parse(k).ok_or_else(|| {
-                    SignalError::Spec(format!(
-                        "unknown kind or scope '{w}' (num, enum, time; all, filtered; per(LIFECYCLE), default(VALUE))"
-                    ))
-                })?,
-            }
-        }
+        let (head, options) = match head.split_once(':') {
+            Some((h, o)) => (h, SignalOptions::parse(o)?),
+            None => (head, SignalOptions::default()),
+        };
         let (name, group) = match head.split_once('(') {
             Some((n, g)) => (n, Some(g.trim().strip_suffix(')').ok_or_else(bad)?)),
             None => (head, None),
         };
-        if per.as_deref().is_some_and(|p| !is_name(p.trim())) {
-            return Err(SignalError::Spec(format!("per({}): not a lifecycle's name", per.unwrap_or_default())));
+        let def = SignalDef::new(name, options.kind.unwrap_or(SignalKind::Num), query, group)?;
+        options.apply(def)
+    }
+
+    /// The options a spec line gives this signal, as [`SignalOptions`].
+    pub fn options(&self) -> SignalOptions {
+        SignalOptions {
+            kind: Some(self.kind),
+            scope: Some(self.scope),
+            per: self.per.clone(),
+            default: self.default.as_ref().map(|d| d.to_string()),
         }
-        SignalDef::new(name, kind, query, group)?
-            .with_scope(scope)
-            .with_per(per.as_deref())
-            .with_default(default.as_deref())
     }
 
     /// Whether `other` uses the same collected events (a copy of this
@@ -1321,29 +1394,32 @@ impl Signals {
 }
 
 /// A picked query as a source of signals: its name, its NFD (parents and
-/// parameters expanded) and the kinds its pack pins for named groups.
+/// parameters expanded) and the options its pack gives its named groups
+/// (`signals:`).
 pub struct QueryPart<'a> {
     pub name: &'a str,
     pub nfd: &'a str,
-    pub pins: &'a [(String, SignalKind)],
+    pub pins: &'a [(String, SignalOptions)],
 }
 
 /// The signals the named groups of picked queries give: one per group
 /// name, its query the OR of every query that has the group (a line takes
-/// the value from the one that matched). The kind is `chosen`'s, else the
-/// pack's pin, else what the values in `source` suggest
-/// ([`SignalDef::infer_kind`]). Queries that don't compile give nothing.
+/// the value from the one that matched). Its options are `chosen`'s (the
+/// tab's) over the pack's (`signals:`); a kind given by neither is what the
+/// values in `source` suggest ([`SignalDef::infer_kind`]). Queries that
+/// don't compile give nothing; options that don't fit (a default that isn't
+/// a number) are left out.
 pub fn query_signals(
     parts: &[QueryPart<'_>],
     source: &dyn LogSource,
-    chosen: &dyn Fn(&str) -> Option<SignalKind>,
+    chosen: &dyn Fn(&str) -> Option<SignalOptions>,
 ) -> Vec<SignalDef> {
     /// A group name and the picked queries that have it.
     struct Group {
         name: String,
         queries: Vec<String>,
         nfds: Vec<String>,
-        pin: Option<SignalKind>,
+        pin: SignalOptions,
     }
     let mut groups: Vec<Group> = Vec::new();
     for p in parts {
@@ -1357,12 +1433,12 @@ pub fn query_signals(
             }
         });
         for g in names.into_iter().filter(|g| is_name(g)) {
-            let pin = p.pins.iter().find(|(x, _)| *x == g).map(|(_, k)| *k);
+            let pin = p.pins.iter().find(|(x, _)| *x == g).map(|(_, o)| o.clone()).unwrap_or_default();
             match groups.iter_mut().find(|e| e.name == g) {
                 Some(e) if !e.nfds.iter().any(|n| n == p.nfd) => {
                     e.queries.push(p.name.to_owned());
                     e.nfds.push(p.nfd.to_owned());
-                    e.pin = e.pin.or(pin);
+                    e.pin = e.pin.over(&pin);
                 }
                 Some(_) => {}
                 None => {
@@ -1381,11 +1457,14 @@ pub fn query_signals(
             };
             let mut def = SignalDef::new(&g.name, SignalKind::Enum, &text, Some(&g.name)).ok()?;
             def.queries = g.queries;
-            def.kind = match chosen(&def.name).or(g.pin) {
+            let options = chosen(&def.name).unwrap_or_default().over(&g.pin);
+            def.kind = match options.kind {
                 Some(k) => k,
                 None => def.infer_kind(source),
             };
-            Some(def)
+            // A default that doesn't fit the kind is left out, not the signal.
+            let without_default = SignalOptions { default: None, ..options.clone() };
+            options.apply(def.clone()).or_else(|_| without_default.apply(def)).ok()
         })
         .collect()
 }
@@ -1605,7 +1684,7 @@ mod tests {
         let log = "2026-10-17 10:00:01 v=12 gear=D\nboot\n2026-10-17 10:00:02 v=13.5 gear=N\nalt w=7\n";
         let file = crate::TextFile::from_bytes("t", log.as_bytes().to_vec());
         let part = |name, nfd| QueryPart { name, nfd, pins: &[] };
-        let pinned = [("v".to_owned(), SignalKind::Enum)];
+        let pinned = [("v".to_owned(), SignalOptions { kind: Some(SignalKind::Enum), ..Default::default() })];
         let parts = [
             part("speed", r"/^(?<t>\S+ \S+) v=(?<v>[\d.]+) gear=(?<gear>\w)/"),
             // The same group in another query: one signal, the two OR'ed.
@@ -1631,11 +1710,49 @@ mod tests {
         assert_eq!(events, [(0, "12".into()), (2, "13.5".into()), (3, "7".into())]);
         // A pin and a choice win over the values.
         let pinned_parts = [QueryPart { name: "speed", nfd: parts[0].nfd, pins: &pinned }];
-        let sig = query_signals(&pinned_parts, &file, &|g| (g == "t").then_some(SignalKind::Enum));
+        let chosen = |g: &str| (g == "t").then(|| SignalOptions { kind: Some(SignalKind::Enum), ..Default::default() });
+        let sig = query_signals(&pinned_parts, &file, &chosen);
         assert_eq!(
             sig.iter().map(|d| d.kind()).collect::<Vec<_>>(),
             [SignalKind::Enum, SignalKind::Enum, SignalKind::Enum]
         );
+    }
+
+    /// Owner, 2026-11-14: a query signal takes a saved signal's options: the
+    /// pack's (`signals:`) are the defaults, the tab's go over them field by
+    /// field; a default that doesn't fit the kind is left out, not the signal.
+    #[test]
+    fn query_signals_take_the_packs_options_and_the_tabs_over_them() {
+        let file = crate::TextFile::from_bytes("t", b"s=up\ns=down\n".to_vec());
+        let pins = [("s".to_owned(), SignalOptions::parse("enum:per(ecu1):default(idle)").unwrap())];
+        let parts = [QueryPart { name: "p.state", nfd: r"/s=(?<s>\w+)/", pins: &pins }];
+        let sig = query_signals(&parts, &file, &|_| None);
+        let s = &sig[0];
+        assert_eq!((s.kind(), s.per(), s.scope()), (SignalKind::Enum, Some("ecu1"), SignalScope::All));
+        assert_eq!(s.default_value(), Some(&SignalValue::Enum(b"idle".to_vec())));
+        assert_eq!(s.options(), pins[0].1.over(&SignalOptions { scope: Some(SignalScope::All), ..Default::default() }));
+        // The tab's scope and lifecycle over the pack's; the pack's default stays.
+        let tab = SignalOptions::parse("filtered:per(boot)").unwrap();
+        let s = query_signals(&parts, &file, &|_| Some(tab.clone())).remove(0);
+        assert_eq!((s.scope(), s.per()), (SignalScope::Filtered, Some("boot")));
+        assert_eq!(s.default_value(), Some(&SignalValue::Enum(b"idle".to_vec())));
+        // A number signal can't take the default `idle`: the signal stays.
+        let num = SignalOptions { kind: Some(SignalKind::Num), ..Default::default() };
+        let s = query_signals(&parts, &file, &|_| Some(num.clone())).remove(0);
+        assert_eq!((s.kind(), s.default_value(), s.per()), (SignalKind::Num, None, Some("ecu1")));
+    }
+
+    #[test]
+    fn options_read_and_write_back() {
+        for spec in ["enum", "num:filtered", "time", "enum:per(ecu1):default(idle)", "filtered", "default(0)"] {
+            assert_eq!(SignalOptions::parse(spec).unwrap().spec(), spec);
+        }
+        assert_eq!(SignalOptions::parse("default(idle):enum").unwrap().spec(), "enum:default(idle)", "kind first");
+        assert!(matches!(SignalOptions::parse("big"), Err(SignalError::Spec(m)) if m.contains("unknown kind")));
+        assert!(matches!(SignalOptions::parse("per(1x)"), Err(SignalError::Spec(m)) if m.contains("lifecycle")));
+        // A saved signal's spec reads the same words.
+        let d = SignalDef::parse_spec(r"s:enum:per(ecu1):default(idle)=/s=(?<s>\w+)/").unwrap();
+        assert_eq!(d.options().spec(), "enum:per(ecu1):default(idle)");
     }
 
     #[test]

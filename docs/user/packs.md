@@ -31,7 +31,13 @@ query frame_drops(cam)  parent: cam_scope  labels: system/vision, perf  color: v
     meaning is `parent AND its own text`;
   - `labels:` comma-separated, `/` for a hierarchy (`system/vision`);
   - `color:` a name or `#rrggbb`, for the lines it keeps;
-  - `signals:` the kinds of its named groups as signals (`signals: t:time`).
+  - `signals:` options for its named groups as [signals](signals.md):
+    `GROUP:OPTIONS`, comma-separated, the options being those of a saved
+    signal (`num`, `enum`, `time`, `filtered`, `per(LIFECYCLE)`,
+    `default(VALUE)`, joined by `:`). Example:
+    `signals: t:time, ota:enum:per(ecu1):default(idle)`. What isn't given
+    is worked out (the kind from the first values). The Signals panel can
+    change them for a tab; **Save to pack** writes them here.
 - The **body** is the indented lines below, kept as written.
 - `$name` or `${name}` is a **parameter**, declared in the query's list.
   `$$` is a `$`; so is a `$` not followed by a name (`/down$/`).
