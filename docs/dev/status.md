@@ -37,6 +37,7 @@ Don't settle these silently: ask.
 
 The open work, in no fixed order; what was done before is in `history.md`, the open review findings in `docs/dev/review/2026-11-09-findings.md`.
 
+- **Performance at scale (2026-11-14, `review/2026-11-14-performance-findings.md`):** 3 GiB traces with a 40-message FIBEX and a plot of 30 signals; open: the plot at full zoom (182 ms a frame), its lanes built on the UI thread (2.6 s, again on every lane, signal or filter change; 5.5 s after adding a signal), a pass per signal (4 s for 30), MF4 open still 3.6x pcap, opens mostly kernel page-fault time, memory per event.
 - **Benchmark:** 0.2.0 measured on 2026-11-12 (every query within 15 % of 2026-11-09, the same counts; `history.md`). The mixed-view cases are measured by hand and not yet in `tools/bench.sh`.
 - **Decisions pending** above: 1 (text profiles, `text-profiles.md`'s open questions), 7, 8.
 - **Postponed by the owner (2026-11-10):** the CLI for scripts and agents (`--json`, exit codes, `-m`, context, stdin; review R10, before the MCP server); `ui/src/main.rs`'s size, with other refactoring (11-08 R6).

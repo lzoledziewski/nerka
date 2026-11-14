@@ -39,6 +39,8 @@ cargo run --release -p nerka-core --example dlt_to_pcap -- big.dlt big.pcap   # 
 cargo run --release -p nerka-core --example dlt_to_pcap -- big.dlt big2.pcap --ports 3490,3491 --copy   # every datagram on both ports
 cargo run --release -p nerka-cli -- filter -c --stats 'apid == NAV AND level >= WARN' big.pcap
 cargo run --release -p nerka-core --example dlt_to_mf4 -- big.dlt big_z.mf4 --deflate   # the same DLT as an MF4 (DZ blocks; --one-block, or no --deflate)
+cargo run --release -p nerka-core --example gen_fibex_dlt -- nv.dlt nv.xml 3072 40   # non-verbose DLT + its FIBEX (40 messages)
+cargo run --release -p nerka-core --example perf_signals -- nv.pcap nv.xml 30   # open, filters, 30 FIBEX signals, plot build and frame, timed
 cargo run --release -p nerka-cli -- --unpack-dir cache filter -c --stats 'apid == NAV AND level >= WARN' big_z.mf4  # 1st run unpacks, then cached
 cargo run --release -p nerka-core --example probe_capture -- trace.pcapng log.mf4   # structure of real captures, no payload
 powershell -ExecutionPolicy Bypass -File tools/screenshot.ps1 -Out shot.png -AppArgs app.log  # GUI screenshot (Windows)

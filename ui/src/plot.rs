@@ -2047,6 +2047,148 @@ mod tests {
         out
     }
 
+    /// What a plot of N FIBEX argument signals costs on a big capture: the
+    /// lanes' build and a frame (layout, shapes, tessellation) at full
+    /// zoom and zoomed in. `NERKA_PERF_FILE=big.pcap NERKA_PERF_FIBEX=big.xml
+    /// cargo test --release -p nerka-gui perf_big_plot -- --ignored --nocapture`
+    /// (files from `gen_fibex_dlt`; `NERKA_PERF_N`, default 30).
+    #[test]
+    #[ignore = "needs a big file"]
+    fn perf_big_plot() {
+        use std::time::Instant;
+        let (Ok(path), Ok(fx)) = (std::env::var("NERKA_PERF_FILE"), std::env::var("NERKA_PERF_FIBEX")) else {
+            return;
+        };
+        let n: usize = std::env::var("NERKA_PERF_N").ok().and_then(|s| s.parse().ok()).unwrap_or(30);
+        let cat = Arc::new(nerka_core::Fibex::load(&[std::path::PathBuf::from(fx)]).unwrap());
+        let mut options = nerka_core::OpenOptions { fibex: Some(cat.clone()), ..Default::default() };
+        options.capture.unpack.dir = nerka_core::cache_dir();
+        let p = nerka_core::Progress::new();
+        let t = Instant::now();
+        let file = nerka_core::open_with(&path, &options, &p).unwrap();
+        eprintln!("open {:.0} ms", t.elapsed().as_secs_f64() * 1e3);
+        let mut args: Vec<_> = cat.arguments().into_iter().filter(|a| a.ty.kind() == SignalKind::Num).collect();
+        args.sort_by_key(|a| (a.mid, a.index));
+        args.truncate(n);
+        let mut sig = Signals::default().for_source(&*file);
+        let mut st = PlotState::default();
+        for a in &args {
+            let q = format!("mid == {} AND ecu == \"{}\"", a.mid, a.ecu.as_deref().unwrap_or("ECU1"));
+            sig.set(SignalDef::argument(&a.name, a.ty.kind(), &q, a.index, "perf").unwrap());
+            st.toggle(&a.name.to_ascii_lowercase());
+        }
+        let t = Instant::now();
+        for d in sig.iter() {
+            d.series(&*file, &p).unwrap();
+        }
+        eprintln!("series {:.0} ms", t.elapsed().as_secs_f64() * 1e3);
+        let ctx = egui::Context::default();
+        let screen = Rect::from_min_size(pos2(0.0, 0.0), vec2(1600.0, 1000.0));
+        let mut time = 0.0;
+        // One frame as the tab draws it; its ui time in ms.
+        let mut run = |label: &str, events: Vec<egui::Event>, st: &mut PlotState, sig: &Signals, gen_: u64, kept| {
+            time += 1.0 / 60.0;
+            let input = egui::RawInput { screen_rect: Some(screen), time: Some(time), events, ..Default::default() };
+            let t = Instant::now();
+            let full = ctx.run_ui(input, |ui| {
+                egui::CentralPanel::default().show(ui, |ui| {
+                    let mut series_of = |d: &SignalDef| d.cached_series(&*file).map(Arc::new);
+                    let src = Source {
+                        signals: sig,
+                        generation: gen_,
+                        file: &*file,
+                        cursor: 0,
+                        kept,
+                        series_of: &mut series_of,
+                        in_window: false,
+                        bookmarks: &[],
+                        saved: &[],
+                    };
+                    plot_panel(ui, st, src);
+                });
+            });
+            let ui_ms = t.elapsed().as_secs_f64() * 1e3;
+            let shapes = full.shapes.len();
+            let t = Instant::now();
+            let meshes = ctx.tessellate(full.shapes, full.pixels_per_point);
+            let verts: usize = meshes
+                .iter()
+                .map(|m| match &m.primitive {
+                    egui::epaint::Primitive::Mesh(m) => m.vertices.len(),
+                    _ => 0,
+                })
+                .sum();
+            let lanes = st.data.as_ref().map_or(0, |(_, d)| d.lanes.len());
+            eprintln!(
+                "{label}: ui {ui_ms:.0} ms, tessellate {:.0} ms, {lanes} lanes, {shapes} shapes, {verts} vertices",
+                t.elapsed().as_secs_f64() * 1e3
+            );
+            ui_ms
+        };
+        let ms = |t: Instant| t.elapsed().as_secs_f64() * 1e3;
+        let mut gen_ = 1;
+        run("first frame (builds the lanes)", vec![], &mut st, &sig, gen_, 0);
+        let at = pos2(GUTTER + 600.0, 300.0);
+        run("pointer moved, full zoom", vec![egui::Event::PointerMoved(at)], &mut st, &sig, gen_, 0);
+        run("pointer moved, full zoom", vec![egui::Event::PointerMoved(at + vec2(5.0, 0.0))], &mut st, &sig, gen_, 0);
+        let full = st.data.as_ref().map(|(_, d)| d.full).unwrap();
+        st.range = Some((full.0, full.0 + (full.1 - full.0) / 100.0));
+        run("zoomed to 1 %", vec![egui::Event::PointerMoved(at)], &mut st, &sig, gen_, 0);
+        st.range = Some((full.0, full.0 + (full.1 - full.0) / 10_000.0));
+        run("zoomed to 0.01 %", vec![egui::Event::PointerMoved(at)], &mut st, &sig, gen_, 0);
+        st.range = None;
+
+        // One change after the plot is up, then frames until it shows again.
+        eprintln!("-- changes (full zoom)");
+        let rare = args.last().unwrap().name.to_ascii_lowercase();
+        let frequent = args[0].name.to_ascii_lowercase();
+        // A lane off and on again: the signal stays, its events are cached.
+        for name in [&rare, &frequent] {
+            st.toggle(name);
+            run(&format!("lane {name} off"), vec![], &mut st, &sig, gen_, 0);
+            st.toggle(name);
+            run(&format!("lane {name} on"), vec![], &mut st, &sig, gen_, 0);
+        }
+        // A new signal ticked and plotted (Signals panel, FIBEX tree): the
+        // tab's signals change, its events are collected in the background
+        // (the others are cached), the plot waits for them.
+        let mut more: Vec<_> = cat.arguments().into_iter().filter(|a| a.ty.kind() == SignalKind::Num).collect();
+        more.sort_by_key(|a| (a.mid, a.index));
+        for a in [&more[n], &more[more.len() - 1]] {
+            let name = a.name.to_ascii_lowercase();
+            let t = Instant::now();
+            let q = format!("mid == {} AND ecu == \"{}\"", a.mid, a.ecu.as_deref().unwrap_or("ECU1"));
+            sig.set(SignalDef::argument(&a.name, a.ty.kind(), &q, a.index, "perf").unwrap());
+            st.toggle(&name);
+            gen_ += 1;
+            run(&format!("signal {name} added (waiting)"), vec![], &mut st, &sig, gen_, 0);
+            let c = Instant::now();
+            for d in sig.iter() {
+                d.series(&*file, &p).unwrap();
+            }
+            let events = sig.get(&name).unwrap().cached_series(&*file).unwrap().len();
+            eprintln!("  its events: {:.0} ms, {events}", ms(c));
+            run(&format!("signal {name} added (built)"), vec![], &mut st, &sig, gen_, 0);
+            eprintln!("  => plot again after {:.0} ms", ms(t));
+            // And taken away again (the − in the list: its lane goes too).
+            let t = Instant::now();
+            sig.remove(&name);
+            st.toggle(&name);
+            gen_ += 1;
+            run(&format!("signal {name} removed"), vec![], &mut st, &sig, gen_, 0);
+            eprintln!("  => plot again after {:.0} ms", ms(t));
+        }
+        // A filter applied: the result is new, so is the plot's key.
+        for q in ["ecu == ECU1", &format!("@{frequent} > 100")] {
+            let t = Instant::now();
+            let f = nerka_core::Filter::Query(nerka_core::Query::compile_in(q, file.schema(), &sig).unwrap());
+            let r = Arc::new(nerka_core::search(&*file, &f, &p).unwrap());
+            eprintln!("filter {q}: {:.0} ms, {} rows", ms(t), r.lines.len());
+            run(&format!("filter {q} applied"), vec![], &mut st, &sig, gen_, Arc::as_ptr(&r) as usize);
+            eprintln!("  => plot again after {:.0} ms", ms(t));
+        }
+    }
+
     #[test]
     fn wheel_zooms_drag_pans_click_goes_to_an_event() {
         let text: String = (0..100)

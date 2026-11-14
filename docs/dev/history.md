@@ -2,6 +2,10 @@
 
 The dated log of the project, newest first; append-only: add an entry at the top when `status.md` changes. Moved from `status.md` on 2026-11-10, word for word: its "Last update" line (each update with the ones before it) and its "Next steps" as they stood then, which tell what was built when and why. Where the moved text says "above", "below" or "this file", it means the old `status.md`: its sections are now `status.md` (state, pending decisions, limitations, licensing), `gui-decisions.md`, `features.md` and `history.md`.
 
+## 2026-11-14
+
+Performance analysis on big files (owner: 2–4 GB pcap / MF4, a FIBEX of 30–50 messages, a plot of 30 signals): `review/2026-11-14-performance-findings.md`, with the generator `gen_fibex_dlt`, the harness `perf_signals` and the ignored GUI test `perf_big_plot`. Fixed on the way: an MF4 open walked the signal data's blocks from the first for every frame (3 GiB, cached: 11.2 s → 3.8 s).
+
 ## 2026-11-12
 
 0.2.0 (a release, GitHub's Latest; the first since 0.1.0 of 2026-11-02, after four pre-releases). Its major changes since 0.1.0: lifecycles (boots and sessions per ECU or app, signals per lifecycle, `@uptime`); checks (issues and facts, overall and per lifecycle, a check feeding another, `nerka check`); protocol definitions (a Kaitai Struct subset read from captures, with rules over ports, addresses and VLANs); several files as one view (merged by time, messages of different protocols in one table, `net.*` fields, a tab's Files window; one file sorted by time); settings bundles (export, import, format upgrades); windows sharing one configuration, a tab moved to another window; the theme setting and Reload; the user guide on GitHub Pages; the review gate (build checks, fuzzing every reader, the benchmark). Before the bump the review gate passed (`--full --bench`) and every 1 GiB benchmark query was within 15 % of the 2026-11-09 baseline with the same match counts: DLT `apid == NAV AND level >= WARN` 30.6 ms (was 30.2), pcap the same 29.7 ms (30.2), text `search ERROR` 32.3 ms (32.6); the largest change `level >= WARN AND raw ~ /timeout/` on text, 35.4 ms (31.6, +12 %).

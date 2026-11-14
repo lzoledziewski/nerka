@@ -323,11 +323,13 @@ struct Stream<'a> {
     segs: Vec<(usize, usize)>,
     seg: usize,
     off: usize,
+    /// Logical end of each segment (built on the first `vlsd_at`).
+    ends: Vec<usize>,
 }
 
 impl<'a> Stream<'a> {
     fn new(buf: &'a [u8], segs: Vec<(usize, usize)>) -> Self {
-        Self { buf, segs, seg: 0, off: 0 }
+        Self { buf, segs, seg: 0, off: 0, ends: Vec::new() }
     }
 
     fn done(&mut self) -> bool {
@@ -369,14 +371,21 @@ impl<'a> Stream<'a> {
     /// The bytes at logical offset `at` (a VLSD entry in SD data: a
     /// 4-byte length, then the bytes).
     fn vlsd_at(&mut self, at: u64) -> Option<Cow<'a, [u8]>> {
-        let mut at = usize::try_from(at).ok()?;
-        self.seg = 0;
-        self.off = 0;
-        while self.seg < self.segs.len() && at >= self.segs[self.seg].1 {
-            at -= self.segs[self.seg].1;
-            self.seg += 1;
+        let at = usize::try_from(at).ok()?;
+        if self.ends.len() != self.segs.len() {
+            let mut end = 0;
+            self.ends = self
+                .segs
+                .iter()
+                .map(|s| {
+                    end += s.1;
+                    end
+                })
+                .collect();
         }
-        self.off = at;
+        // The segment holding `at`: the first that ends after it.
+        self.seg = self.ends.partition_point(|&e| e <= at);
+        self.off = at - if self.seg == 0 { 0 } else { self.ends[self.seg - 1] };
         let len = self.take(4)?;
         let len = u32::from_le_bytes(len.as_ref().try_into().ok()?) as usize;
         self.take(len)
@@ -517,6 +526,7 @@ pub(crate) fn read<'a>(
         let mut waiting_frames: HashMap<u64, VecDeque<Cow<'a, [u8]>>> = HashMap::new();
         let mut waiting_data: HashMap<u64, VecDeque<Cow<'a, [u8]>>> = HashMap::new();
         let sorted_rid = (rec_id == 0).then(|| cgs.iter().find(|c| c.2 & 1 == 0).map(|c| c.1)).flatten();
+        let mut last = None;
         loop {
             if s.done() {
                 break;
@@ -529,8 +539,17 @@ pub(crate) fn read<'a>(
                     id.iter().rev().fold(0u64, |v, &b| (v << 8) | b as u64)
                 }
             };
-            let Some(&(size, vlsd)) = sizes.get(&rid) else {
-                return Err(Error::Format(format!("MF4: unknown record id {rid} in a data group")));
+            // The last record's id again (always, in a sorted group): no lookup.
+            let (size, vlsd, group) = match last {
+                Some((r, size, vlsd, group)) if r == rid => (size, vlsd, group),
+                _ => {
+                    let Some(&(size, vlsd)) = sizes.get(&rid) else {
+                        return Err(Error::Format(format!("MF4: unknown record id {rid} in a data group")));
+                    };
+                    let group = groups.get(&rid);
+                    last = Some((rid, size, vlsd, group));
+                    (size, vlsd, group)
+                }
             };
             if vlsd {
                 let Some(len) = s.take(4) else { break };
@@ -544,7 +563,7 @@ pub(crate) fn read<'a>(
                 }
             } else {
                 let Some(rec) = s.take(size) else { break };
-                if let Some(g) = groups.get(&rid) {
+                if let Some(g) = group {
                     if let DataRef::VlsdGroup(_) = g.data {
                         match waiting_data.get_mut(&rid).and_then(|q| q.pop_front()) {
                             Some(bytes) => deliver(g, &rec, Some(bytes), start_ns, &mut sd_streams, sink),
