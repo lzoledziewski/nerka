@@ -2057,6 +2057,7 @@ name = "nerka-gui"
 version = "0.2.0"
 dependencies = [
  "eframe",
+ "miniz_oxide 0.9.1",
  "nerka-core",
  "rfd",
  "winresource",

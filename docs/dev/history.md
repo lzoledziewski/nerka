@@ -4,6 +4,8 @@ The dated log of the project, newest first; append-only: add an entry at the top
 
 ## 2026-11-14
 
+CI on macOS, non-voting (owner: no Mac to check it on), and a screenshot job on Linux, Windows and macOS: `nerka-gui --screenshot PATH` saves its own window once loaded and drawn, then closes; the PNGs are artifacts. macOS release archives still open (status, decision 4).
+
 Performance analysis on big files (owner: 2–4 GB pcap / MF4, a FIBEX of 30–50 messages, a plot of 30 signals): `review/2026-11-14-performance-findings.md`, with the generator `gen_fibex_dlt`, the harness `perf_signals` and the ignored GUI test `perf_big_plot`. Fixed on the way: an MF4 open walked the signal data's blocks from the first for every frame (3 GiB, cached: 11.2 s → 3.8 s).
 
 The findings' fixes in their proposed order (owner: continue, measuring each step): a tab's signals built again keep the events of unchanged definitions; the plot builds lanes only when all are ready; a tab's signals collected together (`Signals::collect`, keyed by a required field value); plot lanes in core (`nerka_core::plot::lane`: built in parallel, a min / max summary for frames), kept per signal in the GUI; MF4 lookups; mapped pages brought in on every core before a reader and the index sized from its first messages; DZ blocks unpacked in parallel; several files opened at once with one progress. 30 plotted signals on 3 GiB: a repaint 182 → 12 ms, a signal added 6.9 → 0.13 s; the 1 GiB benchmark within ±9 % of 2026-11-09, the same counts; the 6 GiB outputs byte for byte the same.

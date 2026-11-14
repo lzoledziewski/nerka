@@ -98,6 +98,8 @@ Options:
       --fibex FILE         FIBEX file for DLT non-verbose messages
       --new-window         A new window, even if one is open
       --name NAME          The window's name
+      --screenshot PATH    Once loaded and drawn, save the window as a PNG
+                           and close (checks and CI)
   -h, --help               This text
   -V, --version            The version
 ";
@@ -132,6 +134,8 @@ fn main() -> eframe::Result {
     let mut markers: Vec<(String, plot::Marker)> = Vec::new();
     // `--plot-window`: the plot starts in a window of its own.
     let mut plot_window = false;
+    // `--screenshot PATH`: the window as a PNG once loaded, then close.
+    let mut screenshot: Option<PathBuf> = None;
     let (mut window_name, mut preset_file) = (None, None);
     // Options given (anything but files): with none, a running window opens
     // the files (review 2026-11-09, R7: an option left out of a list of
@@ -214,6 +218,10 @@ fn main() -> eframe::Result {
                     Some(x) => cursors.push(x),
                     None => eprintln!("nerka-gui: --cursor: expected a time or a number"),
                 }
+                continue;
+            }
+            Some("--screenshot") => {
+                screenshot = Some(PathBuf::from(value()));
                 continue;
             }
             Some("--plot-window") => {
@@ -325,6 +333,7 @@ fn main() -> eframe::Result {
                 app.status = m;
             }
             app.option_errors = spec_errors;
+            app.shoot = screenshot.map(Shoot::new);
             let mut picks = Picks::default();
             picks.params = params;
             for (role, id) in &startup {
@@ -3042,6 +3051,8 @@ struct App {
     /// Options that didn't parse (`--signal`, `--lifecycle`, `--check`), in a
     /// window until OK.
     option_errors: Vec<String>,
+    /// `--screenshot PATH`: waiting to save the window.
+    shoot: Option<Shoot>,
     focus_search: bool,
     window_title: String,
     /// Query packs (search manager) and where they come from besides the
@@ -4733,6 +4744,31 @@ impl App {
     }
 }
 
+/// `--screenshot PATH`: once every tab has loaded and collected its signals
+/// and a few frames have drawn (the plot builds its lanes in a frame), the
+/// window as a PNG at `path`, then the window closes. For checks without a
+/// person at the screen (CI on Linux, Windows and macOS): the picture comes
+/// from the app's own frame, so no screen-recording permission is needed.
+struct Shoot {
+    path: PathBuf,
+    started: std::time::Instant,
+    /// Frames drawn with nothing loading.
+    quiet: u32,
+    requested: bool,
+    image: Arc<std::sync::Mutex<Option<egui::ColorImage>>>,
+}
+
+impl Shoot {
+    /// Frames with nothing loading before the picture.
+    const QUIET: u32 = 10;
+    /// Taken anyway after this long (said on the terminal).
+    const PATIENCE: Duration = Duration::from_secs(600);
+
+    fn new(path: PathBuf) -> Shoot {
+        Shoot { path, started: std::time::Instant::now(), quiet: 0, requested: false, image: Default::default() }
+    }
+}
+
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.frame(ui);
@@ -4740,6 +4776,36 @@ impl eframe::App for App {
 }
 
 impl App {
+    /// `--screenshot`: count quiet frames, ask for the picture, save it and
+    /// close the window.
+    fn shoot_step(&mut self, ctx: &egui::Context) {
+        let busy = self.tabs.iter().any(|t| t.is_busy());
+        let Some(s) = &mut self.shoot else { return };
+        ctx.request_repaint();
+        let taken = s.image.lock().unwrap_or_else(|e| e.into_inner()).take();
+        if let Some(image) = taken {
+            if let Err(e) = std::fs::write(&s.path, shot::png(&image)) {
+                console::error(&format!("nerka-gui: --screenshot {}: {e}\n", s.path.display()));
+                std::process::exit(1);
+            }
+            self.shoot = None;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            return;
+        }
+        if s.requested {
+            return;
+        }
+        s.quiet = if busy { 0 } else { s.quiet + 1 };
+        let late = s.started.elapsed() > Shoot::PATIENCE;
+        if late {
+            console::error("nerka-gui: --screenshot: still loading; taken as it is\n");
+        }
+        if s.quiet >= Shoot::QUIET || late {
+            s.requested = true;
+            shot::request_into(ctx, s.image.clone());
+        }
+    }
+
     /// One frame of the whole window (also driven by tests).
     fn frame(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
@@ -4753,6 +4819,7 @@ impl App {
         self.follow_focus(&ctx);
         self.poll_instance(&ctx);
         self.poll_jobs(&ctx);
+        self.shoot_step(&ctx);
         for t in &mut self.tabs {
             t.notes = self.prefs.bookmark_notes;
             t.columns.note_column(t.notes == NoteMode::Column);

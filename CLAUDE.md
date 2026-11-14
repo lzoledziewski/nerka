@@ -44,6 +44,7 @@ cargo run --release -p nerka-core --example perf_signals -- nv.pcap nv.xml 30   
 cargo run --release -p nerka-cli -- --unpack-dir cache filter -c --stats 'apid == NAV AND level >= WARN' big_z.mf4  # 1st run unpacks, then cached
 cargo run --release -p nerka-core --example probe_capture -- trace.pcapng log.mf4   # structure of real captures, no payload
 powershell -ExecutionPolicy Bypass -File tools/screenshot.ps1 -Out shot.png -AppArgs app.log  # GUI screenshot (Windows)
+cargo run -p nerka-gui -- nv.dlt --fibex nv.xml --plot m0_speed --screenshot shot.png   # the app saves its own window, then closes (any OS; CI)
 bash tools/review-gate.sh --full                      # review gate: build gates, fuzz, metrics (docs/dev/review/)
 bash tools/bench.sh target/bench 1024 5 > bench.tsv   # the benchmark above as TSV; `tools/bench.sh compare a.tsv b.tsv`
 KSY=1 bash tools/bench.sh target/bench 1024 5 > bench.tsv   # + the DLT definition against native DLT (NERKA_BIN: binaries elsewhere)
@@ -52,7 +53,7 @@ KSY=1 bash tools/bench.sh target/bench 1024 5 > bench.tsv   # + the DLT definiti
 Reviews (a gate before a merge or release, a deep review each cycle): `docs/dev/review/README.md`,
 checklist `docs/dev/review/checklist.md`, latest findings `docs/dev/review/*-findings.md`.
 
-CI (`.github/workflows/ci.yml`) runs fmt, clippy and tests on Linux and Windows, `cargo deny`, and a DCO sign-off check on pull requests (`CONTRIBUTING.md`; commit with `git commit -s`); `release.yml`
+CI (`.github/workflows/ci.yml`) runs fmt, clippy and tests on Linux and Windows (and macOS, non-voting), a GUI screenshot on each (`--screenshot`, kept as artifacts), `cargo deny`, and a DCO sign-off check on pull requests (`CONTRIBUTING.md`; commit with `git commit -s`); `release.yml`
 builds Linux/Windows archives and publishes a pre-release on a `v*` tag.
 
 `docs/dev/status.md` records the current state, the decisions pending with the owner

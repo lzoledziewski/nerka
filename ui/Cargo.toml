@@ -19,6 +19,8 @@ path = "src/main.rs"
 nerka-core.workspace = true
 eframe.workspace = true
 rfd.workspace = true
+# PNG for `--screenshot` (ui/src/shot.rs); already built for core (MF4).
+miniz_oxide.workspace = true
 
 # Embeds the icon in the .exe (build.rs); Windows only.
 [target.'cfg(windows)'.build-dependencies]
