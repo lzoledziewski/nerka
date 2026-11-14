@@ -241,6 +241,40 @@ against the pcap's 0.6 s, a frame per message); a lane with defaults (a signal b
 drawn point by point; an enum that changes on most points walks them all; P5 (memory per event and point),
 P6 (payload regexes), a parallel `.dlt` index.
 
+### On Linux: 0.2.0 against the fixes
+
+The same 3 GiB set (generated in the VM, the same bytes), in the local VirtualBox VM (Ubuntu 24.04, 6 CPUs,
+16 GB, software rendering only), 0.2.0 (`v0.2.0` with the measuring code alone added) against `09920bb`;
+release builds, warm file cache, CLI times the median of 3. Tests pass in both (core 326 / 335, GUI 126 / 128).
+
+| Step | 0.2.0 | Fixed |
+|---|---|---|
+| Open `.dlt` / pcap | 0.36 / 0.73 s | 0.35 / 0.69 s |
+| Open MF4: first (unpacks) / cached | 22.8 / 9.8 s | 6.9 / 1.9 s |
+| `mid == 1000` / `apid == ENG AND level >= WARN` / `payload ~ /message 3:/` (pcap) | 0.25 / 0.43 / 2.2 s | 0.19 / 0.40–0.44 / 2.1 s |
+| 30 signals collected | 7.8 s | 1.65 s |
+| Plot lanes built / a frame at full zoom | 2.46 s / 254 ms | 0.55 s / 20 ms |
+| A lane off / on (the GUI's plot) | 2.4–2.8 s | 17–32 ms (183 ms for the 10.7 M-point lane) |
+| A signal added / removed, until the plot shows | 10.5 / 10.2 s | 0.25 / 0.05 s |
+| A filter applied, until the plot shows | 3.3–3.4 s | 0.4–0.5 s |
+| A frame of the whole window, idle / scrolling (pcap) | 85–98 ms | 0.2–0.8 ms |
+| Peak private memory: open / open + 30 signals + plot | 1,020 / 3,758 MiB | 1,020 / 4,344 MiB (3,692 after P10) |
+
+Opening and searching are about the same on Linux: page faults cost less there than on Windows (P8 mattered
+on Windows). Filters are unchanged by the fixes (a first run of 0.2.0 that showed `apid == ENG AND level >=
+WARN` twice as slow ran while the system wrote back the MF4 cache; rerun quietly, both 377 ms on the
+`.dlt`). The GUI on the VM's Wayland desktop: the 2.1 GiB pcap, six signals plotted, window saved
+(`--screenshot`) 2.6 s after the start.
+
+**P10. Collecting signals together peaked higher (fixed).** With 30 signals, `Signals::collect` peaked at
+4,374 MiB private on Linux, one by one 3,712 MiB (0.2.0: 3,758): every signal's pieces per stretch of rows
+were held until the end, and glibc's per-thread heaps keep what such small pieces free while the big
+arrays fill (`MALLOC_ARENA_MAX=2`: 4,173 MiB). Sizing the joined arrays exactly helped Windows only. Now
+the rows go in batches (stretches for every thread four times over), each batch's pieces appended and
+freed before the next, the arrays sized once at the first batch's rate: Linux 3,692 MiB in 1.59–1.81 s
+(as before); Windows 3,763–3,794 MiB (3,804) and faster, 1.12–1.18 s (1.94–2.09). Tested: batches that
+don't line up with the stretches give the same events.
+
 ## Fixes
 
 Effort: S hours, M days, L a week or more. Costs from the measurements above (30 plotted signals, 3 GiB).

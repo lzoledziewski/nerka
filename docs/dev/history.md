@@ -4,6 +4,8 @@ The dated log of the project, newest first; append-only: add an entry at the top
 
 ## 2026-11-14
 
+Linux in a local VirtualBox VM (owner set it up; Ubuntu 24.04, Wayland): tests pass, the GUI runs with big files; 0.2.0 against the fixes on the 3 GiB set (findings, "On Linux"): signals 7.8 → 1.65 s, a signal added 10.5 → 0.25 s, a frame of the window 90 → under 1 ms; new finding P10 (peak memory of collecting signals together). Decision 5 (trying Linux locally) closed.
+
 CI on macOS, non-voting (owner: no Mac to check it on), and a screenshot job on Linux, Windows and macOS: `nerka-gui --screenshot PATH` saves its own window once loaded and drawn, then closes; the PNGs are artifacts. macOS release archives still open (status, decision 4).
 
 Performance analysis on big files (owner: 2–4 GB pcap / MF4, a FIBEX of 30–50 messages, a plot of 30 signals): `review/2026-11-14-performance-findings.md`, with the generator `gen_fibex_dlt`, the harness `perf_signals` and the ignored GUI test `perf_big_plot`. Fixed on the way: an MF4 open walked the signal data's blocks from the first for every frame (3 GiB, cached: 11.2 s → 3.8 s).

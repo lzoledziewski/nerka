@@ -101,20 +101,37 @@ impl Found {
         }
     }
 
-    /// The pieces of consecutive stretches as one signal's events.
-    fn join(pieces: Vec<Found>, kind: SignalKind) -> Events {
-        let mut all = Found::new(kind);
-        for p in pieces {
-            match (&mut all, p) {
-                (Found::Num(rows, nums), Found::Num(r, n)) => {
-                    rows.extend(r);
-                    nums.extend(n);
-                }
-                (Found::Values(vs), Found::Values(v)) => vs.extend(v),
-                _ => unreachable!("one kind per signal"),
-            }
+    fn len(&self) -> usize {
+        match self {
+            Found::Num(rows, _) => rows.len(),
+            Found::Values(vs) => vs.len(),
         }
-        match all {
+    }
+
+    fn reserve_exact(&mut self, n: usize) {
+        match self {
+            Found::Num(rows, nums) => {
+                rows.reserve_exact(n);
+                nums.reserve_exact(n);
+            }
+            Found::Values(vs) => vs.reserve_exact(n),
+        }
+    }
+
+    /// The next stretch's events after these (the piece is freed).
+    fn append(&mut self, piece: Found) {
+        match (self, piece) {
+            (Found::Num(rows, nums), Found::Num(r, n)) => {
+                rows.extend(r);
+                nums.extend(n);
+            }
+            (Found::Values(vs), Found::Values(v)) => vs.extend(v),
+            _ => unreachable!("one kind per signal"),
+        }
+    }
+
+    fn into_events(self, kind: SignalKind) -> Events {
+        match self {
             Found::Num(rows, nums) => Events::numbers(rows, nums, kind),
             Found::Values(vs) => Events::build(vs, kind),
         }
@@ -127,13 +144,15 @@ impl Signals {
     /// docs), then the others one by one. A definition that doesn't fit
     /// the source is skipped here: its own [`SignalDef::series`] says why.
     pub fn collect(&self, source: &dyn LogSource, progress: &Progress) -> crate::Result<()> {
+        // Rows in a batch: enough stretches for every thread a few times.
+        let batch = LINES_PER_TASK * 4 * rayon::current_num_threads().max(1) as u64;
         match source.parts() {
             Some(ps) => {
                 for p in &ps {
-                    self.collect_keyed(p.source.as_ref(), progress)?;
+                    self.collect_keyed(p.source.as_ref(), progress, batch)?;
                 }
             }
-            None => self.collect_keyed(source, progress)?,
+            None => self.collect_keyed(source, progress, batch)?,
         }
         for d in self.iter() {
             if let Err(crate::Error::Cancelled) = d.series(source, progress) {
@@ -144,7 +163,14 @@ impl Signals {
     }
 
     /// The keyed signals' events in one file (a source without parts).
-    fn collect_keyed(&self, source: &dyn LogSource, progress: &Progress) -> crate::Result<()> {
+    /// `batch` rows at a time (review 2026-11-14, P10): each batch's pieces
+    /// (a stretch's events per signal) are appended to the signals' arrays
+    /// and freed before the next, so only one batch of pieces is ever held.
+    /// Holding every piece until the end peaked ~660 MiB higher than
+    /// collecting one by one with glibc, whose per-thread heaps keep what
+    /// small pieces free while the big arrays fill. The arrays are sized once,
+    /// at the first batch's rate.
+    fn collect_keyed(&self, source: &dyn LogSource, progress: &Progress, batch: u64) -> crate::Result<()> {
         let key = source_key(source);
         // (bound definition, the field it is keyed by, the value it wants)
         let mut keyed: Vec<(SignalDef, FieldId, Want)> = Vec::new();
@@ -183,42 +209,57 @@ impl Signals {
         }
 
         let n = source.line_count();
-        let tasks: Vec<Range<LineNo>> =
-            (0..n.div_ceil(LINES_PER_TASK)).map(|t| t * LINES_PER_TASK..((t + 1) * LINES_PER_TASK).min(n)).collect();
-        let stretches: Vec<Vec<Found>> = tasks
-            .into_par_iter()
-            .map(|rows| {
-                if progress.is_cancelled() {
-                    return Err(crate::Error::Cancelled);
-                }
-                let len = rows.end - rows.start;
-                let mut found: Vec<Found> = keyed.iter().map(|(d, _, _)| Found::new(d.kind)).collect();
-                for row in rows {
-                    let mut ev: Option<Event<'_>> = None;
-                    for (id, index) in &fields {
-                        let Some(v) = source.field(row, *id) else { continue };
-                        index.each(&v, &mut |i| {
-                            let ev = ev.get_or_insert_with(|| Event::from_source(source, row));
-                            if let Some(value) = keyed[i].0.value(ev) {
-                                found[i].push(row, value);
-                            }
-                        });
+        let batch = batch.max(1);
+        let mut all: Vec<Found> = keyed.iter().map(|(d, _, _)| Found::new(d.kind)).collect();
+        let mut start = 0;
+        while start < n {
+            let end = (start + batch).min(n);
+            let tasks: Vec<Range<LineNo>> =
+                (start..end).step_by(LINES_PER_TASK as usize).map(|s| s..(s + LINES_PER_TASK).min(end)).collect();
+            let stretches: Vec<Vec<Found>> = tasks
+                .into_par_iter()
+                .map(|rows| {
+                    if progress.is_cancelled() {
+                        return Err(crate::Error::Cancelled);
                     }
+                    let len = rows.end - rows.start;
+                    let mut found: Vec<Found> = keyed.iter().map(|(d, _, _)| Found::new(d.kind)).collect();
+                    for row in rows {
+                        let mut ev: Option<Event<'_>> = None;
+                        for (id, index) in &fields {
+                            let Some(v) = source.field(row, *id) else { continue };
+                            index.each(&v, &mut |i| {
+                                let ev = ev.get_or_insert_with(|| Event::from_source(source, row));
+                                if let Some(value) = keyed[i].0.value(ev) {
+                                    found[i].push(row, value);
+                                }
+                            });
+                        }
+                    }
+                    progress.add(len);
+                    Ok(found)
+                })
+                .collect::<crate::Result<_>>()?;
+            // Per signal: this batch's stretches in order.
+            let mut pieces: Vec<Vec<Found>> = keyed.iter().map(|_| Vec::with_capacity(stretches.len())).collect();
+            for stretch in stretches {
+                for (i, f) in stretch.into_iter().enumerate() {
+                    pieces[i].push(f);
                 }
-                progress.add(len);
-                Ok(found)
-            })
-            .collect::<crate::Result<_>>()?;
-
-        // Per signal: its stretches in order, then into its cache.
-        let mut per_signal: Vec<Vec<Found>> = keyed.iter().map(|_| Vec::with_capacity(stretches.len())).collect();
-        for stretch in stretches {
-            for (i, f) in stretch.into_iter().enumerate() {
-                per_signal[i].push(f);
             }
+            if start == 0 {
+                // The whole file at this batch's rate (exact for one batch).
+                let scale = if end < n { n as f64 / end as f64 * 1.05 } else { 1.0 };
+                for (a, p) in all.iter_mut().zip(&pieces) {
+                    let got: usize = p.iter().map(Found::len).sum();
+                    a.reserve_exact(((got as f64 * scale) as usize).min(n as usize));
+                }
+            }
+            all.par_iter_mut().zip(pieces).for_each(|(a, pieces)| pieces.into_iter().for_each(|p| a.append(p)));
+            start = end;
         }
-        per_signal.into_par_iter().zip(keyed.par_iter()).for_each(|(pieces, (d, _, _))| {
-            d.store(key, Found::join(pieces, d.kind));
+        all.into_par_iter().zip(keyed.par_iter()).for_each(|(found, (d, _, _))| {
+            d.store(key, found.into_events(d.kind));
         });
         Ok(())
     }
@@ -370,6 +411,20 @@ mod tests {
                 let (x, y) = (events(&alone, d.name(), &**source), events(&together, d.name(), &**source));
                 assert!(!x.is_empty(), "{what}: {} has events", d.name());
                 assert!(x == y, "{what}: {} differs ({} events alone, {} together)", d.name(), x.len(), y.len());
+            }
+            // In batches that don't line up with the stretches: the same.
+            for batch in [1000, LINES_PER_TASK + 7] {
+                let batched = definitions();
+                match source.parts() {
+                    Some(ps) => ps.iter().for_each(|q| batched.collect_keyed(q.source.as_ref(), &p, batch).unwrap()),
+                    None => batched.collect_keyed(&**source, &p, batch).unwrap(),
+                }
+                // The signals no field keys: their own passes, as `collect`.
+                batched.iter().for_each(|d| drop(d.series(&**source, &p).unwrap()));
+                for d in alone.iter() {
+                    let (x, y) = (events(&alone, d.name(), &**source), events(&batched, d.name(), &**source));
+                    assert!(x == y, "{what}, batches of {batch}: {} differs", d.name());
+                }
             }
         }
         std::fs::remove_dir_all(&dir).ok();
