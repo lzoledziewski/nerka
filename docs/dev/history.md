@@ -4,6 +4,8 @@ The dated log of the project, newest first; append-only: add an entry at the top
 
 ## 2026-11-14
 
+0.2.1 (a release). Its changes since 0.2.0: big captures with FIBEX and many plotted signals are fast (a tab's signals collected together and kept across changes, plot lanes in core with a summary per block, built in parallel and kept per signal; MF4 and capture opens faster; several files opened at once), the window stays responsive on big captures, `nerka-gui --screenshot`, macOS built and tested in CI (non-voting) with a GUI screenshot on all three systems, Linux checked in a local VM, and the benchmark extended with signals, the plot, GUI frames and peak heap (`baseline/bench-2026-11-14.tsv`). Before the bump the review gate passed on Windows (`--full --bench`, `KSY=1`: every query within 15 % of 2026-11-09, the same counts) and in the Linux VM.
+
 Linux in a local VirtualBox VM (owner set it up; Ubuntu 24.04, Wayland): tests pass, the GUI runs with big files; 0.2.0 against the fixes on the 3 GiB set (findings, "On Linux"): signals 7.8 → 1.65 s, a signal added 10.5 → 0.25 s, a frame of the window 90 → under 1 ms; new finding P10 (peak memory of collecting signals together). Decision 5 (trying Linux locally) closed.
 
 CI on macOS, non-voting (owner: no Mac to check it on), and a screenshot job on Linux, Windows and macOS: `nerka-gui --screenshot PATH` saves its own window once loaded and drawn, then closes; the PNGs are artifacts. macOS release archives still open (status, decision 4).
