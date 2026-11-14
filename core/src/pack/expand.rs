@@ -23,6 +23,10 @@ use std::ops::Range;
 pub enum Pick {
     /// A query by qualified id (`vision.frame_drops`).
     Query(String),
+    /// A query with arguments of its own, over the shared ones: one
+    /// instance of it (`query-instances.md`). Several picks of one query
+    /// with different arguments are several instances.
+    QueryWith(String, Params),
     /// Every query with this label or one below it, resolved when expanded
     /// (see [`Selection::snapshot`]).
     Label(String),
@@ -46,8 +50,13 @@ impl Selection {
     pub fn snapshot(&self, lib: &Library) -> Result<Selection, ExpandError> {
         let freeze = |picks: &[Pick]| -> Result<Vec<Pick>, ExpandError> {
             let mut out = Vec::new();
-            for id in resolve(lib, picks)? {
-                out.push(Pick::Query(id));
+            for p in picks {
+                match p {
+                    Pick::Label(_) => out.extend(
+                        resolve(lib, std::slice::from_ref(p), &Params::new())?.into_iter().map(|r| Pick::Query(r.id)),
+                    ),
+                    p => out.push(p.clone()),
+                }
             }
             Ok(out)
         };
@@ -98,6 +107,12 @@ pub struct Part {
     /// Qualified id of the picked query.
     pub query: String,
     pub role: Role,
+    /// The pick it comes from: its index in its role's list of the
+    /// [`Selection`] (a label's queries share one). Instances of a query
+    /// share the id, not the pick.
+    pub pick: usize,
+    /// The pick's own arguments (an instance's; empty: the shared ones).
+    pub args: Params,
     /// The query's full meaning (parent chain AND own text), valid NFD on
     /// its own: a range of [`Expansion::nfd`], or of
     /// [`Expansion::aside`] when the part is covered.
@@ -180,35 +195,54 @@ pub enum ExpandError {
     Invalid { query: String, err: DslError },
 }
 
-/// Qualified ids of the picks, labels resolved, in order, without duplicates.
-fn resolve(lib: &Library, picks: &[Pick]) -> Result<Vec<String>, ExpandError> {
-    let mut out: Vec<String> = Vec::new();
-    for p in picks {
-        let ids = match p {
+/// A picked query, resolved: its id, the pick it comes from, the pick's own
+/// arguments and the parameters it expands with (its own over the shared).
+struct Resolved {
+    id: String,
+    pick: usize,
+    args: Params,
+    effective: Params,
+}
+
+/// The picks' queries, labels resolved, in order, without duplicates: a
+/// query with the same effective arguments as an earlier one adds nothing
+/// (instances of it with other arguments do).
+fn resolve(lib: &Library, picks: &[Pick], shared: &Params) -> Result<Vec<Resolved>, ExpandError> {
+    let mut out: Vec<Resolved> = Vec::new();
+    for (pick, p) in picks.iter().enumerate() {
+        let known = |id: &String| lib.get(id).map(|_| ()).ok_or_else(|| ExpandError::UnknownQuery(id.clone()));
+        let (ids, args) = match p {
             Pick::Query(id) => {
-                lib.get(id).ok_or_else(|| ExpandError::UnknownQuery(id.clone()))?;
-                vec![id.clone()]
+                known(id)?;
+                (vec![id.clone()], Params::new())
+            }
+            Pick::QueryWith(id, args) => {
+                known(id)?;
+                (vec![id.clone()], args.clone())
             }
             Pick::Label(l) => match lib.with_label(l) {
                 v if v.is_empty() => return Err(ExpandError::UnknownLabel(l.clone())),
-                v => v,
+                v => (v, Params::new()),
             },
         };
+        let mut effective = shared.clone();
+        effective.extend(args.clone());
         for id in ids {
-            if !out.contains(&id) {
-                out.push(id);
+            if !out.iter().any(|r| r.id == id && r.effective == effective) {
+                out.push(Resolved { id, pick, args: args.clone(), effective: effective.clone() });
             }
         }
     }
     Ok(out)
 }
 
-/// Expand a selection into plain NFD. Labels resolve against `lib` now.
+/// Expand a selection into plain NFD. Labels resolve against `lib` now;
+/// `params` are the shared parameter values, a pick's own over them.
 pub fn expand(sel: &Selection, lib: &Library, params: &Params) -> Result<Expansion, ExpandError> {
-    let include = resolve(lib, &sel.include)?;
-    let require = resolve(lib, &sel.require)?;
-    let exclude = resolve(lib, &sel.exclude)?;
-    let signal = resolve(lib, &sel.signal)?;
+    let include = resolve(lib, &sel.include, params)?;
+    let require = resolve(lib, &sel.require, params)?;
+    let exclude = resolve(lib, &sel.exclude, params)?;
+    let signal = resolve(lib, &sel.signal, params)?;
     if include.is_empty() && require.is_empty() && exclude.is_empty() && signal.is_empty() {
         return Err(ExpandError::Empty);
     }
@@ -222,9 +256,9 @@ pub fn expand(sel: &Selection, lib: &Library, params: &Params) -> Result<Expansi
         nfd.push('(');
     }
     let mut first = true;
-    for (id, covered) in include.iter().zip(include_cov) {
+    for (r, covered) in include.iter().zip(include_cov) {
         if covered.is_some() {
-            parts.push(Part { covered, ..part(lib, id, Role::Include, params, &mut aside)? });
+            parts.push(Part { covered, ..part(lib, r, Role::Include, &mut aside)? });
             continue;
         }
         if !first {
@@ -232,7 +266,7 @@ pub fn expand(sel: &Selection, lib: &Library, params: &Params) -> Result<Expansi
         }
         first = false;
         // AND binds tighter than OR, so a chain needs no parentheses here.
-        parts.push(part(lib, id, Role::Include, params, &mut nfd)?);
+        parts.push(part(lib, r, Role::Include, &mut nfd)?);
     }
     if group {
         nfd.push(')');
@@ -240,16 +274,16 @@ pub fn expand(sel: &Selection, lib: &Library, params: &Params) -> Result<Expansi
     let mut first = shown == 0;
     // Required parts: AND binds tighter than OR, and the includes are
     // grouped when there are several, so a chain needs no parentheses.
-    for id in &require {
+    for r in &require {
         if !first {
             nfd.push_str(" AND ");
         }
         first = false;
-        parts.push(part(lib, id, Role::Require, params, &mut nfd)?);
+        parts.push(part(lib, r, Role::Require, &mut nfd)?);
     }
-    for (id, covered) in exclude.iter().zip(exclude_cov) {
+    for (r, covered) in exclude.iter().zip(exclude_cov) {
         if covered.is_some() {
-            parts.push(Part { covered, ..part(lib, id, Role::Exclude, params, &mut aside)? });
+            parts.push(Part { covered, ..part(lib, r, Role::Exclude, &mut aside)? });
             continue;
         }
         if !first {
@@ -257,31 +291,34 @@ pub fn expand(sel: &Selection, lib: &Library, params: &Params) -> Result<Expansi
         }
         first = false;
         nfd.push_str("NOT ");
-        let chain = chain_len(lib, id)?;
+        let chain = chain_len(lib, &r.id)?;
         if chain > 1 {
             nfd.push('(');
         }
-        parts.push(part(lib, id, Role::Exclude, params, &mut nfd)?);
+        parts.push(part(lib, r, Role::Exclude, &mut nfd)?);
         if chain > 1 {
             nfd.push(')');
         }
     }
     // Signal queries don't filter: their texts go aside.
-    for id in &signal {
+    for r in &signal {
         if !aside.is_empty() {
             aside.push(' ');
         }
-        parts.push(part(lib, id, Role::Signal, params, &mut aside)?);
+        parts.push(part(lib, r, Role::Signal, &mut aside)?);
     }
     Ok(Expansion { nfd, parts, aside })
 }
 
-/// For each id: the nearest ancestor of it that is also in `ids`.
-fn covers(lib: &Library, ids: &[String]) -> Result<Vec<Option<String>>, ExpandError> {
-    ids.iter()
-        .map(|id| {
-            let chain = chain_of(lib, id)?;
-            Ok(chain[..chain.len() - 1].iter().rev().find(|a| ids.contains(a)).cloned())
+/// For each pick: the nearest ancestor of it that is also picked, with the
+/// same effective arguments (another instance's parent doesn't cover it).
+fn covers(lib: &Library, picks: &[Resolved]) -> Result<Vec<Option<String>>, ExpandError> {
+    picks
+        .iter()
+        .map(|r| {
+            let chain = chain_of(lib, &r.id)?;
+            let picked = |a: &&String| picks.iter().any(|o| o.id == **a && o.effective == r.effective);
+            Ok(chain[..chain.len() - 1].iter().rev().find(picked).cloned())
         })
         .collect()
 }
@@ -372,7 +409,8 @@ fn chain_len(lib: &Library, id: &str) -> Result<usize, ExpandError> {
 }
 
 /// Append `(root) AND … AND (query)` to `nfd`.
-fn part(lib: &Library, id: &str, role: Role, params: &Params, nfd: &mut String) -> Result<Part, ExpandError> {
+fn part(lib: &Library, r: &Resolved, role: Role, nfd: &mut String) -> Result<Part, ExpandError> {
+    let (id, params) = (r.id.as_str(), &r.effective);
     let start = nfd.len();
     let mut chain = Vec::new();
     for (i, qid) in chain_of(lib, id)?.into_iter().enumerate() {
@@ -399,7 +437,8 @@ fn part(lib: &Library, id: &str, role: Role, params: &Params, nfd: &mut String) 
         }
         chain.push((qid, s..nfd.len()));
     }
-    Ok(Part { query: id.to_owned(), role, range: start..nfd.len(), chain, covered: None })
+    let (pick, args) = (r.pick, r.args.clone());
+    Ok(Part { query: id.to_owned(), role, pick, args, range: start..nfd.len(), chain, covered: None })
 }
 
 /// A parameter value as NFD text for its context.
