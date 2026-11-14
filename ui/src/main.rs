@@ -1518,6 +1518,8 @@ impl Tab {
     /// Change what this tab chose for a query or FIBEX signal; a choice
     /// that leaves it as the pack gives it is dropped.
     fn choose_option(&mut self, name: &str, change: impl FnOnce(&mut nerka_core::SignalOptions)) {
+        // By the signal's name, which is lower case.
+        let name = &name.to_ascii_lowercase();
         let mut o = self.query_options.get(name).cloned().unwrap_or_default();
         change(&mut o);
         let pack = self.pack_options.get(name).cloned().unwrap_or_default();
@@ -1534,6 +1536,7 @@ impl Tab {
     /// drop the tab's choice (the pack has it now). Never done by itself
     /// (owner, 2026-11-14). Returns what to say.
     fn save_options_to_pack(&mut self, lib: &mut Library, name: &str) -> Result<String, String> {
+        let name = &name.to_ascii_lowercase();
         let tab = self.query_options.get(name).cloned().unwrap_or_default();
         let pack = self.pack_options.get(name).cloned().unwrap_or_default();
         let options = signals::to_save(&tab, &pack);
@@ -1619,19 +1622,19 @@ impl Tab {
             // The first query that gives a group an option wins, as in core;
             // queries that give one differently are a conflict, shown
             // (owner, 2026-11-15).
-            let mut given: std::collections::HashMap<&str, Vec<(String, nerka_core::SignalOptions)>> =
+            let mut given: std::collections::HashMap<String, Vec<(String, nerka_core::SignalOptions)>> =
                 Default::default();
             for p in &parts {
                 for (g, o) in p.pins.iter().filter(|(g, _)| p.nfd.contains(&format!("<{g}>"))) {
-                    let e = self.pack_options.entry(g.clone()).or_default();
+                    // Keyed by the signal's name: lower case.
+                    let e = self.pack_options.entry(g.to_ascii_lowercase()).or_default();
                     *e = e.over(o);
-                    given.entry(g).or_default().push((p.name.to_owned(), o.clone()));
+                    given.entry(g.to_ascii_lowercase()).or_default().push((p.name.to_owned(), o.clone()));
                 }
             }
             self.option_conflicts = given
                 .into_iter()
                 .filter(|(_, list)| list.iter().any(|(_, a)| list.iter().any(|(_, b)| disagree(a, b))))
-                .map(|(g, list)| (g.to_owned(), list))
                 .collect();
             let chosen = |g: &str| self.query_options.get(g).cloned();
             for d in nerka_core::query_signals(&parts, &*file, &chosen) {
@@ -7513,12 +7516,56 @@ query clock  signals: t:time
         tab.refresh_signals(&ctx, &lib, &saved, 0);
         let d = tab.signals.get("drops_CAM1").expect("filled in");
         assert_eq!((d.kind(), d.per()), (SignalKind::Num, Some("ecu_cam1")));
-        assert_eq!(tab.pack_options["drops_CAM1"].spec(), "num:per(ecu_CAM1):default(0)");
+        assert_eq!(tab.pack_options["drops_cam1"].spec(), "num:per(ecu_CAM1):default(0)");
 
         tab.choose_option("drops_CAM1", |o| o.kind = Some(SignalKind::Enum));
         tab.save_options_to_pack(&mut lib, "drops_CAM1").unwrap();
         let file = std::fs::read_to_string(&pack_file).unwrap();
         assert!(file.contains("signals: drops_$cam:enum:per(ecu_$cam):default(0)"), "{file}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Owner, 2026-11-15: instances of a parameterised query give a signal
+    /// each where the group's name uses the parameter, one signal fed by
+    /// all where it doesn't (no conflict: same query, same settings); Save
+    /// to pack from an instance writes the entry as written.
+    #[test]
+    fn instances_give_their_signals() {
+        let dir = std::env::temp_dir().join(format!("nerka-gui-instances-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("app.log");
+        std::fs::write(&log, "CAM1 drop 3 of 9\nCAM2 drop 4 of 8\nCAM1 drop 5 of 7\n").unwrap();
+        let pack_file = dir.join("cam.nerka-pack");
+        let text = "pack cam\nquery drops(cam)  signals: drops_$cam:num, total:num\n    /$cam drop (?<drops_$cam>\\d+) of (?<total>\\d+)/\n";
+        std::fs::write(&pack_file, text).unwrap();
+        let mut lib = Library::new();
+        lib.load(&pack_file).unwrap();
+        let ctx = egui::Context::default();
+        let mut tab = Tab::open(&ctx, log, &SearchPrefs::default());
+        settle(&mut tab, &ctx);
+        let saved = Signals::default();
+        tab.picks.add(&lib, "cam.drops", Use::Signal, None);
+        let n = &mut tab.picks.nodes[0];
+        for cam in ["CAM1", "CAM2"] {
+            n.instances.push(library::Instance { args: [("cam".to_owned(), (cam.to_owned(), false))].into() });
+        }
+        tab.refresh_signals(&ctx, &lib, &saved, 0);
+        let names: Vec<&str> = tab.signals.iter().map(|d| d.name()).collect();
+        assert_eq!(names, ["drops_cam1", "total", "drops_cam2"]);
+        let total = tab.signals.get("total").unwrap();
+        assert_eq!(total.queries(), ["drops (CAM1)", "drops (CAM2)"]);
+        assert!(tab.option_conflicts.is_empty());
+        tab.mode = Mode::Query;
+        tab.pattern = "@drops_CAM2.event".into();
+        tab.start_search(&ctx);
+        settle(&mut tab, &ctx);
+        assert_eq!(tab.result().unwrap().lines, [1]);
+
+        tab.choose_option("drops_cam2", |o| o.kind = Some(SignalKind::Enum));
+        tab.save_options_to_pack(&mut lib, "drops_cam2").unwrap();
+        let file = std::fs::read_to_string(&pack_file).unwrap();
+        assert!(file.contains("signals: total:num, drops_$cam:enum") || file.contains("drops_$cam:enum"), "{file}");
+        assert!(!file.contains("CAM2:"), "{file}");
         std::fs::remove_dir_all(&dir).ok();
     }
 

@@ -549,7 +549,12 @@ pub fn signals_panel(ui: &mut egui::Ui, st: &mut SignalsUi, input: Input<'_>) ->
                             } else {
                                 format!("Its pack gives it: signals: {}:{spec}", d.group())
                             };
-                            ui.weak("query").on_hover_text(format!(
+                            // Fed by several queries or instances: says so.
+                            let from = match d.queries().len() {
+                                1 => "query".to_owned(),
+                                k => format!("query ← {k}"),
+                            };
+                            ui.weak(from).on_hover_text(format!(
                                 "From the named group (?<{}>…) of: {}\nIt goes away with the query. {in_pack}",
                                 d.group(),
                                 d.queries().join(", "),
