@@ -314,6 +314,9 @@ fn several_protocols_share_one_view() {
     let o = CaptureOptions { someip_udp_ports: vec![30490, 30501], ..Default::default() };
     let (f, s) = from_bytes("t.pcap", pcap_file(1, &frames), &o).unwrap();
     assert_eq!(f.protocols(), ["DLT", "SOMEIP", "syslog"]);
+    // What the top bar says (from the protocols found when read, not a
+    // walk over every message per frame).
+    assert_eq!(f.format(), "pcap: DLT + SOMEIP + syslog");
     assert_eq!((s.datagrams, s.messages, s.msg_skipped), (6, 6, 10));
     let names: Vec<&str> = f.columns().iter().map(|c| c.name.as_ref()).collect();
     assert_eq!(names, MIXED_COLUMNS.iter().map(|c| c.name.as_ref()).collect::<Vec<_>>());

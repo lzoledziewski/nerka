@@ -134,6 +134,7 @@ nerka-gui [OPTIONS] [FILE]...
 | `--marker NAME=VALUE[:LABEL]`, `--cursor TIME` | a line in a plotted lane, a time cursor |
 | `--fibex FILE` | a FIBEX file for DLT non-verbose messages |
 | `--new-window`, `--name NAME` | a window of its own, its name |
+| `--screenshot PATH` | once the files are loaded, the signals collected and the plot drawn, save the window as a PNG and close it (for checks without a person at the screen) |
 | `-h, --help`, `-V, --version` | |
 
 A `--signal`, `--lifecycle` or `--check` that doesn't parse is listed in an

@@ -17,13 +17,24 @@
 # examples/protocols/dlt.ksy (DLTK) the other. Each query runs per protocol
 # (`proto == DLT AND …`, `proto == DLTK AND …`), so both readers read the
 # same messages in the same file.
+#
+# Signals, plot and memory (review 2026-11-14; SIGNALS=0 leaves them out): a
+# FIBEX trace of MIB (gen_fibex_dlt, 40 messages) as a pcap, 30 of its
+# arguments as signals (perf_signals): the open, collecting them, building
+# the plot's lanes, a frame at full zoom, the peak heap (MiB, a run of its
+# own with --heap). GUI=1 (the default) also runs the GUI's own code headless
+# (cargo test, ignored tests): a frame of the whole window with the signals
+# plotted, a plot repaint at full zoom, a signal added until the plot shows.
+# A change is flagged when it is over 15 % and over 1 (ms or MiB), so
+# sub-millisecond frames don't flag noise.
 set -euo pipefail
 
 if [ "${1:-}" = compare ]; then
   join -t $'\t' <(tail -n +2 "$2" | sort) <(tail -n +2 "$3" | sort) |
     awk -F'\t' 'BEGIN { OFS = "\t"; print "query", "before_ms", "after_ms", "change", "matches" }
       { ch = ($2 > 0) ? ($4 - $2) / $2 * 100 : 0
-        flag = (ch > 15) ? "  SLOWER" : (ch < -15 ? "  faster" : "")
+        big = ($4 - $2 > 1 || $2 - $4 > 1)
+        flag = (ch > 15 && big) ? "  SLOWER" : (ch < -15 && big ? "  faster" : "")
         if ($3 != $5) flag = flag "  MATCHES DIFFER (" $3 " vs " $5 ")"
         printf "%s\t%s\t%s\t%+.0f%%%s\t%s\n", $1, $2, $4, ch, flag, $5 }'
   exit 0
@@ -97,3 +108,54 @@ while IFS=$'\t' read -r file kind q; do
   med=$(printf '%s\n' "${times[@]}" | sort -n | awk '{ a[NR] = $1 } END { print a[int((NR + 1) / 2)] }')
   printf '%s %s: %s\t%s\t%s\n' "$file" "$kind" "$q" "$med" "$m"
 done <<<"$CASES"
+
+[ "${SIGNALS:-1}" = 1 ] || exit 0
+for b in "$EX/gen_fibex_dlt" "$EX/perf_signals"; do
+  [ -x "$b" ] || [ -x "$b.exe" ] || { echo "bench: no $b (cargo build --release -p nerka-core --examples)" >&2; exit 1; }
+done
+[ -f "$DIR/nv.dlt" ] || "$EX/gen_fibex_dlt" "$DIR/nv.dlt" "$DIR/nv.xml" "$MIB" 40 >&2
+[ -f "$DIR/nv.pcap" ] || "$EX/dlt_to_pcap" "$DIR/nv.dlt" "$DIR/nv.pcap" >&2
+median() { sort -n | awk '{ a[NR] = $1 } END { print a[int((NR + 1) / 2)] }'; }
+# A perf_signals line's value and the number in its third column.
+field() { awk -F'\t' -v k="$1" '$1 == k { v = $2; c = $3 } END { sub(/ .*/, "", v); sub(/ .*/, "", c); print v, c }'; }
+signals() { "$EX/perf_signals" "$DIR/nv.pcap" "$DIR/nv.xml" 30 --skip-filters "$@"; }
+signals >/dev/null # warm the page cache
+declare -A got count
+for _ in $(seq "$RUNS"); do
+  out=$(signals)
+  for k in open "series total" "plot build" "frame (zoom 1)"; do
+    read -r v c < <(field "$k" <<<"$out")
+    got[$k]+="$v"$'\n'
+    count[$k]=$c
+  done
+done
+row() { printf '%s\t%s\t%s\n' "$1" "$(printf '%s' "$2" | median)" "$3"; }
+row "nv.pcap signals: open" "${got[open]}" "${count[open]}"
+row "nv.pcap signals: 30 collected" "${got[series total]}" "${count[series total]}"
+row "nv.pcap signals: plot lanes built" "${got[plot build]}" "${count[series total]}"
+row "nv.pcap signals: plot frame at full zoom" "${got[frame (zoom 1)]}" "${count[frame (zoom 1)]}"
+read -r heap _ < <(signals --heap | field "peak heap")
+printf '%s\t%s\t%s\n' "nv.pcap signals: peak heap MiB" "$heap" "-"
+
+[ "${GUI:-1}" = 1 ] || exit 0
+# The GUI's own code, headless (ui/src/plot.rs, ui/src/main.rs): absolute
+# paths, since cargo runs the tests in the crate's folder.
+abs=$(cd "$DIR" && { pwd -W 2>/dev/null || pwd; })
+gui() {
+  NERKA_PERF_FILE="$abs/nv.pcap" NERKA_PERF_FIBEX="$abs/nv.xml" \
+    cargo test --release -q --manifest-path "$ROOT/Cargo.toml" -p nerka-gui "$1" -- --ignored --nocapture 2>&1
+}
+gui perf_big_app >/dev/null # build and warm
+frames=""
+added=""
+repaint=""
+for _ in $(seq "$RUNS"); do
+  out=$(gui perf_big_app)
+  frames+=$(grep "with signals and plot, scroll the log:" <<<"$out" | sed -E 's/.*: ([0-9.]+) ms.*/\1/' | median)$'\n'
+  out=$(gui perf_big_plot)
+  added+=$(grep -m1 "=> plot again after" <<<"$out" | sed -E 's/.* ([0-9.]+) ms.*/\1/')$'\n'
+  repaint+=$(grep "pointer moved, full zoom" <<<"$out" | tail -1 | sed -E 's/.*ui ([0-9.]+) ms.*/\1/')$'\n'
+done
+row "nv.pcap gui: window frame, signals plotted" "$frames" "-"
+row "nv.pcap gui: plot repaint at full zoom" "$repaint" "-"
+row "nv.pcap gui: signal added until plotted" "$added" "-"

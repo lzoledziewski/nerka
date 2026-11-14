@@ -66,6 +66,8 @@ use rayon::prelude::*;
 use regex::bytes::Regex;
 use std::sync::{Arc, Mutex};
 
+mod collect;
+
 /// Where a signal's events come from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SignalScope {
@@ -292,6 +294,22 @@ impl SignalSeries {
     }
 
     /// The lifecycles it is bound to.
+    /// Whether `other` holds the same events: the same collected ones per
+    /// file, lifecycles and default (what a plot lane built from one shows
+    /// fits the other).
+    pub fn same_as(&self, other: &SignalSeries) -> bool {
+        let same_life = match (&self.life, &other.life) {
+            (None, None) => true,
+            (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+            _ => false,
+        };
+        self.key == other.key
+            && self.default == other.default
+            && same_life
+            && self.parts.len() == other.parts.len()
+            && self.parts.iter().zip(&other.parts).all(|(a, b)| a.0 == b.0 && a.1 == b.1 && Arc::ptr_eq(&a.2, &b.2))
+    }
+
     pub fn lifecycles(&self) -> Option<&Arc<Lifecycles>> {
         self.life.as_ref()
     }
@@ -854,6 +872,19 @@ impl SignalDef {
             .with_default(default.as_deref())
     }
 
+    /// Whether `other` uses the same collected events (a copy of this
+    /// definition, or one that took them over: [`Signals::adopt_caches`]).
+    pub fn shares_events_with(&self, other: &SignalDef) -> bool {
+        Arc::ptr_eq(&self.cache, &other.cache)
+    }
+
+    /// What its events depend on: two definitions with the same key collect
+    /// the same events from a file. `None` for built-in signals.
+    fn events_key(&self) -> Option<String> {
+        matches!(self.builtin, Builtin::No)
+            .then(|| format!("{}|{}|{:?}|{}", self.kind.as_str(), self.group, self.argument, self.query.source()))
+    }
+
     /// The spec line [`Self::parse_spec`] reads back.
     pub fn spec(&self) -> String {
         let off = if self.off { "off " } else { "" };
@@ -1079,15 +1110,22 @@ impl SignalDef {
                 Events::numbers(rows, nums, self.kind)
             }
         };
-        let ev = Arc::new(ev);
+        Ok(self.store(key, ev))
+    }
+
+    /// Keep `ev` as this definition's events in the file `key` (the ones
+    /// kept already, if another thread was first).
+    fn store(&self, key: (usize, LineNo), ev: Events) -> Arc<Events> {
         let mut cache = self.cache.lock().unwrap_or_else(|e| e.into_inner());
-        if !cache.iter().any(|(k, _)| *k == key) {
-            if cache.len() >= CACHED_FILES {
-                cache.remove(0);
-            }
-            cache.push((key, ev.clone()));
+        if let Some((_, kept)) = cache.iter().find(|(k, _)| *k == key) {
+            return kept.clone();
         }
-        Ok(ev)
+        if cache.len() >= CACHED_FILES {
+            cache.remove(0);
+        }
+        let ev = Arc::new(ev);
+        cache.push((key, ev.clone()));
+        ev
     }
 }
 
@@ -1173,6 +1211,29 @@ impl Signals {
             out.push('\n');
         }
         out
+    }
+
+    /// Take over what `old` collected: a definition that collects the same
+    /// events as one of `old` (same kind, group, argument and query,
+    /// whatever its name, scope or default) shares its cache. A tab's
+    /// signals built again (a FIBEX argument or a Selection query added)
+    /// then collect only what is new.
+    pub fn adopt_caches(&mut self, old: &Signals) {
+        let caches: std::collections::HashMap<String, &Cache> =
+            old.0.iter().filter_map(|d| Some((d.events_key()?, &d.cache))).collect();
+        let mut changed = false;
+        for d in &mut self.0 {
+            let Some(cache) = d.events_key().and_then(|k| caches.get(&k).copied()) else { continue };
+            if !Arc::ptr_eq(&d.cache, cache) {
+                let mut new = (**d).clone();
+                new.cache = cache.clone();
+                *d = Arc::new(new);
+                changed = true;
+            }
+        }
+        if changed {
+            self.link();
+        }
     }
 
     pub fn remove(&mut self, name: &str) {
@@ -1654,5 +1715,36 @@ mod tests {
         three.set(SignalDef::parse_spec(r"v:enum=/v=(?<v>\d+)/").unwrap());
         assert_ne!(one.fingerprint(), three.fingerprint());
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A tab's signals built again (a FIBEX argument or a Selection query
+    /// added) keep the events collected for the same definitions; another
+    /// definition of the same name collects its own.
+    #[test]
+    fn signals_built_again_keep_their_events() {
+        let file = crate::TextFile::from_bytes("t", b"v=1 w=a\nv=2 w=b\nv=3\n".to_vec());
+        let build = |w_kind: &str| {
+            let mut s = Signals::default();
+            s.set(SignalDef::parse_spec(r"v=/v=(?<v>\d+)/").unwrap());
+            s.set(SignalDef::parse_spec(&format!(r"w:{w_kind}=/w=(?<w>\w+)/")).unwrap());
+            s
+        };
+        let old = build("enum");
+        for d in old.iter() {
+            d.series(&file, &Progress::new()).unwrap();
+        }
+        let mut new = build("num");
+        new.set(SignalDef::parse_spec(r"v2:filtered=/v=(?<v2>\d+)/").unwrap());
+        assert!(new.get("v").unwrap().cached_series(&file).is_none(), "a new definition has no events");
+        new.adopt_caches(&old);
+        let v = new.get("v").unwrap().cached_series(&file).expect("taken over");
+        assert_eq!(v.len(), 3);
+        assert!(new.get("v").unwrap().shares_events_with(old.get("v").unwrap()));
+        assert!(new.get("w").unwrap().cached_series(&file).is_none(), "another kind: collected again");
+        assert!(new.get("v2").unwrap().cached_series(&file).is_none(), "another group: collected again");
+        // Taking over twice changes nothing.
+        let fp = new.fingerprint();
+        new.adopt_caches(&old);
+        assert_eq!(new.fingerprint(), fp);
     }
 }

@@ -113,6 +113,23 @@ impl Bytes {
     }
 }
 
+/// Bring a mapped file's pages in on every core before a reader walks it
+/// on one thread (review 2026-11-14, P8: an open was mostly the kernel's
+/// page faults, one per 4 KiB, all on the reader's thread). Reads a byte
+/// per page; stops early when cancelled (the reader then says so).
+pub(crate) fn prefault(data: &[u8], progress: &Progress) {
+    use rayon::prelude::*;
+    const PAGE: usize = 4096;
+    if data.len() < 16 << 20 {
+        return;
+    }
+    let sum: u64 = data
+        .par_chunks(4 << 20)
+        .map(|c| if progress.is_cancelled() { 0 } else { c.iter().step_by(PAGE).map(|&b| u64::from(b)).sum() })
+        .sum();
+    std::hint::black_box(sum);
+}
+
 /// A column of a source whose lines are tab-separated cells (DLT).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ColumnDef {

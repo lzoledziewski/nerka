@@ -27,6 +27,8 @@
 //! they hold spaces or quotes. Time cursors and the zoom belong to a file,
 //! so they aren't kept.
 
+pub mod lane;
+
 use crate::pack::PackError;
 use crate::preset::{quote, valid_name, words};
 use std::path::{Path, PathBuf};

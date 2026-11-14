@@ -39,18 +39,22 @@ cargo run --release -p nerka-core --example dlt_to_pcap -- big.dlt big.pcap   # 
 cargo run --release -p nerka-core --example dlt_to_pcap -- big.dlt big2.pcap --ports 3490,3491 --copy   # every datagram on both ports
 cargo run --release -p nerka-cli -- filter -c --stats 'apid == NAV AND level >= WARN' big.pcap
 cargo run --release -p nerka-core --example dlt_to_mf4 -- big.dlt big_z.mf4 --deflate   # the same DLT as an MF4 (DZ blocks; --one-block, or no --deflate)
+cargo run --release -p nerka-core --example gen_fibex_dlt -- nv.dlt nv.xml 3072 40   # non-verbose DLT + its FIBEX (40 messages)
+cargo run --release -p nerka-core --example perf_signals -- nv.pcap nv.xml 30   # open, filters, 30 FIBEX signals, plot build and frame, timed
 cargo run --release -p nerka-cli -- --unpack-dir cache filter -c --stats 'apid == NAV AND level >= WARN' big_z.mf4  # 1st run unpacks, then cached
 cargo run --release -p nerka-core --example probe_capture -- trace.pcapng log.mf4   # structure of real captures, no payload
 powershell -ExecutionPolicy Bypass -File tools/screenshot.ps1 -Out shot.png -AppArgs app.log  # GUI screenshot (Windows)
+cargo run -p nerka-gui -- nv.dlt --fibex nv.xml --plot m0_speed --screenshot shot.png   # the app saves its own window, then closes (any OS; CI)
 bash tools/review-gate.sh --full                      # review gate: build gates, fuzz, metrics (docs/dev/review/)
 bash tools/bench.sh target/bench 1024 5 > bench.tsv   # the benchmark above as TSV; `tools/bench.sh compare a.tsv b.tsv`
 KSY=1 bash tools/bench.sh target/bench 1024 5 > bench.tsv   # + the DLT definition against native DLT (NERKA_BIN: binaries elsewhere)
+# bench.sh also measures 30 FIBEX signals, the plot, peak heap and GUI frames (SIGNALS=0 / GUI=0 leave them out)
 ```
 
 Reviews (a gate before a merge or release, a deep review each cycle): `docs/dev/review/README.md`,
 checklist `docs/dev/review/checklist.md`, latest findings `docs/dev/review/*-findings.md`.
 
-CI (`.github/workflows/ci.yml`) runs fmt, clippy and tests on Linux and Windows, `cargo deny`, and a DCO sign-off check on pull requests (`CONTRIBUTING.md`; commit with `git commit -s`); `release.yml`
+CI (`.github/workflows/ci.yml`) runs fmt, clippy and tests on Linux and Windows (and macOS, non-voting), a GUI screenshot on each (`--screenshot`, kept as artifacts), `cargo deny`, and a DCO sign-off check on pull requests (`CONTRIBUTING.md`; commit with `git commit -s`); `release.yml`
 builds Linux/Windows archives and publishes a pre-release on a `v*` tag.
 
 `docs/dev/status.md` records the current state, the decisions pending with the owner

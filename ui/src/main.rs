@@ -98,6 +98,8 @@ Options:
       --fibex FILE         FIBEX file for DLT non-verbose messages
       --new-window         A new window, even if one is open
       --name NAME          The window's name
+      --screenshot PATH    Once loaded and drawn, save the window as a PNG
+                           and close (checks and CI)
   -h, --help               This text
   -V, --version            The version
 ";
@@ -132,6 +134,8 @@ fn main() -> eframe::Result {
     let mut markers: Vec<(String, plot::Marker)> = Vec::new();
     // `--plot-window`: the plot starts in a window of its own.
     let mut plot_window = false;
+    // `--screenshot PATH`: the window as a PNG once loaded, then close.
+    let mut screenshot: Option<PathBuf> = None;
     let (mut window_name, mut preset_file) = (None, None);
     // Options given (anything but files): with none, a running window opens
     // the files (review 2026-11-09, R7: an option left out of a list of
@@ -214,6 +218,10 @@ fn main() -> eframe::Result {
                     Some(x) => cursors.push(x),
                     None => eprintln!("nerka-gui: --cursor: expected a time or a number"),
                 }
+                continue;
+            }
+            Some("--screenshot") => {
+                screenshot = Some(PathBuf::from(value()));
                 continue;
             }
             Some("--plot-window") => {
@@ -325,6 +333,7 @@ fn main() -> eframe::Result {
                 app.status = m;
             }
             app.option_errors = spec_errors;
+            app.shoot = screenshot.map(Shoot::new);
             let mut picks = Picks::default();
             picks.params = params;
             for (role, id) in &startup {
@@ -1571,6 +1580,9 @@ impl Tab {
             return;
         }
         self.own_fp = Some(fp);
+        // What the signals built before collected stays: only new
+        // definitions collect their events.
+        s.adopt_caches(&self.signals);
         // The checks' signals come back when they ran with these.
         self.own_signals = s.clone();
         self.own_gen += 1;
@@ -1640,14 +1652,10 @@ impl Tab {
         if self.signals.is_empty() {
             return;
         }
-        let defs: Vec<_> = self.signals.iter().cloned().collect();
-        self.signals_job = Some(Job::spawn(ctx, move |prog| {
-            for d in defs {
-                // A definition that doesn't fit the file says so in the panel.
-                let _ = d.series(&*file, prog);
-            }
-            Ok(())
-        }));
+        let signals = self.signals.clone();
+        // Signals keyed by a field together, the rest one by one; a
+        // definition that doesn't fit the file says so in the panel.
+        self.signals_job = Some(Job::spawn(ctx, move |prog| signals.collect(&*file, prog)));
     }
 
     fn build_filter(&self) -> Result<Filter, String> {
@@ -3043,6 +3051,8 @@ struct App {
     /// Options that didn't parse (`--signal`, `--lifecycle`, `--check`), in a
     /// window until OK.
     option_errors: Vec<String>,
+    /// `--screenshot PATH`: waiting to save the window.
+    shoot: Option<Shoot>,
     focus_search: bool,
     window_title: String,
     /// Query packs (search manager) and where they come from besides the
@@ -4734,6 +4744,31 @@ impl App {
     }
 }
 
+/// `--screenshot PATH`: once every tab has loaded and collected its signals
+/// and a few frames have drawn (the plot builds its lanes in a frame), the
+/// window as a PNG at `path`, then the window closes. For checks without a
+/// person at the screen (CI on Linux, Windows and macOS): the picture comes
+/// from the app's own frame, so no screen-recording permission is needed.
+struct Shoot {
+    path: PathBuf,
+    started: std::time::Instant,
+    /// Frames drawn with nothing loading.
+    quiet: u32,
+    requested: bool,
+    image: Arc<std::sync::Mutex<Option<egui::ColorImage>>>,
+}
+
+impl Shoot {
+    /// Frames with nothing loading before the picture.
+    const QUIET: u32 = 10;
+    /// Taken anyway after this long (said on the terminal).
+    const PATIENCE: Duration = Duration::from_secs(600);
+
+    fn new(path: PathBuf) -> Shoot {
+        Shoot { path, started: std::time::Instant::now(), quiet: 0, requested: false, image: Default::default() }
+    }
+}
+
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.frame(ui);
@@ -4741,6 +4776,36 @@ impl eframe::App for App {
 }
 
 impl App {
+    /// `--screenshot`: count quiet frames, ask for the picture, save it and
+    /// close the window.
+    fn shoot_step(&mut self, ctx: &egui::Context) {
+        let busy = self.tabs.iter().any(|t| t.is_busy());
+        let Some(s) = &mut self.shoot else { return };
+        ctx.request_repaint();
+        let taken = s.image.lock().unwrap_or_else(|e| e.into_inner()).take();
+        if let Some(image) = taken {
+            if let Err(e) = nerka_core::write_atomic(&s.path, shot::png(&image)) {
+                console::error(&format!("nerka-gui: --screenshot {}: {e}\n", s.path.display()));
+                std::process::exit(1);
+            }
+            self.shoot = None;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            return;
+        }
+        if s.requested {
+            return;
+        }
+        s.quiet = if busy { 0 } else { s.quiet + 1 };
+        let late = s.started.elapsed() > Shoot::PATIENCE;
+        if late {
+            console::error("nerka-gui: --screenshot: still loading; taken as it is\n");
+        }
+        if s.quiet >= Shoot::QUIET || late {
+            s.requested = true;
+            shot::request_into(ctx, s.image.clone());
+        }
+    }
+
     /// One frame of the whole window (also driven by tests).
     fn frame(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
@@ -4754,6 +4819,7 @@ impl App {
         self.follow_focus(&ctx);
         self.poll_instance(&ctx);
         self.poll_jobs(&ctx);
+        self.shoot_step(&ctx);
         for t in &mut self.tabs {
             t.notes = self.prefs.bookmark_notes;
             t.columns.note_column(t.notes == NoteMode::Column);
@@ -6052,6 +6118,126 @@ gear=D
             std::thread::sleep(Duration::from_millis(10));
         }
         panic!("jobs still running");
+    }
+
+    /// What a frame of the whole window costs on a big file, browsing it:
+    /// idle, scrolling the log, the Signals panel with its FIBEX tree, the
+    /// plot. `NERKA_PERF_FILE=big.pcap NERKA_PERF_FIBEX=big.xml cargo test
+    /// --release -p nerka-gui perf_big_app -- --ignored --nocapture`
+    /// (absolute paths; files from `gen_fibex_dlt`).
+    #[test]
+    #[ignore = "needs a big file"]
+    fn perf_big_app() {
+        let (Ok(path), Ok(fx)) = (std::env::var("NERKA_PERF_FILE"), std::env::var("NERKA_PERF_FIBEX")) else {
+            return;
+        };
+        let ctx = egui::Context::default();
+        // A big file can take longer than `settle_app` waits.
+        let settle = |app: &mut App| {
+            while app.tabs.iter().any(|t| t.is_busy()) {
+                app.poll_jobs(&ctx);
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        };
+        let mut app = App::default();
+        app.set_fibex(&ctx, vec![PathBuf::from(fx)]);
+        let t = std::time::Instant::now();
+        app.open(&ctx, PathBuf::from(path));
+        settle(&mut app);
+        eprintln!("open {:.0} ms", t.elapsed().as_secs_f64() * 1e3);
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1600.0, 1000.0));
+        let mut time = 0.0;
+        let mut run = |app: &mut App, label: &str, events: Vec<egui::Event>| {
+            time += 1.0 / 60.0;
+            let input = egui::RawInput { screen_rect: Some(screen), time: Some(time), events, ..Default::default() };
+            let t = std::time::Instant::now();
+            let mut out = ctx.run_ui(input, |ui| app.frame(ui));
+            out.textures_delta.clear();
+            eprintln!("{label}: {:.1} ms", t.elapsed().as_secs_f64() * 1e3);
+        };
+        let wheel = |y: f32| egui::Event::MouseWheel {
+            unit: egui::MouseWheelUnit::Line,
+            delta: egui::vec2(0.0, y),
+            phase: egui::TouchPhase::Move,
+            source: egui::MouseWheelSource::Wheel,
+            modifiers: egui::Modifiers::NONE,
+        };
+        let over_log = egui::Event::PointerMoved(egui::pos2(600.0, 300.0));
+        for _ in 0..3 {
+            run(&mut app, "idle", vec![]);
+        }
+        run(&mut app, "pointer over the log", vec![over_log.clone()]);
+        for _ in 0..5 {
+            run(&mut app, "scroll the log", vec![wheel(-3.0)]);
+        }
+        // The Signals panel, its FIBEX tree, six arguments plotted.
+        app.show_signals = true;
+        let args = app.fibex_arguments();
+        for a in args.iter().take(6) {
+            app.tabs[0].arg_picks.push(a.clone());
+            plot::lock(&app.tabs[0].plot).toggle(&a.name);
+        }
+        app.tabs[0].choices_gen += 1;
+        let t = std::time::Instant::now();
+        run(&mut app, "signals picked", vec![]);
+        settle(&mut app);
+        eprintln!("events collected {:.0} ms", t.elapsed().as_secs_f64() * 1e3);
+        for _ in 0..3 {
+            run(&mut app, "with signals and plot, idle", vec![]);
+        }
+        for _ in 0..5 {
+            run(&mut app, "with signals and plot, scroll the log", vec![over_log.clone(), wheel(-3.0)]);
+        }
+        let over_panel = egui::Event::PointerMoved(egui::pos2(1450.0, 400.0));
+        for _ in 0..3 {
+            run(&mut app, "pointer over the Signals panel", vec![over_panel.clone()]);
+        }
+        for _ in 0..3 {
+            run(&mut app, "scroll the Signals panel", vec![over_panel.clone(), wheel(-3.0)]);
+        }
+    }
+
+    /// Review 2026-11-14, P9: a tab's signals built again (a FIBEX argument
+    /// ticked) keep the events collected for the ones that stay; before,
+    /// every FIBEX and query signal read the file again.
+    #[test]
+    fn signals_built_again_keep_their_events() {
+        let dir = std::env::temp_dir().join(format!("nerka-gui-keepevents-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let fibex = dir.join("ecu.xml");
+        std::fs::write(&fibex, QUEUE_FIBEX).unwrap();
+        let a = dir.join("a.dlt");
+        std::fs::write(&a, queue_dlt(&[512, 64])).unwrap();
+        let ctx = egui::Context::default();
+        let mut app = App::default();
+        app.set_fibex(&ctx, vec![fibex]);
+        app.open(&ctx, a);
+        settle_app(&mut app, &ctx);
+        let run = |app: &mut App| {
+            let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1200.0, 800.0));
+            let input = egui::RawInput { screen_rect: Some(screen), ..Default::default() };
+            let mut out = ctx.run_ui(input, |ui| app.frame(ui));
+            out.textures_delta.clear();
+        };
+        let args = app.fibex_arguments();
+        app.tabs[0].arg_picks.push(args[0].clone());
+        app.tabs[0].choices_gen += 1;
+        run(&mut app);
+        settle_app(&mut app, &ctx);
+        let file = app.tabs[0].file.clone().unwrap();
+        let first = app.tabs[0].signals.get(&args[0].name).unwrap().clone();
+        assert!(first.cached_series(&*file).is_some(), "collected");
+        // A signal defined: the tab's signals are built again.
+        app.saved_signals.set(nerka_core::SignalDef::parse_spec(r"n=/(?<n>\d+)/").unwrap());
+        app.saved_gen += 1;
+        run(&mut app);
+        let tab = &app.tabs[0];
+        assert!(tab.signals.get("n").is_some(), "the new one is the tab's signal");
+        let kept = tab.signals.get(&args[0].name).unwrap();
+        assert!(!Arc::ptr_eq(kept, &first), "built again");
+        assert!(kept.shares_events_with(&first), "its events are kept, not collected again");
+        assert!(kept.cached_series(&*file).is_some());
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// Owner, 2026-10-28: a plot kept in one tab opens in another with all

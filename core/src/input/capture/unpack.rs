@@ -20,6 +20,7 @@ use super::super::Bytes;
 use crate::{Error, Progress, Result};
 use miniz_oxide::inflate::stream::{InflateState, inflate};
 use miniz_oxide::{DataFormat, MZError, MZFlush, MZStatus};
+use rayon::prelude::*;
 use std::collections::HashMap;
 use std::fs::File;
 use std::hash::{Hash, Hasher};
@@ -174,7 +175,32 @@ fn key(path: &Path) -> Result<u64> {
 /// Write every leaf's bytes, unpacking DZ blocks, checking for
 /// cancellation per chunk.
 fn write_all(buf: &[u8], leaves: &[Leaf], w: &mut impl Write, progress: &Progress) -> Result<()> {
-    for l in leaves {
+    // Runs of DZ blocks up to this size are unpacked in parallel, a batch
+    // at a time, and written in order (review 2026-11-14, P4b: unpacking
+    // was one thread); bigger ones stream through one buffer.
+    const IN_PARALLEL: u64 = 64 << 20;
+    let batch = 2 * rayon::current_num_threads().max(1);
+    let small = |l: &Leaf| l.dz.is_some_and(|(_, _, org)| org <= IN_PARALLEL);
+    let mut i = 0;
+    while i < leaves.len() {
+        let mut j = i;
+        while j < leaves.len() && j - i < batch && small(&leaves[j]) {
+            j += 1;
+        }
+        if j > i {
+            if progress.is_cancelled() {
+                return Err(Error::Cancelled);
+            }
+            let blocks: Vec<Result<Vec<u8>>> =
+                leaves[i..j].par_iter().map(|l| unpack_block(buf, l, progress)).collect();
+            for b in blocks {
+                w.write_all(&b?)?;
+            }
+            i = j;
+            continue;
+        }
+        let l = &leaves[i];
+        i += 1;
         let data = &buf[l.data_at..l.data_at + l.data_len];
         if l.dz.is_none() {
             for chunk in data.chunks(1 << 20) {
@@ -186,23 +212,29 @@ fn write_all(buf: &[u8], leaves: &[Leaf], w: &mut impl Write, progress: &Progres
             }
             continue;
         }
-        let (zip_type, param, org, packed) = dz_header(data)?;
-        let header = (data.len() - packed.len()) as u64;
-        progress.add(header);
+        let (zip_type, _, org, packed) = dz_header(data)?;
         if zip_type == 1 {
-            // Transposed: the block is needed whole to put it back.
-            let v = miniz_oxide::inflate::decompress_to_vec_zlib_with_limit(packed, org as usize)
-                .map_err(|_| Error::Format("MF4: damaged DZ data".into()))?;
-            if v.len() as u64 != org {
-                return Err(Error::Format("MF4: DZ data shorter than its header says".into()));
-            }
-            w.write_all(&untranspose(&v, param as usize))?;
-            progress.add(packed.len() as u64 + org);
+            w.write_all(&unpack_block(buf, l, progress)?)?;
         } else {
+            progress.add((data.len() - packed.len()) as u64);
             inflate_into(packed, org, w, progress)?;
         }
     }
     Ok(())
+}
+
+/// A DZ block's data, unpacked whole (and put back in order if
+/// transposed).
+fn unpack_block(buf: &[u8], l: &Leaf, progress: &Progress) -> Result<Vec<u8>> {
+    let data = &buf[l.data_at..l.data_at + l.data_len];
+    let (zip_type, param, org, packed) = dz_header(data)?;
+    let v = miniz_oxide::inflate::decompress_to_vec_zlib_with_limit(packed, org as usize)
+        .map_err(|_| Error::Format("MF4: damaged DZ data".into()))?;
+    if v.len() as u64 != org {
+        return Err(Error::Format("MF4: DZ data shorter than its header says".into()));
+    }
+    progress.add(data.len() as u64 + org);
+    Ok(if zip_type == 1 { untranspose(&v, param as usize) } else { v })
 }
 
 /// Inflate a zlib stream of `org` bytes into `w`, a chunk at a time.
