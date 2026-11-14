@@ -16,13 +16,61 @@ use nerka_core::plot::lane::lanes_of_all;
 use nerka_core::signal::{Clock, SignalDef, Signals};
 use nerka_core::{Fibex, Filter, OpenOptions, Progress, Query, search};
 use rayon::prelude::*;
+use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
 use std::time::Instant;
 
+/// The system allocator, with `--heap` counting the bytes held and their
+/// peak: the `peak heap` line (`tools/bench.sh`), the same on every system
+/// and allocator (the mapped file isn't heap). Counting slows every thread's
+/// allocations down, so a run that counts is for its peak, not its times.
+struct Counting;
+
+static COUNT: AtomicBool = AtomicBool::new(false);
+static HELD: AtomicIsize = AtomicIsize::new(0);
+static PEAK: AtomicIsize = AtomicIsize::new(0);
+
+fn held(delta: isize) {
+    if COUNT.load(Ordering::Relaxed) {
+        let now = HELD.fetch_add(delta, Ordering::Relaxed) + delta;
+        PEAK.fetch_max(now, Ordering::Relaxed);
+    }
+}
+
+// SAFETY: every call goes to `System` with the caller's arguments unchanged;
+// only the sizes are counted.
+unsafe impl GlobalAlloc for Counting {
+    unsafe fn alloc(&self, l: Layout) -> *mut u8 {
+        // SAFETY: as `GlobalAlloc::alloc`, the caller's layout.
+        let p = unsafe { System.alloc(l) };
+        if !p.is_null() {
+            held(l.size() as isize);
+        }
+        p
+    }
+    unsafe fn dealloc(&self, p: *mut u8, l: Layout) {
+        // SAFETY: `p` came from `alloc` / `realloc` above with this layout.
+        unsafe { System.dealloc(p, l) };
+        held(-(l.size() as isize));
+    }
+    unsafe fn realloc(&self, p: *mut u8, l: Layout, new: usize) -> *mut u8 {
+        // SAFETY: as `GlobalAlloc::realloc`, the caller's pointer and layout.
+        let q = unsafe { System.realloc(p, l, new) };
+        if !q.is_null() {
+            held(new as isize - l.size() as isize);
+        }
+        q
+    }
+}
+
+#[global_allocator]
+static ALLOC: Counting = Counting;
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    COUNT.store(std::env::args().any(|a| a == "--heap"), Ordering::Relaxed);
     let mut a = std::env::args().skip(1);
-    let usage =
-        "usage: perf_signals FILE FIBEX [N] [--unpack-dir DIR] [--par] [--skip-filters] [--reopen] [--one-by-one]";
+    let usage = "usage: perf_signals FILE FIBEX [N] [--unpack-dir DIR] [--par] [--skip-filters] [--reopen] [--one-by-one] [--heap]";
     let file = a.next().ok_or(usage)?;
     let fibex = a.next().ok_or(usage)?;
     let mut n = 30usize;
@@ -34,6 +82,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "--skip-filters" => filters = false,
             "--reopen" => reopen = true,
             "--one-by-one" => one_by_one = true,
+            "--heap" => {}
             s => n = s.parse()?,
         }
     }
@@ -141,6 +190,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             points += s.line.len();
         }
         println!("frame (zoom {zoom})\t{:.1} ms\t{strokes} strokes, {points} line points", ms(t));
+    }
+    if COUNT.load(Ordering::Relaxed) {
+        println!("peak heap\t{} MiB", PEAK.load(Ordering::Relaxed).max(0) >> 20);
     }
     Ok(())
 }

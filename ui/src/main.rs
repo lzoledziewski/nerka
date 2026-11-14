@@ -4784,7 +4784,7 @@ impl App {
         ctx.request_repaint();
         let taken = s.image.lock().unwrap_or_else(|e| e.into_inner()).take();
         if let Some(image) = taken {
-            if let Err(e) = std::fs::write(&s.path, shot::png(&image)) {
+            if let Err(e) = nerka_core::write_atomic(&s.path, shot::png(&image)) {
                 console::error(&format!("nerka-gui: --screenshot {}: {e}\n", s.path.display()));
                 std::process::exit(1);
             }

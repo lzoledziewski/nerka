@@ -48,6 +48,7 @@ cargo run -p nerka-gui -- nv.dlt --fibex nv.xml --plot m0_speed --screenshot sho
 bash tools/review-gate.sh --full                      # review gate: build gates, fuzz, metrics (docs/dev/review/)
 bash tools/bench.sh target/bench 1024 5 > bench.tsv   # the benchmark above as TSV; `tools/bench.sh compare a.tsv b.tsv`
 KSY=1 bash tools/bench.sh target/bench 1024 5 > bench.tsv   # + the DLT definition against native DLT (NERKA_BIN: binaries elsewhere)
+# bench.sh also measures 30 FIBEX signals, the plot, peak heap and GUI frames (SIGNALS=0 / GUI=0 leave them out)
 ```
 
 Reviews (a gate before a merge or release, a deep review each cycle): `docs/dev/review/README.md`,

@@ -55,8 +55,8 @@ regression over 15 %; **S3** debt that makes the next change harder;
 
 | ID | Check | How |
 |---|---|---|
-| PERF-1 🤖 | The `--stats` benchmark runs and is recorded, a row per case (an empty table fails) | `tools/bench.sh DIR 1024 5 > bench.tsv` (`--bench`); `KSY=1` adds the protocol definition cases |
-| PERF-2 🤖 | No query more than 15 % slower than the baseline, match counts identical | `tools/bench.sh compare docs/dev/review/baseline/bench-….tsv bench.tsv` |
+| PERF-1 🤖 | The `--stats` benchmark runs and is recorded, a row per case (an empty table fails); with it 30 FIBEX signals on a pcap (open, collected, plot lanes built, a full-zoom frame, peak heap) and the GUI's code headless (a window frame with the signals plotted, a plot repaint, a signal added until plotted) | `tools/bench.sh DIR 1024 5 > bench.tsv` (`--bench`); `KSY=1` adds the protocol definition cases; `SIGNALS=0` / `GUI=0` leave those out |
+| PERF-2 🤖 | No row more than 15 % (and over 1 ms or MiB) slower or bigger than the baseline, match counts identical | `tools/bench.sh compare docs/dev/review/baseline/bench-….tsv bench.tsv` |
 | PERF-3 | Index memory per line stays as documented (8 B text, 8 / 16 B DLT, +16 B merged) | `nerka open FILE` → `index mem` |
 | PERF-4 | New per-line work in the hot path (allocation, `to_string`, rendering) is avoided or measured | read `scan_*`, `Event`, `field` implementations |
 | PERF-5 | GUI: no repaint loop when idle; heavy work off the UI thread | `gui-decisions.md` "CPU with software rendering"; `ui/src/job.rs` |
