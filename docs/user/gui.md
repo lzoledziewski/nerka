@@ -124,7 +124,7 @@ nerka-gui [OPTIONS] [FILE]...
 |---|---|
 | `-q, --query NFD` / `-r, --regex RE` / `-t, --text TEXT` | filter the first tab |
 | `--pack PATH` | load a query pack (file or folder) |
-| `--pick PACK.QUERY`, `--exclude PACK.QUERY`, `--signal-pick PACK.QUERY` | put a library query in the selection (Include, Exclude, Signal) |
+| `--pick PACK.QUERY`, `--exclude PACK.QUERY`, `--signal-pick PACK.QUERY` | put a library query in the selection (Include, Exclude, Signal); `PACK.QUERY(NAME=VALUE, …)` adds an instance of it (repeat for several) |
 | `--search-pick PACK.QUERY` | put a library query in the Search box |
 | `--param NAME=VALUE` | a library parameter's value |
 | `--highlight NFD` | colour the lines a query matches |

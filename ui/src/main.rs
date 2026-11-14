@@ -83,7 +83,8 @@ Options:
       --pack PATH          Load a library pack (file or folder)
       --pick PACK.QUERY    Select a library query (Include)
       --exclude PACK.QUERY Select a library query (Exclude)
-      --signal-pick PACK.QUERY  Select a library query (Signal)
+      --signal-pick PACK.QUERY  Select a library query (Signal); with
+                           (NAME=VALUE, …): an instance of it (also --pick, --exclude)
       --search-pick PACK.QUERY  Put a library query in the Search box
       --highlight NFD      Colour the lines a query matches
       --param NAME=VALUE   A library parameter's value
@@ -337,7 +338,10 @@ fn main() -> eframe::Result {
             let mut picks = Picks::default();
             picks.params = params;
             for (role, id) in &startup {
-                picks.add(&app.library, id, *role, None);
+                // `ID(NAME=VALUE, …)`: an instance of it, as on the CLI.
+                if let Err(e) = picks.add_given(&app.library, id, *role) {
+                    app.option_errors.push(e);
+                }
             }
             for id in &highlight {
                 picks.light_source(id);

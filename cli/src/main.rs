@@ -276,7 +276,9 @@ struct OutputArgs {
 /// Queries picked from the packs.
 #[derive(clap::Args)]
 struct PickArgs {
-    /// Include a query (pack.query); repeatable.
+    /// Include a query (pack.query); repeatable. `ID(NAME=VALUE, …)`: an
+    /// instance of it with its own parameter values (several: several
+    /// instances); `-p` values are the shared ones.
     #[arg(short = 'q', long = "query", value_name = "ID")]
     queries: Vec<String>,
     /// Include every query with this label (or one below it).
@@ -312,15 +314,21 @@ impl PickArgs {
             && self.exclude_labels.is_empty()
     }
 
-    /// Queries come before labels, each in command-line order.
+    /// Queries come before labels, each in command-line order. A query
+    /// given with arguments (`cam.drops(cam=CAM1)`) is an instance of it.
     fn expand(&self, lib: &Library) -> Result<Expansion> {
-        let picks = |ids: &[String], labels: &[String]| -> Vec<Pick> {
-            ids.iter().map(|q| Pick::Query(q.clone())).chain(labels.iter().map(|l| Pick::Label(l.clone()))).collect()
+        let picks = |ids: &[String], labels: &[String]| -> Result<Vec<Pick>> {
+            let mut out = Vec::new();
+            for q in ids {
+                out.push(Pick::parse_query(lib, q).map_err(anyhow::Error::msg)?);
+            }
+            out.extend(labels.iter().map(|l| Pick::Label(l.clone())));
+            Ok(out)
         };
         let sel = Selection {
-            include: picks(&self.queries, &self.labels),
-            require: picks(&self.require, &self.require_labels),
-            exclude: picks(&self.exclude, &self.exclude_labels),
+            include: picks(&self.queries, &self.labels)?,
+            require: picks(&self.require, &self.require_labels)?,
+            exclude: picks(&self.exclude, &self.exclude_labels)?,
             signal: Vec::new(),
         };
         let mut params = Params::new();
@@ -1114,7 +1122,14 @@ fn run() -> Result<()> {
                         Role::Signal => "signal",
                     };
                     let note = p.covered.as_ref().map(|by| format!(" (in {by}, not repeated)")).unwrap_or_default();
-                    writeln!(out, "{role} {}{note}: {}", p.query, e.part_nfd(p))?;
+                    // An instance: its own arguments.
+                    let args = if p.args.is_empty() {
+                        String::new()
+                    } else {
+                        let a: Vec<String> = p.args.iter().map(|(k, v)| format!("{k}={}", v.value)).collect();
+                        format!("({})", a.join(", "))
+                    };
+                    writeln!(out, "{role} {}{args}{note}: {}", p.query, e.part_nfd(p))?;
                 }
             }
         }

@@ -339,6 +339,23 @@ impl Picks {
         self.add_node(lib, id, role, at, false)
     }
 
+    /// Add a query as given on a command line: `ID`, or `ID(NAME=VALUE, …)`
+    /// for an instance of it (several: several instances of one pick).
+    pub fn add_given(&mut self, lib: &Library, s: &str, role: Use) -> Result<(), String> {
+        let Pick::QueryWith(id, args) = Pick::parse_query(lib, s)? else {
+            self.add(lib, s, role, None);
+            return Ok(());
+        };
+        self.add(lib, &id, role, None);
+        let n = self
+            .nodes
+            .iter_mut()
+            .find(|n| n.source.as_deref() == Some(id.as_str()) && !n.edited && !n.detached && n.role == role)
+            .ok_or_else(|| format!("unknown query '{id}'"))?;
+        n.instances.push(Instance { args: args.into_iter().map(|(k, v)| (k, (v.value, v.raw))).collect() });
+        Ok(())
+    }
+
     /// Add library query `id` without its parents: only its own text, so a
     /// child of a format-specific parent can run on other files.
     pub fn add_detached(&mut self, lib: &Library, id: &str, role: Use) -> bool {
@@ -644,7 +661,19 @@ impl Picks {
             } else {
                 NodeSource::Library(n.source.clone().unwrap_or_default())
             };
-            p.nodes.push(PresetNode { source, role: n.role.into(), lit: n.lit, detached: n.detached });
+            // Each instance's own values (empty ones take the shared value).
+            let instances = n
+                .instances
+                .iter()
+                .map(|i| {
+                    i.args
+                        .iter()
+                        .filter(|(_, (v, _))| !v.is_empty())
+                        .map(|(k, (v, raw))| PresetParam { name: k.clone(), value: v.clone(), raw: *raw })
+                        .collect()
+                })
+                .collect();
+            p.nodes.push(PresetNode { source, role: n.role.into(), lit: n.lit, detached: n.detached, instances });
         }
         p.params = self
             .params
@@ -685,6 +714,11 @@ impl Picks {
                 }
             };
             n.lit = pn.lit && role != Use::Exclude;
+            n.instances = pn
+                .instances
+                .iter()
+                .map(|i| Instance { args: i.iter().map(|p| (p.name.clone(), (p.value.clone(), p.raw))).collect() })
+                .collect();
             if pn.detached {
                 n.detached = true;
                 n.parent = None;
@@ -1770,7 +1804,7 @@ fn instances_ui(ui: &mut egui::Ui, n: &mut Node, params: &[String], shared: &Par
                 let hint = shared.get(p).map_or("shared".to_owned(), |s| s.value.clone());
                 ui.add(egui::TextEdit::singleline(v).desired_width(90.0).hint_text(hint))
                     .on_hover_text("Its own value; empty: the shared one (the Parameters below)");
-                ui.checkbox(raw, "").on_hover_text("regex: insert the value as regex syntax inside regexes");
+                ui.toggle_value(raw, "re").on_hover_text("regex: insert the value as regex syntax inside regexes");
             }
             if let Some(j) = same {
                 ui.colored_label(ui.visuals().warn_fg_color, "⚠")
@@ -2219,6 +2253,12 @@ mod tests {
         assert_eq!(a.keys, [p.nodes[0].key; 4]);
         // Searched for, it is one term: its instances OR'ed.
         assert_eq!(p.search_term(&lib, &Target::Node(p.nodes[0].key), 0).unwrap().nfd, a.exp.nfd);
+        // Kept in a preset.
+        let preset = p.to_preset("cams");
+        assert!(preset.serialize().contains("instance 4 cam = CAM4\n"), "{}", preset.serialize());
+        let mut again = Picks::default();
+        again.use_preset(&lib, &preset);
+        assert_eq!(again.expand(&lib).unwrap().exp.nfd, a.exp.nfd);
     }
 
     /// Owner, 2026-11-15: a `signals:` entry for a group the query no longer

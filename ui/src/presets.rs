@@ -243,8 +243,13 @@ mod tests {
     use nerka_core::preset::{NodeSource, PresetNode};
 
     fn picking(name: &str, id: &str) -> Preset {
-        let node =
-            PresetNode { source: NodeSource::Library(id.into()), role: Role::Include, lit: false, detached: false };
+        let node = PresetNode {
+            source: NodeSource::Library(id.into()),
+            role: Role::Include,
+            lit: false,
+            detached: false,
+            instances: Vec::new(),
+        };
         Preset { name: name.into(), nodes: vec![node], ..Default::default() }
     }
 

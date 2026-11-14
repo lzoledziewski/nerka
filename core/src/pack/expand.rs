@@ -32,6 +32,61 @@ pub enum Pick {
     Label(String),
 }
 
+impl Pick {
+    /// A query as given on a command line: `ID`, or `ID(NAME=VALUE, …)`,
+    /// an instance of it with its own arguments (`query-instances.md`). A
+    /// value holding `,`, `)` or spaces is quoted (`"…"`, with `\"` and
+    /// `\\`). Query names may hold parentheses: `(…)` counts as arguments
+    /// only after the id of a query `lib` has.
+    pub fn parse_query(lib: &Library, s: &str) -> Result<Pick, String> {
+        let Some((id, rest)) = s.split_once('(').filter(|(id, r)| r.ends_with(')') && lib.get(id.trim()).is_some())
+        else {
+            return Ok(Pick::Query(s.to_owned()));
+        };
+        let inner = &rest[..rest.len() - 1];
+        let mut args = Params::new();
+        let mut chars = inner.chars().peekable();
+        loop {
+            let mut name = String::new();
+            let mut eq = false;
+            for c in chars.by_ref() {
+                if c == '=' {
+                    eq = true;
+                    break;
+                }
+                name.push(c);
+            }
+            let name = name.trim();
+            if name.is_empty() && !eq {
+                break;
+            }
+            if !eq || !super::is_name(name) {
+                return Err(format!("{s}: expected NAME=VALUE arguments, got '{name}'"));
+            }
+            while chars.next_if(|c| *c == ' ').is_some() {}
+            let mut value = String::new();
+            if chars.next_if_eq(&'"').is_some() {
+                loop {
+                    match chars.next() {
+                        Some('\\') => value.extend(chars.next()),
+                        Some('"') => break,
+                        Some(c) => value.push(c),
+                        None => return Err(format!("{s}: missing closing '\"'")),
+                    }
+                }
+                while chars.next_if(|c| *c == ' ').is_some() {}
+                if !matches!(chars.next(), Some(',') | None) {
+                    return Err(format!("{s}: expected ',' after a quoted value"));
+                }
+            } else {
+                value = chars.by_ref().take_while(|&c| c != ',').collect::<String>().trim().to_owned();
+            }
+            args.insert(name.to_owned(), ParamValue::literal(value));
+        }
+        Ok(Pick::QueryWith(id.trim().to_owned(), args))
+    }
+}
+
 /// What was picked for Filter or for Search.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Selection {

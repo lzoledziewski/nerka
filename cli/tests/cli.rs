@@ -453,3 +453,37 @@ fn several_files_are_one_view() {
     assert_eq!(o.status.code(), Some(1));
     assert!(err(&o).contains("only files of one kind open as one view"), "{}", err(&o));
 }
+
+/// Owner, 2026-11-15: a query with arguments is an instance of it
+/// (`-q 'ID(NAME=VALUE)'`), several of them its instances; `-p` is the
+/// shared value; a quoted value may hold `,` and spaces.
+#[test]
+fn instances_on_the_command_line() {
+    let d = dir("instances");
+    let pack = d.join("cam.nerka-pack");
+    std::fs::write(&pack, "pack cam\nquery drops(cam)\n    /$cam drop/\n").unwrap();
+    let o = nerka(&[
+        "--pack",
+        s(&pack),
+        "expand",
+        "--parts",
+        "-q",
+        "cam.drops(cam=CAM1)",
+        "-q",
+        r#"cam.drops(cam="CAM 2, x")"#,
+        "-x",
+        "cam.drops",
+        "-p",
+        "cam=CAM3",
+    ]);
+    assert_eq!(
+        out(&o),
+        "((/CAM1 drop/) OR (/CAM 2, x drop/)) AND NOT (/CAM3 drop/)\n\
+         include cam.drops(cam=CAM1): (/CAM1 drop/)\n\
+         include cam.drops(cam=CAM 2, x): (/CAM 2, x drop/)\n\
+         exclude cam.drops: (/CAM3 drop/)\n"
+    );
+    let o = nerka(&["--pack", s(&pack), "expand", "-q", "cam.drops(cam)"]);
+    assert_eq!(o.status.code(), Some(1));
+    assert!(err(&o).contains("expected NAME=VALUE"), "{}", err(&o));
+}
