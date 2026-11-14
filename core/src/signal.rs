@@ -405,6 +405,13 @@ impl SignalSeries {
         self.life.as_ref()
     }
 
+    /// The first row of each of its files in the source (a state doesn't
+    /// carry over into the next file, unless bound to a lifecycle that
+    /// has started).
+    pub fn file_starts(&self) -> impl Iterator<Item = LineNo> + '_ {
+        self.parts.iter().map(|p| p.0)
+    }
+
     /// The value of `view` at `line` of `src` (the whole source or one of
     /// its parts, as the engine scans them): the outer `None` if `src`
     /// isn't one of them. Follows the lifecycle and the default.

@@ -1160,9 +1160,17 @@ pub fn plot_panel(ui: &mut egui::Ui, state: &mut PlotState, src: Source<'_>) -> 
         let x = x0 + (p.x - plot.min.x) as f64 / w * (x1 - x0);
         let at = lane.xs.partition_point(|&v| v <= x).checked_sub(1);
         let mut tip = format!("{}  ", if data.is_time { format_time(x, 6) } else { format!("line {}", x as u64 + 1) });
+        // Why the state starts again at an assumed point.
+        let why = |i: usize| {
+            if lane.file_starts.contains(&lane.rows[i]) {
+                format!("no event yet in the file (from line {})", lane.rows[i] + 1)
+            } else {
+                format!("a lifecycle started on line {}", lane.rows[i] + 1)
+            }
+        };
         match at {
             Some(i) if !lane.ys[i].is_finite() => {
-                tip.push_str(&format!("@{}: unset (a lifecycle started on line {})", lane.name, lane.rows[i] + 1));
+                tip.push_str(&format!("@{}: unset ({})", lane.name, why(i)));
             }
             Some(i) => {
                 let v = match lane.kind {
@@ -1170,11 +1178,7 @@ pub fn plot_panel(ui: &mut egui::Ui, state: &mut PlotState, src: Source<'_>) -> 
                     _ => lane.ys[i].to_string(),
                 };
                 if lane.assumed[i] {
-                    tip.push_str(&format!(
-                        "@{} = {v}  (default: a lifecycle started on line {})",
-                        lane.name,
-                        lane.rows[i] + 1
-                    ));
+                    tip.push_str(&format!("@{} = {v}  (default: {})", lane.name, why(i)));
                 } else {
                     tip.push_str(&format!("@{} = {v}  (event on line {})", lane.name, lane.rows[i] + 1));
                 }
@@ -1639,9 +1643,20 @@ fn draw_steps(
 ) {
     let (from, to) = (events.start, events.end);
     let stroke = Stroke::new(1.5, color);
-    // A lane with defaults or unset spans: drawn piece by piece.
+    // A lane with defaults (dashed) or unset spans (none): its pieces, per
+    // pixel column too.
     if lane.any_assumed() {
-        return draw_pieces(painter, lane, area, from, to, to_px, to_py, stroke);
+        let p = lane.pieces(from, to, (area.min.x, area.max.x), to_px, to_py);
+        for [x, lo, hi] in p.strokes {
+            painter.line_segment([pos2(x, lo), pos2(x, hi)], stroke);
+        }
+        for line in p.lines {
+            painter.add(egui::Shape::line(line.into_iter().map(|(x, y)| pos2(x, y)).collect(), stroke));
+        }
+        for [(x0, y0), (x1, y1)] in p.dashed {
+            painter.extend(egui::Shape::dashed_line(&[pos2(x0, y0), pos2(x1, y1)], stroke, 4.0, 3.0));
+        }
+        return;
     }
     // Per column: the range of values seen, one vertical stroke; a step
     // line through each column's last value (`nerka_core::plot::lane`).
@@ -1650,41 +1665,6 @@ fn draw_steps(
         painter.line_segment([pos2(x, lo), pos2(x, hi)], stroke);
     }
     painter.add(egui::Shape::line(steps.line.into_iter().map(|(x, y)| pos2(x, y)).collect(), stroke));
-}
-
-/// A number's state with defaults (dashed: assumed) and unset spans
-/// (nothing): a step per point, no thinning per pixel column.
-#[allow(clippy::too_many_arguments)]
-fn draw_pieces(
-    painter: &egui::Painter,
-    lane: &Lane,
-    area: Rect,
-    from: usize,
-    to: usize,
-    to_px: impl Fn(f64) -> f32,
-    to_py: impl Fn(f64) -> f32,
-    stroke: Stroke,
-) {
-    let end = to.min(lane.xs.len());
-    for i in from..end {
-        let y = lane.ys[i];
-        if !y.is_finite() {
-            continue;
-        }
-        let a = to_px(lane.xs[i]).max(area.min.x);
-        let b = if i + 1 < lane.xs.len() { to_px(lane.xs[i + 1]) } else { area.max.x }.min(area.max.x);
-        let py = to_py(y);
-        let seg = [pos2(a, py), pos2(b.max(a), py)];
-        if lane.assumed[i] {
-            painter.extend(egui::Shape::dashed_line(&seg, stroke, 4.0, 3.0));
-        } else {
-            painter.line_segment(seg, stroke);
-        }
-        // The step to the next value.
-        if i + 1 < end && lane.ys[i + 1].is_finite() && b < area.max.x {
-            painter.line_segment([pos2(b, py), pos2(b, to_py(lane.ys[i + 1]))], stroke);
-        }
-    }
 }
 
 /// An enum's state: bands coloured by value, labelled where wide enough;
@@ -2006,9 +1986,20 @@ mod tests {
         args.truncate(n);
         let mut sig = Signals::default().for_source(&*file);
         let mut st = PlotState::default();
+        // `NERKA_PERF_PER=1`: each signal bound to a lifecycle (one starts
+        // at each of the rarest message), default 0: lanes with defaults.
+        let per = std::env::var("NERKA_PERF_PER").is_ok_and(|v| v == "1");
+        if per {
+            let rare = cat.arguments().iter().map(|a| a.mid).max().unwrap();
+            sig.set(SignalDef::parse_spec(&format!("lifecycle boot: start mid == {rare}")).unwrap());
+        }
         for a in &args {
             let q = format!("mid == {} AND ecu == \"{}\"", a.mid, a.ecu.as_deref().unwrap_or("ECU1"));
-            sig.set(SignalDef::argument(&a.name, a.ty.kind(), &q, a.index, "perf").unwrap());
+            let mut d = SignalDef::argument(&a.name, a.ty.kind(), &q, a.index, "perf").unwrap();
+            if per {
+                d = d.with_per(Some("boot")).with_default(Some("0")).unwrap();
+            }
+            sig.set(d);
             st.toggle(&a.name.to_ascii_lowercase());
         }
         let t = Instant::now();

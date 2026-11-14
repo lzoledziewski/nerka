@@ -85,7 +85,9 @@ written to a pack without that click.
 Tick a signal's plot box (or `--plot NAME`) to plot it under the main view:
 one **lane** per signal on the time axis. A number is a step line, an enum
 coloured bands, and an **events** box ticks where values arrived. The
-current line is a cursor.
+current line is a cursor. A lane shows the state as the panel does: before
+a signal's first event in each file (or lifecycle, with `per`), its
+default dashed (a pale band for an enum), or nothing if it has none.
 
 - **Navigate:** the wheel zooms, drag pans, double-click shows all; hover
   shows a value; click goes to the line.

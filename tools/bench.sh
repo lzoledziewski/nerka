@@ -24,7 +24,8 @@
 # the plot's lanes, a frame at full zoom, the peak heap (MiB, a run of its
 # own with --heap). GUI=1 (the default) also runs the GUI's own code headless
 # (cargo test, ignored tests): a frame of the whole window with the signals
-# plotted, a plot repaint at full zoom, a signal added until the plot shows.
+# plotted, a plot repaint at full zoom (also with the signals bound to a
+# lifecycle), a signal added until the plot shows.
 # A change is flagged when it is over 15 % and over 1 (ms or MiB), so
 # sub-millisecond frames don't flag noise.
 set -euo pipefail
@@ -149,13 +150,18 @@ gui perf_big_app >/dev/null # build and warm
 frames=""
 added=""
 repaint=""
+per=""
 for _ in $(seq "$RUNS"); do
   out=$(gui perf_big_app)
   frames+=$(grep "with signals and plot, scroll the log:" <<<"$out" | sed -E 's/.*: ([0-9.]+) ms.*/\1/' | median)$'\n'
   out=$(gui perf_big_plot)
   added+=$(grep -m1 "=> plot again after" <<<"$out" | sed -E 's/.* ([0-9.]+) ms.*/\1/')$'\n'
   repaint+=$(grep "pointer moved, full zoom" <<<"$out" | tail -1 | sed -E 's/.*ui ([0-9.]+) ms.*/\1/')$'\n'
+  # The same signals bound to a lifecycle, with a default (dashed spans).
+  out=$(NERKA_PERF_PER=1 gui perf_big_plot)
+  per+=$(grep "pointer moved, full zoom" <<<"$out" | tail -1 | sed -E 's/.*ui ([0-9.]+) ms.*/\1/')$'\n'
 done
 row "nv.pcap gui: window frame, signals plotted" "$frames" "-"
 row "nv.pcap gui: plot repaint at full zoom" "$repaint" "-"
+row "nv.pcap gui: plot repaint, signals bound to a lifecycle" "$per" "-"
 row "nv.pcap gui: signal added until plotted" "$added" "-"

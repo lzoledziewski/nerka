@@ -237,9 +237,16 @@ Checked after all steps: the 6 GiB set gives the same output byte for byte as be
 
 **Still open:** the lanes are built on the UI thread (0.3 s at first, 0.15 s for a 10 M-point lane: a job
 when files grow); a merge by time interleaves on one thread (2.3 s for 132 M rows); the MF4 reader (2.2 s
-against the pcap's 0.6 s, a frame per message); a lane with defaults (a signal bound to a lifecycle) is still
-drawn point by point; an enum that changes on most points walks them all; P5 (memory per event and point),
-P6 (payload regexes), a parallel `.dlt` index.
+against the pcap's 0.6 s, a frame per message); an enum that changes on most points (or has a
+lifecycle starting on most) walks them all; P5 (memory per event and point), P6 (payload regexes), a
+parallel `.dlt` index.
+
+**Lanes with defaults (0.2.2):** a lane of a signal bound to a lifecycle (defaults dashed, unset spans
+empty) was drawn point by point; it is drawn per pixel column now, as the others (`Lane::pieces`). The
+1 GiB pcap, 30 signals bound to a lifecycle that starts at each of message 1039 (~90 k lifecycles),
+default 0, a repaint at full zoom: 4.0–4.6 s of ui and 12.6 s of tessellation (40.6 M shapes) before,
+11 ms and 6 ms (33.6 k shapes) after; the same signals unbound: 10 ms and 6 ms. Bench row "plot
+repaint, signals bound to a lifecycle".
 
 ### On Linux: 0.2.0 against the fixes
 
