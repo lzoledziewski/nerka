@@ -76,7 +76,7 @@ jobs:
             xvfb libxkbcommon-x11-0 mesa-vulkan-drivers libvulkan1 libegl1 libgl1-mesa-dri
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - name: Build
-        run: cargo build --locked -p nerka-gui -p nerka-core --example gen_fibex_dlt
+        run: cargo build --locked -p nerka-gui --bin nerka-gui -p nerka-core --example gen_fibex_dlt
       - name: Test data
         shell: bash
         run: target/debug/examples/gen_fibex_dlt shot.dlt shot.xml 5 40
