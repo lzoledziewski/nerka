@@ -235,8 +235,7 @@ Checked after all steps: the 6 GiB set gives the same output byte for byte as be
 (`filter 'mid == 1039'` on the DLT and the pcap), the 3 GiB pcap and MF4 the same rows; `tools/bench.sh`
 (`KSY=1`, 5 runs) within ±9 % of `baseline/bench-2026-11-09.tsv` on every query, the same match counts.
 
-**Still open:** the lanes are built on the UI thread (0.3 s at first, 0.15 s for a 10 M-point lane: a job
-when files grow); a merge by time interleaves on one thread (2.3 s for 132 M rows); the MF4 reader (2.2 s
+**Still open:** a merge by time interleaves on one thread (2.3 s for 132 M rows); the MF4 reader (2.2 s
 against the pcap's 0.6 s, a frame per message); an enum that changes on most points (or has a
 lifecycle starting on most) walks them all; P5 (memory per event and point), P6 (payload regexes), a
 parallel `.dlt` index.
@@ -247,6 +246,13 @@ empty) was drawn point by point; it is drawn per pixel column now, as the others
 default 0, a repaint at full zoom: 4.0–4.6 s of ui and 12.6 s of tessellation (40.6 M shapes) before,
 11 ms and 6 ms (33.6 k shapes) after; the same signals unbound: 10 ms and 6 ms. Bench row "plot
 repaint, signals bound to a lifecycle".
+
+**Lanes off the UI thread (0.2.2):** lanes were built on the UI thread (0.3 s at first for 30 signals on
+the 3 GiB set, 0.15 s for a 10 M-point lane). Lanes with over a million points are now built on a thread
+of their own, the plot showing what it had (or "Building the plot's lanes…") until they come; smaller
+ones are built at once, as before. The 1 GiB pcap, six FIBEX signals plotted (`perf_big_app`): the frame
+that built them 15 ms before, 0.8 ms after. The benchmark's plot rows (`perf_big_plot`) build them at
+once still, so they stay comparable.
 
 ### On Linux: 0.2.0 against the fixes
 

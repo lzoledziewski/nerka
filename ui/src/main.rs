@@ -5441,6 +5441,7 @@ impl App {
                 in_window,
                 bookmarks: &marks,
                 saved: &saved_plots,
+                owned: Some(file.clone()),
             };
             let shared = tab.plot.clone();
             let mut out = egui::Panel::bottom("plot")

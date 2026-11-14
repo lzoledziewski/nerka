@@ -185,6 +185,7 @@ pub fn window_ui(ui: &mut egui::Ui, shared: &Mutex<Detached>) {
         in_window: true,
         bookmarks: &i.bookmarks,
         saved: &i.saved,
+        owned: Some(i.file.clone()),
     };
     let mut plot = lock(&i.plot);
     let o = egui::CentralPanel::default().show(ui, |ui| plot_panel(ui, &mut plot, src)).inner;
@@ -258,6 +259,10 @@ pub struct PlotState {
     /// elsewhere (another lane, a filter that doesn't touch the signal)
     /// keeps them (review 2026-11-14, P2).
     lane_cache: HashMap<String, (LaneKey, Vec<Arc<Lane>>)>,
+    /// Lanes being built on a thread.
+    lane_job: Option<LaneJob>,
+    /// Tests: lanes with more points than this go on a thread.
+    thread_from: Option<usize>,
 }
 
 /// What a signal's lanes were built from: its definition, its events and
@@ -424,6 +429,39 @@ const SCROLLBAR_W: f32 = 6.0;
 /// Build the lanes, or say why they can't be built yet. A signal's lanes
 /// built before from the same events on the same clock are reused; the
 /// others are built in parallel (`nerka_core::plot::lane`).
+/// Lanes to build: (signal name, definition, events).
+type LaneWork = Vec<(String, Arc<SignalDef>, Arc<SignalSeries>)>;
+
+/// Builds lanes on the clock (with its time signal's events): now, or
+/// `None` while they are built elsewhere.
+type LaneBuilder<'a> = dyn FnMut(LaneWork, &Clock, Option<SignalSeries>) -> Option<Vec<Vec<Lane>>> + 'a;
+
+/// What the plot says while its lanes are built on a thread.
+const BUILDING: &str = "Building the plot's lanes…";
+
+/// Lanes with more points than this are built on a thread of their own
+/// (review 2026-11-14: 0.3 s at first, 0.15 s for a 10 M-point lane, on the
+/// UI thread).
+const BUILD_ON_A_THREAD: usize = 1_000_000;
+
+/// A [`LaneBuilder`] that builds them here, now.
+fn build_here(
+    file: &dyn LogSource,
+) -> impl FnMut(LaneWork, &Clock, Option<SignalSeries>) -> Option<Vec<Vec<Lane>>> + '_ {
+    move |todo, clock, clock_series| {
+        let refs: Vec<(&str, &SignalDef, &SignalSeries)> =
+            todo.iter().map(|(n, d, s)| (n.as_str(), &**d, &**s)).collect();
+        Some(nerka_core::plot::lane::lanes_of_all(&refs, file, clock, clock_series.as_ref()))
+    }
+}
+
+/// Lanes being built on a thread: for which signals (and their events'
+/// identity), and the job.
+pub(crate) struct LaneJob {
+    key: Vec<(String, usize)>,
+    job: crate::job::Job<Vec<Vec<Lane>>>,
+}
+
 fn build(
     state: &PlotState,
     cache: &mut HashMap<String, (LaneKey, Vec<Arc<Lane>>)>,
@@ -431,6 +469,7 @@ fn build(
     file: &dyn LogSource,
     clock: &Clock,
     series_of: &mut dyn FnMut(&SignalDef) -> Option<Arc<SignalSeries>>,
+    builder: &mut LaneBuilder<'_>,
 ) -> Result<PlotData, String> {
     let clock_series = match clock {
         Clock::Signal(d) => Some(d.cached_series(file).ok_or("Collecting the time signal's events…")?),
@@ -483,9 +522,11 @@ fn build(
     // The lanes not built yet for what they show now, in parallel.
     let missing: Vec<_> =
         wanted.iter().filter(|(name, _, key)| !cache.get(*name).is_some_and(|(k, _)| k.same(key))).collect();
-    let todo: Vec<(&str, &SignalDef, &SignalSeries)> =
-        missing.iter().map(|(name, def, key)| (name.as_str(), &***def, &*key.series)).collect();
-    let built = nerka_core::plot::lane::lanes_of_all(&todo, file, clock, clock_series.as_ref());
+    let todo: Vec<(String, Arc<SignalDef>, Arc<SignalSeries>)> =
+        missing.iter().map(|(name, def, key)| (name.to_string(), Arc::clone(def), key.series.clone())).collect();
+    // Built here or on a thread (big ones): until then, the plot as it was.
+    let built = if todo.is_empty() { Some(Vec::new()) } else { builder(todo, clock, clock_series.clone()) };
+    let Some(built) = built else { return Err(BUILDING.to_owned()) };
     let built: Vec<(String, Vec<Arc<Lane>>)> = missing
         .iter()
         .zip(built)
@@ -539,10 +580,13 @@ pub struct Source<'a> {
     pub bookmarks: &'a [Bookmark],
     /// The kept plots, to switch between.
     pub saved: &'a [SavedPlot],
+    /// `file`, owned: big lanes are built on a thread of their own with it
+    /// (none: built here, as tests do).
+    pub owned: Option<Arc<dyn LogSource>>,
 }
 
 pub fn plot_panel(ui: &mut egui::Ui, state: &mut PlotState, src: Source<'_>) -> Output {
-    let Source { signals, generation, file, cursor, kept, series_of, in_window, bookmarks, saved } = src;
+    let Source { signals, generation, file, cursor, kept, series_of, in_window, bookmarks, saved, owned } = src;
     let mut out = Output::default();
     if let Some((from, to)) = state.reorder.take() {
         let names: Vec<String> =
@@ -646,10 +690,50 @@ pub fn plot_panel(ui: &mut egui::Ui, state: &mut PlotState, src: Source<'_>) -> 
     let key = (generation, kept);
     if state.data.as_ref().is_none_or(|(k, _)| *k != key) {
         let mut cache = std::mem::take(&mut state.lane_cache);
-        let built = build(state, &mut cache, signals, file, &clock, series_of);
+        let mut job = state.lane_job.take();
+        let limit = state.thread_from.unwrap_or(BUILD_ON_A_THREAD);
+        let ctx = ui.ctx().clone();
+        let mut here = build_here(file);
+        // Big lanes on a thread of their own, the window stays responsive.
+        let mut builder = |todo: LaneWork, clock: &Clock, clock_series: Option<SignalSeries>| {
+            let points: usize = todo.iter().map(|(_, _, s)| s.len()).sum();
+            let Some(owned) = owned.clone().filter(|_| points > limit) else {
+                job = None;
+                return here(todo, clock, clock_series);
+            };
+            let key: Vec<(String, usize)> = todo.iter().map(|(n, _, s)| (n.clone(), Arc::as_ptr(s) as usize)).collect();
+            if let Some(j) = job.as_ref().filter(|j| j.key == key) {
+                return match j.job.poll() {
+                    crate::job::Poll::Running => None,
+                    crate::job::Poll::Done(Ok(lanes), _) => {
+                        job = None;
+                        Some(lanes)
+                    }
+                    // Not built there (cancelled): here, then.
+                    crate::job::Poll::Done(Err(_), _) => {
+                        job = None;
+                        here(todo, clock, clock_series)
+                    }
+                };
+            }
+            let clock = clock.clone();
+            let work = crate::job::Job::spawn(&ctx, move |_| {
+                let refs: Vec<(&str, &SignalDef, &SignalSeries)> =
+                    todo.iter().map(|(n, d, s)| (n.as_str(), &**d, &**s)).collect();
+                Ok(nerka_core::plot::lane::lanes_of_all(&refs, &*owned, &clock, clock_series.as_ref()))
+            });
+            job = Some(LaneJob { key, job: work });
+            None
+        };
+        let built = build(state, &mut cache, signals, file, &clock, series_of, &mut builder);
+        state.lane_job = job;
         state.lane_cache = cache;
         match built {
             Ok(d) => state.data = Some((key, d)),
+            // Built on a thread: the plot as it was until then.
+            Err(why) if why == BUILDING && state.data.is_some() => {
+                ui.weak(why);
+            }
             Err(why) => {
                 state.data = None;
                 ui.weak(why);
@@ -1876,7 +1960,7 @@ mod tests {
         let mut views = crate::signals::Views::default();
         let mut lanes = |state: &PlotState, cache: &mut _, kept: &Arc<nerka_core::SearchResult>, sig: &Signals| {
             let mut series_of = |d: &SignalDef| views.series(d, &file, Some(kept), 1);
-            let data = build(state, cache, sig, &file, &clock, &mut series_of).unwrap();
+            let data = build(state, cache, sig, &file, &clock, &mut series_of, &mut build_here(&file)).unwrap();
             data.lanes.iter().map(|l| (l.signal.clone(), l.clone())).collect::<HashMap<_, _>>()
         };
         let first = lanes(&state, &mut cache, &kept_all, &sig);
@@ -1926,8 +2010,16 @@ mod tests {
         d.series(&file, &nerka_core::Progress::new()).unwrap();
         let state = PlotState { plotted: vec!["s".into()], ..Default::default() };
         let mut series_of = |d: &SignalDef| d.cached_series(&file).map(Arc::new);
-        let data =
-            build(&state, &mut HashMap::new(), &signals, &file, &Clock::of(&file, &signals), &mut series_of).unwrap();
+        let data = build(
+            &state,
+            &mut HashMap::new(),
+            &signals,
+            &file,
+            &Clock::of(&file, &signals),
+            &mut series_of,
+            &mut build_here(&file),
+        )
+        .unwrap();
         let lane = &data.lanes[0];
         let pts: Vec<(LineNo, bool)> = lane.rows.iter().copied().zip(lane.assumed.iter().copied()).collect();
         // Its events (A's lines); where A's second lifecycle starts, the
@@ -1939,12 +2031,14 @@ mod tests {
         // no lane, its starts drawn; alone, the plot spans its lifecycles.
         let clock = Clock::of(&file, &signals);
         let state = PlotState { plotted: vec!["a".into()], ..Default::default() };
-        let data = build(&state, &mut HashMap::new(), &signals, &file, &clock, &mut series_of).unwrap();
+        let data = build(&state, &mut HashMap::new(), &signals, &file, &clock, &mut series_of, &mut build_here(&file))
+            .unwrap();
         assert!(data.lanes.is_empty());
         let x = |r| clock.at(&file, None, r).unwrap();
         assert_eq!(data.full, (x(0), x(4)));
         let state = PlotState { plotted: vec!["a".into(), "s".into()], ..Default::default() };
-        let data = build(&state, &mut HashMap::new(), &signals, &file, &clock, &mut series_of).unwrap();
+        let data = build(&state, &mut HashMap::new(), &signals, &file, &clock, &mut series_of, &mut build_here(&file))
+            .unwrap();
         assert_eq!(data.lanes.iter().map(|l| l.name.as_str()).collect::<Vec<_>>(), ["s"]);
     }
 
@@ -2009,6 +2103,65 @@ mod tests {
     }
 
     /// One frame of a plot of `@v` (one event per second) at 800 x 300.
+    /// Review 2026-11-14: big lanes are built on a thread; meanwhile the
+    /// plot says so (or keeps what it showed), then shows them as built
+    /// here.
+    #[test]
+    fn big_lanes_are_built_on_a_thread() {
+        let text: String = (0..500).map(|i| format!("v={}\n", i % 7)).collect();
+        let file: Arc<dyn LogSource> = Arc::new(nerka_core::TextFile::from_bytes("t", text.into_bytes()));
+        let mut sig = Signals::default();
+        sig.set(SignalDef::parse_spec(r"v=/v=(?<v>\d+)/").unwrap());
+        sig.collect(&*file, &nerka_core::Progress::new()).unwrap();
+        let mut st = PlotState { thread_from: Some(0), ..Default::default() };
+        st.toggle("v");
+        let ctx = egui::Context::default();
+        let run = |st: &mut PlotState, t: f64| {
+            let screen = Rect::from_min_size(pos2(0.0, 0.0), vec2(800.0, 300.0));
+            let input = egui::RawInput { screen_rect: Some(screen), time: Some(t), ..Default::default() };
+            let mut full = ctx.run_ui(input, |ui| {
+                egui::CentralPanel::default().show(ui, |ui| {
+                    let mut series_of = |d: &SignalDef| d.cached_series(&*file).map(Arc::new);
+                    let src = Source {
+                        signals: &sig,
+                        generation: 1,
+                        file: &*file,
+                        cursor: 0,
+                        kept: 0,
+                        series_of: &mut series_of,
+                        in_window: false,
+                        bookmarks: &[],
+                        saved: &[],
+                        owned: Some(file.clone()),
+                    };
+                    plot_panel(ui, st, src);
+                });
+            });
+            full.textures_delta.clear();
+        };
+        run(&mut st, 0.0);
+        assert!(st.data.is_none() && st.lane_job.is_some(), "on a thread");
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut t = 0.0;
+        while st.data.is_none() {
+            assert!(std::time::Instant::now() < until, "the lanes never came");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            t += 0.1;
+            run(&mut st, t);
+        }
+        let (_, data) = st.data.as_ref().unwrap();
+        assert!(st.lane_job.is_none());
+        let here = nerka_core::plot::lane::lanes(
+            "v",
+            sig.get("v").unwrap(),
+            &sig.get("v").unwrap().cached_series(&*file).unwrap(),
+            &*file,
+            &Clock::of(&*file, &sig),
+            None,
+        );
+        assert_eq!((data.lanes[0].xs.clone(), data.lanes[0].ys.clone()), (here[0].xs.clone(), here[0].ys.clone()));
+    }
+
     fn frame(
         ctx: &egui::Context,
         t: f64,
@@ -2033,6 +2186,7 @@ mod tests {
                     in_window: false,
                     bookmarks: &[],
                     saved: &[],
+                    owned: None,
                 };
                 out = plot_panel(ui, st, src);
             });
@@ -2108,6 +2262,7 @@ mod tests {
                         in_window: false,
                         bookmarks: &[],
                         saved: &[],
+                        owned: None,
                     };
                     plot_panel(ui, st, src);
                 });
@@ -2443,6 +2598,7 @@ mod tests {
                         in_window: false,
                         bookmarks: &marks,
                         saved: &[],
+                        owned: None,
                     };
                     scope = ui.scope_id();
                     out = plot_panel(ui, st, src);
