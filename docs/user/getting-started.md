@@ -15,6 +15,11 @@ Download the archive for your system from the
   time.
 - **Linux:** `nerka-…-linux-x86_64.tar.gz` (glibc 2.35 or newer, e.g.
   Ubuntu 22.04).
+- **macOS (Apple Silicon):** `nerka-…-macos-aarch64.tar.gz`. The binaries
+  are unsigned and not an app bundle: after unpacking, clear the download
+  mark once (`xattr -dr com.apple.quarantine nerka-…-macos-aarch64`), then
+  start `./nerka-gui` from Terminal. macOS builds are tested automatically
+  but not tried by hand.
 
 Each archive holds `nerka-gui` (the desktop viewer), `nerka` (the command
 line tool), the README, the licences, `examples/` (protocol definitions and

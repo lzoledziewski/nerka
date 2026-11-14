@@ -1,6 +1,6 @@
-# Release builds for Linux and Windows.
+# Release builds for Linux, Windows and macOS (Apple Silicon).
 #
-# Push a tag like v0.1.0 to build both and publish them as a GitHub
+# Push a tag like v0.1.0 to build them and publish them as a GitHub
 # release (a tag with a '-' suffix, like v0.1.0-alpha.1, is a pre-release).
 # Run it by hand (Actions tab, "Run workflow") to only build: the archives
 # are kept as workflow artifacts, nothing is published.
@@ -24,6 +24,9 @@ jobs:
   build:
     name: ${{ matrix.name }}
     runs-on: ${{ matrix.os }}
+    # macOS doesn't hold the release back (owner, 2026-11-14: no Mac to
+    # check it on; unsigned): if it fails, the others are published.
+    continue-on-error: ${{ matrix.os == 'macos-latest' }}
     strategy:
       fail-fast: false
       matrix:
@@ -33,6 +36,9 @@ jobs:
             os: ubuntu-22.04
           - name: windows-x86_64
             os: windows-latest
+          # Apple Silicon; unsigned, not a .app bundle (status.md, decision 4).
+          - name: macos-aarch64
+            os: macos-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
@@ -47,8 +53,8 @@ jobs:
         run: cargo test --workspace --release --locked
       - name: Build
         run: cargo build --release --workspace --locked
-      - name: Package (Linux)
-        if: runner.os == 'Linux'
+      - name: Package (Linux, macOS)
+        if: runner.os != 'Windows'
         run: |
           ref="${GITHUB_REF_NAME//\//-}"
           dir="nerka-${ref}-${{ matrix.name }}"
