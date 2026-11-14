@@ -254,6 +254,34 @@ impl Library {
         Some((p, p.query(id)?))
     }
 
+    /// The `signals:` entries of query `q` (of pack `pack`, saved or about
+    /// to be) for groups that no regex of it or its parents captures: a
+    /// typo, or a group renamed or removed since (owner, 2026-11-15: they
+    /// are removed when the query is saved, with a warning).
+    pub fn stale_signals(&self, pack: &str, q: &PackQuery) -> Vec<String> {
+        let mut groups = captured_groups(&q.text);
+        let mut parent = q.parent.as_ref().map(|p| if p.contains('.') { p.clone() } else { format!("{pack}.{p}") });
+        // A parent cycle is an expansion error; stop after a few anyway.
+        for _ in 0..64 {
+            let Some((p, pq)) = parent.as_deref().and_then(|id| self.get(id)) else { break };
+            groups.extend(captured_groups(&pq.text));
+            parent = p.parent_of(pq);
+        }
+        q.signals.iter().map(|(g, _)| g).filter(|g| !groups.contains(g)).cloned().collect()
+    }
+
+    /// [`stale_signals`](Self::stale_signals) of every loaded query:
+    /// (qualified id, group).
+    pub fn all_stale_signals(&self) -> Vec<(String, String)> {
+        self.packs
+            .iter()
+            .flat_map(|p| p.queries.iter().map(move |q| (p, q)))
+            .flat_map(|(p, q)| {
+                self.stale_signals(&p.name, q).into_iter().map(move |g| (format!("{}.{}", p.name, q.id), g))
+            })
+            .collect()
+    }
+
     /// Every query (qualified ids, library order) with `label` or a label
     /// below it (`system` matches `system/vision`).
     pub fn with_label(&self, label: &str) -> Vec<String> {
@@ -387,6 +415,26 @@ pub fn is_query_name(s: &str) -> bool {
 pub fn is_name(s: &str) -> bool {
     let mut cs = s.chars();
     cs.next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_') && cs.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// The names of the groups a query's text captures (`(?<name>…)`,
+/// `(?P<name>…)`), read from the text as written: parameters in a name
+/// (`drops_$cam`) stay as they are.
+pub fn captured_groups(text: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for (i, _) in text.match_indices("(?") {
+        let rest = &text[i + 2..];
+        let rest = rest.strip_prefix('P').unwrap_or(rest);
+        let Some(rest) = rest.strip_prefix('<') else { continue };
+        // `(?<=` and `(?<!` are look-behinds, not groups.
+        let Some(end) = rest.find('>') else { continue };
+        let name = &rest[..end];
+        let ok = |c: char| c.is_ascii_alphanumeric() || matches!(c, '_' | '$' | '{' | '}');
+        if !name.is_empty() && name.chars().all(ok) && !out.iter().any(|n| n == name) {
+            out.push(name.to_owned());
+        }
+    }
+    out
 }
 
 #[cfg(test)]

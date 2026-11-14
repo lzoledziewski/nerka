@@ -3126,6 +3126,8 @@ struct App {
     /// per-user folder.
     library: Library,
     library_errors: Vec<String>,
+    /// Warnings about the loaded packs (`library_warnings`).
+    library_warnings: Vec<String>,
     pack_paths: Vec<PathBuf>,
     show_library: bool,
     library_view: LibraryView,
@@ -3382,6 +3384,18 @@ fn prefs_path() -> Option<PathBuf> {
     nerka_core::config_dir().map(|d| d.join("prefs"))
 }
 
+/// The library's warnings: `signals:` entries for groups their query no
+/// longer captures (owner, 2026-11-15: listed in full in the Library, and
+/// removed when the query is saved).
+fn library_warnings(lib: &Library) -> Vec<String> {
+    lib.all_stale_signals()
+        .into_iter()
+        .map(|(id, g)| {
+            format!("{id}: signals: names '{g}', which no regex of the query captures (removed when it is saved)")
+        })
+        .collect()
+}
+
 impl App {
     /// (Re)load the packs. Picks and running filters keep their expanded
     /// text; only the next expansion sees the change.
@@ -3393,6 +3407,11 @@ impl App {
         }
         for t in &mut self.tabs {
             t.picks.refresh(&lib);
+        }
+        self.library_warnings = library_warnings(&lib);
+        if let Some(w) = self.library_warnings.first() {
+            let more = self.library_warnings.len() - 1;
+            self.status = if more == 0 { w.clone() } else { format!("{w} (and {more} more: see the Library)") };
         }
         self.library = lib;
         self.library_errors = errors;
@@ -3472,7 +3491,11 @@ impl App {
                     self.record_usage(&used.into_iter().collect::<Vec<_>>());
                 }
             }
-            library::Action::Edited { renamed, removed } => {
+            library::Action::Edited { renamed, removed, notice } => {
+                self.library_warnings = library_warnings(&self.library);
+                if let Some(n) = notice {
+                    self.status = n;
+                }
                 let usage = &mut self.library_view.usage;
                 let before = usage.clone();
                 if let Some((old, new)) = &renamed {
@@ -3494,7 +3517,12 @@ impl App {
                     .presets
                     .query_changed(renamed.as_ref().map(|(o, n)| (o.as_str(), n.as_str())), removed.as_deref());
                 if !changed.is_empty() {
-                    self.status = format!("Presets updated: {}", changed.join(", "));
+                    let presets = format!("Presets updated: {}", changed.join(", "));
+                    self.status = if self.status.starts_with("Removed from") {
+                        format!("{}; {presets}", self.status)
+                    } else {
+                        presets
+                    };
                 }
             }
         }
@@ -5086,6 +5114,7 @@ impl App {
                         ui,
                         &mut self.library,
                         &self.library_errors,
+                        &self.library_warnings,
                         &mut tab.picks,
                         &mut self.library_view,
                         Some(file.schema()),

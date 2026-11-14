@@ -19,6 +19,28 @@ fn pack(text: &str) -> Pack {
     parse_pack("t.nerka-pack", text).unwrap_or_else(|e| panic!("{e}"))
 }
 
+/// Owner, 2026-11-15: a `signals:` entry for a group the query no longer
+/// captures (a typo, a group renamed) was ignored silently; now it is
+/// found, counting the parents' groups and groups named with parameters.
+#[test]
+fn stale_signals_entries_are_found() {
+    assert_eq!(
+        captured_groups(r"/a(?<x>\d)(?P<y>\d)(?<=z)(?<!w)(?<drops_$cam>\d)/ AND /(?<x>.)/"),
+        ["x", "y", "drops_$cam"]
+    );
+    let text = "pack p
+query base
+    /ecu=(?<ecu>\\w+)/
+query speed  parent: base  signals: speed:num, ecu:enum, sped:num
+    /speed=(?<speed>\\d+)/
+";
+    let mut lib = Library::new();
+    lib.add(parse_pack("p.nerka-pack", text).unwrap()).unwrap();
+    let (_, q) = lib.get("p.speed").unwrap();
+    assert_eq!(lib.stale_signals("p", q), ["sped"], "the parent's ecu counts");
+    assert_eq!(lib.all_stale_signals(), [("p.speed".to_owned(), "sped".to_owned())]);
+}
+
 #[test]
 fn signals_attribute_pins_kinds() {
     use crate::signal::{SignalKind, SignalOptions};

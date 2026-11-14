@@ -637,6 +637,8 @@ pub enum Action {
     Edited {
         renamed: Option<(String, String)>,
         removed: Option<String>,
+        /// What to say about stale `signals:` entries the save dropped.
+        notice: Option<String>,
     },
 }
 
@@ -818,6 +820,7 @@ pub fn library_panel(
     ui: &mut egui::Ui,
     lib: &mut Library,
     load_errors: &[String],
+    warnings: &[String],
     picks: &mut Picks,
     view: &mut LibraryView,
     schema: Option<&[FieldDef]>,
@@ -842,6 +845,9 @@ pub fn library_panel(
     for e in load_errors {
         ui.colored_label(ui.visuals().error_fg_color, e);
     }
+    for w in warnings {
+        ui.colored_label(ui.visuals().warn_fg_color, format!("⚠ {w}"));
+    }
     ui.separator();
     if lib.packs().is_empty() {
         ui.weak("No packs loaded. Put *.nerka-pack files into the pack folder, or start with --pack <dir|file>.");
@@ -856,13 +862,13 @@ pub fn library_panel(
         match library_editor(ui, lib, edit) {
             EditOutcome::Open => {}
             EditOutcome::Closed => view.editing = None,
-            EditOutcome::Saved(renamed) => {
+            EditOutcome::Saved(renamed, notice) => {
                 view.editing = None;
-                action = Action::Edited { renamed, removed: None };
+                action = Action::Edited { renamed, removed: None, notice };
             }
             EditOutcome::Deleted(id) => {
                 view.editing = None;
-                action = Action::Edited { renamed: None, removed: Some(id) };
+                action = Action::Edited { renamed: None, removed: Some(id), notice: None };
             }
         }
         ui.separator();
@@ -1209,8 +1215,9 @@ fn query_row(
 enum EditOutcome {
     Open,
     Closed,
-    /// Saved; `(old, new)` qualified ids if it was renamed.
-    Saved(Option<(String, String)>),
+    /// Saved; `(old, new)` qualified ids if it was renamed, and what to
+    /// say about stale `signals:` entries it dropped.
+    Saved(Option<(String, String)>, Option<String>),
     /// Deleted from its pack (qualified id).
     Deleted(String),
 }
@@ -1237,6 +1244,7 @@ fn library_editor(ui: &mut egui::Ui, lib: &mut Library, e: &mut LibEdit) -> Edit
             if let Some(short) = q.parent.as_deref().and_then(|p| p.strip_prefix(&format!("{}.", e.pack))) {
                 q.parent = Some(short.to_owned());
             }
+            let notice = drop_stale_signals(lib, &e.pack, &mut q);
             let res = match &e.old {
                 Some(old) => lib.rename_query(&e.pack, old, &q),
                 None if lib.get(&format!("{}.{name}", e.pack)).is_some() => {
@@ -1246,12 +1254,13 @@ fn library_editor(ui: &mut egui::Ui, lib: &mut Library, e: &mut LibEdit) -> Edit
             };
             match res {
                 Ok(()) => {
+                    e.node.signals = q.signals.clone();
                     let renamed = e
                         .old
                         .as_ref()
                         .filter(|old| **old != name)
                         .map(|old| (format!("{}.{old}", e.pack), format!("{}.{name}", e.pack)));
-                    outcome = EditOutcome::Saved(renamed);
+                    outcome = EditOutcome::Saved(renamed, notice);
                 }
                 Err(err) => e.node.error = Some(err.to_string()),
             }
@@ -1457,10 +1466,11 @@ pub fn selection_panel(ui: &mut egui::Ui, lib: &mut Library, picks: &mut Picks) 
     if let Some(key) = remove {
         picks.remove(key);
     }
+    let mut notice = None;
     if let Some(key) = save
-        && let Some(renamed) = save_node(lib, picks, key)
+        && let Some(renamed) = save_node(lib, picks, key, &mut notice)
     {
-        action = Action::Edited { renamed, removed: None };
+        action = Action::Edited { renamed, removed: None, notice: notice.take() };
     }
     if create_pack {
         let name = picks.new_pack.trim().to_owned();
@@ -1607,11 +1617,34 @@ fn node_editor(
     action
 }
 
+/// Drop the `signals:` entries of `q` (to be saved in `pack`) for groups
+/// no regex of it or its parents captures (owner, 2026-11-15): what to say
+/// about them, if any.
+fn drop_stale_signals(lib: &Library, pack: &str, q: &mut PackQuery) -> Option<String> {
+    let stale = lib.stale_signals(pack, q);
+    if stale.is_empty() {
+        return None;
+    }
+    q.signals.retain(|(g, _)| !stale.contains(g));
+    Some(format!(
+        "Removed from {pack}.{}'s signals: {} (no regex of the query captures {})",
+        q.id,
+        stale.join(", "),
+        if stale.len() == 1 { "it" } else { "them" }
+    ))
+}
+
 /// Write node `key` into the chosen pack; it then refers to that query. A
 /// node from a query of the same pack renames that query; otherwise the
 /// query is added (or replaces one with that name). Returns the rename on
-/// success, `None` if saving failed.
-fn save_node(lib: &mut Library, picks: &mut Picks, key: u64) -> Option<Option<(String, String)>> {
+/// success, `None` if saving failed; `notice`: what to say about stale
+/// `signals:` entries it dropped.
+fn save_node(
+    lib: &mut Library,
+    picks: &mut Picks,
+    key: u64,
+    notice: &mut Option<String>,
+) -> Option<Option<(String, String)>> {
     let pack_name = picks.save_pack.clone();
     let n = picks.node_mut(key)?;
     if let Err(e) = n.validate(true) {
@@ -1624,6 +1657,8 @@ fn save_node(lib: &mut Library, picks: &mut Picks, key: u64) -> Option<Option<(S
     if let Some(short) = q.parent.as_deref().and_then(|p| p.strip_prefix(&format!("{pack_name}."))) {
         q.parent = Some(short.to_owned());
     }
+    *notice = drop_stale_signals(lib, &pack_name, &mut q);
+    n.signals = q.signals.clone();
     let old = n
         .source
         .as_deref()
@@ -1690,7 +1725,7 @@ mod tests {
         let input = egui::RawInput { screen_rect: Some(screen), time: Some(t), events, ..Default::default() };
         let mut out = ctx.run_ui(input, |ui| {
             egui::Panel::right("library").exact_size(300.0).show(ui, |ui| {
-                library_panel(ui, &mut lib.clone(), &[], picks, &mut LibraryView::default(), None);
+                library_panel(ui, &mut lib.clone(), &[], &[], picks, &mut LibraryView::default(), None);
             });
             egui::CentralPanel::default().show(ui, |ui| {
                 selection_panel(ui, lib, picks);
@@ -1839,11 +1874,41 @@ mod tests {
         // Saving into a pack needs a name.
         p.save_pack = lib.packs()[0].name.clone();
         let mut lib2 = lib.clone();
-        assert_eq!(save_node(&mut lib2, &mut p, k), None);
+        assert_eq!(save_node(&mut lib2, &mut p, k, &mut None), None);
         assert!(p.nodes[0].error.as_deref().unwrap().contains("Name it"));
         // A name, once typed, is what shows.
         p.nodes[0].name = "timeouts".into();
         assert_eq!(p.nodes[0].display_name(), "timeouts");
+    }
+
+    /// Owner, 2026-11-15: a `signals:` entry for a group the query no longer
+    /// captures is removed when it is saved, and said so.
+    #[test]
+    fn saving_a_query_drops_its_stale_signals_entries() {
+        let dir = std::env::temp_dir().join(format!("nerka-gui-stale-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("a.nerka-pack");
+        std::fs::write(&file, "pack a\nquery speed  signals: speed:num, sped:num\n    /speed=(?<speed>\\d+)/\n")
+            .unwrap();
+        let mut lib = Library::new();
+        lib.load(&file).unwrap();
+        assert_eq!(lib.all_stale_signals(), [("a.speed".to_owned(), "sped".to_owned())]);
+        let mut p = Picks::default();
+        p.add(&lib, "a.speed", Use::Signal, None);
+        let k = p.nodes[0].key;
+        // Edited: the group renamed.
+        let n = p.node_mut(k).unwrap();
+        n.text = "/speed=(?<v>\\d+)/".into();
+        n.edited = true;
+        p.save_pack = "a".into();
+        let mut notice = None;
+        assert_eq!(save_node(&mut lib, &mut p, k, &mut notice), Some(None));
+        let notice = notice.unwrap();
+        assert!(notice.contains("speed, sped") && notice.contains("a.speed"), "{notice}");
+        assert!(lib.get("a.speed").unwrap().1.signals.is_empty());
+        assert!(!std::fs::read_to_string(&file).unwrap().contains("signals:"));
+        assert!(lib.all_stale_signals().is_empty());
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -1871,7 +1936,7 @@ mod tests {
         let mut lib = Library::new();
         lib.load(&file).unwrap();
         p.save_pack = "a".into();
-        assert_eq!(save_node(&mut lib, &mut p, k), Some(None));
+        assert_eq!(save_node(&mut lib, &mut p, k, &mut None), Some(None));
         assert_eq!(p.nodes[0].error, None);
         assert_eq!(
             std::fs::read_to_string(&file).unwrap(),
@@ -1881,7 +1946,7 @@ mod tests {
         // Saving it again under another name renames it in the pack.
         p.nodes[0].name = "xyz all".into();
         p.nodes[0].edited = true;
-        assert_eq!(save_node(&mut lib, &mut p, k), Some(Some(("a.xyz logs".into(), "a.xyz all".into()))));
+        assert_eq!(save_node(&mut lib, &mut p, k, &mut None), Some(Some(("a.xyz logs".into(), "a.xyz all".into()))));
         let ids: Vec<&str> = lib.packs()[0].queries.iter().map(|q| q.id.as_str()).collect();
         assert_eq!(ids, ["xyz all"]);
         // A library node shows its labels and colour as text.
@@ -1932,7 +1997,7 @@ mod tests {
         e.node.name = "very slow".into();
         e.node.text = "/very slow/".into();
         assert!(
-            matches!(run(&mut e, &mut lib, "Save"), EditOutcome::Saved(Some((ref o, ref n))) if o == "v.slow" && n == "v.very slow")
+            matches!(run(&mut e, &mut lib, "Save"), EditOutcome::Saved(Some((ref o, ref n)), _) if o == "v.slow" && n == "v.very slow")
         );
         assert_eq!(
             std::fs::read_to_string(&file).unwrap(),
@@ -2040,7 +2105,7 @@ mod tests {
         let (_, shapes) = frame(vec![], &mut e, &mut lib);
         let p = find_text(&shapes, "Save").unwrap();
         frame(vec![egui::Event::PointerMoved(p), button(p, true)], &mut e, &mut lib);
-        assert!(matches!(frame(vec![button(p, false)], &mut e, &mut lib).0, EditOutcome::Saved(None)));
+        assert!(matches!(frame(vec![button(p, false)], &mut e, &mut lib).0, EditOutcome::Saved(None, None)));
         assert_eq!(
             std::fs::read_to_string(&file).unwrap(),
             "pack v\nquery slow\n  /slow/\n\nquery \"very slow\"  parent: slow\n    level >= WARN\n"
@@ -2064,7 +2129,7 @@ mod tests {
             };
             let mut full = ctx.run_ui(input, |ui| {
                 egui::CentralPanel::default().show(ui, |ui| {
-                    library_panel(ui, &mut lib, &[], &mut picks, view, None);
+                    library_panel(ui, &mut lib, &[], &[], &mut picks, view, None);
                 });
             });
             full.textures_delta.clear();
@@ -2113,7 +2178,7 @@ mod tests {
             };
             let mut full = ctx.run_ui(input, |ui| {
                 egui::CentralPanel::default().show(ui, |ui| {
-                    library_panel(ui, &mut lib, &[], picks, &mut view, Some(&[]));
+                    library_panel(ui, &mut lib, &[], &[], picks, &mut view, Some(&[]));
                 });
             });
             full.textures_delta.clear();
@@ -2176,7 +2241,7 @@ query swup  parent: soc
             };
             let mut full = ctx.run_ui(input, |ui| {
                 egui::CentralPanel::default().show(ui, |ui| {
-                    library_panel(ui, &mut lib, &[], picks, &mut view, Some(&[]));
+                    library_panel(ui, &mut lib, &[], &[], picks, &mut view, Some(&[]));
                 });
             });
             full.textures_delta.clear();

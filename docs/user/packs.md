@@ -37,7 +37,9 @@ query frame_drops(cam)  parent: cam_scope  labels: system/vision, perf  color: v
     `default(VALUE)`, joined by `:`). Example:
     `signals: t:time, ota:enum:per(ecu1):default(idle)`. What isn't given
     is worked out (the kind from the first values). The Signals panel can
-    change them for a tab; **Save to pack** writes them here.
+    change them for a tab; **Save to pack** writes them here. An entry for
+    a group no regex of the query (or its parents) captures is listed as a
+    warning at the top of the Library, and removed when the query is saved.
 - The **body** is the indented lines below, kept as written.
 - `$name` or `${name}` is a **parameter**, declared in the query's list.
   `$$` is a `$`; so is a `$` not followed by a name (`/down$/`).
