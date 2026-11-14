@@ -714,6 +714,8 @@ struct Tab {
     own_gen: u64,
     /// Shared with the plot's own window.
     plot: plot::SharedPlot,
+    /// The log view's lifecycle boundaries, by the lifecycles they are of.
+    boundaries: Option<(Vec<usize>, Arc<Vec<view::Boundary>>)>,
     /// What `signals` was built from: (saved signals' generation, choices'
     /// generation, the selection's fingerprint); none: build again.
     signals_key: Option<(u64, u64, String)>,
@@ -1278,6 +1280,7 @@ impl Tab {
             own_signals: Signals::default(),
             own_gen: 0,
             plot: Default::default(),
+            boundaries: None,
             signals_key: None,
             query_options: Default::default(),
             pack_options: Default::default(),
@@ -1585,7 +1588,8 @@ impl Tab {
                 None => format!("mid == {}", a.mid),
             };
             let from = format!("FIBEX message {}: {}", a.mid, a.message);
-            let options = self.query_options.get(&a.name).cloned().unwrap_or_default();
+            // By the signal's name, which is lower case (an argument's may not be).
+            let options = self.query_options.get(&a.name.to_ascii_lowercase()).cloned().unwrap_or_default();
             let kind = options.kind.unwrap_or(a.ty.kind());
             if s.get(&a.name).is_none()
                 && let Ok(d) = nerka_core::SignalDef::argument(&a.name, kind, &query, a.index, &from)
@@ -2833,17 +2837,25 @@ impl Tab {
                 search: marks.as_ref(),
                 lines: lines.as_ref(),
                 notes: self.notes,
-                lifecycles: Some(&boundaries),
+                lifecycles: Some(boundaries.as_slice()),
             },
         );
         self.view_output(&out, false, line_of_row);
     }
 
-    /// Where the tab's lifecycles start (found already), for the view.
-    fn lifecycle_boundaries(&self, file: &dyn LogSource) -> Vec<view::Boundary> {
+    /// Where the tab's lifecycles start (found already), for the view; made
+    /// again only when they change (a trace can have tens of thousands:
+    /// making them each frame took ~10 ms).
+    fn lifecycle_boundaries(&mut self, file: &dyn LogSource) -> Arc<Vec<view::Boundary>> {
+        let found: Vec<_> = self.signals.lifecycles().filter_map(|d| d.cached(file)).collect();
+        let key: Vec<usize> = found.iter().map(|l| Arc::as_ptr(l) as usize).collect();
+        if let Some((k, b)) = &self.boundaries
+            && *k == key
+        {
+            return b.clone();
+        }
         let mut out = Vec::new();
-        for def in self.signals.lifecycles() {
-            let Some(l) = def.cached(file) else { continue };
+        for (def, l) in self.signals.lifecycles().filter_map(|d| d.cached(file).map(|l| (d, l))) {
             for (i, life) in l.lives.iter().enumerate() {
                 let bad = i > 0 && l.lives[i - 1].outcome.is_bad();
                 out.push(view::Boundary { line: life.first, label: format!("{} #{}", def.name(), life.number), bad });
@@ -2851,6 +2863,8 @@ impl Tab {
         }
         out.sort_by_key(|b| b.line);
         out.dedup_by_key(|b| b.line);
+        let out = Arc::new(out);
+        self.boundaries = Some((key, out.clone()));
         out
     }
 }
@@ -5738,6 +5752,41 @@ query timeouts  labels: vision
         buf
     }
 
+    /// Owner, 2026-11-14: a lifecycle and default chosen for a FIBEX signal
+    /// (its ⚙ menu) didn't take.
+    #[test]
+    fn fibex_signals_take_the_options_chosen_in_the_tab() {
+        let dir = std::env::temp_dir().join(format!("nerka-gui-fibex-opts-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (dlt, xml) = (dir.join("t.dlt"), dir.join("t.xml"));
+        std::fs::write(&dlt, queue_dlt(&[512, 64, 900, 32])).unwrap();
+        // Capitals in the argument's name: the signal's name is lower case.
+        std::fs::write(&xml, QUEUE_FIBEX.replace("Free slots", "Free Slots")).unwrap();
+        let fibex = Arc::new(nerka_core::Fibex::load(&[&xml]).unwrap());
+        let args = fibex.arguments();
+        let ctx = egui::Context::default();
+        let mut tab = Tab::open_many(&ctx, vec![dlt], &SearchPrefs::default(), Some(fibex.clone()));
+        settle(&mut tab, &ctx);
+        let mut saved = Signals::default();
+        saved.set(nerka_core::SignalDef::parse_spec("lifecycle run: start mid == 11").unwrap());
+        tab.arg_picks = args.clone();
+        tab.choices_gen += 1;
+        tab.refresh_signals(&ctx, &Library::new(), &saved, 0);
+        let name = tab.signals.iter().find(|d| d.argument_index().is_some()).unwrap().name().to_owned();
+        // As the panel sends them: by the signal's name.
+        tab.choose_option(&name, |o| o.per = Some("run".into()));
+        tab.choose_option(&name, |o| o.default = Some("7".into()));
+        tab.refresh_signals(&ctx, &Library::new(), &saved, 0);
+        let d = tab.signals.get(&name).unwrap();
+        assert_eq!(d.per(), Some("run"), "{} ({:?})", name, args[0].name);
+        assert_eq!(d.default_value().map(|v| v.to_string()).as_deref(), Some("7"));
+        // Back to none.
+        tab.choose_option(&name, |o| o.per = Some(String::new()));
+        tab.refresh_signals(&ctx, &Library::new(), &saved, 0);
+        assert_eq!(tab.signals.get(&name).unwrap().per(), None);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     #[test]
     fn fibex_arguments_become_signals_of_a_tab() {
         let dir = std::env::temp_dir().join(format!("nerka-gui-fibex-args-{}", std::process::id()));
@@ -6222,6 +6271,12 @@ gear=D
         };
         let mut app = App::default();
         app.set_fibex(&ctx, vec![PathBuf::from(fx)]);
+        // `NERKA_PERF_LIFE=SPEC`: a lifecycle as with --signal (many
+        // lifecycles: the Signals panel lists them).
+        if let Ok(spec) = std::env::var("NERKA_PERF_LIFE") {
+            app.add_session_signal(nerka_core::SignalDef::parse_spec(&spec).unwrap());
+            app.saved_gen += 1;
+        }
         let t = std::time::Instant::now();
         app.open(&ctx, PathBuf::from(path));
         settle(&mut app);

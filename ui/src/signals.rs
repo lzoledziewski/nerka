@@ -41,6 +41,8 @@ pub struct SignalsUi {
     tree_filter: String,
     /// The default typed in a signal's options menu (by signal name).
     default_edit: Option<(String, String)>,
+    /// ✎ was clicked: bring the form into view.
+    show_form: bool,
 }
 
 struct Draft {
@@ -614,6 +616,7 @@ pub fn signals_panel(ui: &mut egui::Ui, st: &mut SignalsUi, input: Input<'_>) ->
             if let Some(d) = edit {
                 st.draft = Draft::of(&d);
                 st.editing = Some(d.name().to_owned());
+                st.show_form = true;
             }
             if let Some(name) = remove_arg {
                 arg_picks.retain(|a| a.name != name);
@@ -630,9 +633,6 @@ pub fn signals_panel(ui: &mut egui::Ui, st: &mut SignalsUi, input: Input<'_>) ->
                 out.saved_changed = true;
             }
 
-            lifecycles_list(ui, signals, file, check_results, &mut out);
-            // A lifecycle edited: its form's fields.
-
             ui.separator();
             // Folded until wanted (an edit opens it): the list stays short.
             let title = match (st.editing.is_some(), st.draft.life) {
@@ -640,7 +640,9 @@ pub fn signals_panel(ui: &mut egui::Ui, st: &mut SignalsUi, input: Input<'_>) ->
                 (true, false) => "Edit signal",
                 (false, _) => "New signal or lifecycle",
             };
-            egui::CollapsingHeader::new(RichText::new(title).strong())
+            // The form right under the list, above the lifecycles (an edit
+            // opened it out of sight, below a long table).
+            let form = egui::CollapsingHeader::new(RichText::new(title).strong())
                 .id_salt("signal_form")
                 .default_open(false)
                 .open(st.editing.is_some().then_some(true))
@@ -768,6 +770,12 @@ pub fn signals_panel(ui: &mut egui::Ui, st: &mut SignalsUi, input: Input<'_>) ->
                         ui.colored_label(ui.visuals().error_fg_color, e);
                     }
                 });
+            // ✎ clicked: the form comes into view.
+            if std::mem::take(&mut st.show_form) {
+                form.header_response.scroll_to_me(Some(egui::Align::TOP));
+            }
+            ui.separator();
+            lifecycles_list(ui, signals, file, check_results, &mut out);
         });
     };
     match fibex {
@@ -951,80 +959,103 @@ fn lifecycles_list(
             .id_salt(("lifecycles", def.name()))
             .default_open(true)
             .show(ui, |ui| {
-                egui::Grid::new(("lifecycles_grid", def.name())).num_columns(5).striped(true).show(ui, |ui| {
-                    for h in ["#", "line", "duration", "outcome", ""] {
-                        ui.weak(h);
-                    }
-                    ui.end_row();
-                    for (i, x) in l.lives.iter().enumerate() {
-                        ui.label(x.number.to_string());
-                        let start = x.first_time.map(|t| nerka_core::time::format_time(t, 3)).unwrap_or_default();
-                        if ui
-                            .link(RichText::new((x.first + 1).to_string()).monospace())
-                            .on_hover_text(format!(
-                                "Started by {} on line {}{}\nClick to go there",
-                                x.started_by.as_str(),
-                                x.first + 1,
-                                if start.is_empty() { String::new() } else { format!(" at {start}") }
-                            ))
-                            .clicked()
-                        {
-                            out.goto = Some(x.first);
-                        }
-                        ui.label(x.duration().map(|d| format!("{d:.1} s")).unwrap_or_default());
-                        let color =
-                            if x.outcome.is_bad() { ui.visuals().error_fg_color } else { ui.visuals().text_color() };
-                        let r = ui.colored_label(color, x.outcome.as_str());
-                        if let Some(m) = x.marker {
-                            r.on_hover_text(format!("Its {} marker is on line {}", x.outcome.as_str(), m + 1));
-                        }
-                        ui.horizontal(|ui| {
-                            if ui
-                                .small_button("▾ filter")
-                                .on_hover_text("Filter to its lines in this lifecycle")
-                                .clicked()
+                // Only the rows in view are laid out: a trace can have tens
+                // of thousands of lifecycles (all of them took seconds a
+                // frame). The header is the first row of what is in view.
+                let row_height = ui.spacing().interact_size.y;
+                egui::ScrollArea::vertical()
+                    .id_salt(("lifecycles_rows", def.name()))
+                    .max_height(320.0)
+                    .auto_shrink([false, true])
+                    .show_rows(ui, row_height, l.lives.len() + 1, |ui, rows| {
+                        egui::Grid::new(("lifecycles_grid", def.name())).num_columns(5).striped(true).show(ui, |ui| {
+                            for h in ["#", "line", "duration", "outcome", ""] {
+                                ui.weak(h);
+                            }
+                            ui.end_row();
+                            for (i, x) in l.lives.iter().enumerate().skip(rows.start).take(rows.len().saturating_sub(1))
                             {
-                                let mut nfd = format!("@{} == {}", def.name(), x.number);
-                                if let Some(lines) = def.lines().and_then(|r| r.query()) {
-                                    nfd += &format!(" AND ({})", lines.source());
-                                }
-                                out.filter = Some(nfd);
-                            }
-                            // What the checks found in it (owner, 2026-11-07).
-                            let (issues, facts, lines) = crate::checks::of_lifecycle(checks, def.name(), x.number);
-                            if !lines.is_empty() {
-                                let text = match (issues, facts) {
-                                    (0, f) => RichText::new(format!("✔ ℹ{f}")).color(ui.visuals().weak_text_color()),
-                                    (n, f) => RichText::new(format!("⚠{n} ℹ{f}")).color(ui.visuals().error_fg_color),
-                                };
-                                let tip = format!(
-                                    "{}
-Click: the Checks pane",
-                                    lines.join(
-                                        "
-"
-                                    )
-                                );
-                                if ui.link(text).on_hover_text(tip).clicked() {
-                                    out.checks = Some((def.name().to_owned(), x.number));
-                                }
-                            }
-                            for f in l.findings_of(i) {
-                                let times = if f.count > 1 { format!(" ×{}", f.count) } else { String::new() };
-                                let r = ui.link(
-                                    RichText::new(format!("⚠ {}{times}", f.kind.as_str()))
-                                        .color(ui.visuals().warn_fg_color),
-                                );
-                                if r.on_hover_text(format!("Line {}: {}\nClick to go there", f.row + 1, f.detail))
+                                ui.label(x.number.to_string());
+                                let start =
+                                    x.first_time.map(|t| nerka_core::time::format_time(t, 3)).unwrap_or_default();
+                                if ui
+                                    .link(RichText::new((x.first + 1).to_string()).monospace())
+                                    .on_hover_text(format!(
+                                        "Started by {} on line {}{}\nClick to go there",
+                                        x.started_by.as_str(),
+                                        x.first + 1,
+                                        if start.is_empty() { String::new() } else { format!(" at {start}") }
+                                    ))
                                     .clicked()
                                 {
-                                    out.goto = Some(f.row);
+                                    out.goto = Some(x.first);
                                 }
+                                ui.label(x.duration().map(|d| format!("{d:.1} s")).unwrap_or_default());
+                                let color = if x.outcome.is_bad() {
+                                    ui.visuals().error_fg_color
+                                } else {
+                                    ui.visuals().text_color()
+                                };
+                                let r = ui.colored_label(color, x.outcome.as_str());
+                                if let Some(m) = x.marker {
+                                    r.on_hover_text(format!("Its {} marker is on line {}", x.outcome.as_str(), m + 1));
+                                }
+                                ui.horizontal(|ui| {
+                                    if ui
+                                        .small_button("▾ filter")
+                                        .on_hover_text("Filter to its lines in this lifecycle")
+                                        .clicked()
+                                    {
+                                        let mut nfd = format!("@{} == {}", def.name(), x.number);
+                                        if let Some(lines) = def.lines().and_then(|r| r.query()) {
+                                            nfd += &format!(" AND ({})", lines.source());
+                                        }
+                                        out.filter = Some(nfd);
+                                    }
+                                    // What the checks found in it (owner, 2026-11-07).
+                                    let (issues, facts, lines) =
+                                        crate::checks::of_lifecycle(checks, def.name(), x.number);
+                                    if !lines.is_empty() {
+                                        let text =
+                                            match (issues, facts) {
+                                                (0, f) => RichText::new(format!("✔ ℹ{f}"))
+                                                    .color(ui.visuals().weak_text_color()),
+                                                (n, f) => RichText::new(format!("⚠{n} ℹ{f}"))
+                                                    .color(ui.visuals().error_fg_color),
+                                            };
+                                        let tip = format!(
+                                            "{}
+Click: the Checks pane",
+                                            lines.join(
+                                                "
+"
+                                            )
+                                        );
+                                        if ui.link(text).on_hover_text(tip).clicked() {
+                                            out.checks = Some((def.name().to_owned(), x.number));
+                                        }
+                                    }
+                                    for f in l.findings_of(i) {
+                                        let times = if f.count > 1 { format!(" ×{}", f.count) } else { String::new() };
+                                        let r = ui.link(
+                                            RichText::new(format!("⚠ {}{times}", f.kind.as_str()))
+                                                .color(ui.visuals().warn_fg_color),
+                                        );
+                                        if r.on_hover_text(format!(
+                                            "Line {}: {}\nClick to go there",
+                                            f.row + 1,
+                                            f.detail
+                                        ))
+                                        .clicked()
+                                        {
+                                            out.goto = Some(f.row);
+                                        }
+                                    }
+                                });
+                                ui.end_row();
                             }
                         });
-                        ui.end_row();
-                    }
-                });
+                    });
             });
     }
 }
@@ -1403,28 +1434,38 @@ pub fn to_save(tab: &SignalOptions, pack: &SignalOptions) -> SignalOptions {
 
 /// A query or FIBEX signal's lifecycle and default, chosen in this tab.
 fn options_menu(ui: &mut egui::Ui, st: &mut SignalsUi, d: &SignalDef, lifecycles: &[&str], out: &mut Output) {
-    let r = ui.menu_button("⚙", |ui| {
+    // Closed by a click outside it or Esc: a plain menu closes on any
+    // click, in its Default field too.
+    let config =
+        egui::containers::menu::MenuConfig::new().close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside);
+    let (button, open) = egui::containers::menu::MenuButton::new("⚙").config(config).ui(ui, |ui| {
         ui.set_min_width(220.0);
         ui.label(RichText::new(format!("@{}", d.name())).monospace().strong());
+        // The choices in a submenu: part of this menu (a drop-down's list
+        // isn't, and opening it closed the menu), and it scrolls when long.
+        let now = d.per().unwrap_or("");
+        let mut to = now.to_owned();
         ui.horizontal(|ui| {
             ui.label("Lifecycle").on_hover_text("Its state resets (to the default) where each lifecycle starts");
-            let now = d.per().unwrap_or("");
-            let mut to = now.to_owned();
-            egui::ComboBox::from_id_salt(("per", d.name()))
-                .selected_text(if now.is_empty() { "none" } else { now })
-                .show_ui(ui, |ui| {
+            let shown = if now.is_empty() { "none".to_owned() } else { format!("@{now}") };
+            ui.menu_button(format!("{shown} ⏷"), |ui| {
+                egui::ScrollArea::vertical().max_height(300.0).show(ui, |ui| {
                     ui.selectable_value(&mut to, String::new(), "none");
                     for l in lifecycles {
-                        ui.selectable_value(&mut to, (*l).to_owned(), *l);
+                        ui.selectable_value(&mut to, (*l).to_owned(), format!("@{l}"));
                     }
                     if !now.is_empty() && !lifecycles.contains(&now) {
-                        ui.selectable_value(&mut to, now.to_owned(), format!("{now} (not defined)"));
+                        ui.selectable_value(&mut to, now.to_owned(), format!("@{now} (not defined)"));
                     }
                 });
-            if to != now {
-                out.per = Some((d.name().to_owned(), to));
-            }
+                if to != now {
+                    ui.close();
+                }
+            });
         });
+        if to != now {
+            out.per = Some((d.name().to_owned(), to));
+        }
         if lifecycles.is_empty() && d.per().is_none() {
             ui.weak("No lifecycle yet: define one with + Lifecycle");
         }
@@ -1446,9 +1487,9 @@ fn options_menu(ui: &mut egui::Ui, st: &mut SignalsUi, d: &SignalDef, lifecycles
             }
         });
     });
-    r.response.on_hover_text("Lifecycle and default (in this tab)");
+    button.on_hover_text("Lifecycle and default (in this tab)");
     // Typed but not set: forgotten when the menu closes.
-    if r.inner.is_none() && st.default_edit.as_ref().is_some_and(|(n, _)| n == d.name()) {
+    if open.is_none() && st.default_edit.as_ref().is_some_and(|(n, _)| n == d.name()) {
         st.default_edit = None;
     }
 }

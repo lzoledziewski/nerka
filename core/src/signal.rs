@@ -974,13 +974,15 @@ impl SignalDef {
             Builtin::Check(_) => return format!("{}:{} (a check's result)", self.name, self.kind.as_str()),
             Builtin::No => {}
         }
-        if let Some(i) = self.argument {
-            return format!("{}:{} = argument {i} of {}", self.name, self.kind.as_str(), self.query.source());
-        }
-        let group = if self.group == self.name { String::new() } else { format!("({})", self.group) };
         let scope = if self.scope == SignalScope::Filtered { ":filtered" } else { "" };
         let per = self.per.as_ref().map(|p| format!(":per({p})")).unwrap_or_default();
         let default = self.default.as_ref().map(|d| format!(":default({d})")).unwrap_or_default();
+        // With its options: a tab compares specs to see what changed.
+        if let Some(i) = self.argument {
+            let (name, kind, query) = (&self.name, self.kind.as_str(), self.query.source());
+            return format!("{name}:{kind}{scope}{per}{default} = argument {i} of {query}");
+        }
+        let group = if self.group == self.name { String::new() } else { format!("({})", self.group) };
         format!("{off}{}{group}:{}{scope}{per}{default}={}", self.name, self.kind.as_str(), self.query.source())
     }
 

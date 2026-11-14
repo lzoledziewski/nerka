@@ -344,9 +344,44 @@ impl PlotState {
 
 struct PlotData {
     lanes: Vec<Arc<Lane>>,
+    /// The plotted lifecycles' starts, in the order plotted.
+    lives: Vec<LifeMarks>,
     /// x range of all events.
     full: (f64, f64),
     is_time: bool,
+}
+
+/// Where a plotted lifecycle's lifecycles start, sorted by x (worked out
+/// once, not per frame: a trace can have tens of thousands).
+struct LifeMarks {
+    name: String,
+    xs: Vec<f64>,
+    numbers: Vec<u32>,
+    rows: Vec<LineNo>,
+    /// The lifecycle before it ended badly (red).
+    bad: Vec<bool>,
+}
+
+impl LifeMarks {
+    fn of(name: &str, l: &nerka_core::lifecycle::Lifecycles, x_of: impl Fn(LineNo) -> Option<f64>) -> LifeMarks {
+        let mut v: Vec<(f64, u32, LineNo, bool)> = l
+            .lives
+            .iter()
+            .enumerate()
+            .filter_map(|(i, life)| {
+                let bad = i > 0 && l.lives[i - 1].outcome.is_bad();
+                x_of(life.first).map(|x| (x, life.number, life.first, bad))
+            })
+            .collect();
+        v.sort_by(|a, b| a.0.total_cmp(&b.0));
+        LifeMarks {
+            name: name.to_owned(),
+            xs: v.iter().map(|m| m.0).collect(),
+            numbers: v.iter().map(|m| m.1).collect(),
+            rows: v.iter().map(|m| m.2).collect(),
+            bad: v.iter().map(|m| m.3).collect(),
+        }
+    }
 }
 
 /// The y range a lane shows: its values' range `(lo, hi)` widened to its
@@ -426,6 +461,7 @@ fn build(
     // 2026-11-07: lifecycles on and off in the plot): its span counts.
     let mut life_span = (f64::INFINITY, f64::NEG_INFINITY);
     let mut wanted = Vec::new();
+    let mut life_marks = Vec::new();
     for (name, def, r) in ready {
         match r {
             Ready::Lives(lives) => {
@@ -435,6 +471,7 @@ fn build(
                         life_span = (life_span.0.min(x), life_span.1.max(x));
                     }
                 }
+                life_marks.push(LifeMarks::of(def.name(), &lives, x_of));
             }
             Ready::Events(series) => {
                 let key =
@@ -482,7 +519,7 @@ fn build(
     } else {
         (0.0, 1.0)
     };
-    Ok(PlotData { lanes, full, is_time: clock.is_time() })
+    Ok(PlotData { lanes, lives: life_marks, full, is_time: clock.is_time() })
 }
 
 /// What a plot is drawn from: the tab's signals (`generation` changes
@@ -1107,41 +1144,72 @@ pub fn plot_panel(ui: &mut egui::Ui, state: &mut PlotState, src: Source<'_>) -> 
     // labels and a dash of its own, so ECUs that boot together are all
     // named (owner, 2026-11-09: U1); a label that would run into the one
     // before in its row is left out, and the hover names every start. -----
-    let plotted: Vec<_> = signals.lifecycles().filter(|d| state.is_plotted(d.name())).collect();
+    // At most a line per pixel column (red if one there follows a bad
+    // end), and only the labels that fit are laid out: a trace can have
+    // tens of thousands of lifecycles (all of them drawn made a mesh past
+    // the GPU's buffer limit, and nerka crashed).
     let label_font = FontId::monospace(9.0);
-    let label_rows = plotted.len().min(LIFE_ROWS).min(((axis_y - plot.min.y) / LIFE_ROW) as usize).max(1);
-    let mut starts: Vec<(f32, String)> = Vec::new();
-    let mut labels: Vec<(usize, f32, f32, String, Color32)> = Vec::new();
-    for (k, def) in plotted.iter().enumerate() {
-        let Some(l) = def.cached(file) else { continue };
+    let label_rows = data.lives.len().min(LIFE_ROWS).min(((axis_y - plot.min.y) / LIFE_ROW) as usize).max(1);
+    let char_w = painter.layout_no_wrap("0".into(), label_font.clone(), weak).size().x;
+    let mut rows = LabelRows::new(label_rows);
+    let hover_x = response.hover_pos().filter(|p| plot.contains(*p)).map(|p| p.x);
+    let (mut near, mut more) = (Vec::new(), 0usize);
+    for (k, m) in data.lives.iter().enumerate() {
         let dash = 2.0 + 2.0 * (k % LIFE_ROWS) as f32;
-        for (i, life) in l.lives.iter().enumerate() {
-            let Some(x) = clock.at(file, clock_series.as_ref(), life.first).filter(|x| (x0..=x1).contains(x)) else {
-                continue;
-            };
-            let bad = i > 0 && l.lives[i - 1].outcome.is_bad();
+        let line = |px: f32, bad: bool| {
             let c = if bad { red } else { weak };
-            let px = to_px(x, x0, x1);
             let line = [pos2(px, plot.min.y), pos2(px, axis_y)];
             painter.extend(egui::Shape::dashed_line(&line, Stroke::new(1.0, c), dash, 2.0));
-            let label = format!("{} #{}", def.name(), life.number);
-            starts.push((px, format!("{label} starts on line {}", life.first + 1)));
-            let w = painter.layout_no_wrap(label.clone(), label_font.clone(), c).size().x;
-            labels.push((k, px, w, label, c));
+        };
+        // A run of columns with starts at most 3 pixels apart: (pixel, the
+        // first start's x, bad). Three or more are one shaded band (red if
+        // one follows a bad end), not a line each.
+        let band = |cols: &mut Vec<(f32, f32, bool)>| {
+            if cols.len() >= 3 {
+                let c = if cols.iter().any(|c| c.2) { red } else { weak };
+                let r = Rect::from_min_max(pos2(cols[0].1, plot.min.y), pos2(cols[cols.len() - 1].1 + 1.0, axis_y));
+                painter.rect_filled(r, 0.0, c.gamma_multiply(0.25));
+            } else {
+                for &(_, at, bad) in cols.iter() {
+                    line(at, bad);
+                }
+            }
+            cols.clear();
+        };
+        let (i0, i1) = (m.xs.partition_point(|&x| x < x0), m.xs.partition_point(|&x| x <= x1));
+        let mut cols: Vec<(f32, f32, bool)> = Vec::new();
+        for i in i0..i1 {
+            let px = to_px(m.xs[i], x0, x1);
+            let c = px.floor();
+            match cols.last_mut() {
+                Some(last) if last.0 == c => last.2 |= m.bad[i],
+                Some(last) if c - last.0 <= 3.0 => cols.push((c, px, m.bad[i])),
+                _ => {
+                    band(&mut cols);
+                    cols.push((c, px, m.bad[i]));
+                }
+            }
+            let label = || format!("{} #{}", m.name, m.numbers[i]);
+            let w = (m.name.chars().count() + 2 + m.numbers[i].to_string().len()) as f32 * char_w;
+            if let Some(row) = rows.place(k, px, w) {
+                let c = if m.bad[i] { red } else { weak };
+                let at = pos2(px + 2.0, plot.min.y + 1.0 + row as f32 * LIFE_ROW);
+                painter.text(at, Align2::LEFT_TOP, label(), label_font.clone(), c);
+            }
+            if hover_x.is_some_and(|h| (px - h).abs() <= 3.0) {
+                if near.len() < 10 {
+                    near.push(format!("{} starts on line {}", label(), m.rows[i] + 1));
+                } else {
+                    more += 1;
+                }
+            }
         }
+        band(&mut cols);
     }
-    let spans: Vec<(usize, f32, f32)> = labels.iter().map(|(k, px, w, ..)| (*k, *px, *w)).collect();
-    for ((_, px, _, label, c), row) in labels.into_iter().zip(life_label_rows(&spans, label_rows)) {
-        if let Some(row) = row {
-            let at = pos2(px + 2.0, plot.min.y + 1.0 + row as f32 * LIFE_ROW);
-            painter.text(at, Align2::LEFT_TOP, label, label_font.clone(), c);
-        }
+    if more > 0 {
+        near.push(format!("… and {more} more"));
     }
-    let life_tip = response.hover_pos().filter(|p| plot.contains(*p)).and_then(|p| {
-        let near: Vec<&str> =
-            starts.iter().filter(|(px, _)| (px - p.x).abs() <= 3.0).map(|(_, t)| t.as_str()).collect();
-        (!near.is_empty()).then(|| near.join("\n"))
-    });
+    let life_tip = (!near.is_empty()).then(|| near.join("\n"));
 
     // ----- cursor -----
     if let Some(cx) = clock.at(file, clock_series.as_ref(), cursor).filter(|x| (x0..=x1).contains(x)) {
@@ -1510,19 +1578,31 @@ const LIFE_ROW: f32 = 11.0;
 /// it would run into the label before it in that row: lifecycle `k` has row
 /// `k` (the last of `rows` shared by the rest), so two lifecycles starting
 /// at one x are both labelled (U1).
+#[cfg(test)]
 fn life_label_rows(spans: &[(usize, f32, f32)], rows: usize) -> Vec<Option<usize>> {
-    let rows = rows.max(1);
-    let mut ends = vec![f32::NEG_INFINITY; rows];
-    spans
-        .iter()
-        .map(|&(k, px, w)| {
-            let row = k.min(rows - 1);
-            (px > ends[row] + 4.0).then(|| {
-                ends[row] = px + 2.0 + w;
-                row
-            })
+    let mut r = LabelRows::new(rows);
+    spans.iter().map(|&(k, px, w)| r.place(k, px, w)).collect()
+}
+
+/// The rows of lifecycle labels as they are placed, left to right per
+/// lifecycle ([`life_label_rows`]).
+struct LabelRows {
+    ends: Vec<f32>,
+}
+
+impl LabelRows {
+    fn new(rows: usize) -> LabelRows {
+        LabelRows { ends: vec![f32::NEG_INFINITY; rows.max(1)] }
+    }
+
+    /// The row for lifecycle `k`'s label at `px`, `w` wide, if it fits.
+    fn place(&mut self, k: usize, px: f32, w: f32) -> Option<usize> {
+        let row = k.min(self.ends.len() - 1);
+        (px > self.ends[row] + 4.0).then(|| {
+            self.ends[row] = px + 2.0 + w;
+            row
         })
-        .collect()
+    }
 }
 
 /// A right-click menu with fields in it (a note, marker labels and values).
@@ -1992,6 +2072,8 @@ mod tests {
         if per {
             let rare = cat.arguments().iter().map(|a| a.mid).max().unwrap();
             sig.set(SignalDef::parse_spec(&format!("lifecycle boot: start mid == {rare}")).unwrap());
+            // Its starts plotted too (all drawn, they crashed the GPU).
+            st.toggle("boot");
         }
         for a in &args {
             let q = format!("mid == {} AND ecu == \"{}\"", a.mid, a.ecu.as_deref().unwrap_or("ECU1"));
