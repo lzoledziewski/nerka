@@ -67,8 +67,30 @@ the lanes; a new signal set or filter result changes their key), though only one
 none whose signal is unfiltered (scope All).
 
 Two files as one view (pcap + MF4, 132 M rows): opened in 4.9 s (one after the other); `--merge` adds 2.3 s.
-Every number grows linearly with the messages (a 4 GiB pcap: about ×1.9), except the MF4 open before P4,
-which grew with messages × blocks.
+Every number grows linearly with the messages, except the MF4 open before P4, which grew with messages ×
+blocks.
+
+### Files over 4 GiB
+
+The same generator at 6 GiB (`gen_fibex_dlt big6.dlt big6.xml 6144 40`: 131.7 M messages, its first 3 GiB the
+3 GiB trace), converted as above: a 6.0 GiB DLT, a 4.2 GiB pcap (4,523,923,822 bytes) and a 2.1 GiB deflated
+MF4 that unpacks to 7.0 GiB. Every file reads all 131,734,210 messages, and every filter gives the same count
+in the three. `filter 'mid == 1039'` (539,358 rows, the last near the files' ends) prints the same bytes for the
+DLT and the MF4 (`--mf4-utc`), and for the pcap the same but the time column (its messages share their
+datagram's capture time). Each step takes about twice its 3 GiB time:
+
+| Step | DLT | pcap | MF4 |
+|---|---|---|---|
+| Open | 1.75 s | 2.31 s | first 25.5 s (7,149 MiB written); cached 8.0 s |
+| `mid == 1000` / `apid == ENG AND level >= WARN` | 235 / 506 ms | 214 / 538 ms | 239 / 496 ms |
+| `payload ~ /message 3:/` | 2.05 s | 2.16 s | 2.16 s |
+| 30 signals' events (135 M) | 8.7 s | 8.4 s | 8.7 s |
+| Plot lanes built | 6.7 s | 4.8 s | 5.4 s |
+| A frame at full zoom | 328 ms | 332 ms | 335 ms |
+| Peak private memory (open, 30 signals, plot) | 6.3 GiB | 7.3 GiB | 7.3 GiB |
+
+With 32 GB of RAM nothing pages; the private memory (beside up to 7 GiB of mapped file) is what limits the
+file size on a smaller machine (P5).
 
 ## Findings, by impact
 
@@ -94,6 +116,16 @@ built; the panel asks for a repaint 100 ms later and tries again. With the new s
 whole 2.6 s, so the plot shows 5.5 s after the click, for events collected in 0.1 s; a signal whose events
 take longer than a build (a regex signal, a bigger file) rebuilds and discards again on every try. Fix (also
 without P2): check that every lane's events are cached before building any, or draw the lanes that are ready.
+
+**P9. A change to a tab's signals collects every FIBEX and query signal again.** `refresh_signals`
+(`ui/src/main.rs`) builds the tab's signals anew whenever what they come from changes (a FIBEX argument ticked
+or unticked, the Selection, a kind or scope chosen): FIBEX arguments with `SignalDef::argument`, pack-query
+signals with `query_signals`. A new definition has an empty cache (`Cache::default()`; only copies share one),
+so every one of them reads the file again: with 30 FIBEX signals, the 4 s of P3 on every change, before the
+plot's rebuild (P2, P2a). Saved signals keep theirs (they are copies). Found in the code, not timed:
+`perf_big_plot` reuses the definitions, so its 5.5 s for an added signal is a lower bound; in the GUI it is
+likely 7–10 s. Fix: a cache keyed by the definition (its fingerprint) and the file, so a definition built
+again finds its events.
 
 **P3. Each signal is a full pass of its own.** `SignalDef::series` scans the file once per signal: 30 signals
 cost 30 × (a bare scan of about 75 ms, plus decoding their events) ≈ 4 s. Collecting them in parallel gains
@@ -171,3 +203,86 @@ questions. WPA (the GUI) can still open the trace.
 What isn't a problem: header filters (`mid`, `ecu`, `apid`, `level`) run at 10–30 GB/s on every format;
 FIBEX lookups and argument decoding are cheap (a hash per message, the argument read in place); tessellation
 is a few ms even at 400 k vertices; zoomed-in plots are fast.
+
+## Fixes
+
+Effort: S hours, M days, L a week or more. Costs from the measurements above (30 plotted signals, 3 GiB).
+
+| # | Fix | Now → expected | Effort |
+|---|---|---|---|
+| P9 | Signal caches keyed by the definition's fingerprint and the file, not by the definition object | ~4 s per signal change → the new signal's pass (~0.1 s) | S |
+| P2a | Build lanes only when every lane's events are cached (or draw the ready ones) | −2.6 s per added signal | S |
+| P2 | (a) the time of each event kept with it when collected; (b) lanes cached per signal; (c) built in a job, a lane per thread | 2.4–3.0 s frozen per change → under 0.1 s | M |
+| P1 | A min / max summary per lane (enum: one value or mixed) | 182 ms a frame → 1–2 ms | M |
+| P3 | One pass for a tab's signals: FIBEX arguments through a message id → signals map, regex signals through a `RegexSet`, other queries a pass of their own | 4 s → about 1 s | M |
+| P8 | Reserve the index from the file's size; prefetch the mapping in large pieces; index `.dlt` in parallel chunks | opens about −30–50 %; no peak above the index | S / S / M |
+| P4 | `vlsd_at`: the current block first; `Field::raw`: one load for an aligned field | MF4 cached 3.8 s → about 2 s | S |
+| P4b | DZ blocks inflated in parallel, written in order | MF4 first open 11 s → about 4 s | M |
+| P5 | x only in lanes (with P2a); rows as u32 per file; the block-compressed index (roadmap) | about −1.5 GiB here; the index later | S–L |
+| P6 | Payload regexes over decoded arguments, or rendered text cached (R14) | 1 s | L |
+| P7 | Files opened in parallel, one progress total (R18) | pcap + MF4 4.9 s → the slowest file | M |
+
+Adding one signal to a plot of 30, the case the owner asked about: likely 7–10 s now (P9, P2a, P2); about
+2.8 s after P9 and P2a; under a second after P2.
+
+## How the fixes fit the architecture
+
+Checked against spec §4 (the UI displays and sends queries; core does the processing), the format-neutral,
+row-at-a-time `LogSource` (R3), `sources-and-signals.md` (one pass over a container feeds every decoder; a
+`SignalStore` of `(time, value)` per signal; subscriptions: only subscribed signals decoded, the rest skipped
+after a hash lookup; batches at the plugin boundary) and CLAUDE.md's rules (`&Progress` and cancellation for
+long work, every fast path tested against the naive one).
+
+| Fix | Fit | Why |
+|---|---|---|
+| P2a, P4, P8 (reserve, prefetch) | Fits | Local to a function or a reader; the mapping stays read-only and untouched. |
+| P4b | Fits | Inside `unpack.rs`; the cache file stays the same. |
+| P7 | Fits | Planned (R18); `open_many` and `Progress` take it. |
+| P9 | A small extension | `Signals::fingerprint` exists; caches already live with a definition and are shared by its copies. Only the cache's identity changes. |
+| P3 | Against the code, toward the design | Each `SignalDef` scans the file itself, which is not the design: one pass feeding every decoder, subscribed signals decoded after one hash lookup. A collector over a tab's signals is that design. |
+| P2 (a) | The same | The design's `SignalStore` holds `(time, value)`; the cache holds `(row, value)` and the plot asks the source for each time. |
+| P1, P2 (b, c) | In the wrong layer now | Building the lanes and thinning them per pixel is processing in `ui/src/plot.rs`, against spec §4: not testable without the GUI, not usable by the CLI or a later MCP server, without `Progress`. |
+| Row-at-a-time `LogSource` (a field read and a dynamic call per row) | A known limit | The design plans batches at the plugin boundary; the engine is still per row. |
+
+## Refactor or redesign?
+
+**No redesign of the engine or of `LogSource`.** A scan of 66 M messages takes 75 ms (10–30 GB/s) and
+profiles as efficient; the time goes to repeating work (30 passes, rebuilding after every change, collecting
+again after every edit), not to the per-row API. A batch or columnar engine would be a large change for a small
+gain once the repetition is gone; revisit if filters on files over 4 GiB become slow.
+
+**Two refactors, so the fixes land in the right place:**
+
+- **R-A. Signal collection as the design's `SignalStore` (core).** A collector over a tab's signals makes one
+  pass per file for all of them (P3: FIBEX arguments through a message id map, regex signals through a
+  `RegexSet`, other queries a pass of their own); the store keeps the time with each event (P2 a) and is keyed
+  by the definition's fingerprint and the file (P9). `SignalDef::series` / `cached_series` stay the API, so
+  filters, lifecycles, checks and the GUI keep working; the invariant to test: events collected together equal
+  those collected one by one, per kind of signal.
+- **R-B. Plot data in core.** `SignalSeries` → a lane's points on the clock, plus its min / max summary (P1);
+  lanes cached one by one and built in a job with `Progress` (P2 b, c). `ui/src/plot.rs` keeps painting and
+  interaction. This meets spec §4, makes the plot testable headless, and gives an export or the MCP server the
+  same thinned data.
+
+**Not now:**
+
+- Parallel indexing of captures (pcap / MF4): fragment reassembly and routing carry state across the file, so
+  chunks are a real design change; P8 takes most of the gain. A parallel `.dlt` index is easy and worth it.
+- The compressed index and u32 rows: memory only, no limit changes. There is no 4 GiB limit: text and `.dlt`
+  keep u64 offsets and rows; captures pack the offset into 40 bits (1 TiB per file, `MAX_OFFSET`); u32 rows
+  would be per file (4 G messages, a fall-back to u64 above). They pay off when the index no longer fits
+  beside the file in RAM: at 8–16 B per message about 1 GiB per 4 GiB of small DLT messages. Worth it if files
+  of 8 GiB and more are a goal (a question for the owner). Files over 4 GiB work ("Files over 4 GiB" above).
+- The full time model (`Timestamp { ns, clock }`) isn't needed for these fixes, but see below.
+
+**With the next features of 0.2:**
+
+- **Profiles** (signals applied by file rules) add many signals per tab: without R-A and P9 every match costs
+  a pass per signal, and every change all of them again.
+- **A file's time adjusted in a merged view:** R-A's time column must come through the source's time, with
+  its adjustment, and be keyed by it; the file's clock offset then belongs to the source (the smallest part of
+  the time model).
+- **Signal options customized in packs:** definitions change often; with P9 a change costs one signal.
+
+**Order:** P9 and P2a (small; most of the frozen time after a change); R-A (P3, P2 a); R-B (P1, P2); P4 and P8;
+P4b and P7; later P5 and P6. R-A before profiles, which build on it.
