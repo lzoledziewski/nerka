@@ -39,6 +39,9 @@ defaults to the signal's name. Parts:
   role, [Query packs](packs.md)): their kind is guessed from the first
   values; the pack can give them options (`signals: t:time,
   s:enum:per(ecu1):default(idle)`), the panel can change them for the tab;
+  instances of a parameterised query give a signal each where the group's
+  name uses the parameter (`drops_$cam`: `@drops_CAM1`, `@drops_CAM2`;
+  [instances](packs.md#instances-of-a-parameterised-query));
 - the file: `@time` for files that know their lines' times (DLT,
   captures);
 - [lifecycles](lifecycles.md) (`@ecu1`, the lifecycle's number) and

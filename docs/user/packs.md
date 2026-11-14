@@ -72,6 +72,32 @@ must be unique. Samples: `examples/packs/`.
 
 Applying the selection puts its expansion in the Filter box (NFD mode).
 
+### Instances of a parameterised query
+
+To track several cameras with one `drops(cam)` query, give its pick
+**instances**: ⊕ → **One more instance**, or **Instances from a list…**
+(one value per line). Each instance is listed under the pick with its own
+values (empty: the shared one from **Parameters**) and is a part of its
+own: `drops (CAM1)`, `drops (CAM2)`, each with its colour. Instances share
+the query's text and settings: editing the query edits them all. An
+instance with the same values as another adds nothing and is marked ⚠.
+
+Signals follow the query's group names: `(?<drops_$cam>…)` gives each
+instance its signal (`@drops_CAM1`, `@drops_CAM2`); `(?<drops>…)` is one
+signal fed by every instance (its row in the Signals panel says
+`query ← 2`). A `signals:` line can use the parameters the same way:
+
+```
+query drops(cam)  signals: drops_$cam:num:default(0)
+    /$cam drop (?<drops_$cam>\d+)/
+```
+
+An option there may use only the parameters its name uses (instances that
+share a signal share its options). On the command line, a query with
+arguments is an instance: `-q 'vision.drops(cam=CAM1)' -q
+'vision.drops(cam=CAM2)'` (quote a value with `,` or spaces: `cam="CAM 1"`);
+`nerka-gui --signal-pick 'vision.drops(cam=CAM1)'` likewise.
+
 ## Expansion
 
 Included queries are joined with `OR`, each with its parent chain
@@ -91,8 +117,8 @@ nerka --pack examples/packs/ expand -l ota -p cam=CAM1 --parts
 ## Presets
 
 A **preset** saves a tab's analysis to use again on other files: the
-selection in order (roles, line colours), copies of queries you edited or
-made, the parameter values, and the text typed in the Filter and Search
+selection in order (roles, line colours, instances), copies of queries you
+edited or made, the parameter values, and the text typed in the Filter and Search
 boxes. Choosing one replaces the tab's selection and runs both boxes.
 
 The bar above the Selection pane: **New from this tab…** → **Keep** (this

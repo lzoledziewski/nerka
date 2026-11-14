@@ -1,9 +1,9 @@
-# Instances of a parameterised query (design, planned)
+# Instances of a parameterised query
 
 A parameterised query (`query drops(cam)`) picked several times in one
 selection, each pick with its own arguments, to track several instances side
 by side (owner, 2026-11-15: so far the query was duplicated by hand, one per
-camera). For 0.2.2 (owner, 2026-11-15); not built yet, the plan is below.
+camera). Built for 0.2.2: `features.md` → "Instances of a parameterised query".
 
 ## Decisions (owner, 2026-11-15)
 
@@ -90,29 +90,8 @@ value. The same for `-r` and `-x`.
 `docs/user/signals.md` (signals per instance), the preset format in
 `preset.rs`'s header.
 
-## Plan
-
-1. Core: picks with argument sets, the part's pick and instance index,
-   coverage per arguments; expansion tests (two instances in each role, a
-   parent chain filled per instance, the same arguments twice dropped).
-2. `signals:` with parameters: parser, filling in, the errors (an option
-   with a parameter its name lacks; a filled-in name that isn't one); pack
-   tests (parse, write back, error positions).
-3. GUI: node instances, + instance, Instances…, chips, mapping parts by
-   index; tests (two instances give `@drops_CAM1` and `@drops_CAM2`; a group
-   without the parameter is one signal marked `← 2 instances`; the same
-   values refused; Save to pack writes `drops_$cam`).
-4. Presets: `instance` lines, round trip, an old preset unchanged.
-5. CLI: `-q ID(ARGS)`; a test per role.
-6. Docs, `features.md` entry, `status.md` / `history.md`.
-
 ## Open
 
-- Labels: a label pick adds its queries with the shared values; proposed:
-  **+ instance** on one of them makes it a pick of its own.
-- Where the warning about queries with disagreeing options shows;
-  proposed: ⚠ on the signal's row in the Signals panel, naming the query
-  whose options are used and the ones that differ.
 - Lifecycle rules that use a library query (`{pack.query}`) take the shared
   parameter values. Instances of a lifecycle (one per ECU) are the same
   idea: `lifecycles.md` lists "add one per ECU" for later; it could reuse
