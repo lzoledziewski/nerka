@@ -1571,6 +1571,9 @@ impl Tab {
             return;
         }
         self.own_fp = Some(fp);
+        // What the signals built before collected stays: only new
+        // definitions collect their events.
+        s.adopt_caches(&self.signals);
         // The checks' signals come back when they ran with these.
         self.own_signals = s.clone();
         self.own_gen += 1;
@@ -1640,14 +1643,10 @@ impl Tab {
         if self.signals.is_empty() {
             return;
         }
-        let defs: Vec<_> = self.signals.iter().cloned().collect();
-        self.signals_job = Some(Job::spawn(ctx, move |prog| {
-            for d in defs {
-                // A definition that doesn't fit the file says so in the panel.
-                let _ = d.series(&*file, prog);
-            }
-            Ok(())
-        }));
+        let signals = self.signals.clone();
+        // Signals keyed by a field together, the rest one by one; a
+        // definition that doesn't fit the file says so in the panel.
+        self.signals_job = Some(Job::spawn(ctx, move |prog| signals.collect(&*file, prog)));
     }
 
     fn build_filter(&self) -> Result<Filter, String> {
@@ -6058,6 +6057,49 @@ gear=D
     /// its lanes. One whose signal that tab lacks stays (it was dropped when
     /// the tab's signals were built again); one the loaded FIBEX files
     /// describe becomes the tab's signal.
+    /// Review 2026-11-14, P9: a tab's signals built again (a FIBEX argument
+    /// ticked) keep the events collected for the ones that stay; before,
+    /// every FIBEX and query signal read the file again.
+    #[test]
+    fn signals_built_again_keep_their_events() {
+        let dir = std::env::temp_dir().join(format!("nerka-gui-keepevents-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let fibex = dir.join("ecu.xml");
+        std::fs::write(&fibex, QUEUE_FIBEX).unwrap();
+        let a = dir.join("a.dlt");
+        std::fs::write(&a, queue_dlt(&[512, 64])).unwrap();
+        let ctx = egui::Context::default();
+        let mut app = App::default();
+        app.set_fibex(&ctx, vec![fibex]);
+        app.open(&ctx, a);
+        settle_app(&mut app, &ctx);
+        let run = |app: &mut App| {
+            let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1200.0, 800.0));
+            let input = egui::RawInput { screen_rect: Some(screen), ..Default::default() };
+            let mut out = ctx.run_ui(input, |ui| app.frame(ui));
+            out.textures_delta.clear();
+        };
+        let args = app.fibex_arguments();
+        app.tabs[0].arg_picks.push(args[0].clone());
+        app.tabs[0].choices_gen += 1;
+        run(&mut app);
+        settle_app(&mut app, &ctx);
+        let file = app.tabs[0].file.clone().unwrap();
+        let first = app.tabs[0].signals.get(&args[0].name).unwrap().clone();
+        assert!(first.cached_series(&*file).is_some(), "collected");
+        // A signal defined: the tab's signals are built again.
+        app.saved_signals.set(nerka_core::SignalDef::parse_spec(r"n=/(?<n>\d+)/").unwrap());
+        app.saved_gen += 1;
+        run(&mut app);
+        let tab = &app.tabs[0];
+        assert!(tab.signals.get("n").is_some(), "the new one is the tab's signal");
+        let kept = tab.signals.get(&args[0].name).unwrap();
+        assert!(!Arc::ptr_eq(kept, &first), "built again");
+        assert!(kept.shares_events_with(&first), "its events are kept, not collected again");
+        assert!(kept.cached_series(&*file).is_some());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     #[test]
     fn a_kept_plot_opens_in_another_tab_with_all_its_lanes() {
         let dir = std::env::temp_dir().join(format!("nerka-gui-tabplots-{}", std::process::id()));

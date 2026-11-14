@@ -16,13 +16,17 @@
 //! to it (`nerka_core::plot`, `crate::plots`); New plot starts a blank one.
 //! A lane whose signal the tab doesn't have stays, named above the lanes.
 //!
-//! Drawn with egui's painter (no plot crate): lanes are decimated to one
-//! step per pixel column, so millions of events draw as fast as a few.
+//! Drawn with egui's painter (no plot crate). The lanes' data and what a
+//! frame draws of them (one step per pixel column, read from a summary
+//! when there are more points than pixels) are in core
+//! (`nerka_core::plot::lane`); a signal's lanes are kept until its events
+//! or the clock change.
 
 use eframe::egui::{self, Align2, Color32, ColorImage, FontId, Pos2, Rect, Sense, Stroke, pos2, vec2};
+use nerka_core::plot::lane::{Band, Lane};
 use nerka_core::plot::{Lane as LaneLayout, PlotLayout};
 pub use nerka_core::plot::{Marker, YAxis};
-use nerka_core::{Clock, LineNo, LogSource, SignalDef, SignalKind, SignalSeries, Signals, ValueRef, time::format_time};
+use nerka_core::{Clock, LineNo, LogSource, SignalDef, SignalKind, SignalSeries, Signals, time::format_time};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard};
 
@@ -250,6 +254,30 @@ pub struct PlotState {
     drag_scroll: bool,
     /// Lanes, built for (signals generation, the filter result).
     data: Option<((u64, usize), PlotData)>,
+    /// Each plotted signal's lanes and what they were built from: a change
+    /// elsewhere (another lane, a filter that doesn't touch the signal)
+    /// keeps them (review 2026-11-14, P2).
+    lane_cache: HashMap<String, (LaneKey, Vec<Arc<Lane>>)>,
+}
+
+/// What a signal's lanes were built from: its definition, its events and
+/// the clock (with the clock signal's events).
+struct LaneKey {
+    spec: String,
+    series: Arc<SignalSeries>,
+    clock: String,
+    clock_series: Option<SignalSeries>,
+}
+
+impl LaneKey {
+    fn same(&self, other: &LaneKey) -> bool {
+        let clock_same = match (&self.clock_series, &other.clock_series) {
+            (None, None) => true,
+            (Some(a), Some(b)) => a.same_as(b),
+            _ => false,
+        };
+        self.spec == other.spec && self.clock == other.clock && clock_same && self.series.same_as(&other.series)
+    }
 }
 
 impl PlotState {
@@ -315,29 +343,10 @@ impl PlotState {
 }
 
 struct PlotData {
-    lanes: Vec<Lane>,
+    lanes: Vec<Arc<Lane>>,
     /// x range of all events.
     full: (f64, f64),
     is_time: bool,
-}
-
-struct Lane {
-    /// What it shows: the signal's name, with the key for a signal bound to
-    /// a lifecycle of several keys (`ota A`).
-    name: String,
-    /// The signal it is of (several lanes for one bound per key).
-    signal: String,
-    kind: SignalKind,
-    /// Events by x (ties keep row order): x, y (value or enum id), row.
-    /// For a signal bound to a lifecycle, also a point where each lifecycle
-    /// starts: its default (`assumed`), or NaN (unset).
-    xs: Vec<f64>,
-    ys: Vec<f64>,
-    rows: Vec<LineNo>,
-    assumed: Vec<bool>,
-    /// Enum ids' texts.
-    labels: Vec<String>,
-    y_range: (f64, f64),
 }
 
 /// The y range a lane shows: its values' range `(lo, hi)` widened to its
@@ -377,12 +386,12 @@ const LANE_MAX: f32 = 110.0;
 const LANE_MIN: f32 = 52.0;
 const SCROLLBAR_W: f32 = 6.0;
 
-/// A lane's point: x, y, row, assumed (a default, not an event).
-type Point = (f64, f64, LineNo, bool);
-
-/// Build the lanes, or say why they can't be built yet.
+/// Build the lanes, or say why they can't be built yet. A signal's lanes
+/// built before from the same events on the same clock are reused; the
+/// others are built in parallel (`nerka_core::plot::lane`).
 fn build(
     state: &PlotState,
+    cache: &mut HashMap<String, (LaneKey, Vec<Arc<Lane>>)>,
     signals: &Signals,
     file: &dyn LogSource,
     clock: &Clock,
@@ -392,84 +401,74 @@ fn build(
         Clock::Signal(d) => Some(d.cached_series(file).ok_or("Collecting the time signal's events…")?),
         _ => None,
     };
+    let clock_name = match clock {
+        Clock::Signal(d) => d.spec(),
+        c => c.describe(),
+    };
     let x_of = |row: LineNo| clock.at(file, clock_series.as_ref(), row);
-    let mut lanes = Vec::new();
+    // Every lane's events first: a lane still being collected leaves the
+    // plot as it is, before any lane is built (review 2026-11-14, P2a: the
+    // lanes before it were built and thrown away on every try).
+    enum Ready {
+        Events(Arc<SignalSeries>),
+        Lives(Arc<nerka_core::lifecycle::Lifecycles>),
+    }
+    let mut ready = Vec::new();
+    for name in &state.plotted {
+        let Some(def) = signals.get(name) else { continue };
+        let r = match def.as_lifecycle() {
+            Some(life) => Ready::Lives(life.cached(file).ok_or("Finding lifecycles…")?),
+            None => Ready::Events(series_of(def).ok_or("Collecting events…")?),
+        };
+        ready.push((name, def, r));
+    }
     // A plotted lifecycle is a line where each starts, no lane (owner,
     // 2026-11-07: lifecycles on and off in the plot): its span counts.
     let mut life_span = (f64::INFINITY, f64::NEG_INFINITY);
+    let mut wanted = Vec::new();
+    for (name, def, r) in ready {
+        match r {
+            Ready::Lives(lives) => {
+                if let Some(first) = lives.lives.first() {
+                    let last = file.line_count().saturating_sub(1);
+                    for x in [x_of(first.first), x_of(last)].into_iter().flatten() {
+                        life_span = (life_span.0.min(x), life_span.1.max(x));
+                    }
+                }
+            }
+            Ready::Events(series) => {
+                let key =
+                    LaneKey { spec: def.spec(), series, clock: clock_name.clone(), clock_series: clock_series.clone() };
+                wanted.push((name, def, key));
+            }
+        }
+    }
+    // The lanes not built yet for what they show now, in parallel.
+    let missing: Vec<_> =
+        wanted.iter().filter(|(name, _, key)| !cache.get(*name).is_some_and(|(k, _)| k.same(key))).collect();
+    let todo: Vec<(&str, &SignalDef, &SignalSeries)> =
+        missing.iter().map(|(name, def, key)| (name.as_str(), &***def, &*key.series)).collect();
+    let built = nerka_core::plot::lane::lanes_of_all(&todo, file, clock, clock_series.as_ref());
+    let built: Vec<(String, Vec<Arc<Lane>>)> = missing
+        .iter()
+        .zip(built)
+        .map(|((name, _, _), lanes)| ((*name).clone(), lanes.into_iter().map(Arc::new).collect()))
+        .collect();
+    let mut keys: HashMap<&String, LaneKey> = HashMap::new();
+    let mut lanes = Vec::new();
+    for (name, _, key) in wanted {
+        keys.insert(name, key);
+    }
+    for (name, built) in built {
+        let key = keys.remove(&name).expect("wanted");
+        cache.insert(name, (key, built));
+    }
+    // Only what is plotted stays.
+    cache.retain(|name, _| state.plotted.contains(name));
     for name in &state.plotted {
-        let Some(def) = signals.get(name) else { continue };
-        if let Some(life) = def.as_lifecycle() {
-            let lives = life.cached(file).ok_or("Finding lifecycles…")?;
-            if let Some(first) = lives.lives.first() {
-                let last = file.line_count().saturating_sub(1);
-                for x in [x_of(first.first), x_of(last)].into_iter().flatten() {
-                    life_span = (life_span.0.min(x), life_span.1.max(x));
-                }
-            }
-            continue;
-        }
-        let series = series_of(def).ok_or("Collecting events…")?;
-        let mut ids: HashMap<Vec<u8>, usize> = HashMap::new();
-        let mut labels = Vec::new();
-        let mut y_of = |v: ValueRef<'_>| match v {
-            ValueRef::Num(n) => n,
-            ValueRef::Enum(t) => *ids.entry(t.to_vec()).or_insert_with(|| {
-                labels.push(String::from_utf8_lossy(t).into_owned());
-                labels.len() - 1
-            }) as f64,
-        };
-        // Points: (x, y, row, assumed); for a signal bound to a lifecycle
-        // also where each starts (its state resets there to the default).
-        let mut groups: Vec<(Option<String>, Vec<Point>)> = Vec::new();
-        let mut pts: Vec<Point> = Vec::new();
-        let mut starts: Vec<LineNo> = match series.lifecycles() {
-            Some(life) => life.lives.iter().rev().map(|l| l.first).collect(),
-            None => Vec::new(),
-        };
-        let reset = def.default_value().map_or(f64::NAN, |d| y_of(d.as_ref()));
-        for (row, v) in series.iter() {
-            while starts.last().is_some_and(|&s| s <= row) {
-                let s = starts.pop().expect("checked");
-                if s < row
-                    && let Some(x) = x_of(s)
-                {
-                    pts.push((x, reset, s, true));
-                }
-            }
-            if let Some(x) = x_of(row) {
-                pts.push((x, y_of(v), row, false));
-            }
-        }
-        for s in starts.into_iter().rev() {
-            if let Some(x) = x_of(s) {
-                pts.push((x, reset, s, true));
-            }
-        }
-        groups.push((None, pts));
-        for (key, mut pts) in groups {
-            // Clocks may step back (a logger's time jumps): keep x sorted.
-            if pts.windows(2).any(|w| w[1].0 < w[0].0) {
-                pts.sort_by(|a, b| a.0.total_cmp(&b.0));
-            }
-            let (lo, hi) = pts
-                .iter()
-                .filter(|p| p.1.is_finite())
-                .fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), p| (lo.min(p.1), hi.max(p.1)));
-            lanes.push(Lane {
-                name: match key {
-                    Some(k) => format!("{name} {k}"),
-                    None => name.clone(),
-                },
-                signal: name.clone(),
-                kind: def.kind(),
-                xs: pts.iter().map(|p| p.0).collect(),
-                ys: pts.iter().map(|p| p.1).collect(),
-                rows: pts.iter().map(|p| p.2).collect(),
-                assumed: pts.iter().map(|p| p.3).collect(),
-                labels: labels.clone(),
-                y_range: if lo <= hi { (lo, hi) } else { (0.0, 1.0) },
-            });
+        if let Some((_, l)) = cache.get(name).filter(|_| signals.get(name).is_some_and(|d| d.as_lifecycle().is_none()))
+        {
+            lanes.extend(l.iter().cloned());
         }
     }
     let full = lanes
@@ -609,7 +608,10 @@ pub fn plot_panel(ui: &mut egui::Ui, state: &mut PlotState, src: Source<'_>) -> 
     }
     let key = (generation, kept);
     if state.data.as_ref().is_none_or(|(k, _)| *k != key) {
-        match build(state, signals, file, &clock, series_of) {
+        let mut cache = std::mem::take(&mut state.lane_cache);
+        let built = build(state, &mut cache, signals, file, &clock, series_of);
+        state.lane_cache = cache;
+        match built {
             Ok(d) => state.data = Some((key, d)),
             Err(why) => {
                 state.data = None;
@@ -948,12 +950,7 @@ pub fn plot_panel(ui: &mut egui::Ui, state: &mut PlotState, src: Source<'_>) -> 
                 let markers = state.markers.get(&lane.name).map_or(&[][..], Vec::as_slice);
                 let (lo, hi) = match state.y.get(&lane.name).copied().unwrap_or(YAxis::All) {
                     YAxis::All => with_markers(lane.y_range, markers),
-                    YAxis::Visible => with_markers(
-                        lane.ys[from..i1.max(from + 1).min(lane.ys.len())]
-                            .iter()
-                            .fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), &v| (lo.min(v), hi.max(v))),
-                        markers,
-                    ),
+                    YAxis::Visible => with_markers(lane.min_max(from, i1.max(from + 1)), markers),
                     YAxis::Fixed(lo, hi) => (lo, hi),
                 };
                 // Labels show the range; a little room around the values.
@@ -1643,39 +1640,16 @@ fn draw_steps(
     let (from, to) = (events.start, events.end);
     let stroke = Stroke::new(1.5, color);
     // A lane with defaults or unset spans: drawn piece by piece.
-    if lane.assumed.iter().any(|&a| a) {
+    if lane.any_assumed() {
         return draw_pieces(painter, lane, area, from, to, to_px, to_py, stroke);
     }
-    let mut line: Vec<Pos2> = Vec::new();
-    // Per column: the range of values seen, drawn as one vertical stroke.
-    let (mut col, mut lo, mut hi) = (f32::NAN, f32::NAN, f32::NAN);
-    let flush = |col: f32, lo: f32, hi: f32| {
-        if col.is_finite() && hi - lo >= 1.0 {
-            painter.line_segment([pos2(col, lo), pos2(col, hi)], stroke);
-        }
-    };
-    for i in from..to.min(lane.xs.len()) {
-        let px = to_px(lane.xs[i]).max(area.min.x).floor();
-        let py = to_py(lane.ys[i]);
-        if px == col {
-            (lo, hi) = (lo.min(py), hi.max(py));
-            line.last_mut().expect("a point in this column").y = py;
-            continue;
-        }
-        flush(col, lo, hi);
-        if let Some(prev) = line.last().copied() {
-            line.push(pos2(px, prev.y));
-        }
-        line.push(pos2(px, py));
-        (col, lo, hi) = (px, py, py);
+    // Per column: the range of values seen, one vertical stroke; a step
+    // line through each column's last value (`nerka_core::plot::lane`).
+    let steps = lane.steps(from, to, (area.min.x, area.max.x), to_px, to_py);
+    for [x, lo, hi] in steps.strokes {
+        painter.line_segment([pos2(x, lo), pos2(x, hi)], stroke);
     }
-    flush(col, lo, hi);
-    // The last state holds to the right edge (if the lane goes on).
-    if let Some(last) = line.last().copied() {
-        let end = if to < lane.xs.len() { to_px(lane.xs[to]) } else { area.max.x };
-        line.push(pos2(end.min(area.max.x), last.y));
-    }
-    painter.add(egui::Shape::line(line, stroke));
+    painter.add(egui::Shape::line(steps.line.into_iter().map(|(x, y)| pos2(x, y)).collect(), stroke));
 }
 
 /// A number's state with defaults (dashed: assumed) and unset spans
@@ -1713,54 +1687,6 @@ fn draw_pieces(
     }
 }
 
-/// A band of an enum lane, in pixels.
-#[derive(Debug, Clone, Copy, PartialEq)]
-enum Band {
-    /// One value (its id; NaN: unset), from an event or assumed (a default).
-    Value { from: f32, to: f32, y: f64, assumed: bool },
-    /// The value changes within these pixels: no one value to show.
-    Mixed { from: f32, to: f32 },
-}
-
-/// The bands of points `from..to` of `lane` in `area`. Runs of one value
-/// (a default is a run of its own) narrower than a pixel gather in a mixed
-/// band (owner, 2026-11-07: a colour there looked like one value, and
-/// zooming in showed another).
-fn bands(lane: &Lane, area: Rect, from: usize, to: usize, to_px: impl Fn(f64) -> f32) -> Vec<Band> {
-    let end = to.min(lane.xs.len());
-    let mut out = Vec::new();
-    let mut mixed: Option<(f32, f32)> = None;
-    let mut i = from;
-    while i < end {
-        let assumed = lane.assumed.get(i).copied().unwrap_or(false);
-        let mut j = i + 1;
-        while j < end && !assumed && lane.ys[j].to_bits() == lane.ys[i].to_bits() && !lane.assumed[j] {
-            j += 1;
-        }
-        let start = to_px(lane.xs[i]).max(area.min.x);
-        let stop = if j < lane.xs.len() { to_px(lane.xs[j]) } else { area.max.x }.min(area.max.x);
-        if start >= area.max.x {
-            break;
-        }
-        if stop - start < 1.0 {
-            mixed = Some(match mixed {
-                Some((a, b)) => (a.min(start), b.max(stop)),
-                None => (start, stop),
-            });
-        } else {
-            if let Some((a, b)) = mixed.take() {
-                out.push(Band::Mixed { from: a, to: b.max(a + 1.0) });
-            }
-            out.push(Band::Value { from: start, to: stop, y: lane.ys[i], assumed });
-        }
-        i = j;
-    }
-    if let Some((a, b)) = mixed {
-        out.push(Band::Mixed { from: a, to: b.max(a + 1.0) });
-    }
-    out
-}
-
 /// An enum's state: bands coloured by value, labelled where wide enough;
 /// grey where it changes within a pixel.
 #[allow(clippy::too_many_arguments)]
@@ -1774,7 +1700,7 @@ fn draw_bands(
     font: &FontId,
     mixed_color: Color32,
 ) {
-    for b in bands(lane, area, from, to, to_px) {
+    for b in lane.bands((area.min.x, area.max.x), from, to, to_px) {
         match b {
             Band::Mixed { from, to } => {
                 let band = Rect::from_min_max(pos2(from, area.min.y), pos2(to, area.max.y));
@@ -1822,16 +1748,8 @@ fn draw_ticks(
     to_px: impl Fn(f64) -> f32,
     color: Color32,
 ) {
-    let mut last = f32::NAN;
-    for i in from..to.min(lane.xs.len()) {
-        if lane.assumed[i] {
-            continue;
-        }
-        let px = to_px(lane.xs[i]).floor();
-        if px != last {
-            painter.line_segment([pos2(px, area.max.y - 6.0), pos2(px, area.max.y + 2.0)], Stroke::new(1.0, color));
-            last = px;
-        }
+    for px in lane.ticks(from, to, to_px) {
+        painter.line_segment([pos2(px, area.max.y - 6.0), pos2(px, area.max.y + 2.0)], Stroke::new(1.0, color));
     }
 }
 
@@ -1876,40 +1794,55 @@ fn short_num(v: f64) -> String {
 mod tests {
     use super::*;
 
-    /// A signal bound to a lifecycle of two ECUs: a lane per ECU, a
-    /// default point (assumed) where each lifecycle starts, its events.
-    /// Values changing within a pixel are one grey band, not the colour of
-    /// the first of them (bug, owner, 2026-11-07).
+    /// Review 2026-11-14, P2: a lane is built again only when what it shows
+    /// changed (its signal's events, the clock); another lane plotted or
+    /// unplotted, or a filter its signal doesn't follow, keeps it.
     #[test]
-    fn values_changing_within_a_pixel_are_mixed() {
-        // a, b, a, b at x 0.0, 0.1, 0.2, 0.3, then a from 1 to 5, b from 5.
-        let lane = Lane {
-            name: "s".into(),
-            signal: "s".into(),
-            kind: SignalKind::Enum,
-            xs: vec![0.0, 0.1, 0.2, 0.3, 1.0, 5.0],
-            ys: vec![0.0, 1.0, 0.0, 1.0, 0.0, 1.0],
-            rows: vec![0, 1, 2, 3, 4, 5],
-            assumed: vec![false, false, false, false, true, false],
-            labels: vec!["a".into(), "b".into()],
-            y_range: (0.0, 1.0),
+    fn lanes_are_built_again_only_when_their_signal_changes() {
+        let text: String = (0..40).map(|i| format!("00:00:{i:02} v={i} w={}\n", i % 3)).collect();
+        let file = nerka_core::TextFile::from_bytes("t", text.into_bytes());
+        let mut sig = Signals::default();
+        for spec in [r"t:time=/^(?<t>\S+)/", r"v=/v=(?<v>\d+)/", r"w:filtered=/w=(?<w>\d+)/"] {
+            sig.set(SignalDef::parse_spec(spec).unwrap());
+        }
+        sig.collect(&file, &nerka_core::Progress::new()).unwrap();
+        let clock = Clock::of(&file, &sig);
+        let mut cache = HashMap::new();
+        let mut state = PlotState::default();
+        state.toggle("v");
+        state.toggle("w");
+        let kept_all = Arc::new(nerka_core::SearchResult { lines: (0..40).collect() });
+        let kept_few = Arc::new(nerka_core::SearchResult { lines: (0..10).collect() });
+        let mut views = crate::signals::Views::default();
+        let mut lanes = |state: &PlotState, cache: &mut _, kept: &Arc<nerka_core::SearchResult>, sig: &Signals| {
+            let mut series_of = |d: &SignalDef| views.series(d, &file, Some(kept), 1);
+            let data = build(state, cache, sig, &file, &clock, &mut series_of).unwrap();
+            data.lanes.iter().map(|l| (l.signal.clone(), l.clone())).collect::<HashMap<_, _>>()
         };
-        let area = Rect::from_min_max(pos2(0.0, 0.0), pos2(10.0, 10.0));
-        // One pixel per x unit.
-        let got = bands(&lane, area, 0, lane.xs.len(), |x| x as f32);
-        assert_eq!(
-            got,
-            [
-                Band::Mixed { from: 0.0, to: 1.0 },
-                Band::Value { from: 1.0, to: 5.0, y: 0.0, assumed: true },
-                Band::Value { from: 5.0, to: 10.0, y: 1.0, assumed: false },
-            ]
-        );
-        // Zoomed in, each is its own band.
-        let got = bands(&lane, area, 0, 4, |x| x as f32 * 100.0);
-        assert!(got.iter().all(|b| matches!(b, Band::Value { .. })), "{got:?}");
+        let first = lanes(&state, &mut cache, &kept_all, &sig);
+        assert_eq!(first.len(), 2);
+        // Another lane off: `v` stays as built.
+        state.toggle("w");
+        let second = lanes(&state, &mut cache, &kept_all, &sig);
+        assert!(Arc::ptr_eq(&first["v"], &second["v"]));
+        assert!(!cache.contains_key("w"), "what isn't plotted goes");
+        state.toggle("w");
+        // A filter: `v` (all lines) stays, `w` (filtered lines) is built again.
+        let third = lanes(&state, &mut cache, &kept_all, &sig);
+        let fourth = lanes(&state, &mut cache, &kept_few, &sig);
+        assert!(Arc::ptr_eq(&first["v"], &fourth["v"]));
+        assert!(!Arc::ptr_eq(&third["w"], &fourth["w"]));
+        assert!(fourth["w"].xs.len() < third["w"].xs.len());
+        // `v` defined again with another kind: built again.
+        sig.set(SignalDef::parse_spec(r"v:enum=/v=(?<v>\d+)/").unwrap());
+        sig.collect(&file, &nerka_core::Progress::new()).unwrap();
+        let fifth = lanes(&state, &mut cache, &kept_few, &sig);
+        assert!(!Arc::ptr_eq(&first["v"], &fifth["v"]));
+        assert_eq!(fifth["v"].kind, SignalKind::Enum);
     }
 
+    /// A signal bound to a lifecycle of two ECUs: a lane per ECU, a
+    /// default point (assumed) where each lifecycle starts, its events.
     #[test]
     fn a_bound_signal_resets_where_its_lifecycle_starts() {
         use nerka_core::input::dlt::writer::{Msg, Value};
@@ -1933,7 +1866,8 @@ mod tests {
         d.series(&file, &nerka_core::Progress::new()).unwrap();
         let state = PlotState { plotted: vec!["s".into()], ..Default::default() };
         let mut series_of = |d: &SignalDef| d.cached_series(&file).map(Arc::new);
-        let data = build(&state, &signals, &file, &Clock::of(&file, &signals), &mut series_of).unwrap();
+        let data =
+            build(&state, &mut HashMap::new(), &signals, &file, &Clock::of(&file, &signals), &mut series_of).unwrap();
         let lane = &data.lanes[0];
         let pts: Vec<(LineNo, bool)> = lane.rows.iter().copied().zip(lane.assumed.iter().copied()).collect();
         // Its events (A's lines); where A's second lifecycle starts, the
@@ -1945,12 +1879,12 @@ mod tests {
         // no lane, its starts drawn; alone, the plot spans its lifecycles.
         let clock = Clock::of(&file, &signals);
         let state = PlotState { plotted: vec!["a".into()], ..Default::default() };
-        let data = build(&state, &signals, &file, &clock, &mut series_of).unwrap();
+        let data = build(&state, &mut HashMap::new(), &signals, &file, &clock, &mut series_of).unwrap();
         assert!(data.lanes.is_empty());
         let x = |r| clock.at(&file, None, r).unwrap();
         assert_eq!(data.full, (x(0), x(4)));
         let state = PlotState { plotted: vec!["a".into(), "s".into()], ..Default::default() };
-        let data = build(&state, &signals, &file, &clock, &mut series_of).unwrap();
+        let data = build(&state, &mut HashMap::new(), &signals, &file, &clock, &mut series_of).unwrap();
         assert_eq!(data.lanes.iter().map(|l| l.name.as_str()).collect::<Vec<_>>(), ["s"]);
     }
 
@@ -2078,9 +2012,7 @@ mod tests {
             st.toggle(&a.name.to_ascii_lowercase());
         }
         let t = Instant::now();
-        for d in sig.iter() {
-            d.series(&*file, &p).unwrap();
-        }
+        sig.collect(&*file, &p).unwrap();
         eprintln!("series {:.0} ms", t.elapsed().as_secs_f64() * 1e3);
         let ctx = egui::Context::default();
         let screen = Rect::from_min_size(pos2(0.0, 0.0), vec2(1600.0, 1000.0));
@@ -2149,33 +2081,46 @@ mod tests {
             st.toggle(name);
             run(&format!("lane {name} on"), vec![], &mut st, &sig, gen_, 0);
         }
-        // A new signal ticked and plotted (Signals panel, FIBEX tree): the
-        // tab's signals change, its events are collected in the background
-        // (the others are cached), the plot waits for them.
+        // A FIBEX signal ticked and plotted, then unticked: as the GUI's
+        // `refresh_signals`, the tab's signals are built again from the
+        // picks; the background job collects every signal's events (cached
+        // ones at once); the plot waits for them.
+        let make = |picks: &[nerka_core::Argument], old: &Signals| {
+            let mut s = Signals::default().for_source(&*file);
+            for a in picks {
+                let q = format!("mid == {} AND ecu == \"{}\"", a.mid, a.ecu.as_deref().unwrap_or("ECU1"));
+                s.set(SignalDef::argument(&a.name, a.ty.kind(), &q, a.index, "perf").unwrap());
+            }
+            s.adopt_caches(old);
+            s
+        };
+        let collect = |s: &Signals| {
+            let c = Instant::now();
+            s.collect(&*file, &p).unwrap();
+            eprintln!("  events collected: {:.0} ms", ms(c));
+        };
+        let mut picks = args.clone();
         let mut more: Vec<_> = cat.arguments().into_iter().filter(|a| a.ty.kind() == SignalKind::Num).collect();
         more.sort_by_key(|a| (a.mid, a.index));
         for a in [&more[n], &more[more.len() - 1]] {
             let name = a.name.to_ascii_lowercase();
             let t = Instant::now();
-            let q = format!("mid == {} AND ecu == \"{}\"", a.mid, a.ecu.as_deref().unwrap_or("ECU1"));
-            sig.set(SignalDef::argument(&a.name, a.ty.kind(), &q, a.index, "perf").unwrap());
+            picks.push(a.clone());
+            sig = make(&picks, &sig);
             st.toggle(&name);
             gen_ += 1;
             run(&format!("signal {name} added (waiting)"), vec![], &mut st, &sig, gen_, 0);
-            let c = Instant::now();
-            for d in sig.iter() {
-                d.series(&*file, &p).unwrap();
-            }
-            let events = sig.get(&name).unwrap().cached_series(&*file).unwrap().len();
-            eprintln!("  its events: {:.0} ms, {events}", ms(c));
+            collect(&sig);
             run(&format!("signal {name} added (built)"), vec![], &mut st, &sig, gen_, 0);
             eprintln!("  => plot again after {:.0} ms", ms(t));
-            // And taken away again (the − in the list: its lane goes too).
             let t = Instant::now();
-            sig.remove(&name);
+            picks.pop();
+            sig = make(&picks, &sig);
             st.toggle(&name);
             gen_ += 1;
-            run(&format!("signal {name} removed"), vec![], &mut st, &sig, gen_, 0);
+            run(&format!("signal {name} removed (waiting)"), vec![], &mut st, &sig, gen_, 0);
+            collect(&sig);
+            run(&format!("signal {name} removed (built)"), vec![], &mut st, &sig, gen_, 0);
             eprintln!("  => plot again after {:.0} ms", ms(t));
         }
         // A filter applied: the result is new, so is the plot's key.

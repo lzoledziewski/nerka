@@ -443,14 +443,34 @@ pub fn open_many(
     options: &super::OpenOptions,
     progress: &crate::Progress,
 ) -> Result<Box<dyn LogSource>> {
-    let mut parts = Vec::with_capacity(paths.len());
-    for p in paths {
-        parts.push(super::open_with(p, options, progress).map_err(|e| Error::opening(p, e))?);
-    }
+    let mut parts = open_all(paths, options, progress)?;
     if parts.len() == 1 {
         return Ok(parts.pop().expect("one"));
     }
     Ok(Box::new(Concat::new(parts)?))
+}
+
+/// Open `paths` at once (review 2026-11-14, P7; review 2026-11-09, R18),
+/// each a part of `progress` by its size; the first error in the given
+/// order, if any.
+fn open_all(
+    paths: &[std::path::PathBuf],
+    options: &super::OpenOptions,
+    progress: &crate::Progress,
+) -> Result<Vec<Box<dyn LogSource>>> {
+    use rayon::prelude::*;
+    if let [one] = paths {
+        return super::open_with(one, options, progress).map_err(|e| Error::opening(one, e)).map(|s| vec![s]);
+    }
+    let parts: Vec<_> =
+        paths.iter().map(|p| progress.part(std::fs::metadata(p).map_or(1, |m| m.len().max(1)))).collect();
+    let opened: Vec<Result<Box<dyn LogSource>>> = paths
+        .par_iter()
+        .zip(&parts)
+        .map(|(p, part)| super::open_with(p, options, part).map_err(|e| Error::opening(p, e)))
+        .collect();
+    progress.end_parts();
+    opened.into_iter().collect()
 }
 
 /// Like [`open_many`], but files that know their lines' times (DLT,
@@ -495,10 +515,7 @@ fn open_sorted(
     options: &super::OpenOptions,
     progress: &crate::Progress,
 ) -> Result<Sorted> {
-    let mut parts = Vec::with_capacity(paths.len());
-    for p in paths {
-        parts.push((p.clone(), super::open_with(p, options, progress).map_err(|e| Error::opening(p, e))?));
-    }
+    let mut parts: Vec<_> = paths.iter().cloned().zip(open_all(paths, options, progress)?).collect();
     let starts: Option<Vec<f64>> = parts.iter().map(|(_, s)| start_time(s.as_ref())).collect();
     let timed = starts.is_some();
     if let Some(starts) = starts {

@@ -113,6 +113,11 @@ struct Field {
 
 impl Field {
     fn raw(&self, rec: &[u8]) -> Option<u64> {
+        // The usual case (offsets, times): a whole little-endian u64.
+        if self.bit == 0 && self.bits == 64 && self.data_type.is_multiple_of(2) {
+            let b = rec.get(self.byte..self.byte + 8)?;
+            return Some(u64::from_le_bytes(b.try_into().expect("8 bytes")));
+        }
         let nbytes = (self.bit + self.bits).div_ceil(8) as usize;
         let bytes = rec.get(self.byte..self.byte + nbytes.min(8))?;
         let mut v = 0u64;
@@ -383,8 +388,14 @@ impl<'a> Stream<'a> {
                 })
                 .collect();
         }
-        // The segment holding `at`: the first that ends after it.
-        self.seg = self.ends.partition_point(|&e| e <= at);
+        // The segment holding `at`: the first that ends after it. Offsets
+        // mostly grow, so the current segment or the next one first.
+        let start = |k: usize| if k == 0 { 0 } else { self.ends[k - 1] };
+        self.seg = match self.seg {
+            k if k < self.ends.len() && start(k) <= at && at < self.ends[k] => k,
+            k if k + 1 < self.ends.len() && self.ends[k] <= at && at < self.ends[k + 1] => k + 1,
+            _ => self.ends.partition_point(|&e| e <= at),
+        };
         self.off = at - if self.seg == 0 { 0 } else { self.ends[self.seg - 1] };
         let len = self.take(4)?;
         let len = u32::from_le_bytes(len.as_ref().try_into().ok()?) as usize;

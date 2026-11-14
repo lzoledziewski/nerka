@@ -191,6 +191,7 @@ fn read(
         Some((b, l)) => (b.bytes(), Some(l)),
         None => (file, None),
     };
+    super::prefault(bytes, progress);
     let protos = protocols(options)?;
     let rules = rules(options, &protos);
     let mut sink = Sink {
@@ -204,6 +205,7 @@ fn read(
             stats: CaptureStats::default(),
             found: Vec::new(),
             origins: OriginTable::default(),
+            sized: false,
         },
         options,
         rules: &rules,
@@ -356,6 +358,8 @@ struct Collector<'a> {
     /// for all datagrams (an MF4 log has one per message).
     found: Vec<usize>,
     origins: OriginTable,
+    /// `msgs` was sized for the whole file (from its first messages).
+    sized: bool,
 }
 
 /// Builds a capture's [`Origins`]: each sender and each (channel, sender)
@@ -483,7 +487,18 @@ impl Collector<'_> {
             Payload::Assembled(_) => None,
         };
         let (in_side, base) = match in_file {
-            Some(off) => (false, off),
+            Some(off) => {
+                // Once a few thousand messages are in, the index is sized
+                // for the whole file at their rate (review 2026-11-14, P8:
+                // growing it by doubling copied it again and again).
+                if !self.sized && self.msgs.len() >= 4096 && off > 0 {
+                    self.sized = true;
+                    let expected = ((self.msgs.len() as f64 * self.base.len() as f64 / off as f64 * 1.05) as usize)
+                        .min(self.base.len() / 16);
+                    self.msgs.reserve_exact(expected.saturating_sub(self.msgs.len()));
+                }
+                (false, off)
+            }
             None => {
                 let at = self.side.len();
                 self.side.extend_from_slice(bytes);

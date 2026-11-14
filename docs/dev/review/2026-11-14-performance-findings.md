@@ -204,6 +204,43 @@ What isn't a problem: header filters (`mid`, `ecu`, `apid`, `level`) run at 10�
 FIBEX lookups and argument decoding are cheap (a hash per message, the argument read in place); tessellation
 is a few ms even at 400 k vertices; zoomed-in plots are fast.
 
+## Fixed (2026-11-14)
+
+In the order proposed below, each step measured (3 GiB set, 30 plotted signals, the GUI's code headless
+through `perf_big_plot` and `perf_signals`) and checked (workspace tests, clippy, a test per change that fails
+without it).
+
+| Step | What | Measured |
+|---|---|---|
+| P9 | `Signals::adopt_caches`: a tab's signals built again share the events of unchanged definitions (`refresh_signals`) | a signal added: its events collected 4.1 s → 0.1 s; removed: 4.1 s → 0 |
+| P2a | `build` checks every lane's events before building any | a signal added: 5.3 s → 2.7 s until the plot shows |
+| R-A (P3) | `Signals::collect` (`core/src/signal/collect.rs`): keyed signals in one pass per file; the GUI's background job uses it | 30 signals: 4.2 s → 1.5 s (pcap), 4.3 s → 1.8 s (MF4) |
+| R-B (P1, P2) | `nerka_core::plot::lane`: lanes built in parallel, a min / max summary and each block's first x; the GUI keeps lanes per signal (`LaneKey`) | below |
+| P4 | MF4: the current block before a search; an aligned u64 field in one load | cached open 3.73 s → 2.58 s |
+| P8 | Mapped pages brought in on every core before a one-thread reader (`input::prefault`); the index sized from its first messages | pcap 1.03 → 0.62 s, MF4 cached 2.58 → 2.20 s, DLT 6 GiB 1.70 → 0.91 s, pcap 6 GiB 2.31 → 1.24 s; peak private memory of a pcap open 1,554 → 1,080 MiB, DLT 6 GiB 1,066 MiB for a 1,005 MiB index |
+| P4b | DZ blocks up to 64 MiB unpacked in parallel batches, written in order (the cache file byte for byte the same) | first MF4 open 10.7 → 8.5–9.7 s: now bound by writing 3.5 GiB to the cache (~600 MB/s here) |
+| P7 | Several files opened at once (`open_all`), each a part of the progress by its size (`Progress::part`; before, the bar sat at 100 % after the first file) | pcap + MF4: 4.86 → 2.36 s; merged by time 7.17 → 4.68 s |
+
+The plot with 30 lanes, before → after R-B:
+
+| | Before (after P9, P2a, R-A) | After |
+|---|---|---|
+| A repaint at full zoom | 182 ms | 12 ms |
+| The first frame (all lanes built) | 2.66 s | 0.30 s |
+| A lane off / on | 2.4–2.7 s | 13–23 ms (the 10.7 M-point lane back on: 148 ms) |
+| A signal added / removed, until the plot shows | 2.8 s / 2.8 s (6.9 s / 6.8 s before P9) | 0.13 s / 0.04 s |
+| A filter applied | 2.9–3.0 s | 0.23–0.29 s (the filter itself) |
+
+Checked after all steps: the 6 GiB set gives the same output byte for byte as before the fixes
+(`filter 'mid == 1039'` on the DLT and the pcap), the 3 GiB pcap and MF4 the same rows; `tools/bench.sh`
+(`KSY=1`, 5 runs) within ±9 % of `baseline/bench-2026-11-09.tsv` on every query, the same match counts.
+
+**Still open:** the lanes are built on the UI thread (0.3 s at first, 0.15 s for a 10 M-point lane: a job
+when files grow); a merge by time interleaves on one thread (2.3 s for 132 M rows); the MF4 reader (2.2 s
+against the pcap's 0.6 s, a frame per message); a lane with defaults (a signal bound to a lifecycle) is still
+drawn point by point; an enum that changes on most points walks them all; P5 (memory per event and point),
+P6 (payload regexes), a parallel `.dlt` index.
+
 ## Fixes
 
 Effort: S hours, M days, L a week or more. Costs from the measurements above (30 plotted signals, 3 GiB).

@@ -221,6 +221,7 @@ impl Records {
     pub fn open(path: impl AsRef<Path>, progress: &Progress) -> Result<Records> {
         let path = path.as_ref();
         let data = Bytes::map(path)?;
+        super::prefault(data.bytes(), progress);
         let (offsets, skipped) = build_index(data.bytes(), progress)?;
         let name = path.display().to_string();
         let dlt = Arc::new(Dlt::default());
@@ -252,14 +253,22 @@ fn build_index(buf: &[u8], progress: &Progress) -> Result<(Vec<u64>, u64)> {
     const REPORT: usize = 4 << 20;
     progress.set_total(buf.len() as u64);
     let finder = memchr::memmem::Finder::new(MAGIC);
-    // Typical messages are 60–200 bytes.
-    let mut offsets = Vec::with_capacity(buf.len() / 96);
+    // Sized for the whole file once the first messages show their size
+    // (review 2026-11-14, P8: a guess of 96 bytes each doubled the index
+    // and copied it for small messages).
+    const SAMPLE: usize = 4096;
+    let mut offsets = Vec::with_capacity(SAMPLE);
     let (mut pos, mut skipped, mut reported) = (0usize, 0u64, 0usize);
     while pos < buf.len() {
         match Message::parse(&buf[pos..]) {
             Some(m) => {
                 offsets.push(pos as u64);
                 pos += STORAGE_LEN + m.len();
+                if offsets.len() == SAMPLE {
+                    let expected = ((SAMPLE as f64 * buf.len() as f64 / pos as f64 * 1.05) as usize)
+                        .min(buf.len() / (STORAGE_LEN + 4));
+                    offsets.reserve(expected.saturating_sub(SAMPLE));
+                }
             }
             None => {
                 let next = finder.find(&buf[pos + 1..]).map_or(buf.len(), |i| pos + 1 + i);
@@ -276,7 +285,10 @@ fn build_index(buf: &[u8], progress: &Progress) -> Result<(Vec<u64>, u64)> {
         }
     }
     progress.add((buf.len() - reported) as u64);
-    offsets.shrink_to_fit();
+    // Only a guess well off is worth the copy.
+    if offsets.capacity() > offsets.len() + offsets.len() / 8 {
+        offsets.shrink_to_fit();
+    }
     Ok((offsets, skipped))
 }
 

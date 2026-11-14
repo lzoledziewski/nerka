@@ -153,7 +153,11 @@ pub struct Progress {
 struct ProgressInner {
     done: std::sync::atomic::AtomicU64,
     total: std::sync::atomic::AtomicU64,
-    cancelled: std::sync::atomic::AtomicBool,
+    /// Shared with its parts ([`Progress::part`]).
+    cancelled: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Parts running at once and their weights: while there are any, the
+    /// fraction is theirs.
+    parts: std::sync::Mutex<Vec<(u64, Progress)>>,
 }
 
 impl Progress {
@@ -166,8 +170,15 @@ impl Progress {
     pub fn add(&self, n: u64) {
         self.inner.done.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
     }
-    /// Fraction in `0.0..=1.0`.
+    /// Fraction in `0.0..=1.0`: the parts' fractions by weight while there
+    /// are parts, else done against the total.
     pub fn fraction(&self) -> f32 {
+        let parts = self.inner.parts.lock().unwrap_or_else(|e| e.into_inner());
+        if !parts.is_empty() {
+            let weight: u64 = parts.iter().map(|(w, _)| w).sum();
+            let done: f64 = parts.iter().map(|(w, p)| *w as f64 * f64::from(p.fraction())).sum();
+            return (done / weight.max(1) as f64).min(1.0) as f32;
+        }
         let total = self.inner.total.load(std::sync::atomic::Ordering::Relaxed);
         if total == 0 {
             return 0.0;
@@ -175,10 +186,49 @@ impl Progress {
         let done = self.inner.done.load(std::sync::atomic::Ordering::Relaxed);
         (done as f64 / total as f64).min(1.0) as f32
     }
+    /// A part of this operation weighing `weight` (a file's size, say)
+    /// against the other parts, with a total and progress of its own, run
+    /// alongside them (files opened at once). Cancelling the whole or a
+    /// part cancels both. [`Self::end_parts`] when they are done.
+    pub fn part(&self, weight: u64) -> Progress {
+        let p = Progress {
+            inner: std::sync::Arc::new(ProgressInner { cancelled: self.inner.cancelled.clone(), ..Default::default() }),
+        };
+        self.inner.parts.lock().unwrap_or_else(|e| e.into_inner()).push((weight, p.clone()));
+        p
+    }
+    /// The parts are done: the fraction is this one's own again.
+    pub fn end_parts(&self) {
+        self.inner.parts.lock().unwrap_or_else(|e| e.into_inner()).clear();
+    }
     pub fn cancel(&self) {
         self.inner.cancelled.store(true, std::sync::atomic::Ordering::Relaxed);
     }
     pub fn is_cancelled(&self) -> bool {
         self.inner.cancelled.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Progress;
+
+    /// Parts run at once report by weight; a cancel reaches every part.
+    #[test]
+    fn progress_parts_report_by_weight() {
+        let p = Progress::new();
+        let (a, b) = (p.part(3), p.part(1));
+        a.set_total(10);
+        b.set_total(4);
+        a.add(5);
+        b.add(4);
+        // (3 * 0.5 + 1 * 1.0) / 4
+        assert!((p.fraction() - 0.625).abs() < 1e-6, "{}", p.fraction());
+        p.end_parts();
+        p.set_total(2);
+        p.add(1);
+        assert_eq!(p.fraction(), 0.5, "its own again");
+        b.cancel();
+        assert!(p.is_cancelled() && a.is_cancelled());
     }
 }
