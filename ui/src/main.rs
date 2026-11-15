@@ -5229,8 +5229,9 @@ impl App {
             let fibex = self.fibex.clone();
             let out = egui::Panel::right("signals")
                 .resizable(true)
-                // Wide enough for a row's kind, scope, value and source.
-                .default_size(500.0)
+                // Wide enough for a row's kind, scope, value and source (names
+                // shorten in a narrower one).
+                .default_size(560.0)
                 .show(ui, |ui| {
                     let input = signals::Input {
                         signals: &tab.signals,

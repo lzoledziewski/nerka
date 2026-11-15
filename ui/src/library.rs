@@ -1467,8 +1467,16 @@ pub fn selection_panel(ui: &mut egui::Ui, lib: &mut Library, picks: &mut Picks) 
     ui.separator();
 
     // Bottom part first, so the list gets the space that is left.
+    // At most 40 % of the pane for the parameters, scrolling beyond: the
+    // query list keeps the rest (owner, 2026-11-15: with many values the
+    // parameters took the whole pane and neither could be scrolled).
+    let room = (ui.available_height() * 0.4).max(80.0);
     egui::Panel::bottom("selection-actions").show(ui, |ui| {
-        params_ui(ui, lib, picks);
+        egui::ScrollArea::vertical()
+            .id_salt("selection-params")
+            .max_height(room)
+            .auto_shrink([false, true])
+            .show(ui, |ui| params_ui(ui, lib, picks));
         if let Some(e) = &picks.error {
             ui.colored_label(ui.visuals().error_fg_color, e);
         }

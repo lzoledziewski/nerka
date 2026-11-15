@@ -77,14 +77,14 @@ the checkbox switches a saved signal on or off, **New signal or lifecycle**
 adds one. The line window (`Enter`) lists the line's own signals.
 
 A query's or FIBEX signal's kind, scope and ⚙ (lifecycle, default) change
-it **in this tab only**. A query signal changed so shows ●; **Save to
-pack** writes its options into the `signals:` line of the picked queries
+it **in this tab only**. A query signal changed so shows ●; 💾 (**Save
+to pack**) writes its options into the `signals:` line of the picked queries
 with that group (a library query: into its pack's file; an edited one keeps
 them until it is saved), ↺ goes back to what the pack gives. Nothing is
 written to a pack without that click. A signal several queries capture
 merges their events; if they give it different options, its row shows ⚠
 (hover: who gives what), the first picked query's options are used, and
-**Save to pack** writes them into all of them so they agree.
+💾 writes them into all of them so they agree.
 
 ## Plots
 
