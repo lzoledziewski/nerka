@@ -732,11 +732,11 @@ pub fn plot_panel(ui: &mut egui::Ui, state: &mut PlotState, src: Source<'_>) -> 
             Ok(d) => state.data = Some((key, d)),
             // Built on a thread: the plot as it was until then.
             Err(why) if why == BUILDING && state.data.is_some() => {
-                ui.weak(why);
+                busy(ui, &why);
             }
             Err(why) => {
                 state.data = None;
-                ui.weak(why);
+                busy(ui, &why);
                 ui.ctx().request_repaint_after(std::time::Duration::from_millis(100));
                 return out;
             }
@@ -1688,6 +1688,16 @@ impl LabelRows {
             row
         })
     }
+}
+
+/// What the plot is waiting for, with a spinner: the window is alive
+/// (owner, 2026-11-15: on a big file it said "Collecting events…" for a
+/// while, still).
+fn busy(ui: &mut egui::Ui, what: &str) {
+    ui.horizontal(|ui| {
+        ui.add(egui::Spinner::new().size(12.0));
+        ui.weak(what);
+    });
 }
 
 /// A right-click menu with fields in it (a note, marker labels and values).

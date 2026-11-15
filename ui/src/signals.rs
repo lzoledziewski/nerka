@@ -489,7 +489,7 @@ pub fn signals_panel(ui: &mut egui::Ui, st: &mut SignalsUi, input: Input<'_>) ->
                                 }
                             },
                             None => {
-                                ui.weak("…").on_hover_text("Collecting events");
+                                ui.add(egui::Spinner::new().size(12.0)).on_hover_text("Collecting events");
                             }
                         },
                         Some(Err(e)) => {
