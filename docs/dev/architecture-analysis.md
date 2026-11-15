@@ -142,7 +142,7 @@ nerka/
       dlt/              DLT reader + writer, FIBEX (non-verbose)
       proto/            Protocol trait; DLT, SOME/IP, syslog; ksy/ (protocols from .ksy definitions)
       capture/          pcap, pcapng, MF4 (+ unpack cache), network layers, UDP port routes
-      concat.rs, merged.rs   several files as one view; interleaved by time (--merge)
+      concat.rs, merged.rs   several files as one view; sorted by time (--merge)
     src/engine/         LineIndex, search/Filter/Highlighter, within (search inside a filter result)
     src/dsl/            NFD parser + evaluator, auto (Auto mode: plain words + NFD)
     src/pack/           query packs: parser, Library, expand, write

@@ -487,7 +487,7 @@ pub fn open_many_by_time(
     Ok((source, paths))
 }
 
-/// Like [`open_many_by_time`], with the files' lines interleaved by time
+/// Like [`open_many_by_time`], with the files' lines sorted by time
 /// ([`super::merged::Merged`]) when there are several and each knows its
 /// lines' times; otherwise as `open_many_by_time` opens them.
 pub fn open_merged_by_time(

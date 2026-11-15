@@ -65,7 +65,8 @@ Files opened together (multi-select in **Open…**, dropping several,
 `nerka-gui a.dlt b.pcap`) become **one tab**, one after another in the
 order given. The tab's menu → **Files…** lists them: move, remove or add
 files, turn protocols on or off per capture. **Merge by time** in the
-menu interleaves lines by their time, for files that know it; a tab of one
+menu sorts all their lines by time (files that know it; lines of one time
+in the order of the files, then of each file); a tab of one
 such file has **Sort by time** instead. A field `file` tells the files
 apart in queries. See [Files and formats](formats.md).
 

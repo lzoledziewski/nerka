@@ -235,7 +235,7 @@ Checked after all steps: the 6 GiB set gives the same output byte for byte as be
 (`filter 'mid == 1039'` on the DLT and the pcap), the 3 GiB pcap and MF4 the same rows; `tools/bench.sh`
 (`KSY=1`, 5 runs) within ±9 % of `baseline/bench-2026-11-09.tsv` on every query, the same match counts.
 
-**Still open:** a merge by time interleaves on one thread (2.3 s for 132 M rows); the MF4 reader (2.2 s
+**Still open:** the MF4 reader (2.2 s
 against the pcap's 0.6 s, a frame per message); an enum that changes on most points (or has a
 lifecycle starting on most) walks them all; P5 (memory per event and point), P6 (payload regexes), a
 parallel `.dlt` index.
@@ -370,3 +370,8 @@ gain once the repetition is gone; revisit if filters on files over 4 GiB become 
 
 **Order:** P9 and P2a (small; most of the frozen time after a change); R-A (P3, P2 a); R-B (P1, P2); P4 and P8;
 P4b and P7; later P5 and P6. R-A before profiles, which build on it.
+
+**Merge by time sorts (0.2.2, owner):** it interleaved the files on one thread, keeping each file's own
+order (2.3 s for 132 M rows); now a stable parallel sort of all their lines by time, which also puts lines
+whose times go back in their file in place. Three captures, 23.7 M rows: 494 ms before, 450-463 ms after;
+the 132 M-row set not measured again.

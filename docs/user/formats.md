@@ -83,7 +83,7 @@ order given:
 
 ```
 nerka filter 'apid == NAV' ecu1.dlt ecu2.dlt bus.pcap          # FILE:LINE: per line
-nerka --merge filter 'apid == NAV' ecu1.dlt ecu2.dlt bus.pcap  # interleaved by time
+nerka --merge filter 'apid == NAV' ecu1.dlt ecu2.dlt bus.pcap  # sorted by time
 nerka-gui ecu1.dlt ecu2.dlt bus.pcap
 ```
 

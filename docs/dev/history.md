@@ -4,6 +4,8 @@ The dated log of the project, newest first; append-only: add an entry at the top
 
 ## 2026-11-15
 
+Merge by time sorts every line by `@time` (owner): it kept each file's own order, and real captures whose times go back inside a file (MF4s read group by group) came out unsorted; lines of one time stay in the order of the files given (`gui-decisions.md`).
+
 Built for 0.2.2: instances of a parameterised query (a pick's argument sets, ⊕ in the selection, a part, colour and signals each; `signals:` lines with parameters; presets and the command line), a warning when queries give one signal different options (⚠ on its row, Save to pack makes them agree), stale `signals:` entries listed as warnings and removed when the query is saved.
 
 Instances of a parameterised query designed (owner): a pick holds argument sets, + instance adds one, instances share the query's settings (never conflict; the same values twice refused), each instance is a part of its own, signals per instance follow the pack's group names, `signals:` lines take parameters (`query-instances.md`); in 0.2.2. Signals merge across packs (no namespaces); options that disagree show a warning and the first picked query's win. A `signals:` entry for a group its query no longer captures is removed when the query is saved, with a warning in the status bar and listed in full at the top of the Library panel.

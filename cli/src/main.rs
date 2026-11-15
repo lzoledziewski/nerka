@@ -113,9 +113,9 @@ struct Cli {
     /// or `auto` (the default: JSON if the file looks like JSON, else lines).
     #[arg(long, global = true, value_name = "SPEC")]
     records: Option<String>,
-    /// Several files: interleave their lines by time (when every file knows
-    /// its lines' times: DLT, captures); else one after another, in the
-    /// order given.
+    /// Several files: their lines sorted by time (when every file knows
+    /// its lines' times: DLT, captures; ties in the order given); else one
+    /// after another, in the order given.
     #[arg(long, global = true)]
     merge: bool,
     #[command(subcommand)]

@@ -308,7 +308,7 @@ pub trait LogSource: Send + Sync {
     }
 
     /// For a source whose rows are another source's lines in another order
-    /// ([`merged::Merged`]: files interleaved by time): that source and the
+    /// ([`merged::Merged`]: files' lines sorted by time): that source and the
     /// map both ways. The engine scans that source (its fast path) and maps
     /// the lines, unless a query depends on row numbers.
     fn reordered(&self) -> Option<Reorder<'_>> {

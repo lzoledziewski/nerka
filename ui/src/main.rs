@@ -4491,8 +4491,8 @@ impl App {
                         }
                         if t.paths.len() > 1 {
                             let mut on = t.merge;
-                            let tip = "Lines of all files in the order of their times (DLT, captures), each file's \
-                                       own order kept; off: one file after another";
+                            let tip = "All files' lines sorted by their times (DLT, captures); lines of one time in \
+                                       the order of the files, then of each file; off: one file after another";
                             if ui.checkbox(&mut on, "Merge by time").on_hover_text(tip).changed() {
                                 merge = Some(i);
                                 ui.close();

@@ -37,12 +37,22 @@ fn q(s: &dyn LogSource, nfd: &str) -> Filter {
     Filter::Query(Query::compile_for(nfd, s.schema()).unwrap_or_else(|e| panic!("{nfd}: {e}")))
 }
 
+/// Owner, 2026-11-15: merged files are in `@time` order, lines whose times
+/// go back in their file too (it kept each file's own order, and real
+/// captures came out unsorted).
 #[test]
-fn lines_interleave_by_time_and_each_file_keeps_its_order() {
+fn lines_of_several_files_are_sorted_by_time() {
     let m = merged();
-    // b2 (35) stays after b1 (40): its file's order holds.
-    assert_eq!(texts(&m), ["a0", "b0", "a1", "b1", "b2", "a2", "b3"]);
-    assert_eq!(m.time(4), Some(35.0));
+    // b2 (35) goes before b1 (40), though its file has it after.
+    assert_eq!(texts(&m), ["a0", "b0", "a1", "b2", "b1", "a2", "b3"]);
+    assert_eq!(m.time(3), Some(35.0));
+    let times: Vec<f64> = (0..m.line_count()).map(|r| m.time(r).unwrap()).collect();
+    assert!(times.windows(2).all(|w| w[0] <= w[1]), "{times:?}");
+    // One time: the files in the order given, then each file's order.
+    let a = dlt("a.dlt", &[(10, "AAA", "a0"), (10, "AAA", "a1")]);
+    let b = dlt("b.dlt", &[(5, "BBB", "b0"), (10, "BBB", "b1"), (10, "BBB", "b2")]);
+    let tie = Merged::new(Concat::new(vec![a, b]).unwrap(), &Progress::new()).unwrap();
+    assert_eq!(texts(&tie), ["b0", "a0", "a1", "b1", "b2"]);
     assert!(m.format().ends_with("merged by time"), "{}", m.format());
     let r = m.reordered().unwrap();
     for row in 0..m.line_count() {
@@ -58,8 +68,8 @@ fn filters_scan_the_files_and_map_the_rows_fast_and_naive_alike() {
     let m = merged();
     // A regex and a field query take the files' own path, mapped to rows.
     let re = Filter::Regex(Matcher::new("v=", MatcherOptions::default()).unwrap());
-    assert_eq!(run_on(&m, &re), [0, 2, 3, 5, 6]);
-    assert_eq!(run_on(&m, &q(&m, "apid == BBB AND NOT /b2/")), [1, 3, 6]);
+    assert_eq!(run_on(&m, &re), [0, 2, 4, 5, 6]);
+    assert_eq!(run_on(&m, &q(&m, "apid == BBB AND NOT /b2/")), [1, 4, 6]);
     assert_eq!(run_on(&m, &q(&m, "file == a.dlt")), [0, 2, 5]);
     // A search inside a filter's rows, by both paths.
     let set = SearchSet { include: vec![q(&m, "/v=/"), q(&m, "apid == AAA")], exclude: vec![] };
@@ -67,7 +77,7 @@ fn filters_scan_the_files_and_map_the_rows_fast_and_naive_alike() {
     let scan = search_within_path(&m, Some(&within), &set, &Progress::new(), Path::Scan).unwrap();
     let per = search_within_path(&m, Some(&within), &set, &Progress::new(), Path::PerLine).unwrap();
     assert_eq!(scan, per);
-    assert_eq!(scan.lines, [2, 3]);
+    assert_eq!(scan.lines, [2, 4]);
 }
 
 #[test]
@@ -76,10 +86,10 @@ fn signal_states_follow_the_rows_across_files() {
     let mut signals = Signals::default();
     signals.set(SignalDef::parse_spec("v=/v=(?<v>\\d+)/").unwrap());
     let f = |nfd: &str| Filter::Query(Query::compile_in(nfd, m.schema(), &signals).unwrap());
-    // b0 (row 1) holds a0's v=1; b2 (row 4) holds b1's v=4.
+    // b0 (row 1) holds a0's v=1; b2 (row 3) holds a1's v=3.
     assert_eq!(run_on(&m, &f("@v == 1")), [0, 1]);
-    assert_eq!(run_on(&m, &f("@v >= 4 AND apid == BBB")), [3, 4, 6]);
-    assert_eq!(run_on(&m, &f("@v.changed")), [0, 2, 3, 5, 6]);
+    assert_eq!(run_on(&m, &f("@v >= 4 AND apid == BBB")), [4, 6]);
+    assert_eq!(run_on(&m, &f("@v.changed")), [0, 2, 4, 5, 6]);
     // `@time` from the files, in row order.
     let mut t = Signals::default().for_source(&m);
     t.set(SignalDef::parse_spec("v=/v=(?<v>\\d+)/").unwrap());
@@ -91,10 +101,10 @@ fn signal_states_follow_the_rows_across_files() {
 fn bookmarks_are_rows_and_anchors_find_them_again() {
     let m = merged();
     let mut marks = Bookmarks::default();
-    marks.toggle(4);
+    marks.toggle(3);
     let marks = Arc::new(marks);
     let f = Filter::Query(Query::compile_for("bookmark OR /a0/", m.schema()).unwrap().with_bookmarks(&marks));
-    assert_eq!(run_on(&m, &f), [0, 4]);
+    assert_eq!(run_on(&m, &f), [0, 3]);
     // Saved per file: through the files' lines (`reordered`), not rows.
     let r = m.reordered().unwrap();
     let per_file = marks.remapped(|row| r.line_of[row as usize]);

@@ -1,5 +1,5 @@
-//! Several files' lines interleaved by time: a [`Concat`] read in the order
-//! of the lines' times, each file's own order kept ([`Merged::new`]); or
+//! Several files' lines in time order: a [`Concat`]'s lines sorted by time
+//! ([`Merged::new`], ties in the files' order); or
 //! one source's lines sorted by time ([`Merged::sorted`], [`sort_by_time`]).
 //!
 //! Rows are the concatenation's lines in another order, so the engine
@@ -12,14 +12,13 @@ use super::concat::Concat;
 use super::{Anchor, ColumnDef, LogSource, Reorder};
 use crate::event::{FieldDef, FieldId, FieldValue, Level};
 use crate::{Error, LineNo, Progress, Result};
+use rayon::prelude::*;
 use std::borrow::Cow;
-use std::cmp::{Ordering, Reverse};
-use std::collections::BinaryHeap;
 
 pub struct Merged {
     name: String,
     inner: Box<dyn LogSource>,
-    /// Sorted by time ([`Merged::sorted`]), else files interleaved.
+    /// One source sorted ([`Merged::sorted`]), else several files' lines.
     sorted: bool,
     /// Row -> line of `inner`.
     line_of: Vec<LineNo>,
@@ -28,74 +27,43 @@ pub struct Merged {
     data_id: usize,
 }
 
-/// A line waiting in the merge: its time, file and line in the file.
-#[derive(PartialEq)]
-struct Next(f64, usize, LineNo);
-
-impl Eq for Next {}
-
-impl PartialOrd for Next {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl Ord for Next {
-    /// Earlier time first; on a tie the file given first, then its order.
-    fn cmp(&self, o: &Self) -> Ordering {
-        self.0.total_cmp(&o.0).then(self.1.cmp(&o.1)).then(self.2.cmp(&o.2))
-    }
-}
-
 impl Merged {
-    /// Interleave `inner`'s files by their lines' times. A line without a
-    /// time goes with the line before it in its file (lines before a file's
-    /// first time go first). Each file keeps its own order even where its
-    /// times go back.
+    /// `inner`'s files' lines sorted by their times (owner, 2026-11-15: in
+    /// `@time` order; it kept each file's own order where its times went
+    /// back, and real captures, an MF4 read group by group, weren't
+    /// sorted). A stable sort: lines of one time in the order of the files
+    /// as given, then each file's order. A line without a time goes with
+    /// the line before it in its file; lines before a file's first time go
+    /// first.
     pub fn new(inner: Concat, progress: &Progress) -> Result<Merged> {
         let parts = inner.part_files();
         let total = inner.line_count();
         progress.set_total(total);
-        // Each file's lines' times, carried forward over lines without one,
-        // and kept from going back (so the file's order holds).
-        let mut times: Vec<Vec<f64>> = Vec::with_capacity(parts.len());
+        let mut times: Vec<f64> = Vec::with_capacity(total as usize);
         for &(first, n) in &parts {
-            let mut t = Vec::with_capacity(n as usize);
             let mut last = f64::NEG_INFINITY;
             for l in 0..n {
                 if l % 65_536 == 0 && progress.is_cancelled() {
                     return Err(Error::Cancelled);
                 }
-                if let Some(x) = inner.time(first + l)
-                    && x > last
-                {
+                if let Some(x) = inner.time(first + l) {
                     last = x;
                 }
-                t.push(last);
+                times.push(last);
             }
-            times.push(t);
             progress.add(n);
         }
-        let mut heap: BinaryHeap<Reverse<Next>> = BinaryHeap::with_capacity(parts.len());
-        for (k, t) in times.iter().enumerate() {
-            if let Some(&x) = t.first() {
-                heap.push(Reverse(Next(x, k, 0)));
-            }
-        }
-        let mut line_of = Vec::with_capacity(total as usize);
-        while let Some(Reverse(Next(_, k, l))) = heap.pop() {
-            line_of.push(parts[k].0 + l);
-            if let Some(&x) = times[k].get(l as usize + 1) {
-                heap.push(Reverse(Next(x, k, l + 1)));
-            }
-        }
+        // The concatenation's order breaks ties: the files as given, then
+        // their lines. Stable, in parallel, quick on runs already in order.
+        let mut line_of: Vec<LineNo> = (0..total).collect();
+        line_of.par_sort_by(|&a, &b| times[a as usize].total_cmp(&times[b as usize]));
         Ok(Self::of(Box::new(inner), line_of, false))
     }
 
     /// `inner`'s lines sorted by their times, lines of the same time in
     /// their order (a stable sort). A line without a time goes with the
-    /// line before it; lines before the first time go first. Unlike
-    /// [`Merged::new`], lines whose times go back move.
+    /// line before it; lines before the first time go first, as
+    /// [`Merged::new`] does for several files.
     pub fn sorted(inner: Box<dyn LogSource>, progress: &Progress) -> Result<Merged> {
         let total = inner.line_count();
         progress.set_total(total);
