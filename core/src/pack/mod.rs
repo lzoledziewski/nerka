@@ -66,7 +66,10 @@ mod write;
 use std::fmt;
 use std::path::{Path, PathBuf};
 
-pub use expand::{ExpandError, Expansion, ParamValue, Params, Part, Pick, Role, Selection, expand};
+pub use expand::{
+    ExpandError, Expansion, ParamValue, ParamValues, Params, Part, Pick, Role, Selection, expand, expand_values,
+    first_values, instances,
+};
 pub use parser::parse_pack;
 pub use usage::{Usage, default_usage_path};
 pub use write::{create_pack_file, format_query, params_in, remove_query, rename_query, upsert_query};

@@ -21,7 +21,7 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use nerka_core::bundle::{Bundle, Choice, Item, Kind, Status, Store};
-use nerka_core::pack::{self, Expansion, Library, ParamValue, Params, Pick, Role, Selection};
+use nerka_core::pack::{self, Expansion, Library, ParamValue, Pick, Role, Selection};
 use nerka_core::{
     Bookmarks, Filter, LineNo, LogSource, Matcher, MatcherOptions, Progress, Query, SearchSet, SignalDef, Signals,
     search, search_within,
@@ -276,9 +276,7 @@ struct OutputArgs {
 /// Queries picked from the packs.
 #[derive(clap::Args)]
 struct PickArgs {
-    /// Include a query (pack.query); repeatable. `ID(NAME=VALUE, …)`: an
-    /// instance of it with its own parameter values (several: several
-    /// instances); `-p` values are the shared ones.
+    /// Include a query (pack.query); repeatable.
     #[arg(short = 'q', long = "query", value_name = "ID")]
     queries: Vec<String>,
     /// Include every query with this label (or one below it).
@@ -296,7 +294,8 @@ struct PickArgs {
     /// Exclude every query with this label.
     #[arg(short = 'X', long = "exclude-label", value_name = "LABEL")]
     exclude_labels: Vec<String>,
-    /// Parameter value, escaped where it is used: NAME=VALUE.
+    /// Parameter value, escaped where it is used: NAME=VALUE. Given again for
+    /// a name: another value, and each query using it an instance per value.
     #[arg(short = 'p', long = "param", value_name = "NAME=VALUE")]
     params: Vec<String>,
     /// Parameter value inserted as regex syntax inside regexes: NAME=VALUE.
@@ -314,31 +313,27 @@ impl PickArgs {
             && self.exclude_labels.is_empty()
     }
 
-    /// Queries come before labels, each in command-line order. A query
-    /// given with arguments (`cam.drops(cam=CAM1)`) is an instance of it.
+    /// Queries come before labels, each in command-line order. A parameter
+    /// given several times has several values: each query using it is an
+    /// instance per value.
     fn expand(&self, lib: &Library) -> Result<Expansion> {
-        let picks = |ids: &[String], labels: &[String]| -> Result<Vec<Pick>> {
-            let mut out = Vec::new();
-            for q in ids {
-                out.push(Pick::parse_query(lib, q).map_err(anyhow::Error::msg)?);
-            }
-            out.extend(labels.iter().map(|l| Pick::Label(l.clone())));
-            Ok(out)
+        let picks = |ids: &[String], labels: &[String]| -> Vec<Pick> {
+            ids.iter().map(|q| Pick::Query(q.clone())).chain(labels.iter().map(|l| Pick::Label(l.clone()))).collect()
         };
         let sel = Selection {
-            include: picks(&self.queries, &self.labels)?,
-            require: picks(&self.require, &self.require_labels)?,
-            exclude: picks(&self.exclude, &self.exclude_labels)?,
+            include: picks(&self.queries, &self.labels),
+            require: picks(&self.require, &self.require_labels),
+            exclude: picks(&self.exclude, &self.exclude_labels),
             signal: Vec::new(),
         };
-        let mut params = Params::new();
+        let mut values = pack::ParamValues::new();
         for (list, raw) in [(&self.params, false), (&self.raw_params, true)] {
             for kv in list {
                 let (k, v) = kv.split_once('=').with_context(|| format!("expected NAME=VALUE, got '{kv}'"))?;
-                params.insert(k.to_owned(), ParamValue { value: v.to_owned(), raw });
+                values.entry(k.to_owned()).or_default().push(ParamValue { value: v.to_owned(), raw });
             }
         }
-        Ok(pack::expand(&sel, lib, &params)?)
+        Ok(pack::expand_values(&sel, lib, &values)?)
     }
 }
 

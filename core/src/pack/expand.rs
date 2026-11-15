@@ -32,61 +32,6 @@ pub enum Pick {
     Label(String),
 }
 
-impl Pick {
-    /// A query as given on a command line: `ID`, or `ID(NAME=VALUE, …)`,
-    /// an instance of it with its own arguments (`query-instances.md`). A
-    /// value holding `,`, `)` or spaces is quoted (`"…"`, with `\"` and
-    /// `\\`). Query names may hold parentheses: `(…)` counts as arguments
-    /// only after the id of a query `lib` has.
-    pub fn parse_query(lib: &Library, s: &str) -> Result<Pick, String> {
-        let Some((id, rest)) = s.split_once('(').filter(|(id, r)| r.ends_with(')') && lib.get(id.trim()).is_some())
-        else {
-            return Ok(Pick::Query(s.to_owned()));
-        };
-        let inner = &rest[..rest.len() - 1];
-        let mut args = Params::new();
-        let mut chars = inner.chars().peekable();
-        loop {
-            let mut name = String::new();
-            let mut eq = false;
-            for c in chars.by_ref() {
-                if c == '=' {
-                    eq = true;
-                    break;
-                }
-                name.push(c);
-            }
-            let name = name.trim();
-            if name.is_empty() && !eq {
-                break;
-            }
-            if !eq || !super::is_name(name) {
-                return Err(format!("{s}: expected NAME=VALUE arguments, got '{name}'"));
-            }
-            while chars.next_if(|c| *c == ' ').is_some() {}
-            let mut value = String::new();
-            if chars.next_if_eq(&'"').is_some() {
-                loop {
-                    match chars.next() {
-                        Some('\\') => value.extend(chars.next()),
-                        Some('"') => break,
-                        Some(c) => value.push(c),
-                        None => return Err(format!("{s}: missing closing '\"'")),
-                    }
-                }
-                while chars.next_if(|c| *c == ' ').is_some() {}
-                if !matches!(chars.next(), Some(',') | None) {
-                    return Err(format!("{s}: expected ',' after a quoted value"));
-                }
-            } else {
-                value = chars.by_ref().take_while(|&c| c != ',').collect::<String>().trim().to_owned();
-            }
-            args.insert(name.to_owned(), ParamValue::literal(value));
-        }
-        Ok(Pick::QueryWith(id.trim().to_owned(), args))
-    }
-}
-
 /// What was picked for Filter or for Search.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Selection {
@@ -108,7 +53,9 @@ impl Selection {
             for p in picks {
                 match p {
                     Pick::Label(_) => out.extend(
-                        resolve(lib, std::slice::from_ref(p), &Params::new())?.into_iter().map(|r| Pick::Query(r.id)),
+                        resolve(lib, std::slice::from_ref(p), &ParamValues::new())?
+                            .into_iter()
+                            .map(|r| Pick::Query(r.id)),
                     ),
                     p => out.push(p.clone()),
                 }
@@ -259,32 +206,82 @@ struct Resolved {
     effective: Params,
 }
 
+/// Parameter values by name, one or several each: a query using a
+/// parameter with several is picked once per value, an instance each
+/// (owner, 2026-11-15, `query-instances.md`).
+pub type ParamValues = BTreeMap<String, Vec<ParamValue>>;
+
+/// A parameter's values that count: empty ones left out (a field not
+/// filled in yet) unless all are, a value given twice once.
+fn values_of(values: &[ParamValue]) -> Vec<ParamValue> {
+    let mut out: Vec<ParamValue> = Vec::new();
+    for v in values.iter().filter(|v| !v.value.is_empty()) {
+        if !out.contains(v) {
+            out.push(v.clone());
+        }
+    }
+    if out.is_empty() { values.iter().take(1).cloned().collect() } else { out }
+}
+
+/// The value each parameter has when it has one (the first of several).
+pub fn first_values(values: &ParamValues) -> Params {
+    values.iter().filter_map(|(k, v)| values_of(v).into_iter().next().map(|v| (k.clone(), v))).collect()
+}
+
+/// The instances of query `id` (with its parents): an argument set per
+/// combination of the parameters it uses that have several values (only
+/// those); one empty set when it uses none with several.
+pub fn instances(lib: &Library, id: &str, values: &ParamValues) -> Vec<Params> {
+    let mut sets = vec![Params::new()];
+    for name in lib.params_needed([id]) {
+        let vals = values.get(&name).map(|v| values_of(v)).unwrap_or_default();
+        if vals.len() < 2 {
+            continue;
+        }
+        let mut next = Vec::with_capacity(sets.len() * vals.len());
+        for set in &sets {
+            for v in &vals {
+                let mut s = set.clone();
+                s.insert(name.clone(), v.clone());
+                next.push(s);
+            }
+        }
+        sets = next;
+    }
+    sets
+}
+
 /// The picks' queries, labels resolved, in order, without duplicates: a
 /// query with the same effective arguments as an earlier one adds nothing
-/// (instances of it with other arguments do).
-fn resolve(lib: &Library, picks: &[Pick], shared: &Params) -> Result<Vec<Resolved>, ExpandError> {
+/// (instances of it with other arguments do). A query using parameters
+/// with several values is an instance per combination.
+fn resolve(lib: &Library, picks: &[Pick], values: &ParamValues) -> Result<Vec<Resolved>, ExpandError> {
+    let shared = first_values(values);
     let mut out: Vec<Resolved> = Vec::new();
     for (pick, p) in picks.iter().enumerate() {
         let known = |id: &String| lib.get(id).map(|_| ()).ok_or_else(|| ExpandError::UnknownQuery(id.clone()));
-        let (ids, args) = match p {
+        let picked: Vec<(String, Params)> = match p {
             Pick::Query(id) => {
                 known(id)?;
-                (vec![id.clone()], Params::new())
+                instances(lib, id, values).into_iter().map(|a| (id.clone(), a)).collect()
             }
             Pick::QueryWith(id, args) => {
                 known(id)?;
-                (vec![id.clone()], args.clone())
+                vec![(id.clone(), args.clone())]
             }
             Pick::Label(l) => match lib.with_label(l) {
                 v if v.is_empty() => return Err(ExpandError::UnknownLabel(l.clone())),
-                v => (v, Params::new()),
+                v => v
+                    .into_iter()
+                    .flat_map(|id| instances(lib, &id, values).into_iter().map(move |a| (id.clone(), a)))
+                    .collect(),
             },
         };
-        let mut effective = shared.clone();
-        effective.extend(args.clone());
-        for id in ids {
+        for (id, args) in picked {
+            let mut effective = shared.clone();
+            effective.extend(args.clone());
             if !out.iter().any(|r| r.id == id && r.effective == effective) {
-                out.push(Resolved { id, pick, args: args.clone(), effective: effective.clone() });
+                out.push(Resolved { id, pick, args, effective });
             }
         }
     }
@@ -292,12 +289,19 @@ fn resolve(lib: &Library, picks: &[Pick], shared: &Params) -> Result<Vec<Resolve
 }
 
 /// Expand a selection into plain NFD. Labels resolve against `lib` now;
-/// `params` are the shared parameter values, a pick's own over them.
+/// `params` are the parameter values (a pick's own over them).
 pub fn expand(sel: &Selection, lib: &Library, params: &Params) -> Result<Expansion, ExpandError> {
-    let include = resolve(lib, &sel.include, params)?;
-    let require = resolve(lib, &sel.require, params)?;
-    let exclude = resolve(lib, &sel.exclude, params)?;
-    let signal = resolve(lib, &sel.signal, params)?;
+    let values: ParamValues = params.iter().map(|(k, v)| (k.clone(), vec![v.clone()])).collect();
+    expand_values(sel, lib, &values)
+}
+
+/// [`expand`] with several values per parameter: a query using one with
+/// several is an instance per value (per combination, with more).
+pub fn expand_values(sel: &Selection, lib: &Library, values: &ParamValues) -> Result<Expansion, ExpandError> {
+    let include = resolve(lib, &sel.include, values)?;
+    let require = resolve(lib, &sel.require, values)?;
+    let exclude = resolve(lib, &sel.exclude, values)?;
+    let signal = resolve(lib, &sel.signal, values)?;
     if include.is_empty() && require.is_empty() && exclude.is_empty() && signal.is_empty() {
         return Err(ExpandError::Empty);
     }

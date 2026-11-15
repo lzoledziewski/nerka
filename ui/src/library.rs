@@ -25,11 +25,11 @@ use eframe::egui::{self, Color32, RichText};
 use nerka_core::FieldDef;
 use nerka_core::SignalOptions;
 use nerka_core::pack::{
-    self, Expansion, Library, Pack, PackQuery, ParamValue, Params, Pick, Selection, format_query, is_query_name,
-    params_in, parse_pack, upsert_query,
+    self, Expansion, Library, Pack, PackQuery, ParamValue, ParamValues, Params, Pick, Selection, format_query,
+    is_query_name, params_in, parse_pack, upsert_query,
 };
 use nerka_core::preset::{NodeSource, Preset, PresetNode, PresetParam};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 /// How a node takes part in the filter.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -125,40 +125,12 @@ pub struct Node {
     pub signals: Vec<(String, SignalOptions)>,
     /// What it is for (the pack's `##` lines).
     pub note: String,
-    /// Its instances (`query-instances.md`): argument sets over the shared
-    /// values, a part each, sharing the query's text and settings. Empty:
-    /// one, with the shared values.
-    pub instances: Vec<Instance>,
-    /// Instances… open: (the parameter, the values typed, one per line).
-    pub bulk: Option<(String, String)>,
-    /// What the last Instances… did (values already there are left out).
-    pub instances_note: Option<String>,
 }
 
-/// One instance of a parameterised pick.
-#[derive(Debug, Clone, PartialEq, Default)]
-pub struct Instance {
-    /// Its own values (and whether each is raw regex syntax); an empty
-    /// value takes the shared one.
-    pub args: BTreeMap<String, (String, bool)>,
-}
-
-impl Instance {
-    /// Its own arguments for the expansion (empty values left out).
-    pub fn params(&self) -> Params {
-        self.args
-            .iter()
-            .filter(|(_, (v, _))| !v.is_empty())
-            .map(|(k, (v, raw))| (k.clone(), ParamValue { value: v.clone(), raw: *raw }))
-            .collect()
-    }
-}
-
-/// How an instance is shown: its values (`CAM1`, or `cam=CAM1, ecu=E`
-/// for several), from a part's own arguments.
+/// How an instance is shown: the values of the parameters with several
+/// (`CAM1`, or `cam=CAM1, ecu=E` for several such), a part's arguments.
 fn instance_label(args: &Params) -> String {
     match args.len() {
-        0 => "shared values".to_owned(),
         1 => args.values().next().map(|v| v.value.clone()).unwrap_or_default(),
         _ => args.iter().map(|(k, v)| format!("{k}={}", v.value)).collect::<Vec<_>>().join(", "),
     }
@@ -183,9 +155,6 @@ impl Node {
             error: None,
             signals: Vec::new(),
             note: String::new(),
-            instances: Vec::new(),
-            bulk: None,
-            instances_note: None,
         }
     }
 
@@ -211,16 +180,6 @@ impl Node {
     /// the line colour and its search hits all use this one.
     pub fn color(&self) -> Color32 {
         parse_color(self.color.trim()).unwrap_or(palette(self.slot))
-    }
-
-    /// Its picks for the expansion: one per instance (with its own
-    /// arguments), or one with the shared values.
-    fn picks(&self) -> Vec<Pick> {
-        let id = self.expand_id();
-        if self.instances.is_empty() {
-            return vec![Pick::Query(id)];
-        }
-        self.instances.iter().map(|i| Pick::QueryWith(id.clone(), i.params())).collect()
     }
 
     /// The colour of instance `i` (the first has the node's).
@@ -317,8 +276,13 @@ pub enum Target {
 pub struct Picks {
     pub nodes: Vec<Node>,
     next_key: u64,
-    /// Parameter values by name, with "insert as regex" (raw).
-    pub params: BTreeMap<String, (String, bool)>,
+    /// Parameter values by name, each with "insert as regex" (raw). Several
+    /// for a name: every picked query using it is an instance per value
+    /// (owner, 2026-11-15, `query-instances.md`).
+    pub params: BTreeMap<String, Vec<(String, bool)>>,
+    /// Values being typed (parameter, value index): they count on Enter or
+    /// when their field is left.
+    pub drafts: HashMap<(String, usize), String>,
     /// The last expansion error, shown in the selection pane.
     pub error: Option<String>,
     /// Pack chosen in the editor's "Save to".
@@ -339,23 +303,6 @@ impl Picks {
         self.add_node(lib, id, role, at, false)
     }
 
-    /// Add a query as given on a command line: `ID`, or `ID(NAME=VALUE, …)`
-    /// for an instance of it (several: several instances of one pick).
-    pub fn add_given(&mut self, lib: &Library, s: &str, role: Use) -> Result<(), String> {
-        let Pick::QueryWith(id, args) = Pick::parse_query(lib, s)? else {
-            self.add(lib, s, role, None);
-            return Ok(());
-        };
-        self.add(lib, &id, role, None);
-        let n = self
-            .nodes
-            .iter_mut()
-            .find(|n| n.source.as_deref() == Some(id.as_str()) && !n.edited && !n.detached && n.role == role)
-            .ok_or_else(|| format!("unknown query '{id}'"))?;
-        n.instances.push(Instance { args: args.into_iter().map(|(k, v)| (k, (v.value, v.raw))).collect() });
-        Ok(())
-    }
-
     /// Add library query `id` without its parents: only its own text, so a
     /// child of a format-specific parent can run on other files.
     pub fn add_detached(&mut self, lib: &Library, id: &str, role: Use) -> bool {
@@ -365,7 +312,22 @@ impl Picks {
     fn add_node(&mut self, lib: &Library, id: &str, role: Use, at: Option<usize>, detached: bool) -> bool {
         let same = |n: &Node| n.source.as_deref() == Some(id) && !n.edited && n.role == role && n.detached == detached;
         if self.nodes.iter().any(same) {
-            return false;
+            // Picked again: one more value for its first parameter, an
+            // instance once filled in (owner, 2026-11-15: + adds a value,
+            // not a second pick).
+            // Without parents: only its own parameters count.
+            let params = if detached {
+                lib.get(id).map(|(_, q)| q.params.clone()).unwrap_or_default()
+            } else {
+                lib.params_needed([id])
+            };
+            let Some(first) = params.into_iter().next() else { return false };
+            let values = self.params.entry(first).or_default();
+            if values.is_empty() {
+                values.push(Default::default());
+            }
+            values.push(Default::default());
+            return true;
         }
         let key = self.next_key();
         let Some(mut n) = Node::of_library(key, lib, id, role) else { return false };
@@ -546,8 +508,17 @@ impl Picks {
         Ok((packs, locals))
     }
 
+    /// Every value of each parameter.
+    pub fn values(&self) -> ParamValues {
+        self.params
+            .iter()
+            .map(|(k, vs)| (k.clone(), vs.iter().map(|(v, raw)| ParamValue { value: v.clone(), raw: *raw }).collect()))
+            .collect()
+    }
+
+    /// The value each parameter has (the first of several).
     pub fn params(&self) -> Params {
-        self.params.iter().map(|(k, (v, raw))| (k.clone(), ParamValue { value: v.clone(), raw: *raw })).collect()
+        pack::first_values(&self.values())
     }
 
     /// The library plus a temporary pack with the local nodes.
@@ -570,9 +541,9 @@ impl Picks {
     pub fn expand(&self, lib: &Library) -> Result<Applied, String> {
         let full = self.with_locals(lib)?;
         let mut sel = Selection::default();
-        // Per role, in pick order: the node and instance of each pick (a
-        // part says its pick; instances share the query id).
-        let mut from: [Vec<(usize, Option<usize>)>; 4] = Default::default();
+        // Per role, in pick order: the node of each pick (a part says its
+        // pick; a query's instances share it).
+        let mut from: [Vec<usize>; 4] = Default::default();
         let role = |u: Use| match u {
             Use::Include => 0,
             Use::Require => 1,
@@ -586,14 +557,14 @@ impl Picks {
                 Use::Exclude => &mut sel.exclude,
                 Use::Signal => &mut sel.signal,
             };
-            for (k, p) in n.picks().into_iter().enumerate() {
-                list.push(p);
-                from[role(n.role)].push((i, (!n.instances.is_empty()).then_some(k)));
-            }
+            list.push(Pick::Query(n.expand_id()));
+            from[role(n.role)].push(i);
         }
         let shared = self.params();
-        let exp = pack::expand(&sel, &full, &shared).map_err(|e| e.to_string())?;
+        let exp = pack::expand_values(&sel, &full, &self.values()).map_err(|e| e.to_string())?;
         let (mut keys, mut names, mut colors, mut pins) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        // Instances of each pick so far: the next one's colour.
+        let mut seen: HashMap<(usize, usize), usize> = HashMap::new();
         for p in &exp.parts {
             let r = match p.role {
                 pack::Role::Include => 0,
@@ -601,18 +572,16 @@ impl Picks {
                 pack::Role::Exclude => 2,
                 pack::Role::Signal => 3,
             };
-            let (i, instance) = from[r][p.pick];
-            let n = &self.nodes[i];
+            let n = &self.nodes[from[r][p.pick]];
             keys.push(n.key);
-            match instance {
-                Some(k) => {
-                    names.push(format!("{} ({})", n.display_name(), instance_label(&p.args)));
-                    colors.push(n.instance_color(k));
-                }
-                None => {
-                    names.push(n.display_name());
-                    colors.push(n.color());
-                }
+            if p.args.is_empty() {
+                names.push(n.display_name());
+                colors.push(n.color());
+            } else {
+                let k = seen.entry((r, p.pick)).or_default();
+                names.push(format!("{} ({})", n.display_name(), instance_label(&p.args)));
+                colors.push(n.instance_color(*k));
+                *k += 1;
             }
             // `drops_$cam` filled in with this part's arguments.
             let args = effective(&shared, &p.args);
@@ -638,14 +607,12 @@ impl Picks {
             }
             Target::Node(key) => {
                 let n = self.nodes.iter().find(|n| n.key == *key).ok_or("the query was removed")?;
-                // Its instances OR'ed: one term.
-                let sel = Selection { include: n.picks(), ..Default::default() };
-                let exp = pack::expand(&sel, &full, &self.params()).map_err(|e| e.to_string())?;
-                return Ok(Term { name: n.display_name(), nfd: exp.nfd, color: n.color() });
+                (n.expand_id(), n.display_name(), n.color())
             }
         };
+        // A query with instances: them OR'ed, one term.
         let sel = Selection { include: vec![Pick::Query(id)], ..Default::default() };
-        let exp = pack::expand(&sel, &full, &self.params()).map_err(|e| e.to_string())?;
+        let exp = pack::expand_values(&sel, &full, &self.values()).map_err(|e| e.to_string())?;
         Ok(Term { name, nfd: exp.nfd, color })
     }
 
@@ -661,24 +628,15 @@ impl Picks {
             } else {
                 NodeSource::Library(n.source.clone().unwrap_or_default())
             };
-            // Each instance's own values (empty ones take the shared value).
-            let instances = n
-                .instances
-                .iter()
-                .map(|i| {
-                    i.args
-                        .iter()
-                        .filter(|(_, (v, _))| !v.is_empty())
-                        .map(|(k, (v, raw))| PresetParam { name: k.clone(), value: v.clone(), raw: *raw })
-                        .collect()
-                })
-                .collect();
-            p.nodes.push(PresetNode { source, role: n.role.into(), lit: n.lit, detached: n.detached, instances });
+            p.nodes.push(PresetNode { source, role: n.role.into(), lit: n.lit, detached: n.detached });
         }
+        // Every value, in order (several: `param NAME += VALUE` lines).
         p.params = self
             .params
             .iter()
-            .map(|(k, (v, raw))| PresetParam { name: k.clone(), value: v.clone(), raw: *raw })
+            .flat_map(|(k, vs)| {
+                vs.iter().map(move |(v, raw)| PresetParam { name: k.clone(), value: v.clone(), raw: *raw })
+            })
             .collect();
         p
     }
@@ -714,11 +672,6 @@ impl Picks {
                 }
             };
             n.lit = pn.lit && role != Use::Exclude;
-            n.instances = pn
-                .instances
-                .iter()
-                .map(|i| Instance { args: i.iter().map(|p| (p.name.clone(), (p.value.clone(), p.raw))).collect() })
-                .collect();
             if pn.detached {
                 n.detached = true;
                 n.parent = None;
@@ -726,7 +679,10 @@ impl Picks {
             n.slot = self.free_slot();
             self.nodes.push(n);
         }
-        self.params = preset.params.iter().map(|p| (p.name.clone(), (p.value.clone(), p.raw))).collect();
+        self.params.clear();
+        for p in &preset.params {
+            self.params.entry(p.name.clone()).or_default().push((p.value.clone(), p.raw));
+        }
         if !missing.is_empty() {
             self.error = Some(format!("Preset '{}': not loaded: {}", preset.name, missing.join(", ")));
         }
@@ -1548,22 +1504,13 @@ pub fn selection_panel(ui: &mut egui::Ui, lib: &mut Library, picks: &mut Picks) 
                     ui.weak("Drag queries here from the library, press + there, or + New.");
                 }
                 let packs: Vec<String> = lib.packs().iter().map(|p| p.name.clone()).collect();
-                let shared = picks.params();
-                let node_params: Vec<Vec<String>> = picks.nodes.iter().map(|n| node_params(lib, n)).collect();
+                // Each node's instances: its parameters' counts of values.
+                let values = picks.values();
+                let counts: Vec<usize> =
+                    picks.nodes.iter().map(|n| instance_count(&node_params(lib, n), &values)).collect();
                 let (save_pack, new_pack) = (&mut picks.save_pack, &mut picks.new_pack);
-                for (n, params) in picks.nodes.iter_mut().zip(&node_params) {
-                    let mut add = None;
-                    row_rects.push(node_row(ui, n, params, &mut add, &mut remove, &mut action));
-                    match add {
-                        Some(AddInstance::One) => add_instance(n, params, &shared),
-                        Some(AddInstance::List) => {
-                            n.bulk = params.first().map(|p| (p.clone(), String::new()));
-                        }
-                        None => {}
-                    }
-                    if !n.instances.is_empty() || n.bulk.is_some() {
-                        instances_ui(ui, n, params, &shared);
-                    }
+                for (n, count) in picks.nodes.iter_mut().zip(counts) {
+                    row_rects.push(node_row(ui, n, count, &mut remove, &mut action));
                     if n.open {
                         let parents = parent_choices(lib, n.source.as_deref());
                         match node_editor(ui, n, &packs, &parents, save_pack, new_pack) {
@@ -1631,19 +1578,13 @@ pub fn selection_panel(ui: &mut egui::Ui, lib: &mut Library, picks: &mut Picks) 
     action
 }
 
-/// ⊕ on a parameterised pick: one more instance, or several from a list.
-enum AddInstance {
-    One,
-    List,
-}
-
-/// One node: handle, role, colour, name, instances (a parameterised
-/// query), search, edit and remove. Returns its rect.
+/// One node: handle, role, colour, name, its instances' count (several
+/// values for a parameter it uses), search, edit and remove. Returns its
+/// rect.
 fn node_row(
     ui: &mut egui::Ui,
     n: &mut Node,
-    params: &[String],
-    add: &mut Option<AddInstance>,
+    instances: usize,
     remove: &mut Option<u64>,
     action: &mut Action,
 ) -> egui::Rect {
@@ -1698,27 +1639,18 @@ fn node_row(
         if n.edited {
             ui.weak("•").on_hover_text("Not saved in a pack");
         }
+        if instances > 1 {
+            ui.weak(format!("× {instances}")).on_hover_text(
+                "Instances: a parameter it uses has several values (Parameters, below), so it is picked once \
+                 per value (per combination, with more), each with its colour and signals",
+            );
+        }
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             if ui.small_button("−").on_hover_text("Remove from the selection").clicked() {
                 *remove = Some(n.key);
             }
             if ui.selectable_label(n.open, "✎").on_hover_text("Edit").clicked() {
                 n.open = !n.open;
-            }
-            if !params.is_empty() {
-                ui.menu_button("⊕", |ui| {
-                    if ui.button("One more instance").clicked() {
-                        *add = Some(AddInstance::One);
-                    }
-                    if ui.button("Instances from a list…").clicked() {
-                        *add = Some(AddInstance::List);
-                    }
-                })
-                .response
-                .on_hover_text(
-                    "Instances: this query again with other parameter values (each its own part, colour \
-                     and signals), sharing its text and settings",
-                );
             }
             search_menu(ui, Target::Node(n.key), action);
         });
@@ -1751,117 +1683,22 @@ fn node_params(lib: &Library, n: &Node) -> Vec<String> {
     }
 }
 
-/// One more instance of `n`; the first time, the shared values become
-/// the first instance's.
-fn add_instance(n: &mut Node, params: &[String], shared: &Params) {
-    if n.instances.is_empty() {
-        let args =
-            params.iter().map(|p| (p.clone(), shared.get(p).map(|v| (v.value.clone(), v.raw)).unwrap_or_default()));
-        n.instances.push(Instance { args: args.collect() });
-    }
-    n.instances.push(Instance { args: params.iter().map(|p| (p.clone(), Default::default())).collect() });
-}
-
-/// Add an instance per value of `param` (one per line); values an
-/// instance already has are left out. Returns what to say.
-fn add_instances(n: &mut Node, params: &[String], shared: &Params, param: &str, values: &str) -> String {
-    let (mut added, mut there) = (0, 0);
-    for v in values.lines().map(str::trim).filter(|v| !v.is_empty()) {
-        let mut args: BTreeMap<String, (String, bool)> =
-            params.iter().map(|p| (p.clone(), Default::default())).collect();
-        args.insert(param.to_owned(), (v.to_owned(), false));
-        let new = Instance { args };
-        let same = |i: &Instance| effective(shared, &i.params()) == effective(shared, &new.params());
-        if n.instances.iter().any(same) {
-            there += 1;
-        } else {
-            n.instances.push(new);
-            added += 1;
-        }
-    }
-    match there {
-        0 => format!("{added} added"),
-        _ => format!("{added} added, {there} already there (left out)"),
-    }
-}
-
-/// A parameterised pick's instances, under its row: a colour, its own
-/// values (empty: the shared one), ✖; ⚠ on one with the same values as an
-/// earlier one (it adds nothing). Instances… adds several from a list.
-fn instances_ui(ui: &mut egui::Ui, n: &mut Node, params: &[String], shared: &Params) {
-    let values: Vec<Params> = n.instances.iter().map(|i| effective(shared, &i.params())).collect();
-    let mut remove = None;
-    for k in 0..n.instances.len() {
-        let color = n.instance_color(k);
-        let same = (0..k).find(|&j| values[j] == values[k]);
-        ui.horizontal(|ui| {
-            ui.add_space(20.0);
-            let (rect, _) = ui.allocate_exact_size(egui::vec2(10.0, 12.0), egui::Sense::hover());
-            ui.painter().rect_filled(rect, 2.0, color);
-            for p in params {
-                let (v, raw) = n.instances[k].args.entry(p.clone()).or_default();
-                ui.monospace(format!("${p}"));
-                let hint = shared.get(p).map_or("shared".to_owned(), |s| s.value.clone());
-                ui.add(egui::TextEdit::singleline(v).desired_width(90.0).hint_text(hint))
-                    .on_hover_text("Its own value; empty: the shared one (the Parameters below)");
-                ui.toggle_value(raw, "re").on_hover_text("regex: insert the value as regex syntax inside regexes");
-            }
-            if let Some(j) = same {
-                ui.colored_label(ui.visuals().warn_fg_color, "⚠")
-                    .on_hover_text(format!("The same values as instance {}: it adds nothing", j + 1));
-            }
-            if ui.small_button("✖").on_hover_text("Remove this instance").clicked() {
-                remove = Some(k);
-            }
-        });
-    }
-    if let Some(k) = remove {
-        n.instances.remove(k);
-    }
-    if let Some(note) = &n.instances_note {
-        ui.horizontal(|ui| {
-            ui.add_space(20.0);
-            ui.weak(note);
-        });
-    }
-    let mut done = None;
-    if let Some((param, text)) = &mut n.bulk {
-        egui::Frame::group(ui.style()).show(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.label("Instances of");
-                if params.len() > 1 {
-                    egui::ComboBox::from_id_salt(("bulk-param", n.key)).selected_text(format!("${param}")).show_ui(
-                        ui,
-                        |ui| {
-                            for p in params {
-                                ui.selectable_value(param, p.clone(), format!("${p}"));
-                            }
-                        },
-                    );
-                } else {
-                    ui.monospace(format!("${param}"));
+/// How many instances a query using `params` is: the product of their
+/// counts of values (those filled in, each value once).
+fn instance_count(params: &[String], values: &ParamValues) -> usize {
+    params
+        .iter()
+        .map(|p| {
+            let vs = values.get(p).map(Vec::as_slice).unwrap_or_default();
+            let mut distinct: Vec<&ParamValue> = Vec::new();
+            for v in vs.iter().filter(|v| !v.value.is_empty()) {
+                if !distinct.contains(&v) {
+                    distinct.push(v);
                 }
-                ui.label("one value per line:");
-            });
-            ui.add(egui::TextEdit::multiline(text).desired_rows(4).desired_width(f32::INFINITY));
-            ui.horizontal(|ui| {
-                if ui.button("Add").clicked() {
-                    done = Some(true);
-                }
-                if ui.button("Cancel").clicked() {
-                    done = Some(false);
-                }
-            });
-        });
-    }
-    match done {
-        Some(true) => {
-            let (param, text) = n.bulk.take().expect("open");
-            n.instances_note = Some(add_instances(n, params, shared, &param, &text));
-        }
-        Some(false) => n.bulk = None,
-        None => {}
-    }
+            }
+            distinct.len().max(1)
+        })
+        .product()
 }
 
 /// A selection node's fields and Save to a pack.
@@ -2033,18 +1870,66 @@ fn params_ui(ui: &mut egui::Ui, lib: &Library, picks: &mut Picks) {
     if names.is_empty() {
         return;
     }
-    ui.label(RichText::new("Parameters").strong());
+    ui.label(RichText::new("Parameters").strong()).on_hover_text(
+        "Several values for a parameter: every picked query using it is picked once per value (an instance each, \
+         its own colour and signals). A value counts once you press Enter or leave its field.",
+    );
+    let (params, drafts) = (&mut picks.params, &mut picks.drafts);
     for name in names {
-        let (value, raw) = picks.params.entry(name.clone()).or_default();
-        ui.horizontal(|ui| {
-            ui.monospace(format!("${name}"));
-            // Right to left: the field takes the width the checkbox leaves.
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.checkbox(raw, "regex").on_hover_text(
-                    "Insert the value as regex syntax inside regexes (normally it is matched literally)",
+        let values = params.entry(name.clone()).or_default();
+        if values.is_empty() {
+            values.push(Default::default());
+        }
+        let mut remove = None;
+        for i in 0..values.len() {
+            let key = (name.clone(), i);
+            let twice = !values[i].0.is_empty() && values[..i].contains(&values[i]);
+            ui.horizontal(|ui| {
+                let label = if i == 0 { format!("${name}") } else { String::new() };
+                ui.add_sized(
+                    [ui.available_width().min(60.0), 18.0],
+                    egui::Label::new(RichText::new(label).monospace()),
                 );
-                ui.add(egui::TextEdit::singleline(value).desired_width(ui.available_width()));
+                // Right to left: the field takes the width the rest leaves.
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if values.len() > 1 && ui.small_button("✖").on_hover_text("Remove this value").clicked() {
+                        remove = Some(i);
+                    }
+                    ui.checkbox(&mut values[i].1, "regex").on_hover_text(
+                        "Insert the value as regex syntax inside regexes (normally it is matched literally)",
+                    );
+                    if twice {
+                        ui.colored_label(ui.visuals().warn_fg_color, "⚠")
+                            .on_hover_text("Given already: it adds nothing");
+                    }
+                    // Typed into a draft; it counts on Enter or leaving the
+                    // field (signals were rebuilt at every key).
+                    let mut text = drafts.get(&key).cloned().unwrap_or_else(|| values[i].0.clone());
+                    let r = ui.add(egui::TextEdit::singleline(&mut text).desired_width(ui.available_width()));
+                    if r.changed() {
+                        drafts.insert(key.clone(), text);
+                    }
+                    if r.lost_focus()
+                        && let Some(t) = drafts.remove(&key)
+                    {
+                        values[i].0 = t;
+                    }
+                });
             });
+        }
+        if let Some(i) = remove {
+            values.remove(i);
+            drafts.retain(|(n, _), _| *n != name);
+        }
+        ui.horizontal(|ui| {
+            ui.add_space(64.0);
+            if ui
+                .small_button("+ value")
+                .on_hover_text(format!("Another value for ${name}: an instance more"))
+                .clicked()
+            {
+                values.push(Default::default());
+            }
         });
     }
 }
@@ -2166,8 +2051,8 @@ mod tests {
         let k = p.add_new(Use::Include);
         p.node_mut(k).unwrap().text = "level >= ERROR".into();
         p.toggle_lit(k);
-        p.params.insert("ecu".into(), ("ECU 1".into(), false));
-        p.params.insert("x".into(), ("a b".into(), true));
+        p.params.insert("ecu".into(), vec![("ECU 1".into(), false)]);
+        p.params.insert("x".into(), vec![("a b".into(), true)]);
 
         let preset = p.to_preset("mine");
         let text = preset.serialize();
@@ -2222,43 +2107,47 @@ mod tests {
         assert_eq!(p.nodes[0].display_name(), "timeouts");
     }
 
-    /// Owner, 2026-11-15: a parameterised pick with instances: a part each
-    /// (named and coloured per instance), the first instance from the
-    /// shared values, the same values twice left out of a list and marked.
+    /// Owner, 2026-11-15: several values for a parameter make each picked
+    /// query using it an instance per value (a part each, named and
+    /// coloured per instance); + on a query already picked adds a value,
+    /// not a second pick; a field not filled in yet adds nothing.
     #[test]
-    fn instances_of_a_pick_are_parts_of_their_own() {
+    fn several_values_of_a_parameter_are_instances() {
         let mut lib = Library::new();
-        let text = "pack c\nquery drops(cam)  color: violet\n    /$cam drop/\n";
+        let text = "pack c\nquery drops(cam)  color: violet\n    /$cam drop/\nquery fps(cam)\n    /$cam fps/\nquery slow\n    /slow/\n";
         lib.add(parse_pack("c.nerka-pack", text).unwrap()).unwrap();
         let mut p = Picks::default();
         p.add(&lib, "c.drops", Use::Include, None);
-        p.params.insert("cam".into(), ("CAM1".into(), false));
-        let params = node_params(&lib, &p.nodes[0]);
-        assert_eq!(params, ["cam"]);
-        let shared = p.params();
-        add_instance(&mut p.nodes[0], &params, &shared);
-        assert_eq!(p.nodes[0].instances.len(), 2);
-        assert_eq!(p.nodes[0].instances[0].args["cam"].0, "CAM1", "the shared value, kept");
-        // The second one empty: the shared value too, so it adds nothing yet.
-        assert_eq!(p.expand(&lib).unwrap().exp.parts.len(), 1);
-        p.nodes[0].instances[1].args.insert("cam".into(), ("CAM2".into(), false));
-        let note = add_instances(&mut p.nodes[0], &params, &shared, "cam", "CAM3\n\nCAM2\n CAM4 \n");
-        assert_eq!(note, "2 added, 1 already there (left out)");
-
+        p.add(&lib, "c.slow", Use::Include, None);
+        p.params.insert("cam".into(), vec![("CAM1".into(), false)]);
+        // Picked again: a value more for $cam, empty until typed.
+        assert!(p.add(&lib, "c.drops", Use::Include, None));
+        assert_eq!(p.nodes.len(), 2, "no second pick");
+        assert_eq!(p.params["cam"], [("CAM1".to_owned(), false), (String::new(), false)]);
+        assert_eq!(p.expand(&lib).unwrap().exp.parts.len(), 2, "the empty value adds nothing yet");
+        p.params.get_mut("cam").unwrap()[1].0 = "CAM2".into();
+        p.params.get_mut("cam").unwrap().push(("CAM1".into(), false));
         let a = p.expand(&lib).unwrap();
-        assert_eq!(a.exp.nfd, "(/CAM1 drop/) OR (/CAM2 drop/) OR (/CAM3 drop/) OR (/CAM4 drop/)");
-        assert_eq!(a.names, ["drops (CAM1)", "drops (CAM2)", "drops (CAM3)", "drops (CAM4)"]);
+        assert_eq!(a.exp.nfd, "(/CAM1 drop/) OR (/CAM2 drop/) OR (/slow/)", "CAM1 twice counts once");
+        assert_eq!(a.names, ["drops (CAM1)", "drops (CAM2)", "slow"]);
         assert_eq!(a.colors[0], parse_color("violet").unwrap(), "the first has the query's colour");
-        assert!(a.colors[1] != a.colors[0] && a.colors[2] != a.colors[1]);
-        assert_eq!(a.keys, [p.nodes[0].key; 4]);
-        // Searched for, it is one term: its instances OR'ed.
-        assert_eq!(p.search_term(&lib, &Target::Node(p.nodes[0].key), 0).unwrap().nfd, a.exp.nfd);
-        // Kept in a preset.
+        assert!(a.colors[1] != a.colors[0]);
+        assert_eq!(instance_count(&node_params(&lib, &p.nodes[0]), &p.values()), 2);
+        assert_eq!(instance_count(&node_params(&lib, &p.nodes[1]), &p.values()), 1);
+        // Another query using $cam: its instances too.
+        p.add(&lib, "c.fps", Use::Signal, None);
+        assert_eq!(p.expand(&lib).unwrap().names[3..], ["fps (CAM1)", "fps (CAM2)"]);
+        // Searched for, a query is one term: its instances OR'ed.
+        assert_eq!(
+            p.search_term(&lib, &Target::Node(p.nodes[0].key), 0).unwrap().nfd,
+            "(/CAM1 drop/) OR (/CAM2 drop/)"
+        );
+        // Kept in a preset: `+=` lines.
         let preset = p.to_preset("cams");
-        assert!(preset.serialize().contains("instance 4 cam = CAM4\n"), "{}", preset.serialize());
+        assert!(preset.serialize().contains("param cam = CAM1\nparam cam += CAM2\n"), "{}", preset.serialize());
         let mut again = Picks::default();
         again.use_preset(&lib, &preset);
-        assert_eq!(again.expand(&lib).unwrap().exp.nfd, a.exp.nfd);
+        assert_eq!(again.expand(&lib).unwrap().exp.nfd, p.expand(&lib).unwrap().exp.nfd);
     }
 
     /// Owner, 2026-11-15: a `signals:` entry for a group the query no longer
@@ -2588,7 +2477,7 @@ mod tests {
     fn a_query_can_be_added_without_its_parents() {
         let lib = lib();
         let mut p = Picks::default();
-        p.params.insert("ecu".into(), ("E1".into(), false));
+        p.params.insert("ecu".into(), vec![("E1".into(), false)]);
         assert!(p.add_detached(&lib, "v.drops", Use::Include));
         assert!(!p.add_detached(&lib, "v.drops", Use::Include), "not twice");
         assert!(p.add(&lib, "v.drops", Use::Include, None), "with parents is another node");
@@ -2714,7 +2603,7 @@ query swup  parent: soc
         p.add(&lib, "v.drops", Use::Include, None);
         let new = p.add_new(Use::Include);
         p.node_mut(new).unwrap().text = "/x/".into();
-        p.params.insert("ecu".into(), ("E1".into(), false));
+        p.params.insert("ecu".into(), vec![("E1".into(), false)]);
         let colors = |p: &Picks| p.nodes.iter().map(|n| (n.key, n.color())).collect::<Vec<_>>();
         let before = colors(&p);
         // Own colour (drops: violet) wins; the others take free entries.
@@ -2750,7 +2639,7 @@ query swup  parent: soc
         let mut p = Picks::default();
         p.add(&lib, "v.slow", Use::Include, None);
         p.add(&lib, "v.drops", Use::Include, None);
-        p.params.insert("ecu".into(), ("E1".into(), false));
+        p.params.insert("ecu".into(), vec![("E1".into(), false)]);
         let a = p.expand(&lib).unwrap();
         assert_eq!(a.exp.nfd, r#"(/slow/) OR (ecu == "E1") AND (/drop/)"#);
         assert_eq!(a.names, ["slow", "drops"]);
@@ -2765,7 +2654,7 @@ query swup  parent: soc
         p.nodes[0].edited = true;
         let new = p.add_new(Use::Exclude);
         p.node_mut(new).unwrap().text = "level <= DEBUG".into();
-        p.params.insert("what".into(), ("a.b".into(), false));
+        p.params.insert("what".into(), vec![("a.b".into(), false)]);
         let a = p.expand(&lib).unwrap();
         assert_eq!(a.exp.nfd, r#"((ecu == "E1") AND (/dropped a\.b/) OR (/slow/)) AND NOT (level <= DEBUG)"#);
         assert_eq!(a.keys.len(), 3);
@@ -2801,7 +2690,7 @@ query swup  parent: soc
         assert!(p.add(&lib, "v.slow", Use::Require, None));
         let new = p.add_new(Use::Require);
         p.node_mut(new).unwrap().text = "level >= WARN".into();
-        p.params.insert("ecu".into(), ("E1".into(), false));
+        p.params.insert("ecu".into(), vec![("E1".into(), false)]);
         let a = p.expand(&lib).unwrap();
         assert_eq!(a.exp.nfd, r#"((/slow/) OR (ecu == "E1") AND (/drop/)) AND (/slow/) AND (level >= WARN)"#);
         assert_eq!(a.names, ["slow", "drops", "slow", "level >= WARN"]);

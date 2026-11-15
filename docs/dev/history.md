@@ -4,6 +4,8 @@ The dated log of the project, newest first; append-only: add an entry at the top
 
 ## 2026-11-15
 
+Instances reworked (owner, of five alternatives weighed): a parameter has several values in the selection's Parameters box (+ value; + on a picked query adds one), every picked query using it an instance per value (`× N` beside it); the instance rows under picks, ⊕ and the `ID(…)` command-line form are gone; presets keep `param NAME += VALUE`. Merge by time is called **Sort by time** for several files too (`query-instances.md`, `gui-decisions.md`).
+
 Merge by time sorts every line by `@time` (owner): it kept each file's own order, and real captures whose times go back inside a file (MF4s read group by group) came out unsorted; lines of one time stay in the order of the files given (`gui-decisions.md`).
 
 Built for 0.2.2: instances of a parameterised query (a pick's argument sets, ⊕ in the selection, a part, colour and signals each; `signals:` lines with parameters; presets and the command line), a warning when queries give one signal different options (⚠ on its row, Save to pack makes them agree), stale `signals:` entries listed as warnings and removed when the query is saved.

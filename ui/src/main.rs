@@ -83,11 +83,11 @@ Options:
       --pack PATH          Load a library pack (file or folder)
       --pick PACK.QUERY    Select a library query (Include)
       --exclude PACK.QUERY Select a library query (Exclude)
-      --signal-pick PACK.QUERY  Select a library query (Signal); with
-                           (NAME=VALUE, …): an instance of it (also --pick, --exclude)
+      --signal-pick PACK.QUERY  Select a library query (Signal)
       --search-pick PACK.QUERY  Put a library query in the Search box
       --highlight NFD      Colour the lines a query matches
-      --param NAME=VALUE   A library parameter's value
+      --param NAME=VALUE   A library parameter's value (again: another value, an
+                           instance of each query using it)
       --library            Show the library
       --signal SPEC        A signal for this session (as `nerka --signal`)
       --lifecycle SPEC     A lifecycle for this session (as `nerka --lifecycle`)
@@ -184,7 +184,8 @@ fn main() -> eframe::Result {
             }
             Some("--param") => {
                 if let Some((k, v)) = value().split_once('=') {
-                    params.insert(k.to_owned(), (v.to_owned(), false));
+                    // Again for a name: another value (instances).
+                    params.entry(k.to_owned()).or_insert_with(Vec::new).push((v.to_owned(), false));
                 }
                 continue;
             }
@@ -338,10 +339,7 @@ fn main() -> eframe::Result {
             let mut picks = Picks::default();
             picks.params = params;
             for (role, id) in &startup {
-                // `ID(NAME=VALUE, …)`: an instance of it, as on the CLI.
-                if let Err(e) = picks.add_given(&app.library, id, *role) {
-                    app.option_errors.push(e);
-                }
+                picks.add(&app.library, id, *role, None);
             }
             for id in &highlight {
                 picks.light_source(id);
@@ -1834,7 +1832,7 @@ impl Tab {
                                 }
                                 1 => format!("Indexed {} lines in {took:.2?}", f.line_count()),
                                 n if f.reordered().is_some() => {
-                                    format!("Merged {} lines of {n} files by time in {took:.2?}", f.line_count())
+                                    format!("Sorted {} lines of {n} files by time in {took:.2?}", f.line_count())
                                 }
                                 n if self.merge => {
                                     // Which files keep it from being merged.
@@ -1848,7 +1846,7 @@ impl Tab {
                                         names.iter().map(String::as_str).zip(parts.iter().map(|p| &*p.source)),
                                     );
                                     format!(
-                                        "Indexed {} lines of {n} files; not merged: {} {} lines without times",
+                                        "Indexed {} lines of {n} files; not sorted: {} {} lines without times",
                                         f.line_count(),
                                         if without.is_empty() {
                                             "not every file".to_owned()
@@ -4518,7 +4516,7 @@ impl App {
                             let mut on = t.merge;
                             let tip = "All files' lines sorted by their times (DLT, captures); lines of one time in \
                                        the order of the files, then of each file; off: one file after another";
-                            if ui.checkbox(&mut on, "Merge by time").on_hover_text(tip).changed() {
+                            if ui.checkbox(&mut on, "Sort by time").on_hover_text(tip).changed() {
                                 merge = Some(i);
                                 ui.close();
                             }
@@ -5735,7 +5733,7 @@ query timeouts  labels: vision
         let mut p = Picks::default();
         p.add(&lib, "vision.errors", Use::Include, None);
         p.add(&lib, "vision.cam", Use::Include, None);
-        p.params.insert("cam".into(), ("cam1".into(), false));
+        p.params.insert("cam".into(), vec![("cam1".into(), false)]);
         let a = p.expand(&lib).unwrap();
         assert_eq!(a.exp.nfd, "(level >= ERROR)");
         let lines = expansion_lines(&a, &|_| false);
@@ -6691,7 +6689,7 @@ gear=D
         let file = tab.file.clone().unwrap();
         let last = |r: LineNo| file.line_text(r).unwrap().rsplit('\t').next().unwrap().to_owned();
         assert_eq!((0..5).map(last).collect::<Vec<_>>(), ["a0", "b0", "a1 boom", "b1 boom", "a2"]);
-        assert!(tab.status.starts_with("Merged 5 lines of 2 files"), "{}", tab.status);
+        assert!(tab.status.starts_with("Sorted 5 lines of 2 files"), "{}", tab.status);
         // Filters run over the merged rows.
         tab.mode = Mode::Text;
         tab.pattern = "boom".into();
@@ -6736,7 +6734,7 @@ gear=D
         assert!(tab.merge, "asked for");
         settle(&mut tab, &ctx);
         assert!(!tab.merge, "not done: unticked");
-        assert!(tab.status.contains("not merged: a.log, b.log have lines without times"), "{}", tab.status);
+        assert!(tab.status.contains("not sorted: a.log, b.log have lines without times"), "{}", tab.status);
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -7157,7 +7155,7 @@ gear=D
         settle(&mut one, &ctx);
         one.picks.add(&lib, "vision.cam", Use::Include, None);
         one.picks.add(&lib, "vision.timeouts", Use::Exclude, None);
-        one.picks.params.insert("cam".into(), ("cam1".into(), false));
+        one.picks.params.insert("cam".into(), vec![("cam1".into(), false)]);
         one.picks.light_source("vision.cam");
         one.apply_filter_picks(&ctx, &lib).unwrap();
         one.search.mode = Mode::Auto;
@@ -7496,7 +7494,7 @@ query nav
         tab.picks.add(&lib, "vision.timeouts", Use::Exclude, None);
         assert_eq!(tab.apply_filter_picks(&ctx, &lib), None, "a missing parameter is reported, not run");
         assert!(tab.picks.error.as_deref().unwrap().contains("'$cam'"), "{:?}", tab.picks.error);
-        tab.picks.params.insert("cam".into(), ("cam1".into(), false));
+        tab.picks.params.insert("cam".into(), vec![("cam1".into(), false)]);
         let nfd = tab.apply_filter_picks(&ctx, &lib).expect("runs");
         assert_eq!(nfd, "(level >= ERROR) AND (raw ~ /cam1 /) AND NOT (/timeout/)");
         assert_eq!(tab.mode, Mode::Query);
@@ -7669,7 +7667,7 @@ query clock  signals: t:time
         settle(&mut tab, &ctx);
         let saved = Signals::default();
         tab.picks.add(&lib, "cam.drops", Use::Signal, None);
-        tab.picks.params.insert("cam".into(), ("CAM1".into(), false));
+        tab.picks.params.insert("cam".into(), vec![("CAM1".into(), false)]);
         tab.refresh_signals(&ctx, &lib, &saved, 0);
         let d = tab.signals.get("drops_CAM1").expect("filled in");
         assert_eq!((d.kind(), d.per()), (SignalKind::Num, Some("ecu_cam1")));
@@ -7702,10 +7700,7 @@ query clock  signals: t:time
         settle(&mut tab, &ctx);
         let saved = Signals::default();
         tab.picks.add(&lib, "cam.drops", Use::Signal, None);
-        let n = &mut tab.picks.nodes[0];
-        for cam in ["CAM1", "CAM2"] {
-            n.instances.push(library::Instance { args: [("cam".to_owned(), (cam.to_owned(), false))].into() });
-        }
+        tab.picks.params.insert("cam".into(), vec![("CAM1".into(), false), ("CAM2".into(), false)]);
         tab.refresh_signals(&ctx, &lib, &saved, 0);
         let names: Vec<&str> = tab.signals.iter().map(|d| d.name()).collect();
         assert_eq!(names, ["drops_cam1", "total", "drops_cam2"]);

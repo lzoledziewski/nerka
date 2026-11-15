@@ -74,13 +74,15 @@ Applying the selection puts its expansion in the Filter box (NFD mode).
 
 ### Instances of a parameterised query
 
-To track several cameras with one `drops(cam)` query, give its pick
-**instances**: ⊕ → **One more instance**, or **Instances from a list…**
-(one value per line). Each instance is listed under the pick with its own
-values (empty: the shared one from **Parameters**) and is a part of its
-own: `drops (CAM1)`, `drops (CAM2)`, each with its colour. Instances share
-the query's text and settings: editing the query edits them all. An
-instance with the same values as another adds nothing and is marked ⚠.
+To track several cameras with one `drops(cam)` query, give `$cam` several
+values in **Parameters**: **+ value** adds a field (so does + on the query
+in the library once it is picked), ✖ removes one. Every picked query
+using `$cam` is then an **instance** per value, a part of its own:
+`drops (CAM1)`, `drops (CAM2)`, each with its colour, and the selection
+shows the count next to it (`× 2`). With two such parameters, every
+combination. A value counts once you press Enter or leave its field; an
+empty field or a value given twice (⚠) adds nothing. Instances share the
+query's text and settings: editing the query edits them all.
 
 Signals follow the query's group names: `(?<drops_$cam>…)` gives each
 instance its signal (`@drops_CAM1`, `@drops_CAM2`); `(?<drops>…)` is one
@@ -93,10 +95,9 @@ query drops(cam)  signals: drops_$cam:num:default(0)
 ```
 
 An option there may use only the parameters its name uses (instances that
-share a signal share its options). On the command line, a query with
-arguments is an instance: `-q 'vision.drops(cam=CAM1)' -q
-'vision.drops(cam=CAM2)'` (quote a value with `,` or spaces: `cam="CAM 1"`);
-`nerka-gui --signal-pick 'vision.drops(cam=CAM1)'` likewise.
+share a signal share its options). On the command line, give a parameter
+several times: `-p cam=CAM1 -p cam=CAM2` (`nerka-gui --param` likewise);
+presets keep the values as `param cam = CAM1` and `param cam += CAM2`.
 
 ## Expansion
 

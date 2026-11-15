@@ -454,36 +454,32 @@ fn several_files_are_one_view() {
     assert!(err(&o).contains("only files of one kind open as one view"), "{}", err(&o));
 }
 
-/// Owner, 2026-11-15: a query with arguments is an instance of it
-/// (`-q 'ID(NAME=VALUE)'`), several of them its instances; `-p` is the
-/// shared value; a quoted value may hold `,` and spaces.
+/// Owner, 2026-11-15: a parameter given several times has several values;
+/// each query using it is an instance per value, in every role.
 #[test]
-fn instances_on_the_command_line() {
+fn several_values_of_a_parameter_on_the_command_line() {
     let d = dir("instances");
     let pack = d.join("cam.nerka-pack");
-    std::fs::write(&pack, "pack cam\nquery drops(cam)\n    /$cam drop/\n").unwrap();
+    std::fs::write(&pack, "pack cam\nquery drops(cam)\n    /$cam drop/\nquery slow\n    /slow/\n").unwrap();
     let o = nerka(&[
         "--pack",
         s(&pack),
         "expand",
         "--parts",
         "-q",
-        "cam.drops(cam=CAM1)",
-        "-q",
-        r#"cam.drops(cam="CAM 2, x")"#,
+        "cam.slow",
         "-x",
         "cam.drops",
         "-p",
-        "cam=CAM3",
+        "cam=CAM1",
+        "-p",
+        "cam=CAM 2, x",
     ]);
     assert_eq!(
         out(&o),
-        "((/CAM1 drop/) OR (/CAM 2, x drop/)) AND NOT (/CAM3 drop/)\n\
-         include cam.drops(cam=CAM1): (/CAM1 drop/)\n\
-         include cam.drops(cam=CAM 2, x): (/CAM 2, x drop/)\n\
-         exclude cam.drops: (/CAM3 drop/)\n"
+        "(/slow/) AND NOT (/CAM1 drop/) AND NOT (/CAM 2, x drop/)\n\
+         include cam.slow: (/slow/)\n\
+         exclude cam.drops(cam=CAM1): (/CAM1 drop/)\n\
+         exclude cam.drops(cam=CAM 2, x): (/CAM 2, x drop/)\n"
     );
-    let o = nerka(&["--pack", s(&pack), "expand", "-q", "cam.drops(cam)"]);
-    assert_eq!(o.status.code(), Some(1));
-    assert!(err(&o).contains("expected NAME=VALUE"), "{}", err(&o));
 }

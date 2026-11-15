@@ -249,6 +249,42 @@ fn instances_of_a_query_are_parts_of_their_own() {
     assert_eq!(s.snapshot(&lib).unwrap(), s);
 }
 
+/// Owner, 2026-11-15: several values for a parameter make every picked
+/// query that uses it an instance per value (per combination with more);
+/// a field not filled in yet and a value given twice don't count.
+#[test]
+fn several_values_of_a_parameter_make_instances() {
+    let mut lib = lib();
+    lib.add(pack(VISION)).unwrap();
+    let vals = |kv: &[(&str, &[&str])]| -> ParamValues {
+        kv.iter().map(|(k, vs)| (k.to_string(), vs.iter().map(|v| ParamValue::literal(*v)).collect())).collect()
+    };
+    let s = sel(&["txt.cam", "nav.slow"], &[]);
+    let e = expand_values(&s, &lib, &vals(&[("cam", &["CAM1", "", "CAM2", "CAM1"]), ("app", &["NAV"])])).unwrap();
+    assert_eq!(e.nfd, r#"(raw ~ /CAM1 frame drop/) OR (raw ~ /CAM2 frame drop/) OR (apid == "NAV") AND (/slow/)"#);
+    let got: Vec<(usize, String)> = e
+        .parts
+        .iter()
+        .map(|p| (p.pick, p.args.values().map(|v| v.value.clone()).collect::<Vec<_>>().join(",")))
+        .collect();
+    assert_eq!(got, [(0, "CAM1".into()), (0, "CAM2".into()), (1, String::new())], "one value: no instance");
+    // Two parameters with several values: every combination.
+    let s = sel(&["vision.cam_scope"], &[]);
+    let e = expand_values(&s, &lib, &vals(&[("ecu", &["E1", "E2"]), ("cam", &["C1", "C2"])])).unwrap();
+    assert_eq!(e.parts.len(), 4);
+    assert_eq!(
+        instances(&lib, "vision.cam_scope", &vals(&[("ecu", &["E1", "E2"]), ("cam", &["C1", "C2", "C3"])])).len(),
+        6
+    );
+    // Labels too: each of their queries.
+    let e =
+        expand_values(&sel(&["@vision"], &[]), &lib, &vals(&[("cam", &["A", "B"]), ("what", &["x"]), ("ecu", &["E"])]))
+            .unwrap();
+    assert_eq!(e.parts.len(), 3, "txt.cam ×2, txt.fail (vision.cam_scope is system/vision)");
+    // One value each: as before.
+    assert_eq!(first_values(&vals(&[("cam", &["", "CAM2"])]))["cam"].value, "CAM2");
+}
+
 #[test]
 fn parameters_are_regex_escaped() {
     let text = "\

@@ -15,11 +15,9 @@
 //! node include detached     query vision.drops
 //! node signal lit           query vision.speed
 //! node include lit          local n1  from vision.timeouts  name "slow ones"
-//! node signal               query vision.drops
-//! instance 1 cam = CAM2
-//! instance 2 cam = CAM3
 //! param cam = CAM1
 //! param re raw = a.b(c)?
+//! param cam += CAM2
 //! filter selection
 //! search auto timeout AND level >= WARN
 //!
@@ -31,8 +29,7 @@
 //! ```text
 //! file   := "preset" NAME line* [ "pack" "_preset" query* ]   -- queries as in packs
 //! line   := "node" ("include" | "require" | "exclude" | "signal") flag* source
-//!         | "instance" N [NAME ["raw"] "=" VALUE]             -- the node above's instance N (from 1)
-//!         | "param" NAME ["raw"] "=" VALUE                    -- VALUE: rest of the line
+//!         | "param" NAME ["raw"] ("=" | "+=") VALUE         -- VALUE: rest of the line; += another value
 //!         | ("filter" | "search") ("selection" | TAG TEXT)    -- TAG: auto, text, regex, query
 //! flag   := "lit" | "detached"
 //! source := "query" ID                                        -- a library query (pack.query)
@@ -42,10 +39,6 @@
 //! IDs and NAMEs are quoted (`"…"`, with `\"` and `\\`) when they hold
 //! spaces or quotes. `filter selection` means the Filter box held the
 //! selection's expansion, which is expanded again when the preset is used.
-//! `instance` lines give the node above its instances (`query-instances.md`),
-//! a line per own value; a parameter an instance doesn't give takes the
-//! `param` value. A new keyword, so an older nerka refuses such a preset
-//! instead of reading the values as shared ones.
 
 use crate::pack::{Pack, PackError, PackQuery, Role, format_query, parse_pack};
 use std::path::{Path, PathBuf};
@@ -79,8 +72,6 @@ pub struct PresetNode {
     pub lit: bool,
     /// Without its parents: only its own text counts.
     pub detached: bool,
-    /// Its instances: each one's own parameter values.
-    pub instances: Vec<Vec<PresetParam>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -195,18 +186,12 @@ impl Preset {
                 }
             }
             out.push('\n');
-            for (i, inst) in n.instances.iter().enumerate() {
-                for p in inst {
-                    out += &format!("instance {} {}{} = {}\n", i + 1, p.name, if p.raw { " raw" } else { "" }, p.value);
-                }
-                // An instance without own values still is one.
-                if inst.is_empty() {
-                    out += &format!("instance {}\n", i + 1);
-                }
-            }
         }
-        for p in &self.params {
-            out += &format!("param {}{} = {}\n", p.name, if p.raw { " raw" } else { "" }, p.value);
+        // A value for a name already given: `+=` (another value; an older
+        // nerka refuses the preset instead of keeping only the last).
+        for (i, p) in self.params.iter().enumerate() {
+            let op = if self.params[..i].iter().any(|x| x.name == p.name) { "+=" } else { "=" };
+            out += &format!("param {}{} {op} {}\n", p.name, if p.raw { " raw" } else { "" }, p.value);
         }
         for (key, b) in [("filter", &self.filter), ("search", &self.search)] {
             match b {
@@ -367,43 +352,18 @@ pub fn parse_preset(file: &str, text: &str) -> Result<Preset, PackError> {
             },
             "preset" => return Err(err(ln, w[0].1, "a file holds one preset: second 'preset' line".into())),
             "node" => p.nodes.push(node(&w).map_err(|(col, m)| err(ln, col.unwrap_or(end_col), m))?),
-            "instance" => {
-                // instance N [NAME [raw] = VALUE]: the node above's instance N.
-                let Some(node) = p.nodes.last_mut() else {
-                    return Err(err(ln, w[0].1, "'instance' before any 'node' line".into()));
-                };
-                let next = node.instances.len() + 1;
-                let n = w.get(1).and_then(|(n, _)| n.parse::<usize>().ok()).filter(|n| (1..=next).contains(n));
-                let Some(n) = n else {
-                    let col = w.get(1).map_or(end_col, |x| x.1);
-                    return Err(err(ln, col, format!("expected the instance's number (1 to {next})")));
-                };
-                if n == next {
-                    node.instances.push(Vec::new());
-                }
-                if w.len() > 2 {
-                    let Some(eq) = content.find(" = ").or_else(|| content.strip_suffix(" =").map(|s| s.len())) else {
-                        return Err(err(ln, end_col, "expected 'instance N NAME = VALUE'".into()));
-                    };
-                    let head: Vec<&str> = content[..eq].split_whitespace().collect();
-                    let (name, raw) = match head.as_slice() {
-                        ["instance", _, n] => (*n, false),
-                        ["instance", _, n, "raw"] => (*n, true),
-                        _ => return Err(err(ln, w[2].1, "expected 'instance N NAME [raw] = VALUE'".into())),
-                    };
-                    if !crate::pack::is_name(name) {
-                        return Err(err(ln, w[2].1, format!("invalid parameter name '{name}'")));
-                    }
-                    let value = content.get(eq + 3..).unwrap_or("").to_owned();
-                    node.instances[n - 1].push(PresetParam { name: name.to_owned(), value, raw });
-                }
-            }
             "param" => {
-                // param NAME [raw] = VALUE (the value is the rest of the line)
-                let Some(eq) = content.find(" = ").or_else(|| content.strip_suffix(" =").map(|s| s.len())) else {
-                    return Err(err(ln, end_col, "expected 'param NAME = VALUE'".into()));
+                // param NAME [raw] = VALUE, or += for another value of it (the
+                // value is the rest of the line; whichever comes first).
+                let set = content.find(" = ").or_else(|| content.strip_suffix(" =").map(|s| s.len()));
+                let add = content.find(" += ").or_else(|| content.strip_suffix(" +=").map(|s| s.len()));
+                let (at, len, more) = match (set, add) {
+                    (Some(s), Some(a)) if a < s => (a, 4, true),
+                    (Some(s), _) => (s, 3, false),
+                    (None, Some(a)) => (a, 4, true),
+                    (None, None) => return Err(err(ln, end_col, "expected 'param NAME = VALUE'".into())),
                 };
-                let head: Vec<&str> = content[..eq].split_whitespace().collect();
+                let head: Vec<&str> = content[..at].split_whitespace().collect();
                 let (name, raw) = match head.as_slice() {
                     ["param", n] => (*n, false),
                     ["param", n, "raw"] => (*n, true),
@@ -412,7 +372,10 @@ pub fn parse_preset(file: &str, text: &str) -> Result<Preset, PackError> {
                 if !crate::pack::is_name(name) {
                     return Err(err(ln, 6, format!("invalid parameter name '{name}'")));
                 }
-                let value = content.get(eq + 3..).unwrap_or("").to_owned();
+                if more && !p.params.iter().any(|x| x.name == name) {
+                    return Err(err(ln, 6, format!("'param {name} +=' before 'param {name} = VALUE'")));
+                }
+                let value = content.get(at + len..).unwrap_or("").to_owned();
                 p.params.push(PresetParam { name: name.to_owned(), value, raw });
             }
             "filter" | "search" => {
@@ -523,7 +486,7 @@ fn node(w: &[(String, usize)]) -> Result<PresetNode, NodeErr> {
     if let Some((extra, col)) = it.next() {
         return Err((Some(*col), format!("unexpected '{extra}'")));
     }
-    Ok(PresetNode { source, role, lit, detached, instances: Vec::new() })
+    Ok(PresetNode { source, role, lit, detached })
 }
 
 #[cfg(test)]
@@ -556,21 +519,18 @@ mod tests {
                     role: Role::Include,
                     lit: true,
                     detached: false,
-                    instances: Vec::new(),
                 },
                 PresetNode {
                     source: NodeSource::Library("camera team.noise".into()),
                     role: Role::Exclude,
                     lit: false,
                     detached: false,
-                    instances: Vec::new(),
                 },
                 PresetNode {
                     source: NodeSource::Library("vision.drops".into()),
                     role: Role::Include,
                     lit: false,
                     detached: true,
-                    instances: Vec::new(),
                 },
                 PresetNode {
                     source: NodeSource::Local {
@@ -581,14 +541,12 @@ mod tests {
                     role: Role::Include,
                     lit: true,
                     detached: false,
-                    instances: Vec::new(),
                 },
                 PresetNode {
                     source: NodeSource::Local { id: "n2".into(), from: None, name: String::new() },
                     role: Role::Require,
                     lit: false,
                     detached: false,
-                    instances: Vec::new(),
                 },
             ],
             params: vec![
@@ -635,6 +593,22 @@ mod tests {
         assert_eq!(p.serialize(), text);
     }
 
+    /// Owner, 2026-11-15: several values of a parameter (instances of the
+    /// queries using it): `+=` lines after the first.
+    #[test]
+    fn several_values_of_a_parameter_round_trip() {
+        let text = "preset p\nparam cam = CAM1\nparam re raw = a += b\nparam cam += CAM 2 = x\nparam cam raw += C.3\n";
+        let p = parse_preset("t", text).unwrap_or_else(|e| panic!("{e}"));
+        let got: Vec<(&str, &str, bool)> =
+            p.params.iter().map(|x| (x.name.as_str(), x.value.as_str(), x.raw)).collect();
+        assert_eq!(
+            got,
+            [("cam", "CAM1", false), ("re", "a += b", true), ("cam", "CAM 2 = x", false), ("cam", "C.3", true)]
+        );
+        assert_eq!(p.serialize(), text);
+        bad("preset p\nparam cam += CAM2\n", 2, 7, "'param cam +=' before 'param cam = VALUE'");
+    }
+
     #[test]
     fn round_trips() {
         let p = sample();
@@ -652,23 +626,6 @@ mod tests {
         assert!(text.contains("local n1 from vision.timeouts name \"slow \\\"ones\\\"\"\n"));
         assert!(text.contains("param re raw = a.b(c)? = x\n"));
         assert!(text.contains("\npack _preset\nquery n1  parent: vision.cam"));
-    }
-
-    /// Owner, 2026-11-15: a node's instances, a line per own value.
-    #[test]
-    fn instances_round_trip() {
-        let text = "preset p\nnode signal query cam.drops\ninstance 1 cam = CAM1\ninstance 1 re raw = a|b\ninstance 2\ninstance 3 cam = CAM 3 = x\nparam cam = CAM9\n";
-        let p = parse_preset("t", text).unwrap_or_else(|e| panic!("{e}"));
-        let inst = &p.nodes[0].instances;
-        assert_eq!(inst.len(), 3);
-        assert_eq!((inst[0][1].name.as_str(), inst[0][1].value.as_str(), inst[0][1].raw), ("re", "a|b", true));
-        assert!(inst[1].is_empty(), "an instance without own values");
-        assert_eq!(inst[2][0].value, "CAM 3 = x", "the rest of the line");
-        assert_eq!(p.serialize(), text);
-        assert_eq!(parse_preset("t", &p.serialize()).unwrap(), p);
-        bad("preset p\ninstance 1 cam = A\n", 2, 1, "'instance' before any 'node' line");
-        bad("preset p\nnode include query a.b\ninstance 2 cam = A\n", 3, 10, "expected the instance's number (1 to 1)");
-        bad("preset p\nnode include query a.b\ninstance 1 c-m = A\n", 3, 12, "invalid parameter name 'c-m'");
     }
 
     #[test]

@@ -1,98 +1,68 @@
 # Instances of a parameterised query
 
-A parameterised query (`query drops(cam)`) picked several times in one
-selection, each pick with its own arguments, to track several instances side
-by side (owner, 2026-11-15: so far the query was duplicated by hand, one per
-camera). Built for 0.2.2: `features.md` → "Instances of a parameterised query".
+A parameterised query (`query drops(cam)`) run for several values of its
+parameter at once, to track several instances side by side (owner,
+2026-11-15: so far the query was duplicated by hand, one per camera).
+Built for 0.2.2: `features.md` → "Instances of a parameterised query".
 
 ## Decisions (owner, 2026-11-15)
 
-- **Each pick carries its own arguments.** A pick of a parameterised query
-  can set its own value for each parameter; a parameter it doesn't set takes
-  the selection's shared value (the `param` values of today). A selection
-  with one pick per query works as now.
-- **Instances are argument sets of one pick.** The pick holds the query
-  (its text, options and role) and a list of argument sets; **+ instance**
-  adds a set. Instances of one query share its settings and can't
-  disagree: editing the query edits it for all of them. The same query in
-  another role (include CAM1, exclude CAM2) is another pick, as today. A
-  shortcut makes several sets at once from a list of values, one per line
-  (not comma-separated: raw regex values hold commas, `a{1,3}`). The same
-  argument values twice are refused.
-- **Each instance is a part of its own:** shown as `drops (CAM1)`, with its
-  own colour; Include instances are OR'ed, Require ones each ANDed, Exclude
-  ones each excluded; the instance's arguments fill its parent chain too.
+- **A parameter can have several values** (alternative C of five weighed:
+  instances under a pick, picks of their own, values per parameter, values
+  per parameter with per-pick overrides, values per query). They are given
+  in the selection's **Parameters** box, one field per value (no commas:
+  raw regex values hold them, `a{1,3}`), **+ value** and ✖; + on a library
+  query already picked adds a value instead of a second pick.
+- **Every picked query using a parameter with several values is an
+  instance per value**, a part of its own: shown as `drops (CAM1)`, with
+  its own colour (the first the query's), in the query's role. With
+  several such parameters, every combination; the selection shows the
+  count next to the query (`× 6`). A field not filled in yet and a value
+  given twice don't count (the second is marked ⚠).
+- **Values belong to the parameter, not to a query:** one query can't have
+  other values of `$cam` than another (cases weighed and accepted: rare;
+  per-pick overrides could come later). Instances of a query share its
+  text and settings.
 - **Signals follow the pack's group names (no names made up):** a group
   that uses the parameter (`(?<drops_$cam>…)`) gives a signal per instance
   (`@drops_CAM1`, `@drops_CAM2`); one that doesn't (`(?<drops>…)`) is one
-  signal from every instance, a valid use (several values feeding one
-  signal), shown in the Signals panel as `@drops ← 3 instances`. Instances
-  never conflict: they come from the same query with the same settings.
+  signal from every instance, a valid use, never a conflict (the same
+  query, the same settings).
 - **`signals:` lines take parameters:** `signals: drops_$cam:num:per(ecu_$cam):default(0)`,
-  filled in from the instance's arguments as its text is; after filling in,
-  a name must be a plain name. An option may use a parameter only if the
-  group's name uses it too (`drops:per(ecu_$ecu)` is an error when the pack
-  is read), so a signal several instances feed has one set of options.
-  **Save to pack** writes the parameterised form back (`drops_$cam`), not
-  the instance's name.
-
-Settled with them (same day): conflicting options between queries are shown
-as a warning and the first picked query's win; signals merge across packs,
-no namespaces.
+  filled in per instance as the text is; an option may use only the
+  parameters its group's name uses (checked when the pack is read), so a
+  signal several instances feed has one set of options. **Save to pack**
+  writes the parameterised form back (`drops_$cam`), not the instance's
+  name.
+- **When values apply:** a value counts once Enter is pressed or its field
+  is left; filter picks still need **Apply**, signal picks follow then.
 
 ## Design
 
-**Core (`pack/expand.rs`).** `Pick::Query` gains its argument sets
-(`Pick::Query { id, instances: Vec<Params> }`; none: one instance with the
-shared values). Each instance expands to a part of its own; its effective
-parameters are its own over the shared ones; an instance whose effective
-arguments equal an earlier one's is dropped. Ancestor coverage (`covers`)
-holds only between instances with the same effective arguments. `Part` gets
-the pick's index in its role's list and the instance's index, so callers map
-parts back without the query id (which instances share), and the instance's
-arguments for display.
+**Core (`pack/expand.rs`).** `ParamValues` (several values per name);
+`expand_values` makes each picked query (or a label's) an instance per
+combination of the parameters it uses that have several values
+(`instances`), the first values shared (`first_values`). A part keeps its
+pick's index and the values of those parameters (`Part::pick`,
+`Part::args`), since instances share the query id. `Pick::QueryWith` (a
+pick with its own arguments) stays in core; nothing in the GUI or CLI
+writes it.
 
-**Packs (`pack/parser.rs`, `signal.rs`).** A `signals:` entry's group and
-option values may hold `$name` / `${name}` (checked as a name with
-parameters when parsed; `SignalOptions` keeps the text). The parser refuses
-an option that uses a parameter its group's name doesn't. Filling in happens
-where the query's text is filled in; a filled-in group that isn't a name is
-an expansion error naming the query and the value.
+**GUI (`ui/src/library.rs`).** `Picks::params` holds a list per name;
+`params_ui` shows them with drafts that count on Enter or focus leaving
+(`Picks::drafts`); `instance_count` gives the `× N`; `expand` maps parts
+back to nodes by pick index and colours each instance
+(`Node::instance_color`).
 
-**GUI (`ui/src/library.rs`).**
-- `Node` gets `instances` (argument sets; raw flag as the shared ones) and
-  a colour slot per instance. `expand` maps parts back by pick and instance
-  index, not by `expand_id`. Editing the node edits the query for all its
-  instances.
-- The node's chip shows the query; under it a chip per instance
-  (`CAM1`), each with its colour, its fields and ✖; the shared fields stay
-  in the selection's parameter list.
-- **+ instance** on a parameterised pick; **Instances…** asks for values,
-  one per line, and adds a set per value; values already there are refused
-  with a message.
-- `search_term`, line colours and the signals' pins use each instance's
-  effective arguments; `Picks::save_signal_options` maps `drops_CAM1` back
-  to the entry or group `drops_$cam` of that query.
-
-**Presets (`preset.rs`).** A node's instances follow it, a line per
-argument: `node include lit query cam.drops`, then `instance 1 cam = CAM1`,
-`instance 2 cam = CAM2` (`instance 2 re raw = …`). A new keyword, not an
-indented `param`: an older nerka refuses the preset instead of reading the
-values as the shared ones. Existing presets read as before, so no
-`bundle::STEPS` migration.
-
-**CLI.** `-q 'cam.drops(cam=CAM1)' -q 'cam.drops(cam=CAM2)'`: picks of the
-same query and role become one pick with two instances (several arguments
-with `,`; a value with `,`, `)` or spaces quoted). `-p` stays the shared
-value. The same for `-r` and `-x`.
-
-**Docs.** `docs/user/packs.md` (instances, `signals:` with parameters),
-`docs/user/signals.md` (signals per instance), the preset format in
-`preset.rs`'s header.
+**Presets (`preset.rs`).** `param cam = CAM1` then `param cam += CAM2`: a
+new operator, so an older nerka refuses the preset instead of keeping only
+one value. **CLI.** `-p cam=CAM1 -p cam=CAM2`; `--parts` names each
+instance's values. `nerka-gui --param` likewise.
 
 ## Open
 
-- Lifecycle rules that use a library query (`{pack.query}`) take the shared
-  parameter values. Instances of a lifecycle (one per ECU) are the same
-  idea: `lifecycles.md` lists "add one per ECU" for later; it could reuse
-  this (a lifecycle over a parameterised query, one per value).
+- Different values of one parameter per query (`drops` for CAM1 and CAM2,
+  `fps` for CAM1 only) or per role: per-pick overrides, if it is needed.
+- Lifecycle rules that use a library query (`{pack.query}`) take the first
+  values. Instances of a lifecycle (one per ECU) are the same idea:
+  `lifecycles.md` lists "add one per ECU" for later.
