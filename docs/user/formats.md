@@ -83,7 +83,7 @@ order given:
 
 ```
 nerka filter 'apid == NAV' ecu1.dlt ecu2.dlt bus.pcap          # FILE:LINE: per line
-nerka --merge filter 'apid == NAV' ecu1.dlt ecu2.dlt bus.pcap  # interleaved by time
+nerka --merge filter 'apid == NAV' ecu1.dlt ecu2.dlt bus.pcap  # sorted by time
 nerka-gui ecu1.dlt ecu2.dlt bus.pcap
 ```
 
@@ -91,11 +91,10 @@ nerka-gui ecu1.dlt ecu2.dlt bus.pcap
   keys), and messages of any protocols (a DLT file with a capture of your
   own protocol). Text and JSON don't mix with the others; the GUI opens them
   as separate tabs and says why.
-- **Merge by time** interleaves lines by their time, for files that all
-  know it (DLT, captures), each file keeping its own order; GUI: the tab's
-  menu. A tab of one such file has **Sort by time** there instead: its
-  lines in the order of their times (lines of the same time keep their
-  order).
+- **Sort by time** puts the lines of all a view's files in the order of
+  their times, for files that know them (DLT, captures); lines of the same
+  time stay in the order of the files given, then of each file. GUI: the
+  tab's menu, for one file or several; CLI: `--merge`.
 - **`file`** tells the files apart in queries ([Queries](queries.md#file-in-a-view-of-several-files)).
 - Bookmarks stay in each file's own `.nerka-marks`.
 

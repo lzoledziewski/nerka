@@ -60,7 +60,7 @@ use nerka_core::preset::{BoxText, Preset};
 use nerka_core::session::{Finished, Output, Session, Stage};
 use nerka_core::{
     Bookmarks, FieldDef, Filter, Highlighter, LineNo, LogSource, Matcher, MatcherOptions, Query, SearchHistory,
-    SearchHits, SearchResult, SearchSet, SignalKind, SignalScope, Signals, text_to_nfd,
+    SearchHits, SearchResult, SearchSet, Signals, text_to_nfd,
 };
 use prefs::SearchPrefs;
 use std::borrow::Cow;
@@ -86,7 +86,8 @@ Options:
       --signal-pick PACK.QUERY  Select a library query (Signal)
       --search-pick PACK.QUERY  Put a library query in the Search box
       --highlight NFD      Colour the lines a query matches
-      --param NAME=VALUE   A library parameter's value
+      --param NAME=VALUE   A library parameter's value (again: another value, an
+                           instance of each query using it)
       --library            Show the library
       --signal SPEC        A signal for this session (as `nerka --signal`)
       --lifecycle SPEC     A lifecycle for this session (as `nerka --lifecycle`)
@@ -183,7 +184,8 @@ fn main() -> eframe::Result {
             }
             Some("--param") => {
                 if let Some((k, v)) = value().split_once('=') {
-                    params.insert(k.to_owned(), (v.to_owned(), false));
+                    // Again for a name: another value (instances).
+                    params.entry(k.to_owned()).or_insert_with(Vec::new).push((v.to_owned(), false));
                 }
                 continue;
             }
@@ -714,12 +716,21 @@ struct Tab {
     own_gen: u64,
     /// Shared with the plot's own window.
     plot: plot::SharedPlot,
+    /// The log view's lifecycle boundaries, by the lifecycles they are of.
+    boundaries: Option<(Vec<usize>, Arc<Vec<view::Boundary>>)>,
     /// What `signals` was built from: (saved signals' generation, choices'
     /// generation, the selection's fingerprint); none: build again.
     signals_key: Option<(u64, u64, String)>,
-    /// Kinds and scopes chosen for query signals, and their generation.
-    query_kind: std::collections::HashMap<String, SignalKind>,
-    query_scope: std::collections::HashMap<String, SignalScope>,
+    /// Options chosen in this tab for query and FIBEX signals, over what
+    /// their pack gives (an empty `per` or `default`: none here), and their
+    /// generation. Never written to the pack by itself: only "Save to
+    /// pack" does (owner, 2026-11-14).
+    query_options: std::collections::HashMap<String, nerka_core::SignalOptions>,
+    /// What the picked queries' packs give each named group (`signals:`).
+    pack_options: std::collections::HashMap<String, nerka_core::SignalOptions>,
+    /// Groups whose picked queries give different options (each query and
+    /// what it gives, in pick order: the first wins).
+    option_conflicts: std::collections::HashMap<String, Vec<(String, nerka_core::SignalOptions)>>,
     choices_gen: u64,
     /// The events each signal shows (filtered ones per filter result).
     views: signals::Views,
@@ -1274,9 +1285,11 @@ impl Tab {
             own_signals: Signals::default(),
             own_gen: 0,
             plot: Default::default(),
+            boundaries: None,
             signals_key: None,
-            query_kind: Default::default(),
-            query_scope: Default::default(),
+            query_options: Default::default(),
+            pack_options: Default::default(),
+            option_conflicts: Default::default(),
             choices_gen: 0,
             views: signals::Views::default(),
             reopen_at: None,
@@ -1504,6 +1517,48 @@ impl Tab {
         Job::spawn(ctx, move |prog| nerka_core::open_many(&ps, &options, prog).map(|f| (f, ps)))
     }
 
+    /// Change what this tab chose for a query or FIBEX signal; a choice
+    /// that leaves it as the pack gives it is dropped.
+    fn choose_option(&mut self, name: &str, change: impl FnOnce(&mut nerka_core::SignalOptions)) {
+        // By the signal's name, which is lower case.
+        let name = &name.to_ascii_lowercase();
+        let mut o = self.query_options.get(name).cloned().unwrap_or_default();
+        change(&mut o);
+        let pack = self.pack_options.get(name).cloned().unwrap_or_default();
+        if signals::to_save(&o, &pack) == signals::to_save(&Default::default(), &pack) {
+            self.query_options.remove(name);
+        } else {
+            self.query_options.insert(name.to_owned(), o);
+        }
+        self.choices_gen += 1;
+    }
+
+    /// "Save to pack": write what this tab chose for query signal `name`
+    /// into the `signals:` line of the picked queries with that group, then
+    /// drop the tab's choice (the pack has it now). Never done by itself
+    /// (owner, 2026-11-14). Returns what to say.
+    fn save_options_to_pack(&mut self, lib: &mut Library, name: &str) -> Result<String, String> {
+        let name = &name.to_ascii_lowercase();
+        let tab = self.query_options.get(name).cloned().unwrap_or_default();
+        let pack = self.pack_options.get(name).cloned().unwrap_or_default();
+        let options = signals::to_save(&tab, &pack);
+        let (packs, locals) = self.picks.save_signal_options(lib, name, &options)?;
+        self.query_options.remove(name);
+        self.choices_gen += 1;
+        let line = if options.is_empty() { "no options".to_owned() } else { format!("{name}:{}", options.spec()) };
+        let mut said = format!("@{name}: {line}");
+        if !packs.is_empty() {
+            said += &format!(", saved in pack {}", packs.join(", "));
+        }
+        if locals > 0 {
+            said += &format!(
+                ", kept in {locals} edited quer{} (save it to write its pack)",
+                if locals == 1 { "y" } else { "ies" }
+            );
+        }
+        Ok(said)
+    }
+
     /// Build the tab's signals again if what they come from changed: the
     /// file's `@time`, the user's `saved` signals, the named groups of the
     /// selection's included and signal queries (with the kinds and scopes
@@ -1542,13 +1597,21 @@ impl Tab {
                 None => format!("mid == {}", a.mid),
             };
             let from = format!("FIBEX message {}: {}", a.mid, a.message);
-            let kind = self.query_kind.get(&a.name).copied().unwrap_or(a.ty.kind());
+            // By the signal's name, which is lower case (an argument's may not be).
+            let options = self.query_options.get(&a.name.to_ascii_lowercase()).cloned().unwrap_or_default();
+            let kind = options.kind.unwrap_or(a.ty.kind());
             if s.get(&a.name).is_none()
                 && let Ok(d) = nerka_core::SignalDef::argument(&a.name, kind, &query, a.index, &from)
             {
-                s.set(d.with_scope(self.query_scope.get(&a.name).copied().unwrap_or_default()));
+                // A default that doesn't fit the kind is left out.
+                let without_default = nerka_core::SignalOptions { default: None, ..options.clone() };
+                if let Ok(d) = options.apply(d.clone()).or_else(|_| without_default.apply(d)) {
+                    s.set(d);
+                }
             }
         }
+        self.pack_options.clear();
+        self.option_conflicts.clear();
         if let Ok(a) = self.picks.expand(lib) {
             let parts: Vec<nerka_core::QueryPart<'_>> = a
                 .exp
@@ -1558,12 +1621,28 @@ impl Tab {
                 .filter(|(_, p)| p.role != Role::Exclude)
                 .map(|(i, p)| nerka_core::QueryPart { name: &a.names[i], nfd: a.exp.part_nfd(p), pins: &a.pins[i] })
                 .collect();
-            let chosen = |g: &str| self.query_kind.get(g).copied();
+            // The first query that gives a group an option wins, as in core;
+            // queries that give one differently are a conflict, shown
+            // (owner, 2026-11-15).
+            let mut given: std::collections::HashMap<String, Vec<(String, nerka_core::SignalOptions)>> =
+                Default::default();
+            for p in &parts {
+                for (g, o) in p.pins.iter().filter(|(g, _)| p.nfd.contains(&format!("<{g}>"))) {
+                    // Keyed by the signal's name: lower case.
+                    let e = self.pack_options.entry(g.to_ascii_lowercase()).or_default();
+                    *e = e.over(o);
+                    given.entry(g.to_ascii_lowercase()).or_default().push((p.name.to_owned(), o.clone()));
+                }
+            }
+            self.option_conflicts = given
+                .into_iter()
+                .filter(|(_, list)| list.iter().any(|(_, a)| list.iter().any(|(_, b)| disagree(a, b))))
+                .collect();
+            let chosen = |g: &str| self.query_options.get(g).cloned();
             for d in nerka_core::query_signals(&parts, &*file, &chosen) {
                 // A saved signal of the same name wins.
                 if s.get(d.name()).is_none() {
-                    let scope = self.query_scope.get(d.name()).copied().unwrap_or_default();
-                    s.set(d.with_scope(scope));
+                    s.set(d);
                 }
             }
         }
@@ -1753,14 +1832,39 @@ impl Tab {
                                 }
                                 1 => format!("Indexed {} lines in {took:.2?}", f.line_count()),
                                 n if f.reordered().is_some() => {
-                                    format!("Merged {} lines of {n} files by time in {took:.2?}", f.line_count())
+                                    format!("Sorted {} lines of {n} files by time in {took:.2?}", f.line_count())
                                 }
-                                n if self.merge => format!(
-                                    "Indexed {} lines of {n} files; not merged: not every file knows its lines' times",
-                                    f.line_count()
-                                ),
+                                n if self.merge => {
+                                    // Which files keep it from being merged.
+                                    let parts = f.parts().unwrap_or_default();
+                                    let names: Vec<String> = self
+                                        .paths
+                                        .iter()
+                                        .map(|p| p.file_name().unwrap_or_default().to_string_lossy().into_owned())
+                                        .collect();
+                                    let without = nerka_core::without_times(
+                                        names.iter().map(String::as_str).zip(parts.iter().map(|p| &*p.source)),
+                                    );
+                                    format!(
+                                        "Indexed {} lines of {n} files; not sorted: {} {} lines without times",
+                                        f.line_count(),
+                                        if without.is_empty() {
+                                            "not every file".to_owned()
+                                        } else {
+                                            without.join(", ")
+                                        },
+                                        if without.len() == 1 { "has" } else { "have" }
+                                    )
+                                }
                                 n => format!("Indexed {} lines of {n} files in {took:.2?}", f.line_count()),
                             };
+                            // Asked for but not done: the menu's box goes off, so it
+                            // says what the view is (owner, 2026-11-15: it stayed
+                            // ticked over files one after another). The remembered
+                            // choice for new tabs stays.
+                            if self.merge && f.reordered().is_none() {
+                                self.merge = false;
+                            }
                             if let Some(note) = self.load_note.take() {
                                 self.status = format!("{note} · {}", self.status);
                             }
@@ -2780,17 +2884,25 @@ impl Tab {
                 search: marks.as_ref(),
                 lines: lines.as_ref(),
                 notes: self.notes,
-                lifecycles: Some(&boundaries),
+                lifecycles: Some(boundaries.as_slice()),
             },
         );
         self.view_output(&out, false, line_of_row);
     }
 
-    /// Where the tab's lifecycles start (found already), for the view.
-    fn lifecycle_boundaries(&self, file: &dyn LogSource) -> Vec<view::Boundary> {
+    /// Where the tab's lifecycles start (found already), for the view; made
+    /// again only when they change (a trace can have tens of thousands:
+    /// making them each frame took ~10 ms).
+    fn lifecycle_boundaries(&mut self, file: &dyn LogSource) -> Arc<Vec<view::Boundary>> {
+        let found: Vec<_> = self.signals.lifecycles().filter_map(|d| d.cached(file)).collect();
+        let key: Vec<usize> = found.iter().map(|l| Arc::as_ptr(l) as usize).collect();
+        if let Some((k, b)) = &self.boundaries
+            && *k == key
+        {
+            return b.clone();
+        }
         let mut out = Vec::new();
-        for def in self.signals.lifecycles() {
-            let Some(l) = def.cached(file) else { continue };
+        for (def, l) in self.signals.lifecycles().filter_map(|d| d.cached(file).map(|l| (d, l))) {
             for (i, life) in l.lives.iter().enumerate() {
                 let bad = i > 0 && l.lives[i - 1].outcome.is_bad();
                 out.push(view::Boundary { line: life.first, label: format!("{} #{}", def.name(), life.number), bad });
@@ -2798,6 +2910,8 @@ impl Tab {
         }
         out.sort_by_key(|b| b.line);
         out.dedup_by_key(|b| b.line);
+        let out = Arc::new(out);
+        self.boundaries = Some((key, out.clone()));
         out
     }
 }
@@ -3059,6 +3173,8 @@ struct App {
     /// per-user folder.
     library: Library,
     library_errors: Vec<String>,
+    /// Warnings about the loaded packs (`library_warnings`).
+    library_warnings: Vec<String>,
     pack_paths: Vec<PathBuf>,
     show_library: bool,
     library_view: LibraryView,
@@ -3315,6 +3431,27 @@ fn prefs_path() -> Option<PathBuf> {
     nerka_core::config_dir().map(|d| d.join("prefs"))
 }
 
+/// Whether two queries give a signal different options: one that both give
+/// with different values.
+fn disagree(a: &nerka_core::SignalOptions, b: &nerka_core::SignalOptions) -> bool {
+    fn differ<T: PartialEq>(a: &Option<T>, b: &Option<T>) -> bool {
+        matches!((a, b), (Some(x), Some(y)) if x != y)
+    }
+    differ(&a.kind, &b.kind) || differ(&a.scope, &b.scope) || differ(&a.per, &b.per) || differ(&a.default, &b.default)
+}
+
+/// The library's warnings: `signals:` entries for groups their query no
+/// longer captures (owner, 2026-11-15: listed in full in the Library, and
+/// removed when the query is saved).
+fn library_warnings(lib: &Library) -> Vec<String> {
+    lib.all_stale_signals()
+        .into_iter()
+        .map(|(id, g)| {
+            format!("{id}: signals: names '{g}', which no regex of the query captures (removed when it is saved)")
+        })
+        .collect()
+}
+
 impl App {
     /// (Re)load the packs. Picks and running filters keep their expanded
     /// text; only the next expansion sees the change.
@@ -3326,6 +3463,11 @@ impl App {
         }
         for t in &mut self.tabs {
             t.picks.refresh(&lib);
+        }
+        self.library_warnings = library_warnings(&lib);
+        if let Some(w) = self.library_warnings.first() {
+            let more = self.library_warnings.len() - 1;
+            self.status = if more == 0 { w.clone() } else { format!("{w} (and {more} more: see the Library)") };
         }
         self.library = lib;
         self.library_errors = errors;
@@ -3405,7 +3547,11 @@ impl App {
                     self.record_usage(&used.into_iter().collect::<Vec<_>>());
                 }
             }
-            library::Action::Edited { renamed, removed } => {
+            library::Action::Edited { renamed, removed, notice } => {
+                self.library_warnings = library_warnings(&self.library);
+                if let Some(n) = notice {
+                    self.status = n;
+                }
                 let usage = &mut self.library_view.usage;
                 let before = usage.clone();
                 if let Some((old, new)) = &renamed {
@@ -3427,7 +3573,12 @@ impl App {
                     .presets
                     .query_changed(renamed.as_ref().map(|(o, n)| (o.as_str(), n.as_str())), removed.as_deref());
                 if !changed.is_empty() {
-                    self.status = format!("Presets updated: {}", changed.join(", "));
+                    let presets = format!("Presets updated: {}", changed.join(", "));
+                    self.status = if self.status.starts_with("Removed from") {
+                        format!("{}; {presets}", self.status)
+                    } else {
+                        presets
+                    };
                 }
             }
         }
@@ -4363,9 +4514,9 @@ impl App {
                         }
                         if t.paths.len() > 1 {
                             let mut on = t.merge;
-                            let tip = "Lines of all files in the order of their times (DLT, captures), each file's \
-                                       own order kept; off: one file after another";
-                            if ui.checkbox(&mut on, "Merge by time").on_hover_text(tip).changed() {
+                            let tip = "All files' lines sorted by their times (DLT, captures); lines of one time in \
+                                       the order of the files, then of each file; off: one file after another";
+                            if ui.checkbox(&mut on, "Sort by time").on_hover_text(tip).changed() {
                                 merge = Some(i);
                                 ui.close();
                             }
@@ -4980,6 +5131,7 @@ impl App {
         // Saved after the tab is done with (the panel changed them), and
         // FIBEX files chosen there (every DLT tab reads its file again).
         let mut save_signals = false;
+        let mut pack_saved = false;
         let mut save_checks = false;
         // A check renamed or removed: every tab's set follows.
         let mut checks_renamed: Option<(String, Option<String>)> = None;
@@ -5018,6 +5170,7 @@ impl App {
                         ui,
                         &mut self.library,
                         &self.library_errors,
+                        &self.library_warnings,
                         &mut tab.picks,
                         &mut self.library_view,
                         Some(file.schema()),
@@ -5076,8 +5229,9 @@ impl App {
             let fibex = self.fibex.clone();
             let out = egui::Panel::right("signals")
                 .resizable(true)
-                // Wide enough for a row's kind, scope, value and source.
-                .default_size(500.0)
+                // Wide enough for a row's kind, scope, value and source (names
+                // shorten in a narrower one).
+                .default_size(560.0)
                 .show(ui, |ui| {
                     let input = signals::Input {
                         signals: &tab.signals,
@@ -5092,6 +5246,9 @@ impl App {
                         arg_picks: &mut tab.arg_picks,
                         library: &self.library,
                         check_results: &tab.check_results,
+                        chosen: &tab.query_options,
+                        pack_options: &tab.pack_options,
+                        conflicts: &tab.option_conflicts,
                     };
                     signals::signals_panel(ui, &mut tab.signals_ui, input)
                 })
@@ -5100,8 +5257,7 @@ impl App {
                 self.show_signals = false;
             }
             if let Some((name, kind)) = out.kind {
-                tab.query_kind.insert(name, kind);
-                tab.choices_gen += 1;
+                tab.choose_option(&name, |o| o.kind = Some(kind));
             }
             if let Some((name, scope)) = out.scope {
                 match self.saved_signals.get(&name) {
@@ -5110,10 +5266,27 @@ impl App {
                         self.saved_signals.set(d);
                         save_signals = true;
                     }
-                    None => {
-                        tab.query_scope.insert(name, scope);
-                        tab.choices_gen += 1;
+                    None => tab.choose_option(&name, |o| o.scope = Some(scope)),
+                }
+            }
+            if let Some((name, per)) = out.per {
+                tab.choose_option(&name, |o| o.per = Some(per));
+            }
+            if let Some((name, default)) = out.default {
+                tab.choose_option(&name, |o| o.default = Some(default));
+            }
+            if let Some(name) = out.reset_options
+                && tab.query_options.remove(&name).is_some()
+            {
+                tab.choices_gen += 1;
+            }
+            if let Some(name) = out.save_to_pack {
+                match tab.save_options_to_pack(&mut self.library, &name) {
+                    Ok(said) => {
+                        self.status = said;
+                        pack_saved = true;
                     }
+                    Err(e) => self.status = format!("@{name} not saved to the pack: {e}"),
                 }
             }
             if let Some(name) = &out.adopted {
@@ -5292,6 +5465,7 @@ impl App {
                 in_window,
                 bookmarks: &marks,
                 saved: &saved_plots,
+                owned: Some(file.clone()),
             };
             let shared = tab.plot.clone();
             let mut out = egui::Panel::bottom("plot")
@@ -5350,6 +5524,12 @@ impl App {
         if save_signals {
             self.save_saved_signals();
         }
+        if pack_saved {
+            // Every tab's queries take the pack's new signals: line.
+            for t in &mut self.tabs {
+                t.picks.refresh(&self.library);
+            }
+        }
         if let Some((old, new)) = checks_renamed {
             for t in &mut self.tabs {
                 if let Some(on) = &mut t.checks_on
@@ -5391,6 +5571,7 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use nerka_core::{SignalKind, SignalScope};
 
     /// Owner, 2026-11-07: checks given with --check (test runs) ended up in
     /// the saved file at the next edit. They last the session; one the user
@@ -5553,7 +5734,7 @@ query timeouts  labels: vision
         let mut p = Picks::default();
         p.add(&lib, "vision.errors", Use::Include, None);
         p.add(&lib, "vision.cam", Use::Include, None);
-        p.params.insert("cam".into(), ("cam1".into(), false));
+        p.params.insert("cam".into(), vec![("cam1".into(), false)]);
         let a = p.expand(&lib).unwrap();
         assert_eq!(a.exp.nfd, "(level >= ERROR)");
         let lines = expansion_lines(&a, &|_| false);
@@ -5659,6 +5840,41 @@ query timeouts  labels: vision
         buf
     }
 
+    /// Owner, 2026-11-14: a lifecycle and default chosen for a FIBEX signal
+    /// (its ⚙ menu) didn't take.
+    #[test]
+    fn fibex_signals_take_the_options_chosen_in_the_tab() {
+        let dir = std::env::temp_dir().join(format!("nerka-gui-fibex-opts-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (dlt, xml) = (dir.join("t.dlt"), dir.join("t.xml"));
+        std::fs::write(&dlt, queue_dlt(&[512, 64, 900, 32])).unwrap();
+        // Capitals in the argument's name: the signal's name is lower case.
+        std::fs::write(&xml, QUEUE_FIBEX.replace("Free slots", "Free Slots")).unwrap();
+        let fibex = Arc::new(nerka_core::Fibex::load(&[&xml]).unwrap());
+        let args = fibex.arguments();
+        let ctx = egui::Context::default();
+        let mut tab = Tab::open_many(&ctx, vec![dlt], &SearchPrefs::default(), Some(fibex.clone()));
+        settle(&mut tab, &ctx);
+        let mut saved = Signals::default();
+        saved.set(nerka_core::SignalDef::parse_spec("lifecycle run: start mid == 11").unwrap());
+        tab.arg_picks = args.clone();
+        tab.choices_gen += 1;
+        tab.refresh_signals(&ctx, &Library::new(), &saved, 0);
+        let name = tab.signals.iter().find(|d| d.argument_index().is_some()).unwrap().name().to_owned();
+        // As the panel sends them: by the signal's name.
+        tab.choose_option(&name, |o| o.per = Some("run".into()));
+        tab.choose_option(&name, |o| o.default = Some("7".into()));
+        tab.refresh_signals(&ctx, &Library::new(), &saved, 0);
+        let d = tab.signals.get(&name).unwrap();
+        assert_eq!(d.per(), Some("run"), "{} ({:?})", name, args[0].name);
+        assert_eq!(d.default_value().map(|v| v.to_string()).as_deref(), Some("7"));
+        // Back to none.
+        tab.choose_option(&name, |o| o.per = Some(String::new()));
+        tab.refresh_signals(&ctx, &Library::new(), &saved, 0);
+        assert_eq!(tab.signals.get(&name).unwrap().per(), None);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     #[test]
     fn fibex_arguments_become_signals_of_a_tab() {
         let dir = std::env::temp_dir().join(format!("nerka-gui-fibex-args-{}", std::process::id()));
@@ -5739,6 +5955,9 @@ query timeouts  labels: vision
                         arg_picks: &mut tab.arg_picks,
                         library: &Library::new(),
                         check_results: &[],
+                        chosen: &tab.query_options,
+                        pack_options: &tab.pack_options,
+                        conflicts: &tab.option_conflicts,
                     };
                     changed = signals::signals_panel(ui, &mut tab.signals_ui, input).args_changed;
                 });
@@ -6121,6 +6340,113 @@ gear=D
     }
 
     /// What a frame of the whole window costs on a big file, browsing it:
+    /// Captures merged by time in the GUI (owner, 2026-11-15: "merge by time
+    /// seems broken"): `NERKA_MERGE_FILES=a.pcap;b.mf4 NERKA_PERF_FIBEX=a.xml
+    /// cargo test --release -p nerka-gui merge_captures -- --ignored
+    /// --nocapture`: the rows in time order, every file's lines, FIBEX
+    /// signals collected and plotted on the merged view.
+    #[test]
+    #[ignore = "needs capture files"]
+    fn merge_captures() {
+        let (Ok(files), Ok(fx)) = (std::env::var("NERKA_MERGE_FILES"), std::env::var("NERKA_PERF_FIBEX")) else {
+            return;
+        };
+        let paths: Vec<PathBuf> = files.split(';').map(PathBuf::from).collect();
+        let ctx = egui::Context::default();
+        let wait = |app: &mut App| {
+            let until = std::time::Instant::now() + Duration::from_secs(120);
+            while app.tabs.iter().any(|t| t.is_busy()) {
+                assert!(std::time::Instant::now() < until, "still busy: {}", app.tabs[0].status);
+                app.poll_jobs(&ctx);
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        };
+        let mut app = App::default();
+        app.set_fibex(&ctx, vec![PathBuf::from(fx)]);
+        let goes_back = |file: &dyn LogSource| {
+            let (mut back, mut prev) = (0, f64::MIN);
+            for r in 0..file.line_count() {
+                let t = file.time(r).unwrap_or(prev);
+                back += usize::from(t < prev);
+                prev = t;
+            }
+            back
+        };
+        // Merge by time off (the default): one file after another; then on,
+        // from the tab's menu.
+        app.prefs.merge_by_time = false;
+        app.open_files(&ctx, paths.clone());
+        wait(&mut app);
+        let one_after_another = goes_back(&**app.tabs[0].file.as_ref().unwrap());
+        eprintln!("one after another: {}; time goes back {one_after_another} times", app.tabs[0].status);
+        let prefs = app.prefs.clone();
+        let fibex = app.fibex.clone();
+        app.tabs[0].merge = true;
+        app.tabs[0].reopen(&ctx, &prefs, fibex);
+        wait(&mut app);
+        let toggled = goes_back(&**app.tabs[0].file.as_ref().unwrap());
+        eprintln!("merged from the menu: {}; time goes back {toggled} times", app.tabs[0].status);
+        assert_eq!(toggled, 0, "Merge by time from the menu sorts");
+        app.tabs.clear();
+        app.prefs.merge_by_time = true;
+        let t = std::time::Instant::now();
+        app.open_files(&ctx, paths.clone());
+        wait(&mut app);
+        let tab = &app.tabs[0];
+        eprintln!("merged in {:.0} ms: {}", t.elapsed().as_secs_f64() * 1e3, tab.status);
+        assert!(tab.merge, "merged");
+        let file = tab.file.clone().expect("opened");
+        assert!(file.reordered().is_some(), "rows reordered by time");
+        let sum: u64 = paths
+            .iter()
+            .map(|p| {
+                let o = nerka_core::OpenOptions { fibex: app.fibex.clone(), ..Default::default() };
+                nerka_core::open_with(p.to_str().unwrap(), &o, &nerka_core::Progress::new()).unwrap().line_count()
+            })
+            .sum();
+        assert_eq!(file.line_count(), sum, "every file's lines");
+        let mut back = 0;
+        let mut prev = f64::MIN;
+        for r in 0..file.line_count() {
+            let t = file.time(r).unwrap_or(prev);
+            if t < prev {
+                back += 1;
+            }
+            prev = t;
+        }
+        assert_eq!(back, 0, "time goes back {back} times in the merged rows");
+        // FIBEX signals on the merged view, plotted.
+        app.show_signals = true;
+        let args = app.fibex_arguments();
+        for a in args.iter().filter(|a| a.ty.kind() == nerka_core::SignalKind::Num).take(4) {
+            app.tabs[0].arg_picks.push(a.clone());
+            plot::lock(&app.tabs[0].plot).toggle(&a.name);
+        }
+        app.tabs[0].choices_gen += 1;
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1600.0, 1000.0));
+        let until = std::time::Instant::now() + Duration::from_secs(120);
+        let mut frames = 0;
+        loop {
+            let input = egui::RawInput { screen_rect: Some(screen), ..Default::default() };
+            let mut out = ctx.run_ui(input, |ui| app.frame(ui));
+            out.textures_delta.clear();
+            app.poll_jobs(&ctx);
+            frames += 1;
+            let lanes = plot::lock(&app.tabs[0].plot).lane_count();
+            if lanes >= 4 {
+                eprintln!("plotted after {frames} frames, {lanes} lanes");
+                break;
+            }
+            assert!(std::time::Instant::now() < until, "the plot never came: {}", app.tabs[0].status);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        for d in app.tabs[0].signals.iter().filter(|d| d.argument_index().is_some()) {
+            let events = d.cached_series(&*file).map(|s| s.len()).unwrap_or(0);
+            eprintln!("@{}: {events} events", d.name());
+            assert!(events > 0, "@{} has no events on the merged view", d.name());
+        }
+    }
+
     /// idle, scrolling the log, the Signals panel with its FIBEX tree, the
     /// plot. `NERKA_PERF_FILE=big.pcap NERKA_PERF_FIBEX=big.xml cargo test
     /// --release -p nerka-gui perf_big_app -- --ignored --nocapture`
@@ -6141,6 +6467,12 @@ gear=D
         };
         let mut app = App::default();
         app.set_fibex(&ctx, vec![PathBuf::from(fx)]);
+        // `NERKA_PERF_LIFE=SPEC`: a lifecycle as with --signal (many
+        // lifecycles: the Signals panel lists them).
+        if let Ok(spec) = std::env::var("NERKA_PERF_LIFE") {
+            app.add_session_signal(nerka_core::SignalDef::parse_spec(&spec).unwrap());
+            app.saved_gen += 1;
+        }
         let t = std::time::Instant::now();
         app.open(&ctx, PathBuf::from(path));
         settle(&mut app);
@@ -6358,7 +6690,7 @@ gear=D
         let file = tab.file.clone().unwrap();
         let last = |r: LineNo| file.line_text(r).unwrap().rsplit('\t').next().unwrap().to_owned();
         assert_eq!((0..5).map(last).collect::<Vec<_>>(), ["a0", "b0", "a1 boom", "b1 boom", "a2"]);
-        assert!(tab.status.starts_with("Merged 5 lines of 2 files"), "{}", tab.status);
+        assert!(tab.status.starts_with("Sorted 5 lines of 2 files"), "{}", tab.status);
         // Filters run over the merged rows.
         tab.mode = Mode::Text;
         tab.pattern = "boom".into();
@@ -6384,6 +6716,26 @@ gear=D
         settle(&mut two, &ctx);
         assert!(two.merge && two.file.as_ref().unwrap().reordered().is_some());
         assert!(two.bookmarks.contains(3), "b1's bookmark on its merged row");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Owner, 2026-11-15: a merge that can't be done unticks the tab's Merge
+    /// by time (it stayed ticked over files one after another) and the
+    /// status names the files without times; new tabs still try.
+    #[test]
+    fn a_merge_that_cannot_be_done_is_unticked_and_says_why() {
+        let dir = std::env::temp_dir().join(format!("nerka-gui-nomerge-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (a, b) = (dir.join("a.log"), dir.join("b.log"));
+        std::fs::write(&a, "one\n").unwrap();
+        std::fs::write(&b, "two\n").unwrap();
+        let ctx = egui::Context::default();
+        let prefs = SearchPrefs { merge_by_time: true, ..SearchPrefs::default() };
+        let mut tab = Tab::open_many(&ctx, vec![a, b], &prefs, None);
+        assert!(tab.merge, "asked for");
+        settle(&mut tab, &ctx);
+        assert!(!tab.merge, "not done: unticked");
+        assert!(tab.status.contains("not sorted: a.log, b.log have lines without times"), "{}", tab.status);
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -6804,7 +7156,7 @@ gear=D
         settle(&mut one, &ctx);
         one.picks.add(&lib, "vision.cam", Use::Include, None);
         one.picks.add(&lib, "vision.timeouts", Use::Exclude, None);
-        one.picks.params.insert("cam".into(), ("cam1".into(), false));
+        one.picks.params.insert("cam".into(), vec![("cam1".into(), false)]);
         one.picks.light_source("vision.cam");
         one.apply_filter_picks(&ctx, &lib).unwrap();
         one.search.mode = Mode::Auto;
@@ -7143,7 +7495,7 @@ query nav
         tab.picks.add(&lib, "vision.timeouts", Use::Exclude, None);
         assert_eq!(tab.apply_filter_picks(&ctx, &lib), None, "a missing parameter is reported, not run");
         assert!(tab.picks.error.as_deref().unwrap().contains("'$cam'"), "{:?}", tab.picks.error);
-        tab.picks.params.insert("cam".into(), ("cam1".into(), false));
+        tab.picks.params.insert("cam".into(), vec![("cam1".into(), false)]);
         let nfd = tab.apply_filter_picks(&ctx, &lib).expect("runs");
         assert_eq!(nfd, "(level >= ERROR) AND (raw ~ /cam1 /) AND NOT (/timeout/)");
         assert_eq!(tab.mode, Mode::Query);
@@ -7282,20 +7634,183 @@ query clock  signals: t:time
         assert_eq!(tab.result().unwrap().lines, [3]);
 
         // A chosen kind wins over the values; a saved signal over the query's.
-        tab.query_kind.insert("v".into(), SignalKind::Enum);
-        tab.choices_gen += 1;
+        tab.choose_option("v", |o| o.kind = Some(SignalKind::Enum));
         saved.set(nerka_core::SignalDef::parse_spec(r"gear:enum=/gear=(?<gear>[A-Z])/").unwrap());
         tab.refresh_signals(&ctx, &lib, &saved, 1);
         assert_eq!(tab.signals.get("v").unwrap().kind(), SignalKind::Enum);
         assert!(tab.signals.get("gear").unwrap().queries().is_empty(), "the saved one");
 
         // A filtered signal can't be used in a filter.
-        tab.query_scope.insert("v".into(), SignalScope::Filtered);
-        tab.choices_gen += 1;
+        tab.choose_option("v", |o| o.scope = Some(SignalScope::Filtered));
         tab.refresh_signals(&ctx, &lib, &saved, 1);
         tab.pattern = "@v == 10".into();
         assert!(!tab.start_search(&ctx));
         assert!(tab.status.contains("filtered lines only"), "{}", tab.status);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Owner, 2026-11-15: a `signals:` line with parameters gives each
+    /// instance its signal (`drops_CAM1`); Save to pack writes the line as
+    /// written (`drops_$cam`, `per(ecu_$cam)` kept).
+    #[test]
+    fn signals_entries_with_parameters_are_filled_in_and_saved_as_written() {
+        let dir = std::env::temp_dir().join(format!("nerka-gui-sigparams-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("app.log");
+        std::fs::write(&log, "CAM1 drop 3\nCAM2 drop 4\nCAM1 drop 5\n").unwrap();
+        let pack_file = dir.join("cam.nerka-pack");
+        let text = "pack cam\nquery drops(cam)  signals: drops_$cam:num:per(ecu_$cam):default(0)\n    /$cam drop (?<drops_$cam>\\d+)/\n";
+        std::fs::write(&pack_file, text).unwrap();
+        let mut lib = Library::new();
+        lib.load(&pack_file).unwrap();
+        let ctx = egui::Context::default();
+        let mut tab = Tab::open(&ctx, log, &SearchPrefs::default());
+        settle(&mut tab, &ctx);
+        let saved = Signals::default();
+        tab.picks.add(&lib, "cam.drops", Use::Signal, None);
+        tab.picks.params.insert("cam".into(), vec![("CAM1".into(), false)]);
+        tab.refresh_signals(&ctx, &lib, &saved, 0);
+        let d = tab.signals.get("drops_CAM1").expect("filled in");
+        assert_eq!((d.kind(), d.per()), (SignalKind::Num, Some("ecu_cam1")));
+        assert_eq!(tab.pack_options["drops_cam1"].spec(), "num:per(ecu_CAM1):default(0)");
+
+        tab.choose_option("drops_CAM1", |o| o.kind = Some(SignalKind::Enum));
+        tab.save_options_to_pack(&mut lib, "drops_CAM1").unwrap();
+        let file = std::fs::read_to_string(&pack_file).unwrap();
+        assert!(file.contains("signals: drops_$cam:enum:per(ecu_$cam):default(0)"), "{file}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Owner, 2026-11-15: instances of a parameterised query give a signal
+    /// each where the group's name uses the parameter, one signal fed by
+    /// all where it doesn't (no conflict: same query, same settings); Save
+    /// to pack from an instance writes the entry as written.
+    #[test]
+    fn instances_give_their_signals() {
+        let dir = std::env::temp_dir().join(format!("nerka-gui-instances-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("app.log");
+        std::fs::write(&log, "CAM1 drop 3 of 9\nCAM2 drop 4 of 8\nCAM1 drop 5 of 7\n").unwrap();
+        let pack_file = dir.join("cam.nerka-pack");
+        let text = "pack cam\nquery drops(cam)  signals: drops_$cam:num, total:num\n    /$cam drop (?<drops_$cam>\\d+) of (?<total>\\d+)/\n";
+        std::fs::write(&pack_file, text).unwrap();
+        let mut lib = Library::new();
+        lib.load(&pack_file).unwrap();
+        let ctx = egui::Context::default();
+        let mut tab = Tab::open(&ctx, log, &SearchPrefs::default());
+        settle(&mut tab, &ctx);
+        let saved = Signals::default();
+        tab.picks.add(&lib, "cam.drops", Use::Signal, None);
+        tab.picks.params.insert("cam".into(), vec![("CAM1".into(), false), ("CAM2".into(), false)]);
+        tab.refresh_signals(&ctx, &lib, &saved, 0);
+        let names: Vec<&str> = tab.signals.iter().map(|d| d.name()).collect();
+        assert_eq!(names, ["drops_cam1", "total", "drops_cam2"]);
+        let total = tab.signals.get("total").unwrap();
+        assert_eq!(total.queries(), ["drops (CAM1)", "drops (CAM2)"]);
+        assert!(tab.option_conflicts.is_empty());
+        tab.mode = Mode::Query;
+        tab.pattern = "@drops_CAM2.event".into();
+        tab.start_search(&ctx);
+        settle(&mut tab, &ctx);
+        assert_eq!(tab.result().unwrap().lines, [1]);
+
+        tab.choose_option("drops_cam2", |o| o.kind = Some(SignalKind::Enum));
+        tab.save_options_to_pack(&mut lib, "drops_cam2").unwrap();
+        let file = std::fs::read_to_string(&pack_file).unwrap();
+        assert!(file.contains("signals: total:num, drops_$cam:enum") || file.contains("drops_$cam:enum"), "{file}");
+        assert!(!file.contains("CAM2:"), "{file}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Owner, 2026-11-15: queries that give one signal different options
+    /// are a conflict, shown; the first picked query's options are used;
+    /// Save to pack makes them agree.
+    #[test]
+    fn queries_giving_a_signal_different_options_are_a_conflict() {
+        let dir = std::env::temp_dir().join(format!("nerka-gui-conflict-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("app.log");
+        std::fs::write(&log, "v=1\nw v=2\n").unwrap();
+        let pack_file = dir.join("p.nerka-pack");
+        let text = "pack p\nquery a  signals: v:num\n    /v=(?<v>\\d)/\nquery b  signals: v:enum, w:enum\n    /w v=(?<v>\\d)/\n";
+        std::fs::write(&pack_file, text).unwrap();
+        let mut lib = Library::new();
+        lib.load(&pack_file).unwrap();
+        let ctx = egui::Context::default();
+        let mut tab = Tab::open(&ctx, log, &SearchPrefs::default());
+        settle(&mut tab, &ctx);
+        let saved = Signals::default();
+        tab.picks.add(&lib, "p.a", Use::Signal, None);
+        tab.picks.add(&lib, "p.b", Use::Signal, None);
+        tab.refresh_signals(&ctx, &lib, &saved, 0);
+        let given: Vec<String> = tab.option_conflicts["v"].iter().map(|(q, o)| format!("{q} {}", o.spec())).collect();
+        assert_eq!(given, ["a num", "b enum"]);
+        assert_eq!(tab.option_conflicts.len(), 1, "w: b's entry for a group it lacks isn't one");
+        assert_eq!(tab.signals.get("v").unwrap().kind(), SignalKind::Num, "the first query's");
+
+        tab.save_options_to_pack(&mut lib, "v").unwrap();
+        tab.picks.refresh(&lib);
+        tab.refresh_signals(&ctx, &lib, &saved, 0);
+        assert!(tab.option_conflicts.is_empty());
+        let file = std::fs::read_to_string(&pack_file).unwrap();
+        assert_eq!(file.matches("v:num").count(), 2, "{file}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Owner, 2026-11-14: a query signal's options can be written in its
+    /// pack (`signals:`); what the tab changes stays in the tab until "Save
+    /// to pack", which writes it there.
+    #[test]
+    fn query_signal_options_stay_in_the_tab_until_saved_to_the_pack() {
+        let dir = std::env::temp_dir().join(format!("nerka-gui-qopt-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("app.log");
+        std::fs::write(&log, "boot\ngear=P\ngear=D\nboot\ngear=R\n").unwrap();
+        let pack_file = dir.join("p.nerka-pack");
+        std::fs::write(&pack_file, "pack p\nquery gears  signals: gear:enum\n    /gear=(?<gear>\\w)/\n").unwrap();
+        let mut lib = Library::new();
+        lib.load(&pack_file).unwrap();
+        let ctx = egui::Context::default();
+        let mut tab = Tab::open(&ctx, log, &SearchPrefs::default());
+        settle(&mut tab, &ctx);
+        let mut saved = Signals::default();
+        saved.set(nerka_core::SignalDef::parse_spec("lifecycle run: start raw ~ /boot/").unwrap());
+        tab.picks.add(&lib, "p.gears", Use::Signal, None);
+        tab.refresh_signals(&ctx, &lib, &saved, 0);
+        assert_eq!(tab.pack_options["gear"].spec(), "enum");
+        let gear = tab.signals.get("gear").unwrap();
+        assert_eq!((gear.per(), gear.default_value()), (None, None));
+
+        // Chosen in the tab: used here, the pack's file unchanged.
+        tab.choose_option("gear", |o| o.per = Some("run".into()));
+        tab.choose_option("gear", |o| o.default = Some("N".into()));
+        tab.refresh_signals(&ctx, &lib, &saved, 0);
+        let gear = tab.signals.get("gear").unwrap();
+        assert_eq!(gear.per(), Some("run"));
+        assert_eq!(gear.default_value().map(|v| v.to_string()).as_deref(), Some("N"));
+        assert!(!std::fs::read_to_string(&pack_file).unwrap().contains("per("));
+        // Choosing what the pack gives again leaves no choice behind.
+        tab.choose_option("gear", |o| o.kind = Some(SignalKind::Enum));
+        assert_eq!(tab.query_options["gear"].kind, Some(SignalKind::Enum), "the others are still chosen");
+
+        // Save to pack: the file has it, the tab's choice is gone, the
+        // signal is the same.
+        let said = tab.save_options_to_pack(&mut lib, "gear").unwrap();
+        assert!(said.contains("saved in pack p"), "{said}");
+        let text = std::fs::read_to_string(&pack_file).unwrap();
+        assert!(text.contains("signals: gear:enum:per(run):default(N)"), "{text}");
+        assert!(tab.query_options.is_empty());
+        tab.refresh_signals(&ctx, &lib, &saved, 0);
+        let gear = tab.signals.get("gear").unwrap();
+        assert_eq!((gear.per(), gear.default_value().map(|v| v.to_string())), (Some("run"), Some("N".to_owned())));
+
+        // "none" in the tab drops the pack's lifecycle when saved.
+        tab.choose_option("gear", |o| o.per = Some(String::new()));
+        tab.refresh_signals(&ctx, &lib, &saved, 0);
+        assert_eq!(tab.signals.get("gear").unwrap().per(), None);
+        tab.save_options_to_pack(&mut lib, "gear").unwrap();
+        let text = std::fs::read_to_string(&pack_file).unwrap();
+        assert!(text.contains("signals: gear:enum:default(N)"), "{text}");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

@@ -17,6 +17,7 @@
 //! node include lit          local n1  from vision.timeouts  name "slow ones"
 //! param cam = CAM1
 //! param re raw = a.b(c)?
+//! param cam += CAM2
 //! filter selection
 //! search auto timeout AND level >= WARN
 //!
@@ -28,7 +29,7 @@
 //! ```text
 //! file   := "preset" NAME line* [ "pack" "_preset" query* ]   -- queries as in packs
 //! line   := "node" ("include" | "require" | "exclude" | "signal") flag* source
-//!         | "param" NAME ["raw"] "=" VALUE                    -- VALUE: rest of the line
+//!         | "param" NAME ["raw"] ("=" | "+=") VALUE         -- VALUE: rest of the line; += another value
 //!         | ("filter" | "search") ("selection" | TAG TEXT)    -- TAG: auto, text, regex, query
 //! flag   := "lit" | "detached"
 //! source := "query" ID                                        -- a library query (pack.query)
@@ -186,8 +187,11 @@ impl Preset {
             }
             out.push('\n');
         }
-        for p in &self.params {
-            out += &format!("param {}{} = {}\n", p.name, if p.raw { " raw" } else { "" }, p.value);
+        // A value for a name already given: `+=` (another value; an older
+        // nerka refuses the preset instead of keeping only the last).
+        for (i, p) in self.params.iter().enumerate() {
+            let op = if self.params[..i].iter().any(|x| x.name == p.name) { "+=" } else { "=" };
+            out += &format!("param {}{} {op} {}\n", p.name, if p.raw { " raw" } else { "" }, p.value);
         }
         for (key, b) in [("filter", &self.filter), ("search", &self.search)] {
             match b {
@@ -349,11 +353,17 @@ pub fn parse_preset(file: &str, text: &str) -> Result<Preset, PackError> {
             "preset" => return Err(err(ln, w[0].1, "a file holds one preset: second 'preset' line".into())),
             "node" => p.nodes.push(node(&w).map_err(|(col, m)| err(ln, col.unwrap_or(end_col), m))?),
             "param" => {
-                // param NAME [raw] = VALUE (the value is the rest of the line)
-                let Some(eq) = content.find(" = ").or_else(|| content.strip_suffix(" =").map(|s| s.len())) else {
-                    return Err(err(ln, end_col, "expected 'param NAME = VALUE'".into()));
+                // param NAME [raw] = VALUE, or += for another value of it (the
+                // value is the rest of the line; whichever comes first).
+                let set = content.find(" = ").or_else(|| content.strip_suffix(" =").map(|s| s.len()));
+                let add = content.find(" += ").or_else(|| content.strip_suffix(" +=").map(|s| s.len()));
+                let (at, len, more) = match (set, add) {
+                    (Some(s), Some(a)) if a < s => (a, 4, true),
+                    (Some(s), _) => (s, 3, false),
+                    (None, Some(a)) => (a, 4, true),
+                    (None, None) => return Err(err(ln, end_col, "expected 'param NAME = VALUE'".into())),
                 };
-                let head: Vec<&str> = content[..eq].split_whitespace().collect();
+                let head: Vec<&str> = content[..at].split_whitespace().collect();
                 let (name, raw) = match head.as_slice() {
                     ["param", n] => (*n, false),
                     ["param", n, "raw"] => (*n, true),
@@ -362,7 +372,10 @@ pub fn parse_preset(file: &str, text: &str) -> Result<Preset, PackError> {
                 if !crate::pack::is_name(name) {
                     return Err(err(ln, 6, format!("invalid parameter name '{name}'")));
                 }
-                let value = content.get(eq + 3..).unwrap_or("").to_owned();
+                if more && !p.params.iter().any(|x| x.name == name) {
+                    return Err(err(ln, 6, format!("'param {name} +=' before 'param {name} = VALUE'")));
+                }
+                let value = content.get(at + len..).unwrap_or("").to_owned();
                 p.params.push(PresetParam { name: name.to_owned(), value, raw });
             }
             "filter" | "search" => {
@@ -578,6 +591,22 @@ mod tests {
         assert_eq!(p.nodes[0].role, Role::Signal);
         assert!(p.nodes[0].lit);
         assert_eq!(p.serialize(), text);
+    }
+
+    /// Owner, 2026-11-15: several values of a parameter (instances of the
+    /// queries using it): `+=` lines after the first.
+    #[test]
+    fn several_values_of_a_parameter_round_trip() {
+        let text = "preset p\nparam cam = CAM1\nparam re raw = a += b\nparam cam += CAM 2 = x\nparam cam raw += C.3\n";
+        let p = parse_preset("t", text).unwrap_or_else(|e| panic!("{e}"));
+        let got: Vec<(&str, &str, bool)> =
+            p.params.iter().map(|x| (x.name.as_str(), x.value.as_str(), x.raw)).collect();
+        assert_eq!(
+            got,
+            [("cam", "CAM1", false), ("re", "a += b", true), ("cam", "CAM 2 = x", false), ("cam", "C.3", true)]
+        );
+        assert_eq!(p.serialize(), text);
+        bad("preset p\nparam cam += CAM2\n", 2, 7, "'param cam +=' before 'param cam = VALUE'");
     }
 
     #[test]

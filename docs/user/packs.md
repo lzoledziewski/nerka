@@ -31,7 +31,15 @@ query frame_drops(cam)  parent: cam_scope  labels: system/vision, perf  color: v
     meaning is `parent AND its own text`;
   - `labels:` comma-separated, `/` for a hierarchy (`system/vision`);
   - `color:` a name or `#rrggbb`, for the lines it keeps;
-  - `signals:` the kinds of its named groups as signals (`signals: t:time`).
+  - `signals:` options for its named groups as [signals](signals.md):
+    `GROUP:OPTIONS`, comma-separated, the options being those of a saved
+    signal (`num`, `enum`, `time`, `filtered`, `per(LIFECYCLE)`,
+    `default(VALUE)`, joined by `:`). Example:
+    `signals: t:time, ota:enum:per(ecu1):default(idle)`. What isn't given
+    is worked out (the kind from the first values). The Signals panel can
+    change them for a tab; 💾 (**Save to pack**) writes them here. An entry for
+    a group no regex of the query (or its parents) captures is listed as a
+    warning at the top of the Library, and removed when the query is saved.
 - The **body** is the indented lines below, kept as written.
 - `$name` or `${name}` is a **parameter**, declared in the query's list.
   `$$` is a `$`; so is a `$` not followed by a name (`/down$/`).
@@ -64,6 +72,33 @@ must be unique. Samples: `examples/packs/`.
 
 Applying the selection puts its expansion in the Filter box (NFD mode).
 
+### Instances of a parameterised query
+
+To track several cameras with one `drops(cam)` query, give `$cam` several
+values in **Parameters**: **+ value** adds a field (so does + on the query
+in the library once it is picked), ✖ removes one. Every picked query
+using `$cam` is then an **instance** per value, a part of its own:
+`drops (CAM1)`, `drops (CAM2)`, each with its colour, and the selection
+shows the count next to it (`× 2`). With two such parameters, every
+combination. A value counts once you press Enter or leave its field; an
+empty field or a value given twice (⚠) adds nothing. Instances share the
+query's text and settings: editing the query edits them all.
+
+Signals follow the query's group names: `(?<drops_$cam>…)` gives each
+instance its signal (`@drops_CAM1`, `@drops_CAM2`); `(?<drops>…)` is one
+signal fed by every instance (its row in the Signals panel says
+`query ← 2`). A `signals:` line can use the parameters the same way:
+
+```
+query drops(cam)  signals: drops_$cam:num:default(0)
+    /$cam drop (?<drops_$cam>\d+)/
+```
+
+An option there may use only the parameters its name uses (instances that
+share a signal share its options). On the command line, give a parameter
+several times: `-p cam=CAM1 -p cam=CAM2` (`nerka-gui --param` likewise);
+presets keep the values as `param cam = CAM1` and `param cam += CAM2`.
+
 ## Expansion
 
 Included queries are joined with `OR`, each with its parent chain
@@ -83,8 +118,8 @@ nerka --pack examples/packs/ expand -l ota -p cam=CAM1 --parts
 ## Presets
 
 A **preset** saves a tab's analysis to use again on other files: the
-selection in order (roles, line colours), copies of queries you edited or
-made, the parameter values, and the text typed in the Filter and Search
+selection in order (roles, line colours, instances), copies of queries you
+edited or made, the parameter values, and the text typed in the Filter and Search
 boxes. Choosing one replaces the tab's selection and runs both boxes.
 
 The bar above the Selection pane: **New from this tab…** → **Keep** (this

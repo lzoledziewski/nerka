@@ -36,7 +36,10 @@
 //!                                                     and QNAMEs
 //!          | "labels:" LABEL ("," LABEL)*          -- LABEL: seg ("/" seg)*
 //!          | "color:" (lowercase name | "#" 6 hex digits)
-//!          | "signals:" GROUP ":" KIND ("," GROUP ":" KIND)*  -- KIND: num, enum, time
+//!          | "signals:" GROUP ":" OPTS ("," GROUP ":" OPTS)*  -- OPTS: a saved signal's
+//!                                                     options, `:`-separated: num, enum,
+//!                                                     time, filtered, per(LIFECYCLE),
+//!                                                     default(VALUE) (no `,` in a VALUE)
 //! body    := indented lines (the NFD text, kept verbatim), up to the next
 //!            line that starts in column 1
 //! note    := "##" [" "] text NEWLINE                -- in column 1, directly
@@ -63,7 +66,10 @@ mod write;
 use std::fmt;
 use std::path::{Path, PathBuf};
 
-pub use expand::{ExpandError, Expansion, ParamValue, Params, Part, Pick, Role, Selection, expand};
+pub use expand::{
+    ExpandError, Expansion, ParamValue, ParamValues, Params, Part, Pick, Role, Selection, expand, expand_values,
+    first_values, instances,
+};
 pub use parser::parse_pack;
 pub use usage::{Usage, default_usage_path};
 pub use write::{create_pack_file, format_query, params_in, remove_query, rename_query, upsert_query};
@@ -89,7 +95,7 @@ pub struct PackQuery {
     pub color: Option<String>,
     /// Kinds pinned for the query's named groups (`signals: speed:num`);
     /// other groups get theirs from the values.
-    pub signals: Vec<(String, crate::signal::SignalKind)>,
+    pub signals: Vec<(String, crate::signal::SignalOptions)>,
     /// NFD text with `$param` placeholders, dedented, lines joined by `\n`.
     pub text: String,
     /// What the query is for (its `##` lines, joined by `\n`); empty for none.
@@ -251,6 +257,37 @@ impl Library {
         Some((p, p.query(id)?))
     }
 
+    /// The `signals:` entries of query `q` (of pack `pack`, saved or about
+    /// to be) for groups that no regex of it or its parents captures: a
+    /// typo, or a group renamed or removed since (owner, 2026-11-15: they
+    /// are removed when the query is saved, with a warning).
+    pub fn stale_signals(&self, pack: &str, q: &PackQuery) -> Vec<String> {
+        let mut groups = captured_groups(&q.text);
+        let mut parent = q.parent.as_ref().map(|p| if p.contains('.') { p.clone() } else { format!("{pack}.{p}") });
+        // A parent cycle is an expansion error; stop after a few anyway.
+        for _ in 0..64 {
+            let Some((p, pq)) = parent.as_deref().and_then(|id| self.get(id)) else { break };
+            groups.extend(captured_groups(&pq.text));
+            parent = p.parent_of(pq);
+        }
+        // `$cam` and `${cam}` are one parameter.
+        let same = |s: &str| render(s, false, |n, _, _| Ok::<_, ()>(format!("${{{n}}}")), |_| ()).unwrap_or_default();
+        let groups: Vec<String> = groups.iter().map(|g| same(g)).collect();
+        q.signals.iter().map(|(g, _)| g).filter(|g| !groups.contains(&same(g))).cloned().collect()
+    }
+
+    /// [`stale_signals`](Self::stale_signals) of every loaded query:
+    /// (qualified id, group).
+    pub fn all_stale_signals(&self) -> Vec<(String, String)> {
+        self.packs
+            .iter()
+            .flat_map(|p| p.queries.iter().map(move |q| (p, q)))
+            .flat_map(|(p, q)| {
+                self.stale_signals(&p.name, q).into_iter().map(move |g| (format!("{}.{}", p.name, q.id), g))
+            })
+            .collect()
+    }
+
     /// Every query (qualified ids, library order) with `label` or a label
     /// below it (`system` matches `system/vision`).
     pub fn with_label(&self, label: &str) -> Vec<String> {
@@ -384,6 +421,58 @@ pub fn is_query_name(s: &str) -> bool {
 pub fn is_name(s: &str) -> bool {
     let mut cs = s.chars();
     cs.next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_') && cs.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// `s` (a signal's name or an option's value from a `signals:` line) with
+/// its parameters filled in as written (`$$` is `$`); `None` if one has no
+/// value.
+pub fn fill_params(s: &str, params: &Params) -> Option<String> {
+    render(s, false, |name, _, _| params.get(name).map(|v| v.value.clone()).ok_or(()), |_| ()).ok()
+}
+
+/// Is `s` a name once its parameters are filled in with a name's
+/// characters (`drops_$cam`, `ecu_${n}`)?
+pub fn is_name_with_params(s: &str) -> bool {
+    render(s, false, |_, _, _| Ok::<_, ()>("x".to_owned()), |_| ()).is_ok_and(|t| is_name(&t))
+}
+
+/// A `signals:` entry (`drops_$cam` with its options) for one instance:
+/// its parameters filled in from `params`. `None` if one has no value or
+/// the name filled in isn't a name (the query's own group then fails to
+/// compile, and says so).
+pub fn fill_signal(
+    group: &str,
+    options: &crate::signal::SignalOptions,
+    params: &Params,
+) -> Option<(String, crate::signal::SignalOptions)> {
+    let name = fill_params(group, params).filter(|n| is_name(n))?;
+    let fill = |v: &Option<String>| match v {
+        Some(v) => fill_params(v, params).map(Some),
+        None => Some(None),
+    };
+    let per = fill(&options.per)?;
+    let default = fill(&options.default)?;
+    Some((name, crate::signal::SignalOptions { per, default, ..options.clone() }))
+}
+
+/// The names of the groups a query's text captures (`(?<name>…)`,
+/// `(?P<name>…)`), read from the text as written: parameters in a name
+/// (`drops_$cam`) stay as they are.
+pub fn captured_groups(text: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for (i, _) in text.match_indices("(?") {
+        let rest = &text[i + 2..];
+        let rest = rest.strip_prefix('P').unwrap_or(rest);
+        let Some(rest) = rest.strip_prefix('<') else { continue };
+        // `(?<=` and `(?<!` are look-behinds, not groups.
+        let Some(end) = rest.find('>') else { continue };
+        let name = &rest[..end];
+        let ok = |c: char| c.is_ascii_alphanumeric() || matches!(c, '_' | '$' | '{' | '}');
+        if !name.is_empty() && name.chars().all(ok) && !out.iter().any(|n| n == name) {
+            out.push(name.to_owned());
+        }
+    }
+    out
 }
 
 #[cfg(test)]

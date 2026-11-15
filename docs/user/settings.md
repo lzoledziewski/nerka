@@ -22,7 +22,7 @@ description: "nerka's settings and where it keeps them: time zones, capture prot
 
 Each tab's menu has **Records…** (how its text files are split into rows),
 **Files…** (its files, their order, protocols), **Reload**, and
-**Merge by time** (several files) or **Sort by time** (one file).
+**Sort by time** (its files' lines in time order, one file or several).
 
 ## Where things are kept
 

@@ -183,28 +183,42 @@ match), and a broad query under a regex rule may cost 4–5× today's.
 Marked forms were not measured; they read the same 160 bytes as the trial and
 check fewer words.
 
+## Settled (owner, 2026-11-14)
+
+- **Written as spec lines**, one per profile (like `--records` and
+  `--lifecycle`, so the CLI takes the same text), kept in a file under
+  `<config>/nerka/profiles`, edited in a GUI dialog, part of settings
+  bundles.
+- **A profile also switches signals on** for its files (a text log's `@time`
+  from a regex, its other values), with the options of signals in packs
+  (`sources-and-signals.md`, "Decisions taken with the owner").
+- **Views of several files**: a text log can be merged by time with DLTs and
+  captures (once a profile gives it a time); the tab's **Files…** window shows
+  and overrides each file's profile and its time (zone, kind, offset,
+  anchor). A **saved view** is a workspace (the files with their profiles and
+  times, reopened in one step): low priority.
+- **Order**: built after the signal options of pack queries, time per file
+  first, then profiles, then views of several files (`status.md`, "Next
+  steps").
+
 ## Open questions
 
-1. **How a profile is written**: a one-line spec like `--records` and
-   `--lifecycle` (CLI-friendly), or a YAML file like a `.ksy`.
-2. **Where profiles live and are edited**: one file in `<config>/nerka/`, a
-   folder of files, or inside packs; the GUI's place for them.
-3. **First-line rule**: how many lines it reads; several profiles matching
+1. **First-line rule**: how many lines it reads; several profiles matching
    (the first in list order?).
-4. **Protocol level maps**: in profiles, or in the protocols' own settings (⚙
+2. **Protocol level maps**: in profiles, or in the protocols' own settings (⚙
    → Captures).
-5. **R11 before profiles**: make marked forms the default now, or wait for
+3. **R11 before profiles**: make marked forms the default now, or wait for
    profiles.
-6. **JSON's fallback**: drop it now (a small change of behaviour), or with
+4. **JSON's fallback**: drop it now (a small change of behaviour), or with
    profiles.
-7. **CLI**: `--profile NAME` and an inline spec.
-8. **A file's offset**: remembered per file or for the session; in a view of
+5. **CLI**: `--profile NAME` and an inline spec.
+6. **A file's offset**: remembered per file or for the session; in a view of
    several files, one per file (as Merge by time needs).
-9. **Anchors in the GUI**: "this line was at …", "this line is the same
+7. **Anchors in the GUI**: "this line was at …", "this line is the same
    moment as that one", and how an anchored file shows that it was moved.
-10. **Seconds since boot**: shown as uptime until anchored, or placed on the
+8. **Seconds since boot**: shown as uptime until anchored, or placed on the
     timeline only with an anchor; a file with several boots (lifecycles).
-11. **Zone per file and the GUI's Local time / UTC switch** (R12): whether a
+9. **Zone per file and the GUI's Local time / UTC switch** (R12): whether a
     file's zone replaces the switch for that file.
 
 Prior art: lnav's log formats (a regex with named groups, a level map and a

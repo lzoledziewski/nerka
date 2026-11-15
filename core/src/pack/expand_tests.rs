@@ -198,6 +198,93 @@ fn labels_resolve_to_a_snapshot() {
     assert_eq!(ids, ["nav.errs", "txt.fail"]);
 }
 
+/// Owner, 2026-11-15: a parameterised query picked with several argument
+/// sets (instances): a part each, in every role; the same effective
+/// arguments twice add nothing; a parent covers only its own instance.
+#[test]
+fn instances_of_a_query_are_parts_of_their_own() {
+    let lib = lib();
+    let with = |id: &str, cam: &str| Pick::QueryWith(id.into(), params(&[("cam", cam)]));
+    let shared = params(&[("cam", "CAM1")]);
+    let s = Selection {
+        include: vec![with("txt.cam", "CAM1"), with("txt.cam", "CAM2"), Pick::Query("txt.cam".into())],
+        ..Default::default()
+    };
+    let e = expand(&s, &lib, &shared).unwrap();
+    assert_eq!(e.nfd, "(raw ~ /CAM1 frame drop/) OR (raw ~ /CAM2 frame drop/)", "the shared CAM1 is the first");
+    let got: Vec<(usize, Option<&str>)> =
+        e.parts.iter().map(|p| (p.pick, p.args.get("cam").map(|v| v.value.as_str()))).collect();
+    assert_eq!(got, [(0, Some("CAM1")), (1, Some("CAM2"))]);
+
+    // Required: each instance ANDed; excluded: each one left out.
+    let s = Selection { require: vec![with("txt.cam", "A"), with("txt.cam", "B")], ..Default::default() };
+    assert_eq!(expand(&s, &lib, &Params::new()).unwrap().nfd, "(raw ~ /A frame drop/) AND (raw ~ /B frame drop/)");
+    let s = Selection {
+        include: vec![Pick::Query("nav.slow".into())],
+        exclude: vec![with("txt.cam", "A"), with("txt.cam", "B")],
+        ..Default::default()
+    };
+    let e = expand(&s, &lib, &params(&[("app", "NAV")])).unwrap();
+    assert_eq!(e.nfd, r#"(apid == "NAV") AND (/slow/) AND NOT (raw ~ /A frame drop/) AND NOT (raw ~ /B frame drop/)"#);
+
+    // A parent picked with one app covers its child with that app only.
+    let app = |id: &str, a: &str| Pick::QueryWith(id.into(), params(&[("app", a)]));
+    let s = Selection {
+        include: vec![app("nav.all", "NAV"), app("nav.slow", "NAV"), app("nav.slow", "ECU")],
+        ..Default::default()
+    };
+    let e = expand(&s, &lib, &Params::new()).unwrap();
+    assert_eq!(e.nfd, r#"(apid == "NAV") OR (apid == "ECU") AND (/slow/)"#);
+    let covered: Vec<Option<&str>> = e.parts.iter().map(|p| p.covered.as_deref()).collect();
+    assert_eq!(covered, [None, Some("nav.all"), None]);
+
+    // Signal picks: an instance each, aside.
+    let s = Selection { signal: vec![with("txt.cam", "A"), with("txt.cam", "B")], ..Default::default() };
+    let e = expand(&s, &lib, &Params::new()).unwrap();
+    assert_eq!(
+        e.parts.iter().map(|p| e.part_nfd(p)).collect::<Vec<_>>(),
+        ["(raw ~ /A frame drop/)", "(raw ~ /B frame drop/)"]
+    );
+    // A snapshot keeps instances as they are.
+    assert_eq!(s.snapshot(&lib).unwrap(), s);
+}
+
+/// Owner, 2026-11-15: several values for a parameter make every picked
+/// query that uses it an instance per value (per combination with more);
+/// a field not filled in yet and a value given twice don't count.
+#[test]
+fn several_values_of_a_parameter_make_instances() {
+    let mut lib = lib();
+    lib.add(pack(VISION)).unwrap();
+    let vals = |kv: &[(&str, &[&str])]| -> ParamValues {
+        kv.iter().map(|(k, vs)| (k.to_string(), vs.iter().map(|v| ParamValue::literal(*v)).collect())).collect()
+    };
+    let s = sel(&["txt.cam", "nav.slow"], &[]);
+    let e = expand_values(&s, &lib, &vals(&[("cam", &["CAM1", "", "CAM2", "CAM1"]), ("app", &["NAV"])])).unwrap();
+    assert_eq!(e.nfd, r#"(raw ~ /CAM1 frame drop/) OR (raw ~ /CAM2 frame drop/) OR (apid == "NAV") AND (/slow/)"#);
+    let got: Vec<(usize, String)> = e
+        .parts
+        .iter()
+        .map(|p| (p.pick, p.args.values().map(|v| v.value.clone()).collect::<Vec<_>>().join(",")))
+        .collect();
+    assert_eq!(got, [(0, "CAM1".into()), (0, "CAM2".into()), (1, String::new())], "one value: no instance");
+    // Two parameters with several values: every combination.
+    let s = sel(&["vision.cam_scope"], &[]);
+    let e = expand_values(&s, &lib, &vals(&[("ecu", &["E1", "E2"]), ("cam", &["C1", "C2"])])).unwrap();
+    assert_eq!(e.parts.len(), 4);
+    assert_eq!(
+        instances(&lib, "vision.cam_scope", &vals(&[("ecu", &["E1", "E2"]), ("cam", &["C1", "C2", "C3"])])).len(),
+        6
+    );
+    // Labels too: each of their queries.
+    let e =
+        expand_values(&sel(&["@vision"], &[]), &lib, &vals(&[("cam", &["A", "B"]), ("what", &["x"]), ("ecu", &["E"])]))
+            .unwrap();
+    assert_eq!(e.parts.len(), 3, "txt.cam ×2, txt.fail (vision.cam_scope is system/vision)");
+    // One value each: as before.
+    assert_eq!(first_values(&vals(&[("cam", &["", "CAM2"])]))["cam"].value, "CAM2");
+}
+
 #[test]
 fn parameters_are_regex_escaped() {
     let text = "\

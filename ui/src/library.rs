@@ -23,13 +23,13 @@
 
 use eframe::egui::{self, Color32, RichText};
 use nerka_core::FieldDef;
-use nerka_core::SignalKind;
+use nerka_core::SignalOptions;
 use nerka_core::pack::{
-    self, Expansion, Library, Pack, PackQuery, ParamValue, Params, Pick, Selection, format_query, is_query_name,
-    params_in, parse_pack, upsert_query,
+    self, Expansion, Library, Pack, PackQuery, ParamValue, ParamValues, Params, Pick, Selection, format_query,
+    is_query_name, params_in, parse_pack, upsert_query,
 };
 use nerka_core::preset::{NodeSource, Preset, PresetNode, PresetParam};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 /// How a node takes part in the filter.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -121,10 +121,19 @@ pub struct Node {
     pub open: bool,
     /// Last save error.
     pub error: Option<String>,
-    /// Kinds its pack pins for its named groups (`signals:`).
-    pub signals: Vec<(String, SignalKind)>,
+    /// Options its pack gives its named groups (`signals:`).
+    pub signals: Vec<(String, SignalOptions)>,
     /// What it is for (the pack's `##` lines).
     pub note: String,
+}
+
+/// How an instance is shown: the values of the parameters with several
+/// (`CAM1`, or `cam=CAM1, ecu=E` for several such), a part's arguments.
+fn instance_label(args: &Params) -> String {
+    match args.len() {
+        1 => args.values().next().map(|v| v.value.clone()).unwrap_or_default(),
+        _ => args.iter().map(|(k, v)| format!("{k}={}", v.value)).collect::<Vec<_>>().join(", "),
+    }
 }
 
 impl Node {
@@ -171,6 +180,11 @@ impl Node {
     /// the line colour and its search hits all use this one.
     pub fn color(&self) -> Color32 {
         parse_color(self.color.trim()).unwrap_or(palette(self.slot))
+    }
+
+    /// The colour of instance `i` (the first has the node's).
+    pub fn instance_color(&self, i: usize) -> Color32 {
+        if i == 0 { self.color() } else { palette(self.slot + i) }
     }
 
     /// The expansion id: the library query, unless edited or detached
@@ -238,8 +252,8 @@ pub struct Applied {
     pub keys: Vec<u64>,
     pub names: Vec<String>,
     pub colors: Vec<Color32>,
-    /// Per part: the kinds its pack pins for its named groups.
-    pub pins: Vec<Vec<(String, SignalKind)>>,
+    /// Per part: the options its pack gives its named groups.
+    pub pins: Vec<Vec<(String, SignalOptions)>>,
 }
 
 /// One query of the Search box: its name, NFD and colour.
@@ -262,8 +276,13 @@ pub enum Target {
 pub struct Picks {
     pub nodes: Vec<Node>,
     next_key: u64,
-    /// Parameter values by name, with "insert as regex" (raw).
-    pub params: BTreeMap<String, (String, bool)>,
+    /// Parameter values by name, each with "insert as regex" (raw). Several
+    /// for a name: every picked query using it is an instance per value
+    /// (owner, 2026-11-15, `query-instances.md`).
+    pub params: BTreeMap<String, Vec<(String, bool)>>,
+    /// Values being typed (parameter, value index): they count on Enter or
+    /// when their field is left.
+    pub drafts: HashMap<(String, usize), String>,
     /// The last expansion error, shown in the selection pane.
     pub error: Option<String>,
     /// Pack chosen in the editor's "Save to".
@@ -293,7 +312,22 @@ impl Picks {
     fn add_node(&mut self, lib: &Library, id: &str, role: Use, at: Option<usize>, detached: bool) -> bool {
         let same = |n: &Node| n.source.as_deref() == Some(id) && !n.edited && n.role == role && n.detached == detached;
         if self.nodes.iter().any(same) {
-            return false;
+            // Picked again: one more value for its first parameter, an
+            // instance once filled in (owner, 2026-11-15: + adds a value,
+            // not a second pick).
+            // Without parents: only its own parameters count.
+            let params = if detached {
+                lib.get(id).map(|(_, q)| q.params.clone()).unwrap_or_default()
+            } else {
+                lib.params_needed([id])
+            };
+            let Some(first) = params.into_iter().next() else { return false };
+            let values = self.params.entry(first).or_default();
+            if values.is_empty() {
+                values.push(Default::default());
+            }
+            values.push(Default::default());
+            return true;
         }
         let key = self.next_key();
         let Some(mut n) = Node::of_library(key, lib, id, role) else { return false };
@@ -397,6 +431,7 @@ impl Picks {
                     n.parent = if n.detached { None } else { p.parent_of(q) };
                     n.labels = q.labels.join(", ");
                     n.color = q.color.clone().unwrap_or_default();
+                    n.signals = q.signals.clone();
                     n.note = q.note.clone();
                 }
                 Some(_) => {}
@@ -408,8 +443,82 @@ impl Picks {
         }
     }
 
+    /// Write `options` as what the packs give named group `group`
+    /// (`signals:`), into every picked query that has that group: a library
+    /// query is saved to its pack's file, an edited or local one keeps it
+    /// until it is saved. Only on the user's "Save to pack": the tab's
+    /// choices are never written by themselves (owner, 2026-11-14). An
+    /// empty `per` or `default` means none: left out. Returns the packs
+    /// written to and how many local queries took it.
+    pub fn save_signal_options(
+        &mut self,
+        lib: &mut Library,
+        group: &str,
+        options: &SignalOptions,
+    ) -> Result<(Vec<String>, usize), String> {
+        let options = SignalOptions {
+            per: options.per.clone().filter(|p| !p.trim().is_empty()),
+            default: options.default.clone().filter(|d| !d.trim().is_empty()),
+            ..options.clone()
+        };
+        let applied = self.expand(lib)?;
+        let shared = self.params();
+        // Signal names are lower case; a group may not be.
+        let wanted = format!("<{group}>").to_ascii_lowercase();
+        // Each query once, with the arguments of its first part that has it.
+        let mut targets: Vec<(u64, Params)> = Vec::new();
+        for (i, p) in applied.exp.parts.iter().enumerate() {
+            if p.role != pack::Role::Exclude
+                && applied.exp.part_nfd(p).to_ascii_lowercase().contains(&wanted)
+                && !targets.iter().any(|(k, _)| *k == applied.keys[i])
+            {
+                targets.push((applied.keys[i], effective(&shared, &p.args)));
+            }
+        }
+        if targets.is_empty() {
+            return Err(format!("no picked query has the group (?<{group}>…)"));
+        }
+        let (mut packs, mut locals) = (Vec::new(), 0);
+        for (key, args) in targets {
+            let Some(n) = self.node_mut(key) else { continue };
+            let from_library = n.source.clone().filter(|_| !n.edited && !n.detached);
+            // The entry as written in the query: `drops_$cam` for
+            // `drops_CAM1`, its values with parameters kept where they
+            // still give what is saved (owner, 2026-11-15).
+            let (name, write) = as_written(&n.signals, &n.text, group, &options, &args);
+            let set = |signals: &mut Vec<(String, SignalOptions)>| {
+                signals.retain(|(g, _)| *g != name);
+                if !write.is_empty() {
+                    signals.push((name.clone(), write.clone()));
+                }
+            };
+            set(&mut n.signals);
+            match from_library.as_deref().and_then(|id| lib.get(id)) {
+                Some((p, q)) => {
+                    let (pack, mut q) = (p.name.clone(), q.clone());
+                    set(&mut q.signals);
+                    lib.save_query(&pack, &q).map_err(|e| e.to_string())?;
+                    if !packs.contains(&pack) {
+                        packs.push(pack);
+                    }
+                }
+                None => locals += 1,
+            }
+        }
+        Ok((packs, locals))
+    }
+
+    /// Every value of each parameter.
+    pub fn values(&self) -> ParamValues {
+        self.params
+            .iter()
+            .map(|(k, vs)| (k.clone(), vs.iter().map(|(v, raw)| ParamValue { value: v.clone(), raw: *raw }).collect()))
+            .collect()
+    }
+
+    /// The value each parameter has (the first of several).
     pub fn params(&self) -> Params {
-        self.params.iter().map(|(k, (v, raw))| (k.clone(), ParamValue { value: v.clone(), raw: *raw })).collect()
+        pack::first_values(&self.values())
     }
 
     /// The library plus a temporary pack with the local nodes.
@@ -432,25 +541,51 @@ impl Picks {
     pub fn expand(&self, lib: &Library) -> Result<Applied, String> {
         let full = self.with_locals(lib)?;
         let mut sel = Selection::default();
-        let mut by_id: Vec<(String, &Node)> = Vec::new();
-        for n in &self.nodes {
-            let id = n.expand_id();
-            match n.role {
-                Use::Include => sel.include.push(Pick::Query(id.clone())),
-                Use::Require => sel.require.push(Pick::Query(id.clone())),
-                Use::Exclude => sel.exclude.push(Pick::Query(id.clone())),
-                Use::Signal => sel.signal.push(Pick::Query(id.clone())),
-            }
-            by_id.push((id, n));
+        // Per role, in pick order: the node of each pick (a part says its
+        // pick; a query's instances share it).
+        let mut from: [Vec<usize>; 4] = Default::default();
+        let role = |u: Use| match u {
+            Use::Include => 0,
+            Use::Require => 1,
+            Use::Exclude => 2,
+            Use::Signal => 3,
+        };
+        for (i, n) in self.nodes.iter().enumerate() {
+            let list = match n.role {
+                Use::Include => &mut sel.include,
+                Use::Require => &mut sel.require,
+                Use::Exclude => &mut sel.exclude,
+                Use::Signal => &mut sel.signal,
+            };
+            list.push(Pick::Query(n.expand_id()));
+            from[role(n.role)].push(i);
         }
-        let exp = pack::expand(&sel, &full, &self.params()).map_err(|e| e.to_string())?;
+        let shared = self.params();
+        let exp = pack::expand_values(&sel, &full, &self.values()).map_err(|e| e.to_string())?;
         let (mut keys, mut names, mut colors, mut pins) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        // Instances of each pick so far: the next one's colour.
+        let mut seen: HashMap<(usize, usize), usize> = HashMap::new();
         for p in &exp.parts {
-            let n = by_id.iter().find(|(id, _)| *id == p.query).map(|(_, n)| *n).expect("expanded from these nodes");
+            let r = match p.role {
+                pack::Role::Include => 0,
+                pack::Role::Require => 1,
+                pack::Role::Exclude => 2,
+                pack::Role::Signal => 3,
+            };
+            let n = &self.nodes[from[r][p.pick]];
             keys.push(n.key);
-            names.push(n.display_name());
-            colors.push(n.color());
-            pins.push(n.signals.clone());
+            if p.args.is_empty() {
+                names.push(n.display_name());
+                colors.push(n.color());
+            } else {
+                let k = seen.entry((r, p.pick)).or_default();
+                names.push(format!("{} ({})", n.display_name(), instance_label(&p.args)));
+                colors.push(n.instance_color(*k));
+                *k += 1;
+            }
+            // `drops_$cam` filled in with this part's arguments.
+            let args = effective(&shared, &p.args);
+            pins.push(n.signals.iter().filter_map(|(g, o)| pack::fill_signal(g, o, &args)).collect());
         }
         Ok(Applied { exp, keys, names, colors, pins })
     }
@@ -475,8 +610,9 @@ impl Picks {
                 (n.expand_id(), n.display_name(), n.color())
             }
         };
+        // A query with instances: them OR'ed, one term.
         let sel = Selection { include: vec![Pick::Query(id)], ..Default::default() };
-        let exp = pack::expand(&sel, &full, &self.params()).map_err(|e| e.to_string())?;
+        let exp = pack::expand_values(&sel, &full, &self.values()).map_err(|e| e.to_string())?;
         Ok(Term { name, nfd: exp.nfd, color })
     }
 
@@ -494,10 +630,13 @@ impl Picks {
             };
             p.nodes.push(PresetNode { source, role: n.role.into(), lit: n.lit, detached: n.detached });
         }
+        // Every value, in order (several: `param NAME += VALUE` lines).
         p.params = self
             .params
             .iter()
-            .map(|(k, (v, raw))| PresetParam { name: k.clone(), value: v.clone(), raw: *raw })
+            .flat_map(|(k, vs)| {
+                vs.iter().map(move |(v, raw)| PresetParam { name: k.clone(), value: v.clone(), raw: *raw })
+            })
             .collect();
         p
     }
@@ -540,7 +679,10 @@ impl Picks {
             n.slot = self.free_slot();
             self.nodes.push(n);
         }
-        self.params = preset.params.iter().map(|p| (p.name.clone(), (p.value.clone(), p.raw))).collect();
+        self.params.clear();
+        for p in &preset.params {
+            self.params.entry(p.name.clone()).or_default().push((p.value.clone(), p.raw));
+        }
         if !missing.is_empty() {
             self.error = Some(format!("Preset '{}': not loaded: {}", preset.name, missing.join(", ")));
         }
@@ -579,6 +721,8 @@ pub enum Action {
     Edited {
         renamed: Option<(String, String)>,
         removed: Option<String>,
+        /// What to say about stale `signals:` entries the save dropped.
+        notice: Option<String>,
     },
 }
 
@@ -760,6 +904,7 @@ pub fn library_panel(
     ui: &mut egui::Ui,
     lib: &mut Library,
     load_errors: &[String],
+    warnings: &[String],
     picks: &mut Picks,
     view: &mut LibraryView,
     schema: Option<&[FieldDef]>,
@@ -784,6 +929,9 @@ pub fn library_panel(
     for e in load_errors {
         ui.colored_label(ui.visuals().error_fg_color, e);
     }
+    for w in warnings {
+        ui.colored_label(ui.visuals().warn_fg_color, format!("⚠ {w}"));
+    }
     ui.separator();
     if lib.packs().is_empty() {
         ui.weak("No packs loaded. Put *.nerka-pack files into the pack folder, or start with --pack <dir|file>.");
@@ -798,13 +946,13 @@ pub fn library_panel(
         match library_editor(ui, lib, edit) {
             EditOutcome::Open => {}
             EditOutcome::Closed => view.editing = None,
-            EditOutcome::Saved(renamed) => {
+            EditOutcome::Saved(renamed, notice) => {
                 view.editing = None;
-                action = Action::Edited { renamed, removed: None };
+                action = Action::Edited { renamed, removed: None, notice };
             }
             EditOutcome::Deleted(id) => {
                 view.editing = None;
-                action = Action::Edited { renamed: None, removed: Some(id) };
+                action = Action::Edited { renamed: None, removed: Some(id), notice: None };
             }
         }
         ui.separator();
@@ -1151,8 +1299,9 @@ fn query_row(
 enum EditOutcome {
     Open,
     Closed,
-    /// Saved; `(old, new)` qualified ids if it was renamed.
-    Saved(Option<(String, String)>),
+    /// Saved; `(old, new)` qualified ids if it was renamed, and what to
+    /// say about stale `signals:` entries it dropped.
+    Saved(Option<(String, String)>, Option<String>),
     /// Deleted from its pack (qualified id).
     Deleted(String),
 }
@@ -1179,6 +1328,7 @@ fn library_editor(ui: &mut egui::Ui, lib: &mut Library, e: &mut LibEdit) -> Edit
             if let Some(short) = q.parent.as_deref().and_then(|p| p.strip_prefix(&format!("{}.", e.pack))) {
                 q.parent = Some(short.to_owned());
             }
+            let notice = drop_stale_signals(lib, &e.pack, &mut q);
             let res = match &e.old {
                 Some(old) => lib.rename_query(&e.pack, old, &q),
                 None if lib.get(&format!("{}.{name}", e.pack)).is_some() => {
@@ -1188,12 +1338,13 @@ fn library_editor(ui: &mut egui::Ui, lib: &mut Library, e: &mut LibEdit) -> Edit
             };
             match res {
                 Ok(()) => {
+                    e.node.signals = q.signals.clone();
                     let renamed = e
                         .old
                         .as_ref()
                         .filter(|old| **old != name)
                         .map(|old| (format!("{}.{old}", e.pack), format!("{}.{name}", e.pack)));
-                    outcome = EditOutcome::Saved(renamed);
+                    outcome = EditOutcome::Saved(renamed, notice);
                 }
                 Err(err) => e.node.error = Some(err.to_string()),
             }
@@ -1316,8 +1467,16 @@ pub fn selection_panel(ui: &mut egui::Ui, lib: &mut Library, picks: &mut Picks) 
     ui.separator();
 
     // Bottom part first, so the list gets the space that is left.
+    // At most 40 % of the pane for the parameters, scrolling beyond: the
+    // query list keeps the rest (owner, 2026-11-15: with many values the
+    // parameters took the whole pane and neither could be scrolled).
+    let room = (ui.available_height() * 0.4).max(80.0);
     egui::Panel::bottom("selection-actions").show(ui, |ui| {
-        params_ui(ui, lib, picks);
+        egui::ScrollArea::vertical()
+            .id_salt("selection-params")
+            .max_height(room)
+            .auto_shrink([false, true])
+            .show(ui, |ui| params_ui(ui, lib, picks));
         if let Some(e) = &picks.error {
             ui.colored_label(ui.visuals().error_fg_color, e);
         }
@@ -1353,9 +1512,13 @@ pub fn selection_panel(ui: &mut egui::Ui, lib: &mut Library, picks: &mut Picks) 
                     ui.weak("Drag queries here from the library, press + there, or + New.");
                 }
                 let packs: Vec<String> = lib.packs().iter().map(|p| p.name.clone()).collect();
+                // Each node's instances: its parameters' counts of values.
+                let values = picks.values();
+                let counts: Vec<usize> =
+                    picks.nodes.iter().map(|n| instance_count(&node_params(lib, n), &values)).collect();
                 let (save_pack, new_pack) = (&mut picks.save_pack, &mut picks.new_pack);
-                for n in picks.nodes.iter_mut() {
-                    row_rects.push(node_row(ui, n, &mut remove, &mut action));
+                for (n, count) in picks.nodes.iter_mut().zip(counts) {
+                    row_rects.push(node_row(ui, n, count, &mut remove, &mut action));
                     if n.open {
                         let parents = parent_choices(lib, n.source.as_deref());
                         match node_editor(ui, n, &packs, &parents, save_pack, new_pack) {
@@ -1399,10 +1562,11 @@ pub fn selection_panel(ui: &mut egui::Ui, lib: &mut Library, picks: &mut Picks) 
     if let Some(key) = remove {
         picks.remove(key);
     }
+    let mut notice = None;
     if let Some(key) = save
-        && let Some(renamed) = save_node(lib, picks, key)
+        && let Some(renamed) = save_node(lib, picks, key, &mut notice)
     {
-        action = Action::Edited { renamed, removed: None };
+        action = Action::Edited { renamed, removed: None, notice: notice.take() };
     }
     if create_pack {
         let name = picks.new_pack.trim().to_owned();
@@ -1422,9 +1586,16 @@ pub fn selection_panel(ui: &mut egui::Ui, lib: &mut Library, picks: &mut Picks) 
     action
 }
 
-/// One node: handle, role, colour, name, search, edit and remove. Returns
-/// its rect.
-fn node_row(ui: &mut egui::Ui, n: &mut Node, remove: &mut Option<u64>, action: &mut Action) -> egui::Rect {
+/// One node: handle, role, colour, name, its instances' count (several
+/// values for a parameter it uses), search, edit and remove. Returns its
+/// rect.
+fn node_row(
+    ui: &mut egui::Ui,
+    n: &mut Node,
+    instances: usize,
+    remove: &mut Option<u64>,
+    action: &mut Action,
+) -> egui::Rect {
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = 4.0;
         ui.dnd_drag_source(ui.scope_id().with(("node-drag", n.key)), Drag::Node(n.key), |ui| {
@@ -1476,6 +1647,12 @@ fn node_row(ui: &mut egui::Ui, n: &mut Node, remove: &mut Option<u64>, action: &
         if n.edited {
             ui.weak("•").on_hover_text("Not saved in a pack");
         }
+        if instances > 1 {
+            ui.weak(format!("× {instances}")).on_hover_text(
+                "Instances: a parameter it uses has several values (Parameters, below), so it is picked once \
+                 per value (per combination, with more), each with its colour and signals",
+            );
+        }
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             if ui.small_button("−").on_hover_text("Remove from the selection").clicked() {
                 *remove = Some(n.key);
@@ -1493,6 +1670,43 @@ fn node_row(ui: &mut egui::Ui, n: &mut Node, remove: &mut Option<u64>, action: &
 enum EditorAction {
     Save,
     CreatePack,
+}
+
+/// The parameters node `n` needs, its parents' included.
+fn node_params(lib: &Library, n: &Node) -> Vec<String> {
+    match n.source.as_deref().filter(|_| !n.edited) {
+        Some(id) if n.detached => lib.get(id).map(|(_, q)| q.params.clone()).unwrap_or_default(),
+        Some(id) => lib.params_needed([id]),
+        None => {
+            let mut v = params_in(&n.text);
+            if let Some(p) = n.parent.as_deref().filter(|_| !n.detached) {
+                for x in lib.params_needed([p]) {
+                    if !v.contains(&x) {
+                        v.push(x);
+                    }
+                }
+            }
+            v
+        }
+    }
+}
+
+/// How many instances a query using `params` is: the product of their
+/// counts of values (those filled in, each value once).
+fn instance_count(params: &[String], values: &ParamValues) -> usize {
+    params
+        .iter()
+        .map(|p| {
+            let vs = values.get(p).map(Vec::as_slice).unwrap_or_default();
+            let mut distinct: Vec<&ParamValue> = Vec::new();
+            for v in vs.iter().filter(|v| !v.value.is_empty()) {
+                if !distinct.contains(&v) {
+                    distinct.push(v);
+                }
+            }
+            distinct.len().max(1)
+        })
+        .product()
 }
 
 /// A selection node's fields and Save to a pack.
@@ -1549,11 +1763,74 @@ fn node_editor(
     action
 }
 
+/// A part's parameter values: its own arguments over the shared ones.
+fn effective(shared: &Params, own: &Params) -> Params {
+    let mut p = shared.clone();
+    p.extend(own.iter().map(|(k, v)| (k.clone(), v.clone())));
+    p
+}
+
+/// Signal `group` (as filled in with `args`) and the `options` to save
+/// for it, as a query's `signals:` line writes them: the entry or regex
+/// group whose name fills in to `group` (`drops_$cam`), and its values
+/// with parameters where they still fill in to what is saved
+/// (`per(ecu_$cam)`), so the other instances keep theirs.
+fn as_written(
+    signals: &[(String, SignalOptions)],
+    text: &str,
+    group: &str,
+    options: &SignalOptions,
+    args: &Params,
+) -> (String, SignalOptions) {
+    let fills = |raw: &str| pack::fill_params(raw, args).is_some_and(|f| f.eq_ignore_ascii_case(group));
+    let name = signals
+        .iter()
+        .map(|(g, _)| g.clone())
+        .chain(pack::captured_groups(text))
+        .find(|g| fills(g))
+        .unwrap_or_else(|| group.to_owned());
+    let raw = signals.iter().find(|(g, _)| *g == name).map(|(_, o)| o.clone()).unwrap_or_default();
+    let keep = |raw: &Option<String>, new: &Option<String>, same: fn(&str, &str) -> bool| match (raw, new) {
+        (Some(r), Some(n)) if pack::fill_params(r, args).is_some_and(|f| same(&f, n)) => Some(r.clone()),
+        _ => new.clone(),
+    };
+    // Lifecycle names don't care about case.
+    let write = SignalOptions {
+        per: keep(&raw.per, &options.per, |a, b| a.eq_ignore_ascii_case(b)),
+        default: keep(&raw.default, &options.default, |a, b| a == b),
+        ..options.clone()
+    };
+    (name, write)
+}
+
+/// Drop the `signals:` entries of `q` (to be saved in `pack`) for groups
+/// no regex of it or its parents captures (owner, 2026-11-15): what to say
+/// about them, if any.
+fn drop_stale_signals(lib: &Library, pack: &str, q: &mut PackQuery) -> Option<String> {
+    let stale = lib.stale_signals(pack, q);
+    if stale.is_empty() {
+        return None;
+    }
+    q.signals.retain(|(g, _)| !stale.contains(g));
+    Some(format!(
+        "Removed from {pack}.{}'s signals: {} (no regex of the query captures {})",
+        q.id,
+        stale.join(", "),
+        if stale.len() == 1 { "it" } else { "them" }
+    ))
+}
+
 /// Write node `key` into the chosen pack; it then refers to that query. A
 /// node from a query of the same pack renames that query; otherwise the
 /// query is added (or replaces one with that name). Returns the rename on
-/// success, `None` if saving failed.
-fn save_node(lib: &mut Library, picks: &mut Picks, key: u64) -> Option<Option<(String, String)>> {
+/// success, `None` if saving failed; `notice`: what to say about stale
+/// `signals:` entries it dropped.
+fn save_node(
+    lib: &mut Library,
+    picks: &mut Picks,
+    key: u64,
+    notice: &mut Option<String>,
+) -> Option<Option<(String, String)>> {
     let pack_name = picks.save_pack.clone();
     let n = picks.node_mut(key)?;
     if let Err(e) = n.validate(true) {
@@ -1566,6 +1843,8 @@ fn save_node(lib: &mut Library, picks: &mut Picks, key: u64) -> Option<Option<(S
     if let Some(short) = q.parent.as_deref().and_then(|p| p.strip_prefix(&format!("{pack_name}."))) {
         q.parent = Some(short.to_owned());
     }
+    *notice = drop_stale_signals(lib, &pack_name, &mut q);
+    n.signals = q.signals.clone();
     let old = n
         .source
         .as_deref()
@@ -1599,18 +1878,66 @@ fn params_ui(ui: &mut egui::Ui, lib: &Library, picks: &mut Picks) {
     if names.is_empty() {
         return;
     }
-    ui.label(RichText::new("Parameters").strong());
+    ui.label(RichText::new("Parameters").strong()).on_hover_text(
+        "Several values for a parameter: every picked query using it is picked once per value (an instance each, \
+         its own colour and signals). A value counts once you press Enter or leave its field.",
+    );
+    let (params, drafts) = (&mut picks.params, &mut picks.drafts);
     for name in names {
-        let (value, raw) = picks.params.entry(name.clone()).or_default();
-        ui.horizontal(|ui| {
-            ui.monospace(format!("${name}"));
-            // Right to left: the field takes the width the checkbox leaves.
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.checkbox(raw, "regex").on_hover_text(
-                    "Insert the value as regex syntax inside regexes (normally it is matched literally)",
+        let values = params.entry(name.clone()).or_default();
+        if values.is_empty() {
+            values.push(Default::default());
+        }
+        let mut remove = None;
+        for i in 0..values.len() {
+            let key = (name.clone(), i);
+            let twice = !values[i].0.is_empty() && values[..i].contains(&values[i]);
+            ui.horizontal(|ui| {
+                let label = if i == 0 { format!("${name}") } else { String::new() };
+                ui.add_sized(
+                    [ui.available_width().min(60.0), 18.0],
+                    egui::Label::new(RichText::new(label).monospace()),
                 );
-                ui.add(egui::TextEdit::singleline(value).desired_width(ui.available_width()));
+                // Right to left: the field takes the width the rest leaves.
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if values.len() > 1 && ui.small_button("✖").on_hover_text("Remove this value").clicked() {
+                        remove = Some(i);
+                    }
+                    ui.checkbox(&mut values[i].1, "regex").on_hover_text(
+                        "Insert the value as regex syntax inside regexes (normally it is matched literally)",
+                    );
+                    if twice {
+                        ui.colored_label(ui.visuals().warn_fg_color, "⚠")
+                            .on_hover_text("Given already: it adds nothing");
+                    }
+                    // Typed into a draft; it counts on Enter or leaving the
+                    // field (signals were rebuilt at every key).
+                    let mut text = drafts.get(&key).cloned().unwrap_or_else(|| values[i].0.clone());
+                    let r = ui.add(egui::TextEdit::singleline(&mut text).desired_width(ui.available_width()));
+                    if r.changed() {
+                        drafts.insert(key.clone(), text);
+                    }
+                    if r.lost_focus()
+                        && let Some(t) = drafts.remove(&key)
+                    {
+                        values[i].0 = t;
+                    }
+                });
             });
+        }
+        if let Some(i) = remove {
+            values.remove(i);
+            drafts.retain(|(n, _), _| *n != name);
+        }
+        ui.horizontal(|ui| {
+            ui.add_space(64.0);
+            if ui
+                .small_button("+ value")
+                .on_hover_text(format!("Another value for ${name}: an instance more"))
+                .clicked()
+            {
+                values.push(Default::default());
+            }
         });
     }
 }
@@ -1632,7 +1959,7 @@ mod tests {
         let input = egui::RawInput { screen_rect: Some(screen), time: Some(t), events, ..Default::default() };
         let mut out = ctx.run_ui(input, |ui| {
             egui::Panel::right("library").exact_size(300.0).show(ui, |ui| {
-                library_panel(ui, &mut lib.clone(), &[], picks, &mut LibraryView::default(), None);
+                library_panel(ui, &mut lib.clone(), &[], &[], picks, &mut LibraryView::default(), None);
             });
             egui::CentralPanel::default().show(ui, |ui| {
                 selection_panel(ui, lib, picks);
@@ -1732,8 +2059,8 @@ mod tests {
         let k = p.add_new(Use::Include);
         p.node_mut(k).unwrap().text = "level >= ERROR".into();
         p.toggle_lit(k);
-        p.params.insert("ecu".into(), ("ECU 1".into(), false));
-        p.params.insert("x".into(), ("a b".into(), true));
+        p.params.insert("ecu".into(), vec![("ECU 1".into(), false)]);
+        p.params.insert("x".into(), vec![("a b".into(), true)]);
 
         let preset = p.to_preset("mine");
         let text = preset.serialize();
@@ -1781,11 +2108,84 @@ mod tests {
         // Saving into a pack needs a name.
         p.save_pack = lib.packs()[0].name.clone();
         let mut lib2 = lib.clone();
-        assert_eq!(save_node(&mut lib2, &mut p, k), None);
+        assert_eq!(save_node(&mut lib2, &mut p, k, &mut None), None);
         assert!(p.nodes[0].error.as_deref().unwrap().contains("Name it"));
         // A name, once typed, is what shows.
         p.nodes[0].name = "timeouts".into();
         assert_eq!(p.nodes[0].display_name(), "timeouts");
+    }
+
+    /// Owner, 2026-11-15: several values for a parameter make each picked
+    /// query using it an instance per value (a part each, named and
+    /// coloured per instance); + on a query already picked adds a value,
+    /// not a second pick; a field not filled in yet adds nothing.
+    #[test]
+    fn several_values_of_a_parameter_are_instances() {
+        let mut lib = Library::new();
+        let text = "pack c\nquery drops(cam)  color: violet\n    /$cam drop/\nquery fps(cam)\n    /$cam fps/\nquery slow\n    /slow/\n";
+        lib.add(parse_pack("c.nerka-pack", text).unwrap()).unwrap();
+        let mut p = Picks::default();
+        p.add(&lib, "c.drops", Use::Include, None);
+        p.add(&lib, "c.slow", Use::Include, None);
+        p.params.insert("cam".into(), vec![("CAM1".into(), false)]);
+        // Picked again: a value more for $cam, empty until typed.
+        assert!(p.add(&lib, "c.drops", Use::Include, None));
+        assert_eq!(p.nodes.len(), 2, "no second pick");
+        assert_eq!(p.params["cam"], [("CAM1".to_owned(), false), (String::new(), false)]);
+        assert_eq!(p.expand(&lib).unwrap().exp.parts.len(), 2, "the empty value adds nothing yet");
+        p.params.get_mut("cam").unwrap()[1].0 = "CAM2".into();
+        p.params.get_mut("cam").unwrap().push(("CAM1".into(), false));
+        let a = p.expand(&lib).unwrap();
+        assert_eq!(a.exp.nfd, "(/CAM1 drop/) OR (/CAM2 drop/) OR (/slow/)", "CAM1 twice counts once");
+        assert_eq!(a.names, ["drops (CAM1)", "drops (CAM2)", "slow"]);
+        assert_eq!(a.colors[0], parse_color("violet").unwrap(), "the first has the query's colour");
+        assert!(a.colors[1] != a.colors[0]);
+        assert_eq!(instance_count(&node_params(&lib, &p.nodes[0]), &p.values()), 2);
+        assert_eq!(instance_count(&node_params(&lib, &p.nodes[1]), &p.values()), 1);
+        // Another query using $cam: its instances too.
+        p.add(&lib, "c.fps", Use::Signal, None);
+        assert_eq!(p.expand(&lib).unwrap().names[3..], ["fps (CAM1)", "fps (CAM2)"]);
+        // Searched for, a query is one term: its instances OR'ed.
+        assert_eq!(
+            p.search_term(&lib, &Target::Node(p.nodes[0].key), 0).unwrap().nfd,
+            "(/CAM1 drop/) OR (/CAM2 drop/)"
+        );
+        // Kept in a preset: `+=` lines.
+        let preset = p.to_preset("cams");
+        assert!(preset.serialize().contains("param cam = CAM1\nparam cam += CAM2\n"), "{}", preset.serialize());
+        let mut again = Picks::default();
+        again.use_preset(&lib, &preset);
+        assert_eq!(again.expand(&lib).unwrap().exp.nfd, p.expand(&lib).unwrap().exp.nfd);
+    }
+
+    /// Owner, 2026-11-15: a `signals:` entry for a group the query no longer
+    /// captures is removed when it is saved, and said so.
+    #[test]
+    fn saving_a_query_drops_its_stale_signals_entries() {
+        let dir = std::env::temp_dir().join(format!("nerka-gui-stale-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("a.nerka-pack");
+        std::fs::write(&file, "pack a\nquery speed  signals: speed:num, sped:num\n    /speed=(?<speed>\\d+)/\n")
+            .unwrap();
+        let mut lib = Library::new();
+        lib.load(&file).unwrap();
+        assert_eq!(lib.all_stale_signals(), [("a.speed".to_owned(), "sped".to_owned())]);
+        let mut p = Picks::default();
+        p.add(&lib, "a.speed", Use::Signal, None);
+        let k = p.nodes[0].key;
+        // Edited: the group renamed.
+        let n = p.node_mut(k).unwrap();
+        n.text = "/speed=(?<v>\\d+)/".into();
+        n.edited = true;
+        p.save_pack = "a".into();
+        let mut notice = None;
+        assert_eq!(save_node(&mut lib, &mut p, k, &mut notice), Some(None));
+        let notice = notice.unwrap();
+        assert!(notice.contains("speed, sped") && notice.contains("a.speed"), "{notice}");
+        assert!(lib.get("a.speed").unwrap().1.signals.is_empty());
+        assert!(!std::fs::read_to_string(&file).unwrap().contains("signals:"));
+        assert!(lib.all_stale_signals().is_empty());
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -1813,7 +2213,7 @@ mod tests {
         let mut lib = Library::new();
         lib.load(&file).unwrap();
         p.save_pack = "a".into();
-        assert_eq!(save_node(&mut lib, &mut p, k), Some(None));
+        assert_eq!(save_node(&mut lib, &mut p, k, &mut None), Some(None));
         assert_eq!(p.nodes[0].error, None);
         assert_eq!(
             std::fs::read_to_string(&file).unwrap(),
@@ -1823,7 +2223,7 @@ mod tests {
         // Saving it again under another name renames it in the pack.
         p.nodes[0].name = "xyz all".into();
         p.nodes[0].edited = true;
-        assert_eq!(save_node(&mut lib, &mut p, k), Some(Some(("a.xyz logs".into(), "a.xyz all".into()))));
+        assert_eq!(save_node(&mut lib, &mut p, k, &mut None), Some(Some(("a.xyz logs".into(), "a.xyz all".into()))));
         let ids: Vec<&str> = lib.packs()[0].queries.iter().map(|q| q.id.as_str()).collect();
         assert_eq!(ids, ["xyz all"]);
         // A library node shows its labels and colour as text.
@@ -1874,7 +2274,7 @@ mod tests {
         e.node.name = "very slow".into();
         e.node.text = "/very slow/".into();
         assert!(
-            matches!(run(&mut e, &mut lib, "Save"), EditOutcome::Saved(Some((ref o, ref n))) if o == "v.slow" && n == "v.very slow")
+            matches!(run(&mut e, &mut lib, "Save"), EditOutcome::Saved(Some((ref o, ref n)), _) if o == "v.slow" && n == "v.very slow")
         );
         assert_eq!(
             std::fs::read_to_string(&file).unwrap(),
@@ -1982,7 +2382,7 @@ mod tests {
         let (_, shapes) = frame(vec![], &mut e, &mut lib);
         let p = find_text(&shapes, "Save").unwrap();
         frame(vec![egui::Event::PointerMoved(p), button(p, true)], &mut e, &mut lib);
-        assert!(matches!(frame(vec![button(p, false)], &mut e, &mut lib).0, EditOutcome::Saved(None)));
+        assert!(matches!(frame(vec![button(p, false)], &mut e, &mut lib).0, EditOutcome::Saved(None, None)));
         assert_eq!(
             std::fs::read_to_string(&file).unwrap(),
             "pack v\nquery slow\n  /slow/\n\nquery \"very slow\"  parent: slow\n    level >= WARN\n"
@@ -2006,7 +2406,7 @@ mod tests {
             };
             let mut full = ctx.run_ui(input, |ui| {
                 egui::CentralPanel::default().show(ui, |ui| {
-                    library_panel(ui, &mut lib, &[], &mut picks, view, None);
+                    library_panel(ui, &mut lib, &[], &[], &mut picks, view, None);
                 });
             });
             full.textures_delta.clear();
@@ -2055,7 +2455,7 @@ mod tests {
             };
             let mut full = ctx.run_ui(input, |ui| {
                 egui::CentralPanel::default().show(ui, |ui| {
-                    library_panel(ui, &mut lib, &[], picks, &mut view, Some(&[]));
+                    library_panel(ui, &mut lib, &[], &[], picks, &mut view, Some(&[]));
                 });
             });
             full.textures_delta.clear();
@@ -2085,7 +2485,7 @@ mod tests {
     fn a_query_can_be_added_without_its_parents() {
         let lib = lib();
         let mut p = Picks::default();
-        p.params.insert("ecu".into(), ("E1".into(), false));
+        p.params.insert("ecu".into(), vec![("E1".into(), false)]);
         assert!(p.add_detached(&lib, "v.drops", Use::Include));
         assert!(!p.add_detached(&lib, "v.drops", Use::Include), "not twice");
         assert!(p.add(&lib, "v.drops", Use::Include, None), "with parents is another node");
@@ -2118,7 +2518,7 @@ query swup  parent: soc
             };
             let mut full = ctx.run_ui(input, |ui| {
                 egui::CentralPanel::default().show(ui, |ui| {
-                    library_panel(ui, &mut lib, &[], picks, &mut view, Some(&[]));
+                    library_panel(ui, &mut lib, &[], &[], picks, &mut view, Some(&[]));
                 });
             });
             full.textures_delta.clear();
@@ -2211,7 +2611,7 @@ query swup  parent: soc
         p.add(&lib, "v.drops", Use::Include, None);
         let new = p.add_new(Use::Include);
         p.node_mut(new).unwrap().text = "/x/".into();
-        p.params.insert("ecu".into(), ("E1".into(), false));
+        p.params.insert("ecu".into(), vec![("E1".into(), false)]);
         let colors = |p: &Picks| p.nodes.iter().map(|n| (n.key, n.color())).collect::<Vec<_>>();
         let before = colors(&p);
         // Own colour (drops: violet) wins; the others take free entries.
@@ -2247,7 +2647,7 @@ query swup  parent: soc
         let mut p = Picks::default();
         p.add(&lib, "v.slow", Use::Include, None);
         p.add(&lib, "v.drops", Use::Include, None);
-        p.params.insert("ecu".into(), ("E1".into(), false));
+        p.params.insert("ecu".into(), vec![("E1".into(), false)]);
         let a = p.expand(&lib).unwrap();
         assert_eq!(a.exp.nfd, r#"(/slow/) OR (ecu == "E1") AND (/drop/)"#);
         assert_eq!(a.names, ["slow", "drops"]);
@@ -2262,7 +2662,7 @@ query swup  parent: soc
         p.nodes[0].edited = true;
         let new = p.add_new(Use::Exclude);
         p.node_mut(new).unwrap().text = "level <= DEBUG".into();
-        p.params.insert("what".into(), ("a.b".into(), false));
+        p.params.insert("what".into(), vec![("a.b".into(), false)]);
         let a = p.expand(&lib).unwrap();
         assert_eq!(a.exp.nfd, r#"((ecu == "E1") AND (/dropped a\.b/) OR (/slow/)) AND NOT (level <= DEBUG)"#);
         assert_eq!(a.keys.len(), 3);
@@ -2298,7 +2698,7 @@ query swup  parent: soc
         assert!(p.add(&lib, "v.slow", Use::Require, None));
         let new = p.add_new(Use::Require);
         p.node_mut(new).unwrap().text = "level >= WARN".into();
-        p.params.insert("ecu".into(), ("E1".into(), false));
+        p.params.insert("ecu".into(), vec![("E1".into(), false)]);
         let a = p.expand(&lib).unwrap();
         assert_eq!(a.exp.nfd, r#"((/slow/) OR (ecu == "E1") AND (/drop/)) AND (/slow/) AND (level >= WARN)"#);
         assert_eq!(a.names, ["slow", "drops", "slow", "level >= WARN"]);

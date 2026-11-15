@@ -55,7 +55,7 @@ Reviews (a gate before a merge or release, a deep review each cycle): `docs/dev/
 checklist `docs/dev/review/checklist.md`, latest findings `docs/dev/review/*-findings.md`.
 
 CI (`.github/workflows/ci.yml`) runs fmt, clippy and tests on Linux and Windows (and macOS, non-voting), a GUI screenshot on each (`--screenshot`, kept as artifacts), `cargo deny`, and a DCO sign-off check on pull requests (`CONTRIBUTING.md`; commit with `git commit -s`); `release.yml`
-builds Linux/Windows archives and publishes a pre-release on a `v*` tag.
+builds Linux/Windows/macOS (Apple Silicon, non-voting) archives and publishes a release on a `v*` tag (a pre-release with a `-`).
 
 `docs/dev/status.md` records the current state, the decisions pending with the owner
 and the next steps; read it first, and update it (with a dated line at the top of

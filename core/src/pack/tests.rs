@@ -19,14 +19,88 @@ fn pack(text: &str) -> Pack {
     parse_pack("t.nerka-pack", text).unwrap_or_else(|e| panic!("{e}"))
 }
 
+/// Owner, 2026-11-15: a `signals:` entry for a group the query no longer
+/// captures (a typo, a group renamed) was ignored silently; now it is
+/// found, counting the parents' groups and groups named with parameters.
+#[test]
+fn stale_signals_entries_are_found() {
+    assert_eq!(
+        captured_groups(r"/a(?<x>\d)(?P<y>\d)(?<=z)(?<!w)(?<drops_$cam>\d)/ AND /(?<x>.)/"),
+        ["x", "y", "drops_$cam"]
+    );
+    let text = "pack p
+query base
+    /ecu=(?<ecu>\\w+)/
+query speed  parent: base  signals: speed:num, ecu:enum, sped:num
+    /speed=(?<speed>\\d+)/
+";
+    let mut lib = Library::new();
+    lib.add(parse_pack("p.nerka-pack", text).unwrap()).unwrap();
+    let (_, q) = lib.get("p.speed").unwrap();
+    assert_eq!(lib.stale_signals("p", q), ["sped"], "the parent's ecu counts");
+    assert_eq!(lib.all_stale_signals(), [("p.speed".to_owned(), "sped".to_owned())]);
+}
+
+/// Owner, 2026-11-15: a `signals:` line takes the query's parameters, an
+/// entry filled in per instance; an option may use only the parameters its
+/// name does (instances with one name share its options).
+#[test]
+fn signals_entries_take_parameters() {
+    let text = "pack cam
+query drops(cam, ecu)  signals: drops_${cam}:num:per(ecu_${cam}):default(0), total:num
+    /$cam drop (?<drops_$cam>\\d+) total (?<total>\\d+) $ecu/
+";
+    let p = parse_pack("cam.nerka-pack", text).unwrap();
+    let q = p.query("drops").unwrap();
+    assert_eq!(q.signals[0].0, "drops_${cam}");
+    assert_eq!(q.signals[0].1.spec(), "num:per(ecu_${cam}):default(0)");
+    // Written back as it was.
+    let again = parse_pack("cam.nerka-pack", &format!("pack cam\n{}", format_query(q))).unwrap();
+    assert_eq!(again.query("drops").unwrap().signals, q.signals);
+    // Filled in for an instance.
+    let params: Params = [("cam".to_owned(), ParamValue::literal("CAM1"))].into();
+    let (name, o) = fill_signal(&q.signals[0].0, &q.signals[0].1, &params).unwrap();
+    assert_eq!((name.as_str(), o.spec().as_str()), ("drops_CAM1", "num:per(ecu_CAM1):default(0)"));
+    assert!(fill_signal("drops_$cam", &q.signals[0].1, &Params::new()).is_none(), "no value");
+    let dash: Params = [("cam".to_owned(), ParamValue::literal("CAM-1"))].into();
+    assert!(fill_signal("drops_$cam", &q.signals[0].1, &dash).is_none(), "not a name");
+    // Captured groups count with parameters: nothing is stale.
+    let mut lib = Library::new();
+    lib.add(p).unwrap();
+    assert!(lib.all_stale_signals().is_empty());
+
+    let err = |line: &str| parse_pack("t.nerka-pack", &format!("pack t\n{line}\n    /x/\n")).unwrap_err().to_string();
+    assert!(
+        err("query a(cam)  signals: d_$x:num").contains("'$x' is not declared"),
+        "{}",
+        err("query a(cam)  signals: d_$x:num")
+    );
+    let e = err("query a(ecu)  signals: drops:num:per(ecu_$ecu)");
+    assert!(
+        e.contains("an option uses '$ecu' but the name 'drops' doesn't") && e.starts_with("t.nerka-pack:2:"),
+        "{e}"
+    );
+}
+
 #[test]
 fn signals_attribute_pins_kinds() {
-    use crate::signal::SignalKind;
+    use crate::signal::{SignalKind, SignalOptions};
     let p = pack("pack p\nquery q  signals: v:num, t:time, v:enum\n    /v=(?<v>\\d+)/\n");
-    assert_eq!(p.queries[0].signals, [("t".to_owned(), SignalKind::Time), ("v".to_owned(), SignalKind::Enum)]);
+    let kind = |k| SignalOptions { kind: Some(k), ..Default::default() };
+    assert_eq!(
+        p.queries[0].signals,
+        [("t".to_owned(), kind(SignalKind::Time)), ("v".to_owned(), kind(SignalKind::Enum))]
+    );
     assert!(format_query(&p.queries[0]).starts_with("query q  signals: t:time, v:enum\n"));
     let e = parse_pack("t", "pack p\nquery q  signals: v:big\n    /x/\n").unwrap_err();
     assert!(e.to_string().contains("invalid signal 'v:big'"), "{e}");
+    // Owner, 2026-11-14: a saved signal's options, written back the same.
+    let text = "pack p\nquery q  signals: s:enum:per(ecu1):default(not ready), t:time\n    /s=(?<s>\\w+)/\n";
+    let q = &pack(text).queries[0];
+    assert_eq!(q.signals[0].1, SignalOptions::parse("enum:per(ecu1):default(not ready)").unwrap());
+    assert!(format_query(q).starts_with("query q  signals: s:enum:per(ecu1):default(not ready), t:time\n"));
+    let e = parse_pack("t", "pack p\nquery q  signals: s:per(9)\n    /x/\n").unwrap_err();
+    assert!(e.to_string().contains("not a lifecycle's name"), "{e}");
 }
 
 #[test]

@@ -64,10 +64,13 @@ they find their lines again in a changed file (one that can't is marked
 Files opened together (multi-select in **Open…**, dropping several,
 `nerka-gui a.dlt b.pcap`) become **one tab**, one after another in the
 order given. The tab's menu → **Files…** lists them: move, remove or add
-files, turn protocols on or off per capture. **Merge by time** in the
-menu interleaves lines by their time, for files that know it; a tab of one
-such file has **Sort by time** instead. A field `file` tells the files
-apart in queries. See [Files and formats](formats.md).
+files, turn protocols on or off per capture. **Sort by time** in the
+menu sorts all their lines by time (files that know it; lines of one time
+in the order of the files, then of each file), for one file too. Files
+that can't be sorted (one with lines but no times) leave the box
+unticked, and the status bar names them; a file without lines doesn't
+count. A field `file` tells the files apart in queries. See
+[Files and formats](formats.md).
 
 A tab's menu → **Reload** reads its files again from disk, keeping
 the filter, search, selection and the line you are on.
@@ -124,7 +127,7 @@ nerka-gui [OPTIONS] [FILE]...
 |---|---|
 | `-q, --query NFD` / `-r, --regex RE` / `-t, --text TEXT` | filter the first tab |
 | `--pack PATH` | load a query pack (file or folder) |
-| `--pick PACK.QUERY`, `--exclude PACK.QUERY`, `--signal-pick PACK.QUERY` | put a library query in the selection (Include, Exclude, Signal) |
+| `--pick PACK.QUERY`, `--exclude PACK.QUERY`, `--signal-pick PACK.QUERY` | put a library query in the selection (Include, Exclude, Signal); `PACK.QUERY(NAME=VALUE, …)` adds an instance of it (repeat for several) |
 | `--search-pick PACK.QUERY` | put a library query in the Search box |
 | `--param NAME=VALUE` | a library parameter's value |
 | `--highlight NFD` | colour the lines a query matches |

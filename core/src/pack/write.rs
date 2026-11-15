@@ -42,7 +42,7 @@ pub fn format_query(q: &PackQuery) -> String {
         out += &format!("  color: {c}");
     }
     if !q.signals.is_empty() {
-        let s: Vec<String> = q.signals.iter().map(|(g, k)| format!("{g}:{}", k.as_str())).collect();
+        let s: Vec<String> = q.signals.iter().map(|(g, o)| format!("{g}:{}", o.spec())).collect();
         out += &format!("  signals: {}", s.join(", "));
     }
     for line in q.text.lines() {

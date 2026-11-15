@@ -2,7 +2,25 @@
 
 The dated log of the project, newest first; append-only: add an entry at the top when `status.md` changes. Moved from `status.md` on 2026-11-10, word for word: its "Last update" line (each update with the ones before it) and its "Next steps" as they stood then, which tell what was built when and why. Where the moved text says "above", "below" or "this file", it means the old `status.md`: its sections are now `status.md` (state, pending decisions, limitations, licensing), `gui-decisions.md`, `features.md` and `history.md`.
 
+## 2026-11-15
+
+0.2.2 (a release). Its changes since 0.2.1: signal options in pack queries (`signals:` with kind, scope, lifecycle, default; changed per tab, written back only on Save to pack; warnings for disagreeing options and stale entries); instances of a parameterised query as several values of its parameter; plot lanes of signals bound to a lifecycle drawn per pixel column, the state before a signal's first event shown, big lanes built off the UI thread, spinners while waiting; freezes and a GPU crash with tens of thousands of lifecycles fixed; Sort by time (was Merge by time) sorting every line of several files, and a file without lines no longer stopping it; a macOS (Apple Silicon) release archive. Before the bump the review gate passed on Windows (`--full --bench`, `KSY=1`: every query within 15 % of 0.2.1, the same counts) and in the Linux VM (checks passed; its benchmark ran while the VM was busy, the rows rerun idle matched). Profiles move to 0.2.3, after time per file (owner).
+
+Instances reworked (owner, of five alternatives weighed): a parameter has several values in the selection's Parameters box (+ value; + on a picked query adds one), every picked query using it an instance per value (`× N` beside it); the instance rows under picks, ⊕ and the `ID(…)` command-line form are gone; presets keep `param NAME += VALUE`. Merge by time is called **Sort by time** for several files too (`query-instances.md`, `gui-decisions.md`).
+
+Merge by time sorts every line by `@time` (owner): it kept each file's own order, and real captures whose times go back inside a file (MF4s read group by group) came out unsorted; lines of one time stay in the order of the files given (`gui-decisions.md`).
+
+Built for 0.2.2: instances of a parameterised query (a pick's argument sets, ⊕ in the selection, a part, colour and signals each; `signals:` lines with parameters; presets and the command line), a warning when queries give one signal different options (⚠ on its row, Save to pack makes them agree), stale `signals:` entries listed as warnings and removed when the query is saved.
+
+Instances of a parameterised query designed (owner): a pick holds argument sets, + instance adds one, instances share the query's settings (never conflict; the same values twice refused), each instance is a part of its own, signals per instance follow the pack's group names, `signals:` lines take parameters (`query-instances.md`); in 0.2.2. Signals merge across packs (no namespaces); options that disagree show a warning and the first picked query's win. A `signals:` entry for a group its query no longer captures is removed when the query is saved, with a warning in the status bar and listed in full at the top of the Library panel.
+
 ## 2026-11-14
+
+Signal options of pack queries built (0.2.2, owner's plan): a query's `signals:` attribute gives its groups a saved signal's options (`s:enum:per(ecu1):default(idle)`), the Signals panel changes them for the tab (kind, scope, ⚙ lifecycle and default), and **Save to pack** writes them into the pack; never by itself.
+
+Release archives for macOS on Apple Silicon from 0.2.2 (owner): `release.yml` builds `macos-aarch64` (unsigned, plain binaries, non-voting); the user guide says how to clear the download mark.
+
+Plan after 0.2.1 (owner): signal options of pack queries next (defaults in the pack's query definition, the tab overrides them, an explicit save into the pack), then time per file, profiles (spec lines in `<config>/nerka/profiles`, switching signals on) and views of several files (text with DLTs and captures; profile and time per file in Files…; a saved view later). The v0.2.1 release page got a summary above the generated list.
 
 0.2.1 (a release). Its changes since 0.2.0: big captures with FIBEX and many plotted signals are fast (a tab's signals collected together and kept across changes, plot lanes in core with a summary per block, built in parallel and kept per signal; MF4 and capture opens faster; several files opened at once), the window stays responsive on big captures, `nerka-gui --screenshot`, macOS built and tested in CI (non-voting) with a GUI screenshot on all three systems, Linux checked in a local VM, and the benchmark extended with signals, the plot, GUI frames and peak heap (`baseline/bench-2026-11-14.tsv`). Before the bump the review gate passed on Windows (`--full --bench`, `KSY=1`: every query within 15 % of 2026-11-09, the same counts) and in the Linux VM.
 

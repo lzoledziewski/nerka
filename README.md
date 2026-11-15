@@ -13,9 +13,9 @@ one UI-free engine (`nerka-core`).
 
 ![nerka on a synthetic DLT drive: warnings filtered from a query pack, speed, temperature and battery voltage plotted with a throttling threshold, a text search (regex, ignoring case) for throttling messages in the bottom pane, and the library and selection panes on the right](docs/user/img/nerka.png)
 
-> Status: **0.2.1**. Windows is the main platform;
-> Linux builds come from CI (and run in a local VM); macOS is built and tested in CI, with no release
-> archives yet. While nerka is at 0.x,
+> Status: **0.2.2**. Windows is the main platform;
+> Linux builds come from CI (and run in a local VM); macOS is built and tested in CI, with release
+> archives for Apple Silicon (unsigned). While nerka is at 0.x,
 > file formats, the filter language and the GUI can still change.
 
 **User guide:** [lzoledziewski.github.io/nerka](https://lzoledziewski.github.io/nerka/) · **Download:** [latest release](https://github.com/lzoledziewski/nerka/releases/latest)
@@ -181,10 +181,12 @@ nerka import --dry-run theirs.nerka-bundle
 
 ## Install
 
-Builds for Windows (`.zip`) and Linux (`.tar.gz`, glibc 2.35+) are on the
+Builds for Windows (`.zip`), Linux (`.tar.gz`, glibc 2.35+) and macOS on Apple
+Silicon (`.tar.gz`, from 0.2.2) are on the
 [Releases](https://github.com/lzoledziewski/nerka/releases) page, with the
 example protocol definitions in `examples/`. They are unsigned, so Windows
-SmartScreen may warn on first start.
+SmartScreen may warn on first start, and macOS needs the download mark cleared
+(`xattr -dr com.apple.quarantine <folder>`; the user guide's Getting started).
 
 To build from source you need a stable Rust toolchain
 ([rustup.rs](https://rustup.rs)); on Windows, the MSVC toolchain with the

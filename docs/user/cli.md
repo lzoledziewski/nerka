@@ -100,7 +100,7 @@ These apply to every command:
 
 | Option | |
 |---|---|
-| `--merge` | several files: interleave their lines by time (files that know their times: DLT, captures); else one after another |
+| `--merge` | several files: their lines sorted by time (files that know their times: DLT, captures; ties in the order given); else one after another |
 | `--records SPEC` | read text as records: `start=/REGEX/`, `blank`, `sep=/REGEX/`, `json`, `lines` or `auto` ([Files and formats](formats.md)) |
 | `--dlt-port PORT`, `--someip-port PORT`, `--syslog-port PORT` | UDP ports of these protocols in captures (repeatable; defaults 3490, 30490, 514) |
 | `--protocol FILE` | a [protocol definition](protocol-definitions.md) (`.ksy`) |

@@ -37,7 +37,11 @@ defaults to the signal's name. Parts:
   in `%APPDATA%\nerka\signals`), `--signal SPEC` (CLI; GUI: for the session);
 - the **named groups of the queries in the selection** (Include or Signal
   role, [Query packs](packs.md)): their kind is guessed from the first
-  values, a pack can pin it (`signals: t:time`), the panel can change it;
+  values; the pack can give them options (`signals: t:time,
+  s:enum:per(ecu1):default(idle)`), the panel can change them for the tab;
+  instances of a parameterised query give a signal each where the group's
+  name uses the parameter (`drops_$cam`: `@drops_CAM1`, `@drops_CAM2`;
+  [instances](packs.md#instances-of-a-parameterised-query));
 - the file: `@time` for files that know their lines' times (DLT,
   captures);
 - [lifecycles](lifecycles.md) (`@ecu1`, the lifecycle's number) and
@@ -72,12 +76,24 @@ the current line: `• event` when the line itself carries it, else `↑ N`
 the checkbox switches a saved signal on or off, **New signal or lifecycle**
 adds one. The line window (`Enter`) lists the line's own signals.
 
+A query's or FIBEX signal's kind, scope and ⚙ (lifecycle, default) change
+it **in this tab only**. A query signal changed so shows ●; 💾 (**Save
+to pack**) writes its options into the `signals:` line of the picked queries
+with that group (a library query: into its pack's file; an edited one keeps
+them until it is saved), ↺ goes back to what the pack gives. Nothing is
+written to a pack without that click. A signal several queries capture
+merges their events; if they give it different options, its row shows ⚠
+(hover: who gives what), the first picked query's options are used, and
+💾 writes them into all of them so they agree.
+
 ## Plots
 
 Tick a signal's plot box (or `--plot NAME`) to plot it under the main view:
 one **lane** per signal on the time axis. A number is a step line, an enum
 coloured bands, and an **events** box ticks where values arrived. The
-current line is a cursor.
+current line is a cursor. A lane shows the state as the panel does: before
+a signal's first event in each file (or lifecycle, with `per`), its
+default dashed (a pale band for an enum), or nothing if it has none.
 
 - **Navigate:** the wheel zooms, drag pans, double-click shows all; hover
   shows a value; click goes to the line.

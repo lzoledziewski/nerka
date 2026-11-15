@@ -21,7 +21,7 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use nerka_core::bundle::{Bundle, Choice, Item, Kind, Status, Store};
-use nerka_core::pack::{self, Expansion, Library, ParamValue, Params, Pick, Role, Selection};
+use nerka_core::pack::{self, Expansion, Library, ParamValue, Pick, Role, Selection};
 use nerka_core::{
     Bookmarks, Filter, LineNo, LogSource, Matcher, MatcherOptions, Progress, Query, SearchSet, SignalDef, Signals,
     search, search_within,
@@ -113,9 +113,9 @@ struct Cli {
     /// or `auto` (the default: JSON if the file looks like JSON, else lines).
     #[arg(long, global = true, value_name = "SPEC")]
     records: Option<String>,
-    /// Several files: interleave their lines by time (when every file knows
-    /// its lines' times: DLT, captures); else one after another, in the
-    /// order given.
+    /// Several files: their lines sorted by time (when every file knows
+    /// its lines' times: DLT, captures; ties in the order given); else one
+    /// after another, in the order given.
     #[arg(long, global = true)]
     merge: bool,
     #[command(subcommand)]
@@ -294,7 +294,8 @@ struct PickArgs {
     /// Exclude every query with this label.
     #[arg(short = 'X', long = "exclude-label", value_name = "LABEL")]
     exclude_labels: Vec<String>,
-    /// Parameter value, escaped where it is used: NAME=VALUE.
+    /// Parameter value, escaped where it is used: NAME=VALUE. Given again for
+    /// a name: another value, and each query using it an instance per value.
     #[arg(short = 'p', long = "param", value_name = "NAME=VALUE")]
     params: Vec<String>,
     /// Parameter value inserted as regex syntax inside regexes: NAME=VALUE.
@@ -312,7 +313,9 @@ impl PickArgs {
             && self.exclude_labels.is_empty()
     }
 
-    /// Queries come before labels, each in command-line order.
+    /// Queries come before labels, each in command-line order. A parameter
+    /// given several times has several values: each query using it is an
+    /// instance per value.
     fn expand(&self, lib: &Library) -> Result<Expansion> {
         let picks = |ids: &[String], labels: &[String]| -> Vec<Pick> {
             ids.iter().map(|q| Pick::Query(q.clone())).chain(labels.iter().map(|l| Pick::Label(l.clone()))).collect()
@@ -323,14 +326,14 @@ impl PickArgs {
             exclude: picks(&self.exclude, &self.exclude_labels),
             signal: Vec::new(),
         };
-        let mut params = Params::new();
+        let mut values = pack::ParamValues::new();
         for (list, raw) in [(&self.params, false), (&self.raw_params, true)] {
             for kv in list {
                 let (k, v) = kv.split_once('=').with_context(|| format!("expected NAME=VALUE, got '{kv}'"))?;
-                params.insert(k.to_owned(), ParamValue { value: v.to_owned(), raw });
+                values.entry(k.to_owned()).or_default().push(ParamValue { value: v.to_owned(), raw });
             }
         }
-        Ok(pack::expand(&sel, lib, &params)?)
+        Ok(pack::expand_values(&sel, lib, &values)?)
     }
 }
 
@@ -1114,7 +1117,14 @@ fn run() -> Result<()> {
                         Role::Signal => "signal",
                     };
                     let note = p.covered.as_ref().map(|by| format!(" (in {by}, not repeated)")).unwrap_or_default();
-                    writeln!(out, "{role} {}{note}: {}", p.query, e.part_nfd(p))?;
+                    // An instance: its own arguments.
+                    let args = if p.args.is_empty() {
+                        String::new()
+                    } else {
+                        let a: Vec<String> = p.args.iter().map(|(k, v)| format!("{k}={}", v.value)).collect();
+                        format!("({})", a.join(", "))
+                    };
+                    writeln!(out, "{role} {}{args}{note}: {}", p.query, e.part_nfd(p))?;
                 }
             }
         }

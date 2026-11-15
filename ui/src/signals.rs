@@ -14,7 +14,9 @@
 use crate::plot::PlotState;
 use eframe::egui::{self, RichText};
 use nerka_core::lifecycle::{self, LifecycleDef};
-use nerka_core::{Library, LineNo, LogSource, SearchResult, SignalDef, SignalKind, SignalScope, SignalSeries, Signals};
+use nerka_core::{
+    Library, LineNo, LogSource, SearchResult, SignalDef, SignalKind, SignalOptions, SignalScope, SignalSeries, Signals,
+};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -37,6 +39,10 @@ pub struct SignalsUi {
     tree: (u64, Option<bool>),
     /// The filter the tree was last opened for.
     tree_filter: String,
+    /// The default typed in a signal's options menu (by signal name).
+    default_edit: Option<(String, String)>,
+    /// ✎ was clicked: bring the form into view.
+    show_form: bool,
 }
 
 struct Draft {
@@ -220,6 +226,14 @@ pub struct Output {
     pub kind: Option<(String, SignalKind)>,
     /// A scope chosen for a signal.
     pub scope: Option<(String, SignalScope)>,
+    /// A lifecycle chosen for a query or FIBEX signal (empty: none).
+    pub per: Option<(String, String)>,
+    /// A default typed for a query or FIBEX signal (empty: none).
+    pub default: Option<(String, String)>,
+    /// Write this query signal's options into its packs ("Save to pack").
+    pub save_to_pack: Option<String>,
+    /// Drop the options this tab chose for a signal: the pack's again.
+    pub reset_options: Option<String>,
     /// Go to this line (the event that set a state was clicked).
     pub goto: Option<LineNo>,
     /// Filter by this NFD (a lifecycle's "filter to it").
@@ -291,11 +305,34 @@ pub struct Input<'a> {
     pub library: &'a Library,
     /// The checks' results on this tab's file: shown per lifecycle.
     pub check_results: &'a [(String, crate::checks::Outcome)],
+    /// The options this tab chose for query and FIBEX signals, and what
+    /// the packs give the query signals (`signals:`).
+    pub chosen: &'a HashMap<String, SignalOptions>,
+    pub pack_options: &'a HashMap<String, SignalOptions>,
+    /// Groups whose queries give different options: each query and what it
+    /// gives, the first wins (owner, 2026-11-15: shown, not resolved).
+    pub conflicts: &'a HashMap<String, Vec<(String, SignalOptions)>>,
 }
 
 pub fn signals_panel(ui: &mut egui::Ui, st: &mut SignalsUi, input: Input<'_>) -> Output {
-    let Input { signals, generation, saved, file, line, plot, views, kept, fibex, arg_picks, library, check_results } =
-        input;
+    let Input {
+        signals,
+        generation,
+        saved,
+        file,
+        line,
+        plot,
+        views,
+        kept,
+        fibex,
+        arg_picks,
+        library,
+        check_results,
+        chosen,
+        pack_options,
+        conflicts,
+    } = input;
+    let lifecycles: Vec<&str> = signals.iter().filter(|d| d.as_lifecycle().is_some()).map(|d| d.name()).collect();
     let mut out = Output::default();
     ui.horizontal(|ui| {
         ui.heading("Signals");
@@ -333,7 +370,7 @@ pub fn signals_panel(ui: &mut egui::Ui, st: &mut SignalsUi, input: Input<'_>) ->
             }
             // The value column gets the room the other columns leave
             // (owner, 2026-10-28: a fixed cut wasted a wide panel).
-            let fit = value_room(ui, signals);
+            let (name_fit, fit) = value_room(ui, signals, chosen, conflicts);
             let mut remove = None;
             let mut switch: Option<(String, bool)> = None;
             let mut remove_arg: Option<String> = None;
@@ -377,7 +414,7 @@ pub fn signals_panel(ui: &mut egui::Ui, st: &mut SignalsUi, input: Input<'_>) ->
                         h
                     };
                     // Long names keep their end, where they differ.
-                    let name = crate::plot::name_tail(&format!("@{}", d.name()), 32);
+                    let name = crate::plot::name_tail(&format!("@{}", d.name()), name_fit);
                     ui.label(RichText::new(name).monospace().strong()).on_hover_text(format!("@{}\n{hover}", d.name()));
                     kind_cell(ui, d, &mut out);
                     scope_cell(ui, d, &mut out);
@@ -452,7 +489,7 @@ pub fn signals_panel(ui: &mut egui::Ui, st: &mut SignalsUi, input: Input<'_>) ->
                                 }
                             },
                             None => {
-                                ui.weak("…").on_hover_text("Collecting events");
+                                ui.add(egui::Spinner::new().size(12.0)).on_hover_text("Collecting events");
                             }
                         },
                         Some(Err(e)) => {
@@ -488,19 +525,87 @@ pub fn signals_panel(ui: &mut egui::Ui, st: &mut SignalsUi, input: Input<'_>) ->
                     } else if d.argument_index().is_some() {
                         ui.horizontal(|ui| {
                             ui.weak("FIBEX").on_hover_text(d.queries()[0].as_str());
+                            options_menu(ui, st, d, &lifecycles, &mut out);
+                            if chosen.get(d.name()).is_some_and(|o| !o.is_empty())
+                                && ui
+                                    .small_button("↺")
+                                    .on_hover_text(
+                                        "Back to what the FIBEX catalog says (kind) and no lifecycle or default",
+                                    )
+                                    .clicked()
+                            {
+                                out.reset_options = Some(d.name().to_owned());
+                            }
                             if ui.small_button("−").on_hover_text("Remove it from this tab's signals").clicked() {
                                 remove_arg = Some(d.name().to_owned());
                             }
                         });
                     } else {
-                        ui.weak("query").on_hover_text(format!(
-                        "From the named group (?<{}>…) of: {}\nIt goes away with the query; pin its kind in the pack \
-                     with signals: {}:{}",
-                        d.group(),
-                        d.queries().join(", "),
-                        d.group(),
-                        d.kind().as_str()
-                    ));
+                        ui.horizontal(|ui| {
+                            let pack = pack_options.get(d.name()).cloned().unwrap_or_default();
+                            let spec = pack.spec();
+                            let in_pack = if spec.is_empty() {
+                                "Its pack gives it no options: the kind comes from its values.".to_owned()
+                            } else {
+                                format!("Its pack gives it: signals: {}:{spec}", d.group())
+                            };
+                            // Fed by several queries or instances: says so.
+                            let from = match d.queries().len() {
+                                1 => "query".to_owned(),
+                                k => format!("query ← {k}"),
+                            };
+                            ui.weak(from).on_hover_text(format!(
+                                "From the named group (?<{}>…) of: {}\nIt goes away with the query. {in_pack}",
+                                d.group(),
+                                d.queries().join(", "),
+                            ));
+                            options_menu(ui, st, d, &lifecycles, &mut out);
+                            if let Some(list) = conflicts.get(d.name()) {
+                                let lines: Vec<String> =
+                                    list.iter().map(|(q, o)| format!("  {q}: {}:{}", d.group(), o.spec())).collect();
+                                ui.colored_label(ui.visuals().warn_fg_color, "⚠").on_hover_text(format!(
+                                    "Its queries give it different options:\n{}\nThe first one's are used (where \
+                                     it gives one). Save to pack writes one set into all of them.",
+                                    lines.join("\n")
+                                ));
+                            }
+                            let tab = chosen.get(d.name()).filter(|o| !o.is_empty());
+                            if let Some(tab) = tab {
+                                let saved = to_save(tab, &pack);
+                                ui.colored_label(ui.visuals().warn_fg_color, "●").on_hover_text(format!(
+                                    "Changed in this tab, not in the pack. {in_pack}\nSave to pack writes: signals: \
+                                     {}:{}",
+                                    d.group(),
+                                    if saved.is_empty() { "(nothing: the line goes)".to_owned() } else { saved.spec() }
+                                ));
+                                if ui
+                                    .small_button("💾")
+                                    .on_hover_text(
+                                        "Save to pack: these options into the signals: line of every picked query with this \
+                                         group (library queries: into their pack's file). The tab's choices are \
+                                         never written by themselves.",
+                                    )
+                                    .clicked()
+                                {
+                                    out.save_to_pack = Some(d.name().to_owned());
+                                }
+                                if ui.small_button("↺").on_hover_text("Back to what the pack gives").clicked() {
+                                    out.reset_options = Some(d.name().to_owned());
+                                }
+                            } else if conflicts.contains_key(d.name())
+                                && ui
+                                    .small_button("💾")
+                                    .on_hover_text(format!(
+                                        "Save to pack: the options in use (signals: {}:{}) into every picked query with this \
+                                         group, so they agree",
+                                        d.group(),
+                                        pack.spec()
+                                    ))
+                                    .clicked()
+                            {
+                                out.save_to_pack = Some(d.name().to_owned());
+                            }
+                        });
                     }
                     ui.end_row();
                 }
@@ -541,6 +646,7 @@ pub fn signals_panel(ui: &mut egui::Ui, st: &mut SignalsUi, input: Input<'_>) ->
             if let Some(d) = edit {
                 st.draft = Draft::of(&d);
                 st.editing = Some(d.name().to_owned());
+                st.show_form = true;
             }
             if let Some(name) = remove_arg {
                 arg_picks.retain(|a| a.name != name);
@@ -557,9 +663,6 @@ pub fn signals_panel(ui: &mut egui::Ui, st: &mut SignalsUi, input: Input<'_>) ->
                 out.saved_changed = true;
             }
 
-            lifecycles_list(ui, signals, file, check_results, &mut out);
-            // A lifecycle edited: its form's fields.
-
             ui.separator();
             // Folded until wanted (an edit opens it): the list stays short.
             let title = match (st.editing.is_some(), st.draft.life) {
@@ -567,7 +670,9 @@ pub fn signals_panel(ui: &mut egui::Ui, st: &mut SignalsUi, input: Input<'_>) ->
                 (true, false) => "Edit signal",
                 (false, _) => "New signal or lifecycle",
             };
-            egui::CollapsingHeader::new(RichText::new(title).strong())
+            // The form right under the list, above the lifecycles (an edit
+            // opened it out of sight, below a long table).
+            let form = egui::CollapsingHeader::new(RichText::new(title).strong())
                 .id_salt("signal_form")
                 .default_open(false)
                 .open(st.editing.is_some().then_some(true))
@@ -695,6 +800,12 @@ pub fn signals_panel(ui: &mut egui::Ui, st: &mut SignalsUi, input: Input<'_>) ->
                         ui.colored_label(ui.visuals().error_fg_color, e);
                     }
                 });
+            // ✎ clicked: the form comes into view.
+            if std::mem::take(&mut st.show_form) {
+                form.header_response.scroll_to_me(Some(egui::Align::TOP));
+            }
+            ui.separator();
+            lifecycles_list(ui, signals, file, check_results, &mut out);
         });
     };
     match fibex {
@@ -878,80 +989,103 @@ fn lifecycles_list(
             .id_salt(("lifecycles", def.name()))
             .default_open(true)
             .show(ui, |ui| {
-                egui::Grid::new(("lifecycles_grid", def.name())).num_columns(5).striped(true).show(ui, |ui| {
-                    for h in ["#", "line", "duration", "outcome", ""] {
-                        ui.weak(h);
-                    }
-                    ui.end_row();
-                    for (i, x) in l.lives.iter().enumerate() {
-                        ui.label(x.number.to_string());
-                        let start = x.first_time.map(|t| nerka_core::time::format_time(t, 3)).unwrap_or_default();
-                        if ui
-                            .link(RichText::new((x.first + 1).to_string()).monospace())
-                            .on_hover_text(format!(
-                                "Started by {} on line {}{}\nClick to go there",
-                                x.started_by.as_str(),
-                                x.first + 1,
-                                if start.is_empty() { String::new() } else { format!(" at {start}") }
-                            ))
-                            .clicked()
-                        {
-                            out.goto = Some(x.first);
-                        }
-                        ui.label(x.duration().map(|d| format!("{d:.1} s")).unwrap_or_default());
-                        let color =
-                            if x.outcome.is_bad() { ui.visuals().error_fg_color } else { ui.visuals().text_color() };
-                        let r = ui.colored_label(color, x.outcome.as_str());
-                        if let Some(m) = x.marker {
-                            r.on_hover_text(format!("Its {} marker is on line {}", x.outcome.as_str(), m + 1));
-                        }
-                        ui.horizontal(|ui| {
-                            if ui
-                                .small_button("▾ filter")
-                                .on_hover_text("Filter to its lines in this lifecycle")
-                                .clicked()
+                // Only the rows in view are laid out: a trace can have tens
+                // of thousands of lifecycles (all of them took seconds a
+                // frame). The header is the first row of what is in view.
+                let row_height = ui.spacing().interact_size.y;
+                egui::ScrollArea::vertical()
+                    .id_salt(("lifecycles_rows", def.name()))
+                    .max_height(320.0)
+                    .auto_shrink([false, true])
+                    .show_rows(ui, row_height, l.lives.len() + 1, |ui, rows| {
+                        egui::Grid::new(("lifecycles_grid", def.name())).num_columns(5).striped(true).show(ui, |ui| {
+                            for h in ["#", "line", "duration", "outcome", ""] {
+                                ui.weak(h);
+                            }
+                            ui.end_row();
+                            for (i, x) in l.lives.iter().enumerate().skip(rows.start).take(rows.len().saturating_sub(1))
                             {
-                                let mut nfd = format!("@{} == {}", def.name(), x.number);
-                                if let Some(lines) = def.lines().and_then(|r| r.query()) {
-                                    nfd += &format!(" AND ({})", lines.source());
-                                }
-                                out.filter = Some(nfd);
-                            }
-                            // What the checks found in it (owner, 2026-11-07).
-                            let (issues, facts, lines) = crate::checks::of_lifecycle(checks, def.name(), x.number);
-                            if !lines.is_empty() {
-                                let text = match (issues, facts) {
-                                    (0, f) => RichText::new(format!("✔ ℹ{f}")).color(ui.visuals().weak_text_color()),
-                                    (n, f) => RichText::new(format!("⚠{n} ℹ{f}")).color(ui.visuals().error_fg_color),
-                                };
-                                let tip = format!(
-                                    "{}
-Click: the Checks pane",
-                                    lines.join(
-                                        "
-"
-                                    )
-                                );
-                                if ui.link(text).on_hover_text(tip).clicked() {
-                                    out.checks = Some((def.name().to_owned(), x.number));
-                                }
-                            }
-                            for f in l.findings_of(i) {
-                                let times = if f.count > 1 { format!(" ×{}", f.count) } else { String::new() };
-                                let r = ui.link(
-                                    RichText::new(format!("⚠ {}{times}", f.kind.as_str()))
-                                        .color(ui.visuals().warn_fg_color),
-                                );
-                                if r.on_hover_text(format!("Line {}: {}\nClick to go there", f.row + 1, f.detail))
+                                ui.label(x.number.to_string());
+                                let start =
+                                    x.first_time.map(|t| nerka_core::time::format_time(t, 3)).unwrap_or_default();
+                                if ui
+                                    .link(RichText::new((x.first + 1).to_string()).monospace())
+                                    .on_hover_text(format!(
+                                        "Started by {} on line {}{}\nClick to go there",
+                                        x.started_by.as_str(),
+                                        x.first + 1,
+                                        if start.is_empty() { String::new() } else { format!(" at {start}") }
+                                    ))
                                     .clicked()
                                 {
-                                    out.goto = Some(f.row);
+                                    out.goto = Some(x.first);
                                 }
+                                ui.label(x.duration().map(|d| format!("{d:.1} s")).unwrap_or_default());
+                                let color = if x.outcome.is_bad() {
+                                    ui.visuals().error_fg_color
+                                } else {
+                                    ui.visuals().text_color()
+                                };
+                                let r = ui.colored_label(color, x.outcome.as_str());
+                                if let Some(m) = x.marker {
+                                    r.on_hover_text(format!("Its {} marker is on line {}", x.outcome.as_str(), m + 1));
+                                }
+                                ui.horizontal(|ui| {
+                                    if ui
+                                        .small_button("▾ filter")
+                                        .on_hover_text("Filter to its lines in this lifecycle")
+                                        .clicked()
+                                    {
+                                        let mut nfd = format!("@{} == {}", def.name(), x.number);
+                                        if let Some(lines) = def.lines().and_then(|r| r.query()) {
+                                            nfd += &format!(" AND ({})", lines.source());
+                                        }
+                                        out.filter = Some(nfd);
+                                    }
+                                    // What the checks found in it (owner, 2026-11-07).
+                                    let (issues, facts, lines) =
+                                        crate::checks::of_lifecycle(checks, def.name(), x.number);
+                                    if !lines.is_empty() {
+                                        let text =
+                                            match (issues, facts) {
+                                                (0, f) => RichText::new(format!("✔ ℹ{f}"))
+                                                    .color(ui.visuals().weak_text_color()),
+                                                (n, f) => RichText::new(format!("⚠{n} ℹ{f}"))
+                                                    .color(ui.visuals().error_fg_color),
+                                            };
+                                        let tip = format!(
+                                            "{}
+Click: the Checks pane",
+                                            lines.join(
+                                                "
+"
+                                            )
+                                        );
+                                        if ui.link(text).on_hover_text(tip).clicked() {
+                                            out.checks = Some((def.name().to_owned(), x.number));
+                                        }
+                                    }
+                                    for f in l.findings_of(i) {
+                                        let times = if f.count > 1 { format!(" ×{}", f.count) } else { String::new() };
+                                        let r = ui.link(
+                                            RichText::new(format!("⚠ {}{times}", f.kind.as_str()))
+                                                .color(ui.visuals().warn_fg_color),
+                                        );
+                                        if r.on_hover_text(format!(
+                                            "Line {}: {}\nClick to go there",
+                                            f.row + 1,
+                                            f.detail
+                                        ))
+                                        .clicked()
+                                        {
+                                            out.goto = Some(f.row);
+                                        }
+                                    }
+                                });
+                                ui.end_row();
                             }
                         });
-                        ui.end_row();
-                    }
-                });
+                    });
             });
     }
 }
@@ -959,17 +1093,56 @@ Click: the Checks pane",
 /// What follows a value in its cell (`  • event`, `  ↑ 12345`), in characters.
 const SUFFIX: usize = 10;
 
-/// How many characters of a value fit in the list's value column: the
-/// panel's width less the other columns (the names as shown, at most 32
-/// characters), at least 8.
-fn value_room(ui: &egui::Ui, signals: &Signals) -> usize {
-    let font = egui::TextStyle::Monospace.resolve(ui.style());
-    let cw = ui.painter().layout_no_wrap("0".into(), font, egui::Color32::WHITE).size().x.max(1.0);
-    let names = signals.iter().map(|d| d.name().chars().count() + 1).max().unwrap_or(0).min(32);
-    // Plot box, kind, scope, the last column and the spaces between.
-    const OTHERS: f32 = 250.0;
-    let room = (ui.available_width() - OTHERS - names as f32 * cw) / cw;
-    (room.max(0.0) as usize).saturating_sub(SUFFIX).max(8)
+/// How many characters fit in the list's name and value columns: the
+/// panel's width less the other columns (the last as wide as its widest
+/// row's buttons). Names take up to 32 characters, values at least 8; in a
+/// narrow panel the names give way first, down to 10 (shown by their end).
+/// Owner, 2026-11-15: a fixed allowance and 32-character names left ⚙,
+/// Save to pack and ↺ past the panel's right edge with long names.
+fn value_room(
+    ui: &egui::Ui,
+    signals: &Signals,
+    chosen: &HashMap<String, SignalOptions>,
+    conflicts: &HashMap<String, Vec<(String, SignalOptions)>>,
+) -> (usize, usize) {
+    let mono = egui::TextStyle::Monospace.resolve(ui.style());
+    let body = egui::TextStyle::Body.resolve(ui.style());
+    let width =
+        |s: &str, f: &egui::FontId| ui.painter().layout_no_wrap(s.into(), f.clone(), egui::Color32::WHITE).size().x;
+    let cw = width("0", &mono).max(1.0);
+    let gap = ui.spacing().item_spacing.x;
+    let label = |s: &str| width(s, &body) + gap;
+    let button = |s: &str| width(s, &body) + ui.spacing().button_padding.x * 2.0 + gap;
+    let last = signals
+        .iter()
+        .map(|d| {
+            let changed = chosen.get(d.name()).is_some_and(|o| !o.is_empty());
+            if d.check_name().is_some() || d.is_from_source() {
+                label("built in")
+            } else if d.queries().is_empty() {
+                button("☐") + button("✎") + button("−")
+            } else if d.argument_index().is_some() {
+                label("FIBEX") + button("⚙") + if changed { button("↺") } else { 0.0 } + button("−")
+            } else {
+                let conflict = conflicts.contains_key(d.name());
+                label("query ← 99")
+                    + button("⚙")
+                    + if conflict { label("⚠") } else { 0.0 }
+                    + match (changed, conflict) {
+                        (true, _) => label("●") + button("💾") + button("↺"),
+                        (false, true) => button("💾"),
+                        (false, false) => 0.0,
+                    }
+            }
+        })
+        .fold(0.0, f32::max);
+    // Plot box, kind list, scope and the gaps between the columns.
+    const FIXED: f32 = 170.0;
+    let free = ((ui.available_width() - FIXED - last) / cw).max(0.0) as usize;
+    let wanted = signals.iter().map(|d| d.name().chars().count() + 1).max().unwrap_or(0).min(32);
+    let least_value = 8 + SUFFIX;
+    let names = wanted.min(free.saturating_sub(least_value)).max(10.min(wanted));
+    (names, free.saturating_sub(names).saturating_sub(SUFFIX).max(8))
 }
 
 /// A value cut to `fit` characters (the hover has all of it).
@@ -1316,6 +1489,80 @@ fn check_hover(check: &str, d: &SignalDef) -> String {
     )
 }
 
+/// What "Save to pack" writes for a query signal: the tab's options over
+/// the pack's, an empty `per` or `default` (none, chosen in the tab) left
+/// out.
+pub fn to_save(tab: &SignalOptions, pack: &SignalOptions) -> SignalOptions {
+    let o = tab.over(pack);
+    SignalOptions {
+        per: o.per.clone().filter(|p| !p.trim().is_empty()),
+        default: o.default.clone().filter(|d| !d.trim().is_empty()),
+        ..o
+    }
+}
+
+/// A query or FIBEX signal's lifecycle and default, chosen in this tab.
+fn options_menu(ui: &mut egui::Ui, st: &mut SignalsUi, d: &SignalDef, lifecycles: &[&str], out: &mut Output) {
+    // Closed by a click outside it or Esc: a plain menu closes on any
+    // click, in its Default field too.
+    let config =
+        egui::containers::menu::MenuConfig::new().close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside);
+    let (button, open) = egui::containers::menu::MenuButton::new("⚙").config(config).ui(ui, |ui| {
+        ui.set_min_width(220.0);
+        ui.label(RichText::new(format!("@{}", d.name())).monospace().strong());
+        // The choices in a submenu: part of this menu (a drop-down's list
+        // isn't, and opening it closed the menu), and it scrolls when long.
+        let now = d.per().unwrap_or("");
+        let mut to = now.to_owned();
+        ui.horizontal(|ui| {
+            ui.label("Lifecycle").on_hover_text("Its state resets (to the default) where each lifecycle starts");
+            let shown = if now.is_empty() { "none".to_owned() } else { format!("@{now}") };
+            ui.menu_button(format!("{shown} ⏷"), |ui| {
+                egui::ScrollArea::vertical().max_height(300.0).show(ui, |ui| {
+                    ui.selectable_value(&mut to, String::new(), "none");
+                    for l in lifecycles {
+                        ui.selectable_value(&mut to, (*l).to_owned(), format!("@{l}"));
+                    }
+                    if !now.is_empty() && !lifecycles.contains(&now) {
+                        ui.selectable_value(&mut to, now.to_owned(), format!("@{now} (not defined)"));
+                    }
+                });
+                if to != now {
+                    ui.close();
+                }
+            });
+        });
+        if to != now {
+            out.per = Some((d.name().to_owned(), to));
+        }
+        if lifecycles.is_empty() && d.per().is_none() {
+            ui.weak("No lifecycle yet: define one with + Lifecycle");
+        }
+        ui.horizontal(|ui| {
+            ui.label("Default").on_hover_text("Its state where no event set it (in each lifecycle, with one)");
+            if d.kind() == SignalKind::Time {
+                ui.weak("none (a time takes none)");
+                return;
+            }
+            let now = d.default_value().map(|v| v.to_string()).unwrap_or_default();
+            if st.default_edit.as_ref().is_none_or(|(n, _)| n != d.name()) {
+                st.default_edit = Some((d.name().to_owned(), now.clone()));
+            }
+            let Some((_, text)) = st.default_edit.as_mut() else { return };
+            let r = ui.add(egui::TextEdit::singleline(text).desired_width(100.0).hint_text("none"));
+            let enter = r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+            if (ui.add_enabled(text.trim() != now, egui::Button::new("Set")).clicked() || enter) && text.trim() != now {
+                out.default = Some((d.name().to_owned(), text.trim().to_owned()));
+            }
+        });
+    });
+    button.on_hover_text("Lifecycle and default (in this tab)");
+    // Typed but not set: forgotten when the menu closes.
+    if open.is_none() && st.default_edit.as_ref().is_some_and(|(n, _)| n == d.name()) {
+        st.default_edit = None;
+    }
+}
+
 /// The scope: all lines, or only the lines the filter keeps.
 fn scope_cell(ui: &mut egui::Ui, d: &SignalDef, out: &mut Output) {
     if d.is_builtin() {
@@ -1463,19 +1710,29 @@ query drops(cam)
         // for less.
         let mut sig = Signals::default();
         sig.set(SignalDef::parse_spec(r"speed=/v=(?<speed>\d+)/").unwrap());
-        let room = |w: f32| {
+        let room_of = |sig: &Signals, w: f32| {
             let ctx = egui::Context::default();
             let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(w, 400.0));
-            let mut fit = 0;
+            let mut fit = (0, 0);
+            let none = HashMap::new();
             let mut out = ctx.run_ui(egui::RawInput { screen_rect: Some(screen), ..Default::default() }, |ui| {
-                egui::CentralPanel::default().show(ui, |ui| fit = value_room(ui, &sig));
+                egui::CentralPanel::default().show(ui, |ui| fit = value_room(ui, sig, &none, &HashMap::new()));
             });
             out.textures_delta.clear();
             fit
         };
+        let room = |w: f32| room_of(&sig, w).1;
         assert!(room(900.0) >= 26, "{}", room(900.0));
         assert!(room(460.0) < 26, "{}", room(460.0));
         assert_eq!(room(100.0), 8, "at least 8");
+        // Long names give way in a narrow panel, down to 10 characters
+        // (owner, 2026-11-15: the row's buttons were past its right edge).
+        let mut long = Signals::default();
+        long.set(SignalDef::parse_spec(r"frame_drops_of_the_front_camera_x(v)=/v=(?<v>\d+)/").unwrap());
+        assert_eq!(room_of(&long, 1200.0).0, 32, "wide: as long as names get");
+        let (names, value) = room_of(&long, 460.0);
+        assert!((10..32).contains(&names) && value >= 8, "{names} {value}");
+        assert_eq!(room_of(&long, 200.0).0, 10, "never under 10");
     }
 
     /// Owner, 2026-10-28: a whole group in or out at once.

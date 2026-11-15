@@ -56,7 +56,7 @@ pub use engine::search::{Filter, Highlighter, Matcher, MatcherOptions, SearchRes
 pub use engine::within::{SearchHits, SearchSet, search_within};
 pub use event::{Event, FieldDef, FieldId, FieldKind, FieldValue, Level};
 pub use history::SearchHistory;
-pub use input::concat::{open_many, open_many_by_time, open_merged_by_time, start_time};
+pub use input::concat::{open_many, open_many_by_time, open_merged_by_time, start_time, without_times};
 pub use input::dlt::DltFile;
 pub use input::dlt::fibex::{ArgType, Argument, Fibex, FibexError};
 pub use input::merged::sort_by_time;
@@ -65,8 +65,8 @@ pub use input::{Anchor, ColumnDef, LogSource, OpenOptions, SourceInfo, open, ope
 pub use pack::{Library, Pack, PackError, PackQuery};
 pub use session::{QueryContext, Session};
 pub use signal::{
-    Clock, QueryPart, SignalDef, SignalKind, SignalScope, SignalSeries, SignalValue, SignalView, Signals, ValueRef,
-    query_signals,
+    Clock, QueryPart, SignalDef, SignalKind, SignalOptions, SignalScope, SignalSeries, SignalValue, SignalView,
+    Signals, ValueRef, query_signals,
 };
 
 /// Line numbers are 0-based internally; UIs add 1 for display.
