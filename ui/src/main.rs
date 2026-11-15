@@ -6316,6 +6316,88 @@ gear=D
     }
 
     /// What a frame of the whole window costs on a big file, browsing it:
+    /// Captures merged by time in the GUI (owner, 2026-11-15: "merge by time
+    /// seems broken"): `NERKA_MERGE_FILES=a.pcap;b.mf4 NERKA_PERF_FIBEX=a.xml
+    /// cargo test --release -p nerka-gui merge_captures -- --ignored
+    /// --nocapture`: the rows in time order, every file's lines, FIBEX
+    /// signals collected and plotted on the merged view.
+    #[test]
+    #[ignore = "needs capture files"]
+    fn merge_captures() {
+        let (Ok(files), Ok(fx)) = (std::env::var("NERKA_MERGE_FILES"), std::env::var("NERKA_PERF_FIBEX")) else {
+            return;
+        };
+        let paths: Vec<PathBuf> = files.split(';').map(PathBuf::from).collect();
+        let ctx = egui::Context::default();
+        let wait = |app: &mut App| {
+            let until = std::time::Instant::now() + Duration::from_secs(120);
+            while app.tabs.iter().any(|t| t.is_busy()) {
+                assert!(std::time::Instant::now() < until, "still busy: {}", app.tabs[0].status);
+                app.poll_jobs(&ctx);
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        };
+        let mut app = App::default();
+        app.set_fibex(&ctx, vec![PathBuf::from(fx)]);
+        app.prefs.merge_by_time = true;
+        let t = std::time::Instant::now();
+        app.open_files(&ctx, paths.clone());
+        wait(&mut app);
+        let tab = &app.tabs[0];
+        eprintln!("merged in {:.0} ms: {}", t.elapsed().as_secs_f64() * 1e3, tab.status);
+        assert!(tab.merge, "merged");
+        let file = tab.file.clone().expect("opened");
+        assert!(file.reordered().is_some(), "rows reordered by time");
+        let sum: u64 = paths
+            .iter()
+            .map(|p| {
+                let o = nerka_core::OpenOptions { fibex: app.fibex.clone(), ..Default::default() };
+                nerka_core::open_with(p.to_str().unwrap(), &o, &nerka_core::Progress::new()).unwrap().line_count()
+            })
+            .sum();
+        assert_eq!(file.line_count(), sum, "every file's lines");
+        let mut back = 0;
+        let mut prev = f64::MIN;
+        for r in 0..file.line_count() {
+            let t = file.time(r).unwrap_or(prev);
+            if t < prev {
+                back += 1;
+            }
+            prev = t;
+        }
+        assert_eq!(back, 0, "time goes back {back} times in the merged rows");
+        // FIBEX signals on the merged view, plotted.
+        app.show_signals = true;
+        let args = app.fibex_arguments();
+        for a in args.iter().filter(|a| a.ty.kind() == nerka_core::SignalKind::Num).take(4) {
+            app.tabs[0].arg_picks.push(a.clone());
+            plot::lock(&app.tabs[0].plot).toggle(&a.name);
+        }
+        app.tabs[0].choices_gen += 1;
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1600.0, 1000.0));
+        let until = std::time::Instant::now() + Duration::from_secs(120);
+        let mut frames = 0;
+        loop {
+            let input = egui::RawInput { screen_rect: Some(screen), ..Default::default() };
+            let mut out = ctx.run_ui(input, |ui| app.frame(ui));
+            out.textures_delta.clear();
+            app.poll_jobs(&ctx);
+            frames += 1;
+            let lanes = plot::lock(&app.tabs[0].plot).lane_count();
+            if lanes >= 4 {
+                eprintln!("plotted after {frames} frames, {lanes} lanes");
+                break;
+            }
+            assert!(std::time::Instant::now() < until, "the plot never came: {}", app.tabs[0].status);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        for d in app.tabs[0].signals.iter().filter(|d| d.argument_index().is_some()) {
+            let events = d.cached_series(&*file).map(|s| s.len()).unwrap_or(0);
+            eprintln!("@{}: {events} events", d.name());
+            assert!(events > 0, "@{} has no events on the merged view", d.name());
+        }
+    }
+
     /// idle, scrolling the log, the Signals panel with its FIBEX tree, the
     /// plot. `NERKA_PERF_FILE=big.pcap NERKA_PERF_FIBEX=big.xml cargo test
     /// --release -p nerka-gui perf_big_app -- --ignored --nocapture`

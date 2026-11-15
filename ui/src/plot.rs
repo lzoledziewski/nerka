@@ -288,6 +288,12 @@ impl LaneKey {
 }
 
 impl PlotState {
+    /// How many lanes the plot shows now (tests).
+    #[cfg(test)]
+    pub fn lane_count(&self) -> usize {
+        self.data.as_ref().map_or(0, |(_, d)| d.lanes.len())
+    }
+
     pub fn is_plotted(&self, name: &str) -> bool {
         self.plotted.iter().any(|n| n == name)
     }
