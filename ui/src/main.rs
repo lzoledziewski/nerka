@@ -6339,6 +6339,31 @@ gear=D
         };
         let mut app = App::default();
         app.set_fibex(&ctx, vec![PathBuf::from(fx)]);
+        let goes_back = |file: &dyn LogSource| {
+            let (mut back, mut prev) = (0, f64::MIN);
+            for r in 0..file.line_count() {
+                let t = file.time(r).unwrap_or(prev);
+                back += usize::from(t < prev);
+                prev = t;
+            }
+            back
+        };
+        // Merge by time off (the default): one file after another; then on,
+        // from the tab's menu.
+        app.prefs.merge_by_time = false;
+        app.open_files(&ctx, paths.clone());
+        wait(&mut app);
+        let one_after_another = goes_back(&**app.tabs[0].file.as_ref().unwrap());
+        eprintln!("one after another: {}; time goes back {one_after_another} times", app.tabs[0].status);
+        let prefs = app.prefs.clone();
+        let fibex = app.fibex.clone();
+        app.tabs[0].merge = true;
+        app.tabs[0].reopen(&ctx, &prefs, fibex);
+        wait(&mut app);
+        let toggled = goes_back(&**app.tabs[0].file.as_ref().unwrap());
+        eprintln!("merged from the menu: {}; time goes back {toggled} times", app.tabs[0].status);
+        assert_eq!(toggled, 0, "Merge by time from the menu sorts");
+        app.tabs.clear();
         app.prefs.merge_by_time = true;
         let t = std::time::Instant::now();
         app.open_files(&ctx, paths.clone());
