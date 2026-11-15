@@ -263,6 +263,8 @@ pub struct PlotState {
     lane_job: Option<LaneJob>,
     /// Tests: lanes with more points than this go on a thread.
     thread_from: Option<usize>,
+    /// Lane jobs started (tests: one per change, not one per frame).
+    jobs_started: usize,
 }
 
 /// What a signal's lanes were built from: its definition, its events and
@@ -458,8 +460,33 @@ fn build_here(
 /// Lanes being built on a thread: for which signals (and their events'
 /// identity), and the job.
 pub(crate) struct LaneJob {
-    key: Vec<(String, usize)>,
+    key: LaneJobKey,
     job: crate::job::Job<Vec<Vec<Lane>>>,
+}
+
+/// What a lane job builds: the signals (name, definition, events) and the
+/// clock. Compared by content: the plot gets its events in a new `Arc`
+/// every frame (owner, 2026-11-15: by address, nearly every frame looked
+/// like new work and started another job; dozens a second overflowed a
+/// worker's stack).
+struct LaneJobKey {
+    lanes: Vec<(String, String, Arc<SignalSeries>)>,
+    clock: String,
+    clock_series: Option<SignalSeries>,
+}
+
+impl LaneJobKey {
+    fn same(&self, other: &LaneJobKey) -> bool {
+        let clock_same = match (&self.clock_series, &other.clock_series) {
+            (None, None) => true,
+            (Some(a), Some(b)) => a.same_as(b),
+            _ => false,
+        };
+        self.clock == other.clock
+            && clock_same
+            && self.lanes.len() == other.lanes.len()
+            && self.lanes.iter().zip(&other.lanes).all(|(a, b)| a.0 == b.0 && a.1 == b.1 && a.2.same_as(&b.2))
+    }
 }
 
 fn build(
@@ -692,6 +719,7 @@ pub fn plot_panel(ui: &mut egui::Ui, state: &mut PlotState, src: Source<'_>) -> 
         let mut cache = std::mem::take(&mut state.lane_cache);
         let mut job = state.lane_job.take();
         let limit = state.thread_from.unwrap_or(BUILD_ON_A_THREAD);
+        let mut jobs_started = 0;
         let ctx = ui.ctx().clone();
         let mut here = build_here(file);
         // Big lanes on a thread of their own, the window stays responsive.
@@ -701,20 +729,30 @@ pub fn plot_panel(ui: &mut egui::Ui, state: &mut PlotState, src: Source<'_>) -> 
                 job = None;
                 return here(todo, clock, clock_series);
             };
-            let key: Vec<(String, usize)> = todo.iter().map(|(n, _, s)| (n.clone(), Arc::as_ptr(s) as usize)).collect();
-            if let Some(j) = job.as_ref().filter(|j| j.key == key) {
-                return match j.job.poll() {
-                    crate::job::Poll::Running => None,
-                    crate::job::Poll::Done(Ok(lanes), _) => {
+            let key = LaneJobKey {
+                lanes: todo.iter().map(|(n, d, s)| (n.clone(), d.spec(), s.clone())).collect(),
+                clock: match clock {
+                    Clock::Signal(d) => d.spec(),
+                    c => c.describe(),
+                },
+                clock_series: clock_series.clone(),
+            };
+            // One job at a time: while it runs, a change waits for it.
+            if let Some(j) = &job {
+                match j.job.poll() {
+                    crate::job::Poll::Running => return None,
+                    crate::job::Poll::Done(Ok(lanes), _) if j.key.same(&key) => {
                         job = None;
-                        Some(lanes)
+                        return Some(lanes);
                     }
                     // Not built there (cancelled): here, then.
-                    crate::job::Poll::Done(Err(_), _) => {
+                    crate::job::Poll::Done(Err(_), _) if j.key.same(&key) => {
                         job = None;
-                        here(todo, clock, clock_series)
+                        return here(todo, clock, clock_series);
                     }
-                };
+                    // Built for what was plotted before: dropped.
+                    crate::job::Poll::Done(..) => job = None,
+                }
             }
             let clock = clock.clone();
             let work = crate::job::Job::spawn(&ctx, move |_| {
@@ -723,10 +761,12 @@ pub fn plot_panel(ui: &mut egui::Ui, state: &mut PlotState, src: Source<'_>) -> 
                 Ok(nerka_core::plot::lane::lanes_of_all(&refs, &*owned, &clock, clock_series.as_ref()))
             });
             job = Some(LaneJob { key, job: work });
+            jobs_started += 1;
             None
         };
         let built = build(state, &mut cache, signals, file, &clock, series_of, &mut builder);
         state.lane_job = job;
+        state.jobs_started += jobs_started;
         state.lane_cache = cache;
         match built {
             Ok(d) => state.data = Some((key, d)),
@@ -2127,12 +2167,20 @@ mod tests {
         let mut st = PlotState { thread_from: Some(0), ..Default::default() };
         st.toggle("v");
         let ctx = egui::Context::default();
+        let held: std::cell::RefCell<Vec<Arc<SignalSeries>>> = Default::default();
         let run = |st: &mut PlotState, t: f64| {
             let screen = Rect::from_min_size(pos2(0.0, 0.0), vec2(800.0, 300.0));
             let input = egui::RawInput { screen_rect: Some(screen), time: Some(t), ..Default::default() };
             let mut full = ctx.run_ui(input, |ui| {
                 egui::CentralPanel::default().show(ui, |ui| {
-                    let mut series_of = |d: &SignalDef| d.cached_series(&*file).map(Arc::new);
+                    // A new Arc each frame, as the tab gives them, kept alive so
+                    // their addresses differ (by address, each frame started a
+                    // job of its own).
+                    let mut series_of = |d: &SignalDef| {
+                        let s = Arc::new(d.cached_series(&*file)?);
+                        held.borrow_mut().push(s.clone());
+                        Some(s)
+                    };
                     let src = Source {
                         signals: &sig,
                         generation: 1,
@@ -2162,6 +2210,7 @@ mod tests {
         }
         let (_, data) = st.data.as_ref().unwrap();
         assert!(st.lane_job.is_none());
+        assert_eq!(st.jobs_started, 1, "one job, however many frames");
         let here = nerka_core::plot::lane::lanes(
             "v",
             sig.get("v").unwrap(),
