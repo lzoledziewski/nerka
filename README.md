@@ -13,9 +13,9 @@ one UI-free engine (`nerka-core`).
 
 ![nerka on a synthetic DLT drive: warnings filtered from a query pack, speed, temperature and battery voltage plotted with a throttling threshold, a text search (regex, ignoring case) for throttling messages in the bottom pane, and the library and selection panes on the right](docs/user/img/nerka.png)
 
-> Status: **0.2.1**. Windows is the main platform;
-> Linux builds come from CI (and run in a local VM); macOS is built and tested in CI, with no release
-> archives yet. While nerka is at 0.x,
+> Status: **0.2.2**. Windows is the main platform;
+> Linux builds come from CI (and run in a local VM); macOS is built and tested in CI, with release
+> archives for Apple Silicon (unsigned). While nerka is at 0.x,
 > file formats, the filter language and the GUI can still change.
 
 **User guide:** [lzoledziewski.github.io/nerka](https://lzoledziewski.github.io/nerka/) · **Download:** [latest release](https://github.com/lzoledziewski/nerka/releases/latest)
