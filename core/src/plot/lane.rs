@@ -15,6 +15,10 @@ use std::collections::HashMap;
 const B1: usize = 64;
 const B2: usize = 64 * 64;
 
+/// Assumed points in view up to which [`Lane::pieces`] draws the stretches
+/// between them as steps.
+const FEW_ASSUMED: usize = 64;
+
 /// (least, greatest) of nothing.
 const NONE: (f64, f64) = (f64::INFINITY, f64::NEG_INFINITY);
 
@@ -271,13 +275,101 @@ impl Lane {
         out
     }
 
-    /// A number's steps with assumed points ([`Pieces`]), as [`Lane::steps`]
-    /// per pixel column: whatever the number of points or lifecycles in
-    /// view, it costs about the plot's width. A column's last point decides
-    /// the level that leaves it: an event's solid, a default's dashed, an
-    /// unset one none; the step into a column's state is solid. Without
-    /// assumed points it is [`Lane::steps`] (tested below).
+    /// A number's steps with assumed points ([`Pieces`]), as [`Lane::steps`]:
+    /// a column's last point decides the level that leaves it (an event's
+    /// solid, a default's dashed, an unset one none); the step into a
+    /// column's state is solid. Without assumed points it is
+    /// [`Lane::steps`] (tested below). With a few in view (a file's start,
+    /// some lifecycles) the stretches between them are [`Lane::steps`];
+    /// with many, per pixel column: either way about the plot's width.
     pub fn pieces(
+        &self,
+        from: usize,
+        to: usize,
+        (left, right): (f32, f32),
+        to_px: impl Fn(f64) -> f32,
+        to_py: impl Fn(f64) -> f32,
+    ) -> Pieces {
+        if self.assumed_in(from, to.min(self.xs.len())) <= FEW_ASSUMED {
+            self.pieces_between(from, to, (left, right), to_px, to_py)
+        } else {
+            self.pieces_by_column(from, to, (left, right), to_px, to_py)
+        }
+    }
+
+    /// [`Lane::pieces`] with few assumed points: [`Lane::steps`] between
+    /// them, each assumed point a level of its own.
+    fn pieces_between(
+        &self,
+        from: usize,
+        to: usize,
+        (left, right): (f32, f32),
+        to_px: impl Fn(f64) -> f32,
+        to_py: impl Fn(f64) -> f32,
+    ) -> Pieces {
+        let end = to.min(self.xs.len());
+        let mut out = Pieces::default();
+        let flush = |out: &mut Pieces, cur: &mut Vec<(f32, f32)>| {
+            if cur.len() > 1 {
+                out.lines.push(std::mem::take(cur));
+            } else {
+                cur.clear();
+            }
+        };
+        let col = |x: f64| to_px(x).max(left).floor();
+        // Where the state after point `i` stops being drawn.
+        let stop = |i: usize| {
+            if i + 1 < end {
+                col(self.xs[i + 1])
+            } else if to < self.xs.len() {
+                to_px(self.xs[to]).min(right)
+            } else {
+                right
+            }
+        };
+        let mut cur: Vec<(f32, f32)> = Vec::new();
+        // A default's level, after it: the next stretch steps from it.
+        let mut after_default: Option<f32> = None;
+        let mut i = from;
+        while i < end {
+            if self.assumed[i] {
+                let px = col(self.xs[i]);
+                // The stretch before ends at this column (not past it).
+                if let Some(&(_, y0)) = cur.last() {
+                    cur.pop();
+                    cur.push((px, y0));
+                }
+                let y = self.ys[i];
+                if y.is_finite() {
+                    let py = to_py(y);
+                    if !cur.is_empty() {
+                        cur.push((px, py));
+                    }
+                    out.dashed.push([(px, py), (stop(i), py)]);
+                    after_default = Some(py);
+                } else {
+                    after_default = None;
+                }
+                flush(&mut out, &mut cur);
+                i += 1;
+            } else {
+                let j = self.next_assumed(i).min(end);
+                let s = self.steps(i, j, (left, right), &to_px, &to_py);
+                out.strokes.extend(s.strokes);
+                cur = s.line;
+                if let (Some(y0), Some(&(x, _))) = (after_default.take(), cur.first()) {
+                    cur.insert(0, (x, y0));
+                }
+                i = j;
+            }
+        }
+        flush(&mut out, &mut cur);
+        out
+    }
+
+    /// [`Lane::pieces`] per pixel column: whatever the number of points or
+    /// lifecycles in view, it costs about the plot's width.
+    fn pieces_by_column(
         &self,
         from: usize,
         to: usize,
@@ -650,6 +742,27 @@ mod tests {
         assert_eq!(got, want);
         // Ticks: the events' columns, not the assumed points'.
         assert_eq!(l.ticks(0, 6, |x| x as f32), [0.0, 20.0, 40.0, 50.0]);
+    }
+
+    /// A few defaults: the stretches between them as steps (cheaper) give
+    /// what the per-column drawing gives, points a pixel or more apart.
+    #[test]
+    fn pieces_between_few_defaults_are_the_same_as_per_column() {
+        let n = 2000;
+        let xs: Vec<f64> = (0..n).map(|i| i as f64).collect();
+        let ys: Vec<f64> = (0..n).map(|i| if i % 300 == 150 { f64::NAN } else { ((i * 7919) % 13) as f64 }).collect();
+        let assumed: Vec<bool> = (0..n).map(|i| i % 100 == 0 || i % 300 == 150).collect();
+        let l = lane(SignalKind::Num, xs, ys, assumed);
+        let to_py = |y: f64| 90.0 - y as f32 * 5.0;
+        for (from, to, scale) in [(0, n, 1.0f32), (37, 1500, 2.0), (450, 460, 50.0)] {
+            let to_px = |x: f64| (x as f32 - from as f32) * scale;
+            let right = (to - from) as f32 * scale + 10.0;
+            assert_eq!(
+                l.pieces_between(from, to, (0.0, right), to_px, to_py),
+                l.pieces_by_column(from, to, (0.0, right), to_px, to_py),
+                "{from}..{to}"
+            );
+        }
     }
 
     /// Many lifecycles in view (a default every tenth point): what a frame
