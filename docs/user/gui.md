@@ -67,7 +67,9 @@ order given. The tab's menu → **Files…** lists them: move, remove or add
 files, turn protocols on or off per capture. **Merge by time** in the
 menu sorts all their lines by time (files that know it; lines of one time
 in the order of the files, then of each file); a tab of one
-such file has **Sort by time** instead. A field `file` tells the files
+such file has **Sort by time** instead. Files that can't be merged (one
+with lines but no times) leave the box unticked, and the status bar names
+them; a file without lines doesn't count. A field `file` tells the files
 apart in queries. See [Files and formats](formats.md).
 
 A tab's menu → **Reload** reads its files again from disk, keeping

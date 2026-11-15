@@ -1860,6 +1860,13 @@ impl Tab {
                                 }
                                 n => format!("Indexed {} lines of {n} files in {took:.2?}", f.line_count()),
                             };
+                            // Asked for but not done: the menu's box goes off, so it
+                            // says what the view is (owner, 2026-11-15: it stayed
+                            // ticked over files one after another). The remembered
+                            // choice for new tabs stays.
+                            if self.merge && f.reordered().is_none() {
+                                self.merge = false;
+                            }
                             if let Some(note) = self.load_note.take() {
                                 self.status = format!("{note} · {}", self.status);
                             }
@@ -6710,6 +6717,26 @@ gear=D
         settle(&mut two, &ctx);
         assert!(two.merge && two.file.as_ref().unwrap().reordered().is_some());
         assert!(two.bookmarks.contains(3), "b1's bookmark on its merged row");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Owner, 2026-11-15: a merge that can't be done unticks the tab's Merge
+    /// by time (it stayed ticked over files one after another) and the
+    /// status names the files without times; new tabs still try.
+    #[test]
+    fn a_merge_that_cannot_be_done_is_unticked_and_says_why() {
+        let dir = std::env::temp_dir().join(format!("nerka-gui-nomerge-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (a, b) = (dir.join("a.log"), dir.join("b.log"));
+        std::fs::write(&a, "one\n").unwrap();
+        std::fs::write(&b, "two\n").unwrap();
+        let ctx = egui::Context::default();
+        let prefs = SearchPrefs { merge_by_time: true, ..SearchPrefs::default() };
+        let mut tab = Tab::open_many(&ctx, vec![a, b], &prefs, None);
+        assert!(tab.merge, "asked for");
+        settle(&mut tab, &ctx);
+        assert!(!tab.merge, "not done: unticked");
+        assert!(tab.status.contains("not merged: a.log, b.log have lines without times"), "{}", tab.status);
         std::fs::remove_dir_all(&dir).ok();
     }
 
