@@ -516,7 +516,11 @@ fn open_sorted(
     progress: &crate::Progress,
 ) -> Result<Sorted> {
     let mut parts: Vec<_> = paths.iter().cloned().zip(open_all(paths, options, progress)?).collect();
-    let starts: Option<Vec<f64>> = parts.iter().map(|(_, s)| start_time(s.as_ref())).collect();
+    // A file without lines has nothing to place: it goes last.
+    let starts: Option<Vec<f64>> = parts
+        .iter()
+        .map(|(_, s)| if s.line_count() == 0 { Some(f64::INFINITY) } else { start_time(s.as_ref()) })
+        .collect();
     let timed = starts.is_some();
     if let Some(starts) = starts {
         let mut order: Vec<usize> = (0..parts.len()).collect();
@@ -528,10 +532,22 @@ fn open_sorted(
     Ok((parts.into_iter().map(|(_, s)| s).collect(), paths, timed))
 }
 
-/// The first time a source holds (looking at its first lines only), if it
-/// knows its lines' times.
+/// The first time a source holds, if it knows its lines' times: the first
+/// line with one (owner, 2026-11-15: looking at the first 1000 lines only,
+/// a capture whose first messages had no time kept a whole view from
+/// being merged).
 pub fn start_time(s: &dyn LogSource) -> Option<f64> {
-    (0..s.line_count().min(1000)).find_map(|l| s.time(l))
+    (0..s.line_count()).find_map(|l| s.time(l))
+}
+
+/// The files of `parts` (names) that have lines but no times: they keep
+/// the view from being merged by time. A file without lines doesn't.
+pub fn without_times<'a>(parts: impl IntoIterator<Item = (&'a str, &'a dyn LogSource)>) -> Vec<String> {
+    parts
+        .into_iter()
+        .filter(|(_, s)| s.line_count() > 0 && start_time(*s).is_none())
+        .map(|(n, _)| n.to_owned())
+        .collect()
 }
 
 #[cfg(test)]

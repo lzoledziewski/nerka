@@ -133,6 +133,23 @@ fn opening_merged_falls_back_where_times_are_missing() {
     let (s, order) = crate::open_merged_by_time(&[late.clone(), early.clone()], &o, &p).unwrap();
     assert_eq!(order, [early.clone(), late.clone()]);
     assert_eq!(texts(&*s), ["e0", "l0", "e1", "l1"]);
+    // A file without lines (a capture with none of the protocols read)
+    // doesn't keep the others from being merged: it goes last (owner,
+    // 2026-11-15: one such file left a view of seven unmerged).
+    let empty = dir.join("none.pcap");
+    // A pcap's header and no packets.
+    let mut header = 0xA1B2_C3D4u32.to_le_bytes().to_vec();
+    header.extend_from_slice(&[2, 0, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 0, 0, 1, 0, 0, 0]);
+    std::fs::write(&empty, header).unwrap();
+    let three = [late.clone(), empty.clone(), early.clone()];
+    let (s, order) = crate::open_merged_by_time(&three, &o, &p).unwrap();
+    assert!(s.reordered().is_some(), "merged");
+    assert_eq!(order, [early.clone(), late.clone(), empty.clone()]);
+    assert_eq!(texts(&*s), ["e0", "l0", "e1", "l1"]);
+    let names = ["late", "none", "early"];
+    let opened: Vec<Box<dyn LogSource>> =
+        three.iter().map(|f| crate::open_with(f.to_str().unwrap(), &o, &p).unwrap()).collect();
+    assert!(crate::without_times(names.iter().copied().zip(opened.iter().map(|s| &**s))).is_empty());
     // One file: itself.
     let (one, _) = crate::open_merged_by_time(std::slice::from_ref(&late), &o, &p).unwrap();
     assert!(one.reordered().is_none());

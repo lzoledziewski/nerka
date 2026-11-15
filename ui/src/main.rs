@@ -1836,10 +1836,28 @@ impl Tab {
                                 n if f.reordered().is_some() => {
                                     format!("Merged {} lines of {n} files by time in {took:.2?}", f.line_count())
                                 }
-                                n if self.merge => format!(
-                                    "Indexed {} lines of {n} files; not merged: not every file knows its lines' times",
-                                    f.line_count()
-                                ),
+                                n if self.merge => {
+                                    // Which files keep it from being merged.
+                                    let parts = f.parts().unwrap_or_default();
+                                    let names: Vec<String> = self
+                                        .paths
+                                        .iter()
+                                        .map(|p| p.file_name().unwrap_or_default().to_string_lossy().into_owned())
+                                        .collect();
+                                    let without = nerka_core::without_times(
+                                        names.iter().map(String::as_str).zip(parts.iter().map(|p| &*p.source)),
+                                    );
+                                    format!(
+                                        "Indexed {} lines of {n} files; not merged: {} {} lines without times",
+                                        f.line_count(),
+                                        if without.is_empty() {
+                                            "not every file".to_owned()
+                                        } else {
+                                            without.join(", ")
+                                        },
+                                        if without.len() == 1 { "has" } else { "have" }
+                                    )
+                                }
                                 n => format!("Indexed {} lines of {n} files in {took:.2?}", f.line_count()),
                             };
                             if let Some(note) = self.load_note.take() {
