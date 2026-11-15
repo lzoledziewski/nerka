@@ -1669,7 +1669,8 @@ fn life_label_rows(spans: &[(usize, f32, f32)], rows: usize) -> Vec<Option<usize
 }
 
 /// The rows of lifecycle labels as they are placed, left to right per
-/// lifecycle ([`life_label_rows`]).
+/// lifecycle: a row per lifecycle (the last shared), a label left out where
+/// it would run into the one before it in its row.
 struct LabelRows {
     ends: Vec<f32>,
 }

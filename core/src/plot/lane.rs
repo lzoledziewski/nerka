@@ -435,8 +435,6 @@ pub fn lanes(
         }) as f64,
     };
     // The points in row order (y, row, assumed); x comes after.
-    let n = series.len();
-    let (mut ys, mut rows, mut assumed) = (Vec::with_capacity(n), Vec::with_capacity(n), Vec::with_capacity(n));
     let lives: Vec<LineNo> = series.lifecycles().map(|l| l.lives.iter().map(|l| l.first).collect()).unwrap_or_default();
     // Files start the state again until a lifecycle has started.
     let first_life = lives.first().copied().unwrap_or(LineNo::MAX);
@@ -445,6 +443,10 @@ pub fn lanes(
     let mut starts: Vec<LineNo> = file_starts.iter().chain(&lives).copied().collect();
     starts.sort_unstable_by(|a, b| b.cmp(a));
     starts.dedup();
+    // Room for the starts too: one point past the events doubled every
+    // vector (+365 MiB peak for 30 lanes of 22 M points).
+    let n = series.len() + starts.len();
+    let (mut ys, mut rows, mut assumed) = (Vec::with_capacity(n), Vec::with_capacity(n), Vec::with_capacity(n));
     let reset = def.default_value().map_or(f64::NAN, |d| y_of(d.as_ref()));
     let mut push = |y: f64, row: LineNo, a: bool| {
         ys.push(y);
