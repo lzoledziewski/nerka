@@ -2228,6 +2228,72 @@ mod tests {
         assert_eq!((data.lanes[0].xs.clone(), data.lanes[0].ys.clone()), (here[0].xs.clone(), here[0].ys.clone()));
     }
 
+    /// Bug (owner, 2026-11-16): with a check's signal plotted, a lane built
+    /// on a thread never came ("Building the plot's lanes…" for ever): the
+    /// check's events were new every frame, so each finished job looked
+    /// out of date and another started.
+    #[test]
+    fn lanes_with_a_check_signal_come_from_one_job() {
+        let text: String = (0..500)
+            .map(|i| {
+                if i % 50 == 0 {
+                    "retry
+"
+                    .to_owned()
+                } else {
+                    format!(
+                        "v={}
+",
+                        i % 7
+                    )
+                }
+            })
+            .collect();
+        let file: Arc<dyn LogSource> = Arc::new(nerka_core::TextFile::from_bytes("t", text.into_bytes()));
+        let mut sig = Signals::default();
+        sig.set(SignalDef::parse_spec(r"v=/v=(?<v>\d+)/").unwrap());
+        let mut checks = nerka_core::check::Checks::default();
+        checks.set(nerka_core::check::CheckDef::parse_spec("retries: lines /retry/").unwrap());
+        let lib = nerka_core::pack::Library::default();
+        let sig = checks.run_all(&*file, &sig, &lib, &nerka_core::Progress::new()).unwrap().signals;
+        sig.collect(&*file, &nerka_core::Progress::new()).unwrap();
+        assert!(sig.get("retries").is_some_and(|d| d.is_check()));
+        let mut st = PlotState { thread_from: Some(0), ..Default::default() };
+        st.toggle("retries");
+        st.toggle("v");
+        let ctx = egui::Context::default();
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut t = 0.0;
+        while st.data.is_none() {
+            assert!(std::time::Instant::now() < until, "the lanes never came ({} jobs)", st.jobs_started);
+            t += 0.1;
+            let screen = Rect::from_min_size(pos2(0.0, 0.0), vec2(800.0, 300.0));
+            let input = egui::RawInput { screen_rect: Some(screen), time: Some(t), ..Default::default() };
+            ctx.run_ui(input, |ui| {
+                egui::CentralPanel::default().show(ui, |ui| {
+                    let mut series_of = |d: &SignalDef| d.cached_series(&*file).map(Arc::new);
+                    let src = Source {
+                        signals: &sig,
+                        generation: 1,
+                        file: &*file,
+                        cursor: 0,
+                        kept: 0,
+                        series_of: &mut series_of,
+                        in_window: false,
+                        bookmarks: &[],
+                        saved: &[],
+                        owned: Some(file.clone()),
+                    };
+                    plot_panel(ui, &mut st, src);
+                });
+            })
+            .textures_delta
+            .clear();
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!((st.lane_count(), st.jobs_started), (2, 1));
+    }
+
     fn frame(
         ctx: &egui::Context,
         t: f64,
