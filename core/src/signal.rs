@@ -366,7 +366,7 @@ pub(crate) fn source_key(source: &dyn LogSource) -> (usize, LineNo) {
 pub struct SignalSeries {
     key: (usize, LineNo),
     /// (first line in the source, key of the file's own source, events).
-    parts: Vec<(LineNo, (usize, LineNo), Arc<Events>)>,
+    parts: Vec<Part>,
     /// The lifecycles of a signal bound to one (or of a lifecycle).
     life: Option<Arc<Lifecycles>>,
     /// The state where no event set it (in its lifecycle, or its file).
@@ -544,6 +544,27 @@ type Cache = Arc<Mutex<Vec<((usize, LineNo), Arc<Events>)>>>;
 /// Files kept in a definition's cache at most.
 const CACHED_FILES: usize = 64;
 
+/// A file's events in a source: (first line in the source, key of the
+/// file's own source, events).
+type Part = (LineNo, (usize, LineNo), Arc<Events>);
+
+/// A built-in signal's events (a lifecycle's starts, a check's results) as
+/// last built, shared by every copy of a definition: the same `Arc`s each
+/// time, so what keeps events by identity (the plot's lanes) sees them
+/// unchanged. Bug (owner, 2026-11-16): built anew on every call, a check's
+/// signal in the plot looked changed every frame, and the lanes built with
+/// it on a thread were thrown away and started again, for ever.
+type Built = Arc<Mutex<Option<BuiltParts>>>;
+
+#[derive(Debug)]
+struct BuiltParts {
+    /// The source, and the lifecycles they were built from (held, so the
+    /// address can't be another's).
+    key: (usize, LineNo),
+    life: Option<Arc<Lifecycles>>,
+    parts: Vec<Part>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SignalKind {
     /// The capture read as a number (decimal, float or `0x` hex).
@@ -633,6 +654,7 @@ pub struct SignalDef {
     query: Query,
     cache: Cache,
     builtin: Builtin,
+    built: Built,
     scope: SignalScope,
     /// The lifecycle it is bound to (`per(NAME)`), and that lifecycle once
     /// [`Signals`] links it.
@@ -683,6 +705,7 @@ impl SignalDef {
             query,
             cache: Cache::default(),
             builtin: Builtin::No,
+            built: Built::default(),
             scope: SignalScope::All,
             per: None,
             life: None,
@@ -714,6 +737,7 @@ impl SignalDef {
             query: Query::compile(query).map_err(SignalError::Query)?,
             cache: Cache::default(),
             builtin: Builtin::No,
+            built: Built::default(),
             scope: SignalScope::All,
             per: None,
             life: None,
@@ -780,6 +804,7 @@ impl SignalDef {
             query: Query::compile("/(?<time>)/").expect("valid"),
             cache: Cache::default(),
             builtin: Builtin::Time,
+            built: Built::default(),
             scope: SignalScope::All,
             per: None,
             life: None,
@@ -1052,6 +1077,53 @@ impl SignalDef {
         }
     }
 
+    /// A lifecycle's or a check's events in `source`, per file (`life`:
+    /// the lifecycles), built once for them ([`Built`]).
+    fn built_parts(&self, source: &dyn LogSource, life: Option<&Arc<Lifecycles>>) -> Vec<Part> {
+        let key = source_key(source);
+        let mut built = self.built.lock().unwrap_or_else(|e| e.into_inner());
+        let same_life = |b: &BuiltParts| match (&b.life, life) {
+            (None, None) => true,
+            (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+            _ => false,
+        };
+        if let Some(b) = built.as_ref().filter(|b| b.key == key && same_life(b)) {
+            return b.parts.clone();
+        }
+        let mut parts = Vec::new();
+        match &self.builtin {
+            // Events where lifecycles start, per file.
+            Builtin::Life(_) => {
+                let lifes = life.expect("a lifecycle is bound to itself");
+                for (first, n, key) in leaves(source) {
+                    let lives: Vec<_> =
+                        lifes.lives.iter().filter(|l| l.first >= first && l.first < first + n).collect();
+                    let rows = lives.iter().map(|l| l.first - first).collect();
+                    let nums = lives.iter().map(|l| f64::from(l.number)).collect();
+                    let ev = Events::numbers(rows, nums, SignalKind::Num);
+                    parts.push((first, key, Arc::new(ev)));
+                }
+            }
+            // The check's occurrences, per file; none in another source.
+            Builtin::Check(c) => {
+                let mine = c.key == key;
+                for (first, n, key) in leaves(source) {
+                    let found: Vec<(LineNo, SignalValue)> = if mine {
+                        let a = c.events.partition_point(|e| e.0 < first);
+                        let b = c.events.partition_point(|e| e.0 < first + n);
+                        c.events[a..b].iter().map(|(r, v)| (r - first, v.clone())).collect()
+                    } else {
+                        Vec::new()
+                    };
+                    parts.push((first, key, Arc::new(Events::build(found, self.kind))));
+                }
+            }
+            Builtin::No | Builtin::Time => unreachable!("not built in"),
+        }
+        *built = Some(BuiltParts { key, life: life.cloned(), parts: parts.clone() });
+        parts
+    }
+
     /// The signal's events in `source`, one pass per file on first use,
     /// then from the cache this definition (and every copy of it) keeps.
     pub fn series(&self, source: &dyn LogSource, progress: &Progress) -> crate::Result<SignalSeries> {
@@ -1066,32 +1138,10 @@ impl SignalDef {
             Builtin::Time => {
                 return Ok(SignalSeries { key: source_key(source), parts, life: None, default: None });
             }
-            // Events where lifecycles start, per file.
-            Builtin::Life(_) => {
-                let lifes = life.clone().expect("a lifecycle is bound to itself");
-                for (first, n, key) in leaves(source) {
-                    let lives: Vec<_> =
-                        lifes.lives.iter().filter(|l| l.first >= first && l.first < first + n).collect();
-                    let rows = lives.iter().map(|l| l.first - first).collect();
-                    let nums = lives.iter().map(|l| f64::from(l.number)).collect();
-                    let ev = Events::numbers(rows, nums, SignalKind::Num);
-                    parts.push((first, key, Arc::new(ev)));
-                }
-                return Ok(SignalSeries { key: source_key(source), parts, life, default: None });
-            }
-            // The check's occurrences, per file; none in another source.
-            Builtin::Check(c) => {
-                let mine = c.key == source_key(source);
-                for (first, n, key) in leaves(source) {
-                    let found: Vec<(LineNo, SignalValue)> = if mine {
-                        let a = c.events.partition_point(|e| e.0 < first);
-                        let b = c.events.partition_point(|e| e.0 < first + n);
-                        c.events[a..b].iter().map(|(r, v)| (r - first, v.clone())).collect()
-                    } else {
-                        Vec::new()
-                    };
-                    parts.push((first, key, Arc::new(Events::build(found, self.kind))));
-                }
+            // Events where lifecycles start, or the check's occurrences.
+            Builtin::Life(_) | Builtin::Check(_) => {
+                let parts = self.built_parts(source, life.as_ref());
+                let default = if matches!(self.builtin, Builtin::Check(_)) { default } else { None };
                 return Ok(SignalSeries { key: source_key(source), parts, life, default });
             }
             Builtin::No => {}

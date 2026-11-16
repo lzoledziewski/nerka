@@ -536,6 +536,24 @@ mod as_signals {
         assert_eq!(result(&r, "hot").signal_note, None);
     }
 
+    /// Bug (owner, 2026-11-16): a check's signal (and a lifecycle's) was
+    /// built anew on each call; the plot, which keeps lanes by their events'
+    /// identity, saw it change every frame and never finished a lane job.
+    /// Its events are the same each time, also from a copy of it.
+    #[test]
+    fn a_check_signal_gives_the_same_events_each_time() {
+        let c = checks(&["retries: lines raw == retry; per a"]);
+        let r = run(&c, &signals());
+        for name in ["retries", "a"] {
+            let d = r.signals.get(name).unwrap();
+            let first = d.cached_series(src()).expect("built");
+            assert!(first.same_as(&d.cached_series(src()).unwrap()), "@{name}");
+            let copy = (**d).clone();
+            assert!(first.same_as(&copy.series(src(), &Progress::new()).unwrap()), "@{name}: a copy");
+            assert!(!first.is_empty(), "@{name}");
+        }
+    }
+
     /// Two checks whose names make the same signal: the first in the list
     /// makes it, the other says so.
     #[test]

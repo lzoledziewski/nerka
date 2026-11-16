@@ -2,6 +2,10 @@
 
 The dated log of the project, newest first; append-only: add an entry at the top when `status.md` changes. Moved from `status.md` on 2026-11-10, word for word: its "Last update" line (each update with the ones before it) and its "Next steps" as they stood then, which tell what was built when and why. Where the moved text says "above", "below" or "this file", it means the old `status.md`: its sections are now `status.md` (state, pending decisions, limitations, licensing), `gui-decisions.md`, `features.md` and `history.md`.
 
+## 2026-11-16
+
+0.2.3 (a release), only a fix since 0.2.2: with a check's signal plotted, a lane built on a thread never came ("Building the plot's lanes…" for ever); a check's or lifecycle's signal now gives the same events each time. Time per file and profiles move to 0.2.4 (owner).
+
 ## 2026-11-15
 
 0.2.2 (a release). Its changes since 0.2.1: signal options in pack queries (`signals:` with kind, scope, lifecycle, default; changed per tab, written back only on Save to pack; warnings for disagreeing options and stale entries); instances of a parameterised query as several values of its parameter; plot lanes of signals bound to a lifecycle drawn per pixel column, the state before a signal's first event shown, big lanes built off the UI thread, spinners while waiting; freezes and a GPU crash with tens of thousands of lifecycles fixed; Sort by time (was Merge by time) sorting every line of several files, and a file without lines no longer stopping it; a macOS (Apple Silicon) release archive. Before the bump the review gate passed on Windows (`--full --bench`, `KSY=1`: every query within 15 % of 0.2.1, the same counts) and in the Linux VM (checks passed; its benchmark ran while the VM was busy, the rows rerun idle matched). Profiles move to 0.2.3, after time per file (owner).
