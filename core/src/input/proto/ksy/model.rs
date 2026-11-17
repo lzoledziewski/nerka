@@ -1027,10 +1027,10 @@ impl Builder<'_> {
                 None => None,
                 Some(EndianSpec::Fixed(e)) => Some(EndianRule::Fixed(*e)),
                 Some(EndianSpec::Switch { on, cases, default }) => {
-                    let on = self.bind(on, id, Under::No)?.0;
+                    let (on, ty) = self.bind(on, id, Under::No)?;
                     let mut out = Vec::new();
                     for (k, e) in cases {
-                        out.push((self.lit_key(k, id)?, *e));
+                        out.push((self.lit_key(k, id, ty)?, *e));
                     }
                     Some(EndianRule::Switch { on, cases: out, default: *default })
                 }
@@ -1061,9 +1061,9 @@ impl Builder<'_> {
                 };
                 let switch = match (&a.ty, &self.nodes[id].attrs[i].kind) {
                     (TypeRef::Switch { on, cases, .. }, Kind::Switch(_)) => {
-                        let on = self.bind(on, id, Under::No)?.0;
+                        let (on, ty) = self.bind(on, id, Under::No)?;
                         let keys: Vec<Lit> =
-                            cases.iter().map(|(k, _)| self.lit_key(k, id)).collect::<Result<_, _>>()?;
+                            cases.iter().map(|(k, _)| self.lit_key(k, id, ty)).collect::<Result<_, _>>()?;
                         Some((on, keys))
                     }
                     _ => None,
@@ -1194,10 +1194,28 @@ impl Builder<'_> {
             (TypeRef::User(_) | TypeRef::Switch { .. }, None, false) => Size::Child,
         };
         let cond = a.cond.as_ref().map(|c| self.bind(c, id, Under::No)).transpose()?.map(|b| b.0);
+        // What `valid` values are compared with (`expr` is a condition).
+        let own = match a.ty {
+            TypeRef::Bits(1) if a.enum_name.is_none() => Ty::Bool,
+            TypeRef::Int { .. } | TypeRef::Float { .. } | TypeRef::Bits(_) => Ty::Int,
+            TypeRef::Str | TypeRef::Strz | TypeRef::Bytes => Ty::Bytes,
+            TypeRef::User(_) | TypeRef::Switch { .. } => Ty::Any,
+        };
         let mut checks = Vec::new();
         for (key, list) in &a.valid {
-            let bound: Vec<CExpr> =
-                list.iter().map(|e| self.bind(e, id, elem).map(|b| b.0)).collect::<Result<_, _>>()?;
+            let mut bound = Vec::new();
+            for e in list {
+                let (c, t) = self.bind(e, id, elem)?;
+                if key != "expr" && mixes_bool(own, t) {
+                    let m = if own == Ty::Bool {
+                        "a `b1` is a boolean: its `valid` is `true` or `false`".to_owned()
+                    } else {
+                        format!("this `valid` needs {}, not a boolean", not_bool_name(own, Ty::Bool))
+                    };
+                    return Err(err(e.line, e.col, m));
+                }
+                bound.push(c);
+            }
             checks.push(match key.as_str() {
                 "eq" => Check::Eq(bound.into_iter().next().unwrap_or(CExpr::Lit(Lit::Bool(true)))),
                 "min" => Check::Min(bound.into_iter().next().unwrap_or(CExpr::Lit(Lit::Int(0)))),
@@ -1210,10 +1228,18 @@ impl Builder<'_> {
     }
 
     /// A case key of `switch-on`: a number, `true` / `false`, a string or an
-    /// enum value.
-    fn lit_key(&self, k: &Node, id: NodeId) -> Result<Lit, KsyError> {
+    /// enum value; `true` / `false` when switching on a boolean, and only then.
+    fn lit_key(&self, k: &Node, id: NodeId, on: Ty) -> Result<Lit, KsyError> {
         let src = as_expr(k, "a case")?;
         match self.bind(&src, id, Under::No)?.0 {
+            CExpr::Lit(l) if mixes_bool(on, lit_ty(&l)) => Err(node_err(
+                k,
+                if on == Ty::Bool {
+                    "this switches on a boolean: its cases are `true` and `false`".to_owned()
+                } else {
+                    format!("this switches on {}, not a boolean", not_bool_name(on, Ty::Bool))
+                },
+            )),
             CExpr::Lit(l) => Ok(l),
             _ => Err(node_err(k, "a case must be a constant")),
         }
@@ -1387,14 +1413,18 @@ impl Scope<'_, '_> {
             return Ok(match &a.kind {
                 Kind::User(c) => Bound::Obj(*c),
                 Kind::Switch(_) => Bound::Value(CExpr::Attr(n, i), Ty::Any),
-                k => Bound::Value(CExpr::Attr(n, i), kind_ty(k)),
+                k => Bound::Value(CExpr::Attr(n, i), kind_ty(k, spec.enum_name.is_some())),
             });
         }
         if let Some(k) = node.insts.iter().position(|a| a.id == name) {
             return Ok(match &node.insts[k].kind {
                 InstKind::Read { read, .. } => match read.kind {
                     Kind::User(c) => Bound::Obj(c),
-                    _ => Bound::Value(CExpr::Inst(n, k), kind_ty(&read.kind)),
+                    _ => {
+                        let spec = &self.b.types[self.b.node_types[n]].insts[k];
+                        let enumed = spec.read.as_ref().is_some_and(|r| r.enum_name.is_some());
+                        Bound::Value(CExpr::Inst(n, k), kind_ty(&read.kind, enumed))
+                    }
                 },
                 // Its type is known once it is bound; until then, any.
                 InstKind::Value(_) => Bound::Value(CExpr::Inst(n, k), self.inst_ty(n, k)),
@@ -1518,10 +1548,30 @@ impl Scope<'_, '_> {
             Expr::Binary(op, a, b) => {
                 let (a, ta) = self.value(a, at, d)?;
                 let (b, tb) = self.value(b, at, d)?;
+                let compares = matches!(op, BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge);
+                let bits = matches!(op, BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor);
+                let sym = op.symbol();
+                if compares && mixes_bool(ta, tb) {
+                    return Err(format!(
+                        "`{sym}` compares a boolean with {}, which is never equal; use the boolean as it is \
+                         (`flag`, `not flag`) or compare it with `true` / `false`",
+                        not_bool_name(ta, tb)
+                    ));
+                }
+                if bits && mixes_bool(ta, tb) {
+                    return Err(format!(
+                        "`{sym}` mixes a boolean with {}; use `and` / `or` on booleans, or make the number one (`x != 0`)",
+                        not_bool_name(ta, tb)
+                    ));
+                }
+                if !compares && !bits && !matches!(op, BinOp::Or | BinOp::And) && (ta == Ty::Bool || tb == Ty::Bool) {
+                    return Err(format!("`{sym}` takes numbers, not a boolean"));
+                }
                 let ty = match op {
                     BinOp::Or | BinOp::And | BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => {
                         Ty::Bool
                     }
+                    _ if bits && ta == Ty::Bool && tb == Ty::Bool => Ty::Bool,
                     BinOp::Add if ta == Ty::Bytes || tb == Ty::Bytes => Ty::Bytes,
                     BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod
                         if ta == Ty::Float || tb == Ty::Float =>
@@ -1551,15 +1601,42 @@ fn terminator(a: &AttrSpec) -> Option<u8> {
     }
 }
 
-fn kind_ty(k: &Kind) -> Ty {
+/// A read value's type; a `b1` with an `enum` is its number, not a boolean.
+fn kind_ty(k: &Kind, enumed: bool) -> Ty {
     match k {
         Kind::Int { .. } => Ty::Int,
         Kind::Float { .. } => Ty::Float,
-        Kind::Bits(1) => Ty::Bool,
+        Kind::Bits(1) if !enumed => Ty::Bool,
         Kind::Bits(_) => Ty::Int,
         Kind::Bytes | Kind::Str => Ty::Bytes,
         Kind::User(_) => Ty::Obj,
         Kind::Switch(_) => Ty::Any,
+    }
+}
+
+pub fn lit_ty(l: &Lit) -> Ty {
+    match l {
+        Lit::Int(_) => Ty::Int,
+        Lit::Float(_) => Ty::Float,
+        Lit::Bool(_) => Ty::Bool,
+        Lit::Bytes(_) => Ty::Bytes,
+    }
+}
+
+/// A boolean met with a value of another type (both known): never equal,
+/// so `flag != 0` would always be true. Kaitai rejects it; so does loading.
+pub fn mixes_bool(a: Ty, b: Ty) -> bool {
+    a != b && (a == Ty::Bool || b == Ty::Bool) && a != Ty::Any && b != Ty::Any
+}
+
+/// The other side of a boolean, as an error names it.
+pub fn not_bool_name(a: Ty, b: Ty) -> &'static str {
+    match if a == Ty::Bool { b } else { a } {
+        Ty::Int | Ty::Float => "a number",
+        Ty::Bytes => "bytes",
+        Ty::Obj => "an object",
+        Ty::List(_) => "a list",
+        Ty::Bool | Ty::Any => "a value",
     }
 }
 

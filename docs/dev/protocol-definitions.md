@@ -29,6 +29,7 @@ effort: as close to native as is reasonable, not a requirement.
 | Execution | **Compiled at load time into an intermediate form**, not into Rust code (definitions arrive at runtime, from files, later packs and bundles). |
 | Comparison with native | **Not a feature of the released core.** An integration test in `core/tests/` and a benchmark run of the normal CLI; no comparison mode, flag or API. |
 | Dependencies | None. Nerka reads the YAML subset `.ksy` files use itself (as it reads JSON). |
+| Booleans and numbers (2026-11-17) | **An error when the definition loads**, as in Kaitai's compiler, not booleans read as 0 / 1: a boolean is compared (`==`, `valid`, `switch-on` cases, `map` keys) and combined (`&` `\|` `^`) only with a boolean, and takes no arithmetic. `and` / `or` / `not` still take numbers by their truth. (`flag != 0` had been always true.) |
 
 ## For users
 
