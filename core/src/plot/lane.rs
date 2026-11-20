@@ -79,8 +79,27 @@ pub struct Lane {
 pub enum Band {
     /// One value (its id; NaN: unset), from an event or assumed (a default).
     Value { from: f32, to: f32, y: f64, assumed: bool },
-    /// The value changes within these pixels: no one value to show.
-    Mixed { from: f32, to: f32 },
+    /// The value changes within these pixels: no one value to show. The
+    /// values that occur in it (enum ids, in the order first seen; at most
+    /// [`MIXED_STATES`], none unset), so a short state isn't lost from sight.
+    Mixed { from: f32, to: f32, states: [Option<u32>; MIXED_STATES] },
+}
+
+/// Values a [`Band::Mixed`] names, at most.
+pub const MIXED_STATES: usize = 4;
+
+/// `y` (an enum id) among `states`, if it is set and there is room.
+fn add_state(states: &mut [Option<u32>; MIXED_STATES], y: f64) {
+    if !y.is_finite() || y < 0.0 {
+        return;
+    }
+    let id = y as u32;
+    if states.contains(&Some(id)) {
+        return;
+    }
+    if let Some(slot) = states.iter_mut().find(|s| s.is_none()) {
+        *slot = Some(id);
+    }
 }
 
 /// What a number's lane draws: per pixel column with points, a vertical
@@ -460,7 +479,7 @@ impl Lane {
     pub fn bands(&self, (left, right): (f32, f32), from: usize, to: usize, to_px: impl Fn(f64) -> f32) -> Vec<Band> {
         let end = to.min(self.xs.len());
         let mut out = Vec::new();
-        let mut mixed: Option<(f32, f32)> = None;
+        let mut mixed: Option<(f32, f32, [Option<u32>; MIXED_STATES])> = None;
         let mut i = from;
         while i < end {
             // A default is a run of its own; a run of events ends at the
@@ -473,20 +492,19 @@ impl Lane {
                 break;
             }
             if stop - start < 1.0 {
-                mixed = Some(match mixed {
-                    Some((a, b)) => (a.min(start), b.max(stop)),
-                    None => (start, stop),
-                });
+                let (a, b, mut states) = mixed.unwrap_or((start, stop, [None; MIXED_STATES]));
+                add_state(&mut states, self.ys[i]);
+                mixed = Some((a.min(start), b.max(stop), states));
             } else {
-                if let Some((a, b)) = mixed.take() {
-                    out.push(Band::Mixed { from: a, to: b.max(a + 1.0) });
+                if let Some((a, b, states)) = mixed.take() {
+                    out.push(Band::Mixed { from: a, to: b.max(a + 1.0), states });
                 }
                 out.push(Band::Value { from: start, to: stop, y: self.ys[i], assumed });
             }
             i = j;
         }
-        if let Some((a, b)) = mixed {
-            out.push(Band::Mixed { from: a, to: b.max(a + 1.0) });
+        if let Some((a, b, states)) = mixed {
+            out.push(Band::Mixed { from: a, to: b.max(a + 1.0), states });
         }
         out
     }
@@ -805,7 +823,7 @@ mod tests {
     ) -> Vec<Band> {
         let end = to.min(l.xs.len());
         let mut out = Vec::new();
-        let mut mixed: Option<(f32, f32)> = None;
+        let mut mixed: Option<(f32, f32, [Option<u32>; MIXED_STATES])> = None;
         let mut i = from;
         while i < end {
             let assumed = l.assumed[i];
@@ -819,17 +837,19 @@ mod tests {
                 break;
             }
             if stop - start < 1.0 {
-                mixed = Some(mixed.map_or((start, stop), |(a, b)| (a.min(start), b.max(stop))));
+                let (a, b, mut states) = mixed.unwrap_or((start, stop, [None; MIXED_STATES]));
+                add_state(&mut states, l.ys[i]);
+                mixed = Some((a.min(start), b.max(stop), states));
             } else {
-                if let Some((a, b)) = mixed.take() {
-                    out.push(Band::Mixed { from: a, to: b.max(a + 1.0) });
+                if let Some((a, b, states)) = mixed.take() {
+                    out.push(Band::Mixed { from: a, to: b.max(a + 1.0), states });
                 }
                 out.push(Band::Value { from: start, to: stop, y: l.ys[i], assumed });
             }
             i = j;
         }
-        if let Some((a, b)) = mixed {
-            out.push(Band::Mixed { from: a, to: b.max(a + 1.0) });
+        if let Some((a, b, states)) = mixed {
+            out.push(Band::Mixed { from: a, to: b.max(a + 1.0), states });
         }
         out
     }
@@ -955,7 +975,7 @@ mod tests {
         assert_eq!(
             got,
             [
-                Band::Mixed { from: 0.0, to: 1.0 },
+                Band::Mixed { from: 0.0, to: 1.0, states: [Some(0), Some(1), None, None] },
                 Band::Value { from: 1.0, to: 5.0, y: 0.0, assumed: true },
                 Band::Value { from: 5.0, to: 10.0, y: 1.0, assumed: false },
             ]
@@ -968,7 +988,10 @@ mod tests {
         let got = l.bands((0.0, 10.0), 0, l.xs.len(), |x| x as f32);
         assert_eq!(
             got,
-            [Band::Mixed { from: 0.0, to: 1.0 }, Band::Value { from: 0.3, to: 10.0, y: 1.0, assumed: false }]
+            [
+                Band::Mixed { from: 0.0, to: 1.0, states: [Some(0), Some(1), None, None] },
+                Band::Value { from: 0.3, to: 10.0, y: 1.0, assumed: false }
+            ]
         );
     }
 }

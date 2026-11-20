@@ -97,19 +97,28 @@ current line is a cursor. A lane shows the state as the panel does: before
 a signal's first event in each file (or lifecycle, with `per`), its
 default dashed (a pale band for an enum), or nothing if it has none.
 
+An enum's state too short to see at the zoom is never left out: a state
+narrower than 3 pixels is drawn 3 pixels wide, in a lighter shade of its
+colour and under a small ▼ notch on the lane's top edge (shorter than
+drawn), and several within one pixel become such a column split into
+their colours. A band without a notch is as long as it looks. Hovering
+there names them: *near here: error ×2, idle ×2 (4
+changes in 60 ms): zoom in to see them*.
+
 - **Navigate:** the wheel zooms, drag pans, double-click shows all; hover
   shows a value; click goes to the line.
 - **Time cursors:** right-click → place cursor A, B, …; Δt between them is
-  shown (like a logic analyser). Drag a cursor to move it. Placed or
-  dragged within a few pixels of a change of a signal (the lane under the
-  pointer first, else any lane), a cursor snaps onto it: the menu says
-  **at the change of @gear**. Farther away it goes where you clicked;
-  hold **Alt** to place or drag it freely.
+  shown (like a logic analyser). Drag a cursor to move it. Clicked near a
+  change of a signal (the lane under the pointer first, else any lane),
+  the menu also offers **Place cursor C at the change of @gear**: exactly
+  where the value changed.
 - **Value markers:** right-click a number lane's name → add a horizontal line
   at a value (a limit, a threshold); the same menu sets the y axis.
 - **Bookmarks** show as red lines with their names and notes and take part
-  in Δt; the plot's menu bookmarks the nearest event, with a **name** (empty:
-  `B1`, `B2`…, or the one it has) and a **note**.
+  in Δt; the plot's menu bookmarks the nearest event of the lane you
+  clicked, or, clicked near a change, **the change of @ota** (the line
+  where the value changed), with a **name** (empty: `B1`, `B2`…, or the one
+  it has) and a **note**.
 - Cursor and bookmark lines are drawn under the signals, so a value
   changing on the same x stays visible.
 - **Kept plots:** ⋮ → **Keep this plot as…** (this session, `•`) or **Save**;

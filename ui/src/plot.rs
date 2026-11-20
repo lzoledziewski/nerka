@@ -294,8 +294,9 @@ pub struct PlotState {
     /// The cursor being dragged, and where the context menu was opened.
     drag_cursor: Option<usize>,
     menu_x: Option<f64>,
-    /// The lane whose change `menu_x` snapped to.
-    menu_snap: Option<String>,
+    /// The change of a signal nearest to where the menu was opened (its x,
+    /// lane and line), offered for a cursor and a bookmark.
+    menu_snap: Option<(f64, String, LineNo)>,
     /// The event nearest to where the menu was opened: its line and lane.
     menu_row: Option<(LineNo, String)>,
     /// The name and note typed in the menu for a bookmark.
@@ -473,8 +474,8 @@ pub struct Output {
 }
 
 const GUTTER: f32 = 120.0;
-/// How near (points) a placed or dragged cursor snaps to a change.
-const SNAP_PX: f32 = 6.0;
+/// How near (points) a change of a signal is offered for a cursor.
+const SNAP_PX: f32 = 12.0;
 const GUTTER_MIN: f32 = 60.0;
 /// A row of the strip above the lanes (tags, Δt).
 const MARK_ROW: f32 = 17.0;
@@ -975,13 +976,11 @@ pub fn plot_panel(ui: &mut egui::Ui, state: &mut PlotState, src: Source<'_>) -> 
         // Where the press began: egui starts a drag only after some movement.
         state.drag_cursor = ui.input(|i| i.pointer.press_origin()).and_then(near_cursor);
     }
-    // Snapping: a cursor placed or dragged near a change of a signal goes
-    // onto it (the lane under the pointer, else any lane), within a few
-    // pixels; farther away, or with Alt held, it stays where the pointer is.
-    let snap = |x: f64, p: Pos2, (x0, x1, scroll): (f64, f64, f32)| -> (f64, Option<String>) {
-        if ui.input(|i| i.modifiers.alt) {
-            return (x, None);
-        }
+    // The change of a signal nearest to a right-click (the lane under the
+    // pointer, else any lane), within a few pixels: the menu offers it
+    // besides the click's own x (owner, 2026-11-20: snapping by itself kept
+    // cursors from going where they were put).
+    let snap = |x: f64, p: Pos2, (x0, x1, scroll): (f64, f64, f32)| -> Option<(f64, String, LineNo)> {
         let tol = SNAP_PX as f64 * (x1 - x0) / w;
         let under = (plot.y_range().contains(p.y) && !data.lanes.is_empty())
             .then(|| lane_at(p.y, plot.min.y, lane_h, scroll, data.lanes.len()));
@@ -989,20 +988,12 @@ pub fn plot_panel(ui: &mut egui::Ui, state: &mut PlotState, src: Source<'_>) -> 
             Some(k) => vec![&*data.lanes[k]],
             None => data.lanes.iter().map(|l| &**l).collect(),
         };
-        match snap_to_change(&lanes, x, tol) {
-            Some((at, lane)) => (at, Some(lane)),
-            None => (x, None),
-        }
+        snap_to_change(&lanes, x, tol)
     };
     if response.dragged() {
         let dx = response.drag_delta().x as f64 * (x1 - x0) / w;
         match state.drag_cursor {
-            Some(i) => {
-                if let Some(p) = response.interact_pointer_pos() {
-                    let at = x0 + (p.x - plot.min.x).clamp(0.0, plot.width()) as f64 / w * (x1 - x0);
-                    state.cursors[i] = snap(at, p, (x0, x1, state.scroll)).0;
-                }
-            }
+            Some(i) => state.cursors[i] += dx,
             None => {
                 if dx != 0.0 {
                     (x0, x1) = (x0 - dx, x1 - dx);
@@ -1021,13 +1012,19 @@ pub fn plot_panel(ui: &mut egui::Ui, state: &mut PlotState, src: Source<'_>) -> 
         && let Some(p) = response.interact_pointer_pos()
     {
         let mx = x0 + (p.x - plot.min.x).clamp(0.0, plot.width()) as f64 / w * (x1 - x0);
-        let (at, snapped) = snap(mx, p, (x0, x1, state.scroll));
-        state.menu_x = Some(at);
-        state.menu_snap = snapped;
-        // The event nearest to it in any lane: what a bookmark goes on.
-        state.menu_row = data
-            .lanes
-            .iter()
+        state.menu_x = Some(mx);
+        state.menu_snap = snap(mx, p, (x0, x1, state.scroll));
+        // The event nearest to it in the lane under the pointer (else in any
+        // lane): what a bookmark goes on. Any lane let a busy one (an event
+        // every 0.5 s) win over the lane clicked (owner, 2026-11-20).
+        let under = (plot.y_range().contains(p.y) && !data.lanes.is_empty())
+            .then(|| lane_at(p.y, plot.min.y, lane_h, state.scroll, data.lanes.len()));
+        let lanes: Vec<&Arc<Lane>> = match under {
+            Some(k) => vec![&data.lanes[k]],
+            None => data.lanes.iter().collect(),
+        };
+        state.menu_row = lanes
+            .into_iter()
             .filter_map(|l| {
                 let j = l.xs.partition_point(|&v| v < mx);
                 let near = [j.checked_sub(1), (j < l.xs.len()).then_some(j)]
@@ -1038,7 +1035,9 @@ pub fn plot_panel(ui: &mut egui::Ui, state: &mut PlotState, src: Source<'_>) -> 
             })
             .min_by(|a, b| a.0.total_cmp(&b.0))
             .map(|(_, row, lane)| (row, lane));
-        let existing = state.menu_row.as_ref().and_then(|(row, _)| bookmarks.iter().find(|b| b.line == *row));
+        // A bookmark already on one of the lines: its name and note to edit.
+        let rows = [state.menu_snap.as_ref().map(|s| s.2), state.menu_row.as_ref().map(|r| r.0)];
+        let existing = rows.into_iter().flatten().find_map(|row| bookmarks.iter().find(|b| b.line == row));
         state.bookmark_note = existing.map(|b| b.note.clone()).unwrap_or_default();
         state.bookmark_name = existing.map(|b| b.name.clone()).unwrap_or_default();
     }
@@ -1046,7 +1045,8 @@ pub fn plot_panel(ui: &mut egui::Ui, state: &mut PlotState, src: Source<'_>) -> 
     let mut bookmark = None;
     response.context_menu_with_fields(|ui| {
         let fields = (&mut state.bookmark_name, &mut state.bookmark_note);
-        bookmark = cursor_menu(ui, &mut state.cursors, menu_x, menu_snap.as_deref(), menu_row, fields);
+        let snap = menu_snap.as_ref().map(|(x, lane, row)| (*x, lane.as_str(), *row));
+        bookmark = cursor_menu(ui, &mut state.cursors, menu_x, snap, menu_row, fields);
     });
     out.bookmark = bookmark;
     if let Some(p) = ui.input(|i| i.pointer.hover_pos()).filter(|_| response.contains_pointer()) {
@@ -1081,6 +1081,7 @@ pub fn plot_panel(ui: &mut egui::Ui, state: &mut PlotState, src: Source<'_>) -> 
     let text_color = vis.text_color();
     let weak = vis.weak_text_color();
     let grid = vis.widgets.noninteractive.bg_stroke.color;
+    let panel_bg = vis.panel_fill;
     let font = FontId::monospace(11.0);
     let mut hovered_lane = None;
     // The lanes' own drawing stays above the axis (scrolled lanes are cut).
@@ -1217,7 +1218,8 @@ pub fn plot_panel(ui: &mut egui::Ui, state: &mut PlotState, src: Source<'_>) -> 
         let from = i0.saturating_sub(1);
         match lane.kind {
             SignalKind::Enum => {
-                draw_bands(&painter, lane, area, from, i1, |x| to_px(x, x0, x1), &font, weak);
+                let ink = (weak, panel_bg, text_color);
+                draw_bands(&painter, lane, area, from, i1, |x| to_px(x, x0, x1), &font, ink);
                 band_areas.push(area.intersect(lanes_clip));
             }
             _ => {
@@ -1483,6 +1485,14 @@ pub fn plot_panel(ui: &mut egui::Ui, state: &mut PlotState, src: Source<'_>) -> 
                 }
             }
             None => tip.push_str(&format!("@{}: no event yet", lane.name)),
+        }
+        // States too short to see at this zoom near the pointer: named.
+        if lane.kind == SignalKind::Enum {
+            let tol = SHORT_BAND as f64 * (x1 - x0) / w;
+            if let Some(near) = hidden_states(lane, x - tol, x + tol) {
+                tip.push('\n');
+                tip.push_str(&near.text(data.is_time));
+            }
         }
         if let Some(life) = life_tip {
             tip.push('\n');
@@ -1868,12 +1878,12 @@ fn cursor_menu(
     ui: &mut egui::Ui,
     cursors: &mut Vec<f64>,
     x: Option<f64>,
-    snapped: Option<&str>,
+    snapped: Option<(f64, &str, LineNo)>,
     row: Option<(LineNo, String)>,
     (name, note): (&mut String, &mut String),
 ) -> Option<(LineNo, String, String)> {
     let mut bookmark = None;
-    if let Some((line, lane)) = row {
+    if row.is_some() || snapped.is_some() {
         ui.label(egui::RichText::new("Bookmark").strong());
         // The name is what the plot's tag and the Bookmarks panel show
         // first; the note says more (hover).
@@ -1885,24 +1895,36 @@ fn cursor_menu(
             ui.add(egui::TextEdit::singleline(note).hint_text("optional").desired_width(160.0));
             ui.end_row();
         });
-        let r = ui.button(format!("🔖 Bookmark line {}", line + 1));
-        if r.on_hover_text(format!("The event of @{lane} nearest to where you clicked")).clicked() {
-            bookmark = Some((line, name.trim().to_owned(), note.trim().to_owned()));
-            ui.close();
+        // The change near the click first: exactly where a value changed.
+        if let Some((_, lane, line)) = snapped {
+            let r = ui.button(format!("🔖 Bookmark the change of @{lane} (line {})", line + 1));
+            if r.on_hover_text("The line where its value changes, near where you clicked").clicked() {
+                bookmark = Some((line, name.trim().to_owned(), note.trim().to_owned()));
+                ui.close();
+            }
+        }
+        if let Some((line, lane)) = row.filter(|(line, _)| snapped.is_none_or(|s| s.2 != *line)) {
+            let r = ui.button(format!("🔖 Bookmark line {}", line + 1));
+            if r.on_hover_text(format!("The event of @{lane} nearest to where you clicked")).clicked() {
+                bookmark = Some((line, name.trim().to_owned(), note.trim().to_owned()));
+                ui.close();
+            }
         }
         ui.separator();
     }
     ui.label(egui::RichText::new("Time cursors").strong());
     let Some(x) = x else { return bookmark };
-    let place = match snapped {
-        Some(lane) => format!("Place cursor {} at the change of @{lane}", cursor_name(cursors.len())),
-        None => format!("Place cursor {} here", cursor_name(cursors.len())),
-    };
-    let tip = "Near a change of a signal (the lane under the pointer first), a cursor goes onto it; \
-               hold Alt to place or drag it freely";
-    if ui.button(place).on_hover_text(tip).clicked() {
+    let name = cursor_name(cursors.len());
+    if ui.button(format!("Place cursor {name} here")).clicked() {
         cursors.push(x);
         ui.close();
+    }
+    if let Some((at, lane, _)) = snapped {
+        let tip = "Where the value of the signal nearest to the click changes (the lane under the pointer first)";
+        if ui.button(format!("Place cursor {name} at the change of @{lane}")).on_hover_text(tip).clicked() {
+            cursors.push(at);
+            ui.close();
+        }
     }
     let near = (0..cursors.len()).min_by(|&a, &b| (cursors[a] - x).abs().total_cmp(&(cursors[b] - x).abs()));
     if let Some(i) = near
@@ -1920,11 +1942,11 @@ fn cursor_menu(
 
 /// The change of a signal nearest to `x`, at most `tol` away, in `lanes`:
 /// an event whose value differs from the one before it (the first event
-/// too). Returns its x and the lane's name.
-fn snap_to_change(lanes: &[&Lane], x: f64, tol: f64) -> Option<(f64, String)> {
+/// too). Returns its x, the lane's name and the event's line.
+fn snap_to_change(lanes: &[&Lane], x: f64, tol: f64) -> Option<(f64, String, LineNo)> {
     /// Events looked at per lane, at most (zoomed far out, many are near).
     const MAX_LOOK: usize = 4096;
-    let mut best: Option<(f64, f64, &str)> = None;
+    let mut best: Option<(f64, f64, &str, LineNo)> = None;
     for lane in lanes {
         let from = lane.xs.partition_point(|&v| v < x - tol);
         let to = lane.xs.partition_point(|&v| v <= x + tol).min(from + MAX_LOOK);
@@ -1935,11 +1957,11 @@ fn snap_to_change(lanes: &[&Lane], x: f64, tol: f64) -> Option<(f64, String)> {
             };
             let d = (lane.xs[i] - x).abs();
             if changed && best.is_none_or(|(bd, ..)| d < bd) {
-                best = Some((d, lane.xs[i], &lane.name));
+                best = Some((d, lane.xs[i], &lane.name, lane.rows[i]));
             }
         }
     }
-    best.map(|(_, at, name)| (at, name.to_owned()))
+    best.map(|(_, at, name, row)| (at, name.to_owned(), row))
 }
 
 /// The y-axis menu of a number lane; `all` is the range of all its values.
@@ -2029,8 +2051,9 @@ fn draw_steps(
     painter.add(egui::Shape::line(steps.line.into_iter().map(|(x, y)| pos2(x, y)).collect(), stroke));
 }
 
-/// An enum's state: bands coloured by value, labelled where wide enough;
-/// grey where it changes within a pixel.
+/// An enum's state: bands coloured by value, labelled where wide enough.
+/// States too short to see are widened, lighter, under a notch; `ink` is
+/// (grey for unset values, the panel's background, the notches).
 #[allow(clippy::too_many_arguments)]
 fn draw_bands(
     painter: &egui::Painter,
@@ -2040,14 +2063,23 @@ fn draw_bands(
     to: usize,
     to_px: impl Fn(f64) -> f32,
     font: &FontId,
-    mixed_color: Color32,
+    (mixed_color, bg, notch): (Color32, Color32, Color32),
 ) {
-    for b in lane.bands((area.min.x, area.max.x), from, to, to_px) {
+    let bands = lane.bands((area.min.x, area.max.x), from, to, to_px);
+    // A state too short to see at this zoom (owner, 2026-11-20: easy to
+    // miss an update): drawn at least SHORT_BAND wide, at full strength,
+    // over its neighbours, centred where it was; several within a pixel
+    // as a column split into their colours.
+    let short = |from: f32, to: f32| {
+        let mid = (from + to) / 2.0;
+        let half = (to - from).max(SHORT_BAND) / 2.0;
+        (mid - half, mid + half)
+    };
+    let mut on_top = Vec::new();
+    for b in bands {
         match b {
-            Band::Mixed { from, to } => {
-                let band = Rect::from_min_max(pos2(from, area.min.y), pos2(to, area.max.y));
-                painter.rect_filled(band, 0.0, mixed_color.gamma_multiply(0.35));
-            }
+            Band::Mixed { .. } => on_top.push(b),
+            Band::Value { from, to, y, .. } if y.is_finite() && to - from < SHORT_BAND => on_top.push(b),
             // Unset (a lifecycle started, no default): no band.
             Band::Value { y, .. } if !y.is_finite() => {}
             Band::Value { from, to, y, assumed } => {
@@ -2078,6 +2110,102 @@ fn draw_bands(
             }
         }
     }
+    // Widened (owner, 2026-11-20): lighter than a band of its real width,
+    // on the panel's background (not mixed with its neighbours), and a
+    // notch on the lane's top edge: shorter than drawn.
+    let light = |c: Color32| c.gamma_multiply(0.3);
+    let mut last_notch = f32::NEG_INFINITY;
+    for b in on_top {
+        let (a, z) = match b {
+            Band::Value { from, to, .. } | Band::Mixed { from, to, .. } => short(from, to),
+        };
+        painter.rect_filled(Rect::from_min_max(pos2(a, area.min.y), pos2(z, area.max.y)), 0.0, bg);
+        match b {
+            Band::Value { y, assumed, .. } => {
+                let c = crate::library::palette(y as usize + 3);
+                let band = Rect::from_min_max(pos2(a, area.min.y), pos2(z, area.max.y));
+                painter.rect_filled(band, 0.0, if assumed { c.gamma_multiply(0.15) } else { light(c) });
+            }
+            Band::Mixed { states, .. } => {
+                let ids: Vec<u32> = states.iter().flatten().copied().collect();
+                if ids.is_empty() {
+                    // Only unset values: grey.
+                    let band = Rect::from_min_max(pos2(a, area.min.y), pos2(z, area.max.y));
+                    painter.rect_filled(band, 0.0, mixed_color.gamma_multiply(0.35));
+                }
+                // One stripe per value that occurred, top to bottom.
+                let h = area.height() / ids.len().max(1) as f32;
+                for (k, id) in ids.iter().enumerate() {
+                    let top = area.min.y + k as f32 * h;
+                    let band = Rect::from_min_max(pos2(a, top), pos2(z, top + h));
+                    painter.rect_filled(band, 0.0, light(crate::library::palette(*id as usize + 3)));
+                }
+            }
+        }
+        // One notch per few pixels: many in a row read as one ridge.
+        let mid = (a + z) / 2.0;
+        if mid - last_notch >= NOTCH_GAP {
+            last_notch = mid;
+            let t = area.min.y;
+            let tri = vec![pos2(mid - 4.0, t), pos2(mid + 4.0, t), pos2(mid, t + 6.0)];
+            painter.add(egui::Shape::convex_polygon(tri, notch, Stroke::NONE));
+        }
+    }
+}
+
+/// Notches of widened states this far apart (points), at least.
+const NOTCH_GAP: f32 = 6.0;
+
+/// Narrower than this (points), an enum's state is drawn this wide.
+const SHORT_BAND: f32 = 3.0;
+
+/// The changes of an enum lane within an x range, when there are several:
+/// what a hover near a crowded spot names.
+#[derive(Debug, PartialEq)]
+struct Hidden {
+    /// Each value that came, with how many times, in the order first seen.
+    states: Vec<(String, usize)>,
+    changes: usize,
+    /// From the first change to the last.
+    span: f64,
+}
+
+impl Hidden {
+    fn text(&self, is_time: bool) -> String {
+        let states: Vec<String> = self.states.iter().map(|(s, n)| format!("{s} ×{n}")).collect();
+        format!(
+            "near here: {} ({} changes in {}): zoom in to see them",
+            states.join(", "),
+            self.changes,
+            duration(self.span, is_time)
+        )
+    }
+}
+
+/// [`Hidden`] of `lane` between `a` and `b` (none: fewer than two changes).
+fn hidden_states(lane: &Lane, a: f64, b: f64) -> Option<Hidden> {
+    /// Events looked at, at most (zoomed far out, a spot can hold many).
+    const MAX_LOOK: usize = 100_000;
+    let from = lane.xs.partition_point(|&v| v < a);
+    let to = lane.xs.partition_point(|&v| v <= b).min(from + MAX_LOOK);
+    let mut states: Vec<(String, usize)> = Vec::new();
+    let (mut changes, mut first, mut last) = (0, f64::NAN, f64::NAN);
+    for i in from..to {
+        let y = lane.ys[i];
+        let changed = i == 0 || lane.ys[i - 1].to_bits() != y.to_bits();
+        if !changed || !y.is_finite() {
+            continue;
+        }
+        changes += 1;
+        first = if first.is_nan() { lane.xs[i] } else { first };
+        last = lane.xs[i];
+        let label = lane.labels.get(y as usize).cloned().unwrap_or_default();
+        match states.iter_mut().find(|(s, _)| *s == label) {
+            Some((_, n)) => *n += 1,
+            None => states.push((label, 1)),
+        }
+    }
+    (changes >= 2).then_some(Hidden { states, changes, span: last - first })
 }
 
 /// The events: a tick per pixel column that has one.
@@ -2136,6 +2264,40 @@ fn short_num(v: f64) -> String {
 mod tests {
     use super::*;
 
+    /// A short state near the pointer is named in the hover, with how many
+    /// changes and over how long; a single change (two wide bands) isn't.
+    #[test]
+    fn short_states_near_the_pointer_are_named() {
+        let labels = vec!["idle".to_owned(), "error".to_owned()];
+        // idle, error at 10.00, idle at 10.04, error at 10.05, idle at 10.06.
+        let xs = vec![0.0, 10.0, 10.04, 10.05, 10.06, 20.0];
+        let ys = vec![0.0, 1.0, 0.0, 1.0, 0.0, 0.0];
+        let n = xs.len();
+        let lane = Lane::new(
+            "st".into(),
+            "st".into(),
+            SignalKind::Enum,
+            xs,
+            ys,
+            (0..n as u64).collect(),
+            vec![false; n],
+            labels,
+        );
+        let h = hidden_states(&lane, 9.9, 10.1).expect("several changes");
+        assert_eq!(h.states, [("error".to_owned(), 2), ("idle".to_owned(), 2)]);
+        assert_eq!(h.changes, 4);
+        assert!((h.span - 0.06).abs() < 1e-9);
+        assert!(h.text(false).starts_with("near here: error ×2, idle ×2 (4 changes in "), "{}", h.text(false));
+        // Around the first change alone: nothing hidden.
+        assert_eq!(hidden_states(&lane, -1.0, 1.0), None);
+        // Drawn: the short ones become a mixed band naming both values.
+        let bands = lane.bands((0.0, 200.0), 0, n, |x| x as f32 * 10.0);
+        assert!(
+            bands.iter().any(|b| matches!(b, Band::Mixed { states, .. } if states[..2] == [Some(1), Some(0)])),
+            "{bands:?}"
+        );
+    }
+
     /// Cursors snap to where a value changes, not to an event that repeats
     /// it; the nearest change of the lanes given, within the tolerance.
     #[test]
@@ -2156,11 +2318,11 @@ mod tests {
         // 0/1 signal: changes at 0 (its first event), 3 and 7; 1, 2, 5 repeat.
         let bit = lane("bit", &[0.0, 1.0, 2.0, 3.0, 5.0, 7.0], &[0.0, 0.0, 0.0, 1.0, 1.0, 0.0]);
         let other = lane("other", &[4.4], &[9.0]);
-        assert_eq!(snap_to_change(&[&bit], 2.6, 0.5), Some((3.0, "bit".into())));
+        assert_eq!(snap_to_change(&[&bit], 2.6, 0.5), Some((3.0, "bit".into(), 3)));
         assert_eq!(snap_to_change(&[&bit], 5.1, 0.5), None, "5 repeats the value: no change");
         assert_eq!(snap_to_change(&[&bit], 4.0, 0.5), None, "too far: placed where clicked");
-        assert_eq!(snap_to_change(&[&bit, &other], 4.0, 0.5), Some((4.4, "other".into())));
-        assert_eq!(snap_to_change(&[&bit, &other], 3.6, 0.8), Some((3.0, "bit".into())), "the nearer one");
+        assert_eq!(snap_to_change(&[&bit, &other], 4.0, 0.5), Some((4.4, "other".into(), 0)));
+        assert_eq!(snap_to_change(&[&bit, &other], 3.6, 0.8), Some((3.0, "bit".into(), 3)), "the nearer one");
         assert_eq!(snap_to_change(&[], 3.0, 1.0), None);
     }
 
@@ -2530,6 +2692,69 @@ mod tests {
         });
         full.textures_delta.clear();
         out
+    }
+
+    /// Owner, 2026-11-20: nerka froze while a cursor was dragged across
+    /// lanes. A cursor dragged over enum lanes with short states and a
+    /// number lane, frame by frame, back and forth: every frame returns.
+    #[test]
+    fn dragging_a_cursor_across_lanes_keeps_going() {
+        let text: String = (0..3000)
+            .map(|i| {
+                // A state every 10 s, with a 0.1 s blip now and then.
+                let s = if i % 97 == 0 {
+                    "error"
+                } else if (i / 100) % 2 == 0 {
+                    "idle"
+                } else {
+                    "busy"
+                };
+                format!("{:02}:{:02}:{:02}.{} st={s} v={}\n", i / 36000, (i / 600) % 60, (i / 10) % 60, i % 10, i % 13)
+            })
+            .collect();
+        let file = nerka_core::TextFile::from_bytes("t", text.into_bytes());
+        let mut sig = Signals::default();
+        sig.set(nerka_core::SignalDef::parse_spec(r"t:time=/^(?<t>\S+)/").unwrap());
+        sig.set(nerka_core::SignalDef::parse_spec(r"st:enum=/st=(?<st>\w+)/").unwrap());
+        sig.set(nerka_core::SignalDef::parse_spec(r"v=/v=(?<v>\d+)/").unwrap());
+        for d in sig.iter() {
+            d.series(&file, &nerka_core::Progress::new()).unwrap();
+        }
+        let mut st = PlotState::default();
+        st.toggle("st");
+        st.toggle("v");
+        let ctx = egui::Context::default();
+        let mut t = 0.0;
+        let mut step = |events, st: &mut PlotState| {
+            t += 1.0 / 60.0;
+            frame(&ctx, t, events, st, &sig, &file)
+        };
+        step(vec![], &mut st);
+        let (x0, x1) = st.data.as_ref().map(|(_, d)| d.full).expect("built");
+        st.cursors = vec![x0 + (x1 - x0) * 0.25];
+        step(vec![], &mut st);
+        // The cursor's pixel: where its line is drawn.
+        let w = 800.0 - GUTTER - 20.0;
+        let px = |x: f64| GUTTER + 8.0 + ((x - x0) / (x1 - x0)) as f32 * w;
+        let start = pos2(px(st.cursors[0]), 120.0);
+        let button = |pos, pressed| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        let began = std::time::Instant::now();
+        step(vec![egui::Event::PointerMoved(start), button(start, true)], &mut st);
+        for k in 0..400 {
+            // Right and left over the whole width, up and down over the lanes.
+            let f = (k as f32 / 400.0 * std::f32::consts::TAU * 2.0).sin() * 0.5 + 0.5;
+            let p = pos2(GUTTER + 10.0 + f * (w - 20.0), 60.0 + (k % 60) as f32 * 3.0);
+            step(vec![egui::Event::PointerMoved(p)], &mut st);
+        }
+        let dragged = st.cursors[0];
+        step(vec![button(start, false)], &mut st);
+        assert!(began.elapsed() < std::time::Duration::from_secs(20), "{:?}", began.elapsed());
+        assert!((dragged - x0 - (x1 - x0) * 0.25).abs() > (x1 - x0) * 0.01, "the cursor moved: {dragged}");
     }
 
     /// What a plot of N FIBEX argument signals costs on a big capture: the
