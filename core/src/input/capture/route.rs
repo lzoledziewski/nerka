@@ -27,6 +27,26 @@ pub struct Datagram {
     pub vlan: [u16; 2],
 }
 
+impl Datagram {
+    /// `10.0.0.1:3490 → 10.0.0.2:3490 VLAN 5`: ports left out when not
+    /// known (a fragment), VLANs when untagged.
+    pub fn describe(&self) -> String {
+        use crate::input::proto::addr_text;
+        let (src, dst) = (addr_text(&self.src, self.v6), addr_text(&self.dst, self.v6));
+        let mut out = if self.src_port == 0 && self.dst_port == 0 {
+            format!("{src} → {dst}")
+        } else if self.v6 {
+            format!("[{src}]:{} → [{dst}]:{}", self.src_port, self.dst_port)
+        } else {
+            format!("{src}:{} → {dst}:{}", self.src_port, self.dst_port)
+        };
+        for v in self.vlan.iter().filter(|&&v| v != 0) {
+            out.push_str(&format!(" VLAN {v}"));
+        }
+        out
+    }
+}
+
 /// An address and how many of its leading bits count.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Prefix {

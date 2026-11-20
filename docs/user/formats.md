@@ -98,6 +98,49 @@ nerka-gui ecu1.dlt ecu2.dlt bus.pcap
 - **`file`** tells the files apart in queries ([Queries](queries.md#file-in-a-view-of-several-files)).
 - Bookmarks stay in each file's own `.nerka-marks`.
 
+## What wasn't read
+
+A damaged file still opens: what can't be read is skipped, and the status
+line and the top bar say how much with ⚠ (`120 bytes weren't DLT messages:
+skipped`, `3 datagrams lost a fragment: not read`, `2 MiB of the file
+couldn't be read`). **Click ⚠ in the top bar** for where, one by one:
+
+| Column | |
+|---|---|
+| kind | *not whole messages* (bytes of a `.dlt` file or a datagram that weren't messages), *lost a fragment* (a datagram whose IP fragments didn't all arrive), *unreadable* (the rest of a pcap after a broken block, MF4 blocks) |
+| line | the first line read after it: click the row to go there |
+| time | its frame's capture time; in a `.dlt` file, the message's before it |
+| frame | its frame's number in a pcap / pcapng: Wireshark's `frame.number` |
+| bytes | how many (a lost fragment: what did arrive) |
+| detail | the protocol, the datagram's addresses, ports and VLAN, and why, as far as nerka can tell: *a message of 1520 bytes with 900 left: cut short*, *no DLT header here*; and *the capture cut its frame: 1514 of 9000 bytes kept* when the frame is shorter in the file than it was on the wire (the capture's snap length) |
+
+Hovering a row shows its offset in the file and its first 16 bytes in hex.
+Each file lists its first 10,000; past that they are counted.
+
+What the rows usually mean:
+
+- *cut short* with *the capture cut its frame*: the capture's snap length
+  was too small for these frames; capture again with a larger one.
+  *Cut short* without it: the sender wrote a message longer than the
+  datagram.
+- *no DLT header here*: the data stopped being DLT within a datagram. One
+  sender in the summary: that sender; a whole port: something else uses
+  it (Settings → Captures: protocols says which datagrams are DLT).
+- *lost a fragment*: an IP fragment never reached the capture. Above the
+  list, a pcapng's own statistics say whether the capture dropped packets
+  (*capture drops: some*) or not (*none*: they were lost before it, on the
+  network); pcap and MF4 files don't record that.
+- *unreadable*, at the end: the file stops in the middle (a capture or a
+  copy cut off).
+
+**Export…** writes every skip, however many, to a tab-separated file: the
+files are read again and nothing is kept in memory. At the top it says
+nerka's version, the system, each file's name (not its folder), size and
+kind and the capture settings; each row has the columns above and the
+skip's first 16 bytes; a summary at the end counts them per kind and per
+sender. That is enough to attach to a bug report without the file itself
+(the 16 bytes are the only data from the file in it).
+
 ## Times
 
 Times are kept in UTC. The GUI shows **local time** by default, the CLI

@@ -105,7 +105,17 @@ impl LogSource for Merged {
     }
 
     fn info(&self) -> super::SourceInfo {
-        self.inner.info()
+        let mut info = self.inner.info();
+        // Skips on the rows their next lines are on now (sorted by time:
+        // the list stays in file order).
+        let skips: Vec<super::Skip> = (info.skips.iter())
+            .map(|s| super::Skip {
+                line: s.line.and_then(|l| self.row_of.get(usize::try_from(l).ok()?).copied()),
+                ..s.clone()
+            })
+            .collect();
+        info.skips = std::sync::Arc::new(skips);
+        info
     }
 
     fn line_count(&self) -> LineNo {

@@ -1,0 +1,44 @@
+# Queries for the demo trace (`cargo run -p nerka-core --example gen_demo -- demo.dlt`),
+# the one the user guide's screenshots show. Load with `--pack examples/packs/`.
+pack demo
+
+## Warnings and worse, from every ECU.
+query warnings  labels: severity  color: orange
+    level >= WARN
+
+## Errors and worse: a refinement of warnings.
+query errors  parent: warnings  labels: severity  color: red
+    level >= ERROR
+
+## The vehicle's speed, from the navigation's GPS lines.
+query speed  labels: vehicle  color: blue
+    apid == NAV AND payload ~ /speed=(?<speed>\d+) km\/h/
+
+## The gear lever: P, R, N or D.
+query gear  labels: vehicle  color: teal  signals: gear:enum
+    apid == NAV AND payload ~ /gear=(?<gear>\w)/
+
+## The SoC temperature (°C).
+query temperature  labels: thermal  color: orange
+    apid == THRM AND payload ~ /temp=(?<temp>[\d.]+) C/
+
+## Throttling engaged, active or released.
+query throttling  labels: thermal  color: violet
+    apid == THRM AND payload ~ /throttling/
+
+## The battery voltage (mV), from the gateway.
+query voltage  labels: power  color: green
+    apid == PWR AND payload ~ /voltage=(?<voltage>\d+) mV/
+
+## Below 11 V: a refinement of voltage.
+query undervoltage  parent: voltage  labels: power  color: red
+    level >= WARN
+
+## The over-the-air update's state on ECU1.
+query ota  labels: update  color: pink  signals: ota:enum:default(idle)
+    ecu == ECU1 AND apid == OTA AND payload ~ /OTA state=(?<ota>\w+)/
+
+## Sessions to one ECU that timed out; @timeout_ms: how long each waited.
+query timeouts(ecu)  labels: network  color: red
+    apid == COM AND level >= ERROR
+    AND payload ~ /session \d+ to $ecu timeout after (?<timeout_ms>\d+) ms/

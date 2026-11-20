@@ -319,6 +319,11 @@ pub fn format_time(t: f64, digits: usize) -> String {
     format_shown(shown(t), digits)
 }
 
+/// [`format_time`] in UTC whatever [`is_local`] says (files for scripts).
+pub fn format_utc(t: f64, digits: usize) -> String {
+    format_shown(t, digits)
+}
+
 /// [`format_time`] of a value already [`shown`].
 fn format_shown(t: f64, digits: usize) -> String {
     let digits = digits.min(9);

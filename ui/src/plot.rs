@@ -56,6 +56,46 @@ pub struct Detached {
     pub closed: bool,
     /// The theme the window last drew with.
     theme: Option<egui::ThemePreference>,
+    /// Where the window was, for opening it there again.
+    pub placed: Placement,
+    /// `--screenshot`: the window's picture goes here once it is drawn.
+    pub shoot: Option<Arc<Mutex<Option<egui::ColorImage>>>>,
+}
+
+/// Where the plot's window was last: maximized (remembered between runs),
+/// else its position and size (this run only: a monitor may be gone by the
+/// next).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Placement {
+    pub maximized: Option<bool>,
+    pub pos: Option<egui::Pos2>,
+    pub size: Option<egui::Vec2>,
+}
+
+impl Placement {
+    /// Record what the window reports (nothing while it is minimized).
+    pub fn update(&mut self, info: &egui::ViewportInfo) {
+        if info.minimized == Some(true) {
+            return;
+        }
+        if let Some(m) = info.maximized {
+            self.maximized = Some(m);
+        }
+        if info.maximized == Some(false) && info.fullscreen != Some(true) {
+            self.pos = info.outer_rect.map(|r| r.min).or(self.pos);
+            self.size = info.inner_rect.map(|r| r.size()).or(self.size);
+        }
+    }
+
+    /// A new window where this one was (maximized as `maximized` says).
+    pub fn builder(&self, maximized: bool) -> egui::ViewportBuilder {
+        let b = egui::ViewportBuilder::default().with_inner_size(self.size.unwrap_or(egui::vec2(1100.0, 460.0)));
+        let b = match self.pos {
+            Some(p) => b.with_position(p),
+            None => b,
+        };
+        b.with_maximized(maximized)
+    }
 }
 
 pub struct WindowInput {
@@ -164,7 +204,7 @@ impl Bookmark {
 /// Paint the plot's own window (the deferred viewport's callback).
 pub fn window_ui(ui: &mut egui::Ui, shared: &Mutex<Detached>) {
     let mut d = shared.lock().unwrap_or_else(|e| e.into_inner());
-    let Detached { input, views, out, closed, theme } = &mut *d;
+    let Detached { input, views, out, closed, theme, placed, shoot } = &mut *d;
     // egui tells the window's frame (title bar) the theme at the end of a
     // pass, and the frame takes it at the window's next pass: draw one more
     // after a change, else the frame stays a theme behind.
@@ -173,7 +213,15 @@ pub fn window_ui(ui: &mut egui::Ui, shared: &Mutex<Detached>) {
         *theme = Some(now);
         ui.ctx().request_repaint();
     }
-    let Some(i) = input else { return };
+    ui.ctx().input(|i| placed.update(i.viewport()));
+    let Some(i) = input else {
+        // Its tab reads its files again (Reload): the window stays.
+        egui::CentralPanel::default().show(ui, |ui| {
+            ui.centered_and_justified(|ui| ui.label("Reading the files…"));
+        });
+        *closed |= ui.input(|i| i.viewport().close_requested());
+        return;
+    };
     let mut series_of = |def: &SignalDef| views.series(def, &*i.file, i.kept.as_ref(), i.generation);
     let src = Source {
         signals: &i.signals,
@@ -190,6 +238,9 @@ pub fn window_ui(ui: &mut egui::Ui, shared: &Mutex<Detached>) {
     let mut plot = lock(&i.plot);
     let o = egui::CentralPanel::default().show(ui, |ui| plot_panel(ui, &mut plot, src)).inner;
     drop(plot);
+    if let Some(slot) = shoot.take() {
+        crate::shot::request_into(ui.ctx(), slot);
+    }
     out.goto = o.goto.or(out.goto);
     out.toggle_window |= o.toggle_window;
     out.bookmark = o.bookmark.or(out.bookmark.take());
@@ -243,9 +294,12 @@ pub struct PlotState {
     /// The cursor being dragged, and where the context menu was opened.
     drag_cursor: Option<usize>,
     menu_x: Option<f64>,
+    /// The lane whose change `menu_x` snapped to.
+    menu_snap: Option<String>,
     /// The event nearest to where the menu was opened: its line and lane.
     menu_row: Option<(LineNo, String)>,
-    /// The note typed in the menu for a new bookmark.
+    /// The name and note typed in the menu for a bookmark.
+    bookmark_name: String,
     bookmark_note: String,
     /// Bookmarks aren't drawn.
     pub hide_bookmarks: bool,
@@ -409,8 +463,9 @@ pub struct Output {
     pub goto: Option<LineNo>,
     /// Move the plot to its own window, or back.
     pub toggle_window: bool,
-    /// Bookmark this line with this note (added, or its note replaced).
-    pub bookmark: Option<(LineNo, String)>,
+    /// Bookmark this line (added, or changed): its name (empty: the one it
+    /// has, or the next free `B<n>`) and note.
+    pub bookmark: Option<(LineNo, String, String)>,
     /// The kept plots' list or menu was used.
     pub plots: Option<PlotAction>,
     /// The plot was closed (its ✖).
@@ -418,6 +473,8 @@ pub struct Output {
 }
 
 const GUTTER: f32 = 120.0;
+/// How near (points) a placed or dragged cursor snaps to a change.
+const SNAP_PX: f32 = 6.0;
 const GUTTER_MIN: f32 = 60.0;
 /// A row of the strip above the lanes (tags, Δt).
 const MARK_ROW: f32 = 17.0;
@@ -918,10 +975,34 @@ pub fn plot_panel(ui: &mut egui::Ui, state: &mut PlotState, src: Source<'_>) -> 
         // Where the press began: egui starts a drag only after some movement.
         state.drag_cursor = ui.input(|i| i.pointer.press_origin()).and_then(near_cursor);
     }
+    // Snapping: a cursor placed or dragged near a change of a signal goes
+    // onto it (the lane under the pointer, else any lane), within a few
+    // pixels; farther away, or with Alt held, it stays where the pointer is.
+    let snap = |x: f64, p: Pos2, (x0, x1, scroll): (f64, f64, f32)| -> (f64, Option<String>) {
+        if ui.input(|i| i.modifiers.alt) {
+            return (x, None);
+        }
+        let tol = SNAP_PX as f64 * (x1 - x0) / w;
+        let under = (plot.y_range().contains(p.y) && !data.lanes.is_empty())
+            .then(|| lane_at(p.y, plot.min.y, lane_h, scroll, data.lanes.len()));
+        let lanes: Vec<&Lane> = match under {
+            Some(k) => vec![&*data.lanes[k]],
+            None => data.lanes.iter().map(|l| &**l).collect(),
+        };
+        match snap_to_change(&lanes, x, tol) {
+            Some((at, lane)) => (at, Some(lane)),
+            None => (x, None),
+        }
+    };
     if response.dragged() {
         let dx = response.drag_delta().x as f64 * (x1 - x0) / w;
         match state.drag_cursor {
-            Some(i) => state.cursors[i] += dx,
+            Some(i) => {
+                if let Some(p) = response.interact_pointer_pos() {
+                    let at = x0 + (p.x - plot.min.x).clamp(0.0, plot.width()) as f64 / w * (x1 - x0);
+                    state.cursors[i] = snap(at, p, (x0, x1, state.scroll)).0;
+                }
+            }
             None => {
                 if dx != 0.0 {
                     (x0, x1) = (x0 - dx, x1 - dx);
@@ -940,7 +1021,9 @@ pub fn plot_panel(ui: &mut egui::Ui, state: &mut PlotState, src: Source<'_>) -> 
         && let Some(p) = response.interact_pointer_pos()
     {
         let mx = x0 + (p.x - plot.min.x).clamp(0.0, plot.width()) as f64 / w * (x1 - x0);
-        state.menu_x = Some(mx);
+        let (at, snapped) = snap(mx, p, (x0, x1, state.scroll));
+        state.menu_x = Some(at);
+        state.menu_snap = snapped;
         // The event nearest to it in any lane: what a bookmark goes on.
         state.menu_row = data
             .lanes
@@ -955,17 +1038,15 @@ pub fn plot_panel(ui: &mut egui::Ui, state: &mut PlotState, src: Source<'_>) -> 
             })
             .min_by(|a, b| a.0.total_cmp(&b.0))
             .map(|(_, row, lane)| (row, lane));
-        state.bookmark_note = state
-            .menu_row
-            .as_ref()
-            .and_then(|(row, _)| bookmarks.iter().find(|b| b.line == *row))
-            .map(|b| b.note.clone())
-            .unwrap_or_default();
+        let existing = state.menu_row.as_ref().and_then(|(row, _)| bookmarks.iter().find(|b| b.line == *row));
+        state.bookmark_note = existing.map(|b| b.note.clone()).unwrap_or_default();
+        state.bookmark_name = existing.map(|b| b.name.clone()).unwrap_or_default();
     }
-    let (menu_x, menu_row) = (state.menu_x, state.menu_row.clone());
+    let (menu_x, menu_row, menu_snap) = (state.menu_x, state.menu_row.clone(), state.menu_snap.clone());
     let mut bookmark = None;
     response.context_menu_with_fields(|ui| {
-        bookmark = cursor_menu(ui, &mut state.cursors, menu_x, menu_row, &mut state.bookmark_note);
+        let fields = (&mut state.bookmark_name, &mut state.bookmark_note);
+        bookmark = cursor_menu(ui, &mut state.cursors, menu_x, menu_snap.as_deref(), menu_row, fields);
     });
     out.bookmark = bookmark;
     if let Some(p) = ui.input(|i| i.pointer.hover_pos()).filter(|_| response.contains_pointer()) {
@@ -1006,6 +1087,29 @@ pub fn plot_panel(ui: &mut egui::Ui, state: &mut PlotState, src: Source<'_>) -> 
     let lanes_clip = Rect::from_min_max(pos2(rect.min.x, plot.min.y), pos2(rect.max.x, plot.max.y));
     let painter = base.with_clip_rect(lanes_clip);
     let mut drop_at = None;
+    // Time cursors (dashed) and bookmarks: lines from the tags' strip to the
+    // axis, drawn before the lanes, so a signal changing on the same x shows
+    // over them (a marker there hid the change, red on a red signal worst).
+    let amber = Color32::from_rgb(230, 150, 20);
+    let red = Color32::from_rgb(220, 60, 60);
+    let verticals: Vec<(f32, Color32, bool)> = (state.cursors.iter().map(|&c| (c, amber, true)))
+        .chain(marks.iter().map(|m| (m.x, red, false)))
+        .filter(|(x, ..)| (x0..=x1).contains(x))
+        .map(|(x, c, dashed)| (to_px(x, x0, x1), c, dashed))
+        .collect();
+    let draw_verticals = |p: &egui::Painter, alpha: f32| {
+        for &(px, c, dashed) in &verticals {
+            let line = [pos2(px, strip.min.y), pos2(px, plot.max.y)];
+            let stroke = Stroke::new(1.5, c.gamma_multiply(alpha));
+            if dashed {
+                p.extend(egui::Shape::dashed_line(&line, stroke, 5.0, 3.0));
+            } else {
+                p.line_segment(line, stroke);
+            }
+        }
+    };
+    draw_verticals(&base, 1.0);
+    let mut band_areas = Vec::new();
     for (k, lane) in data.lanes.iter().enumerate() {
         let top = plot.min.y + k as f32 * lane_h - state.scroll;
         if top + lane_h < plot.min.y {
@@ -1112,7 +1216,10 @@ pub fn plot_panel(ui: &mut egui::Ui, state: &mut PlotState, src: Source<'_>) -> 
         // The state at the left edge is the last event before it.
         let from = i0.saturating_sub(1);
         match lane.kind {
-            SignalKind::Enum => draw_bands(&painter, lane, area, from, i1, |x| to_px(x, x0, x1), &font, weak),
+            SignalKind::Enum => {
+                draw_bands(&painter, lane, area, from, i1, |x| to_px(x, x0, x1), &font, weak);
+                band_areas.push(area.intersect(lanes_clip));
+            }
             _ => {
                 let markers = state.markers.get(&lane.name).map_or(&[][..], Vec::as_slice);
                 let (lo, hi) = match state.y.get(&lane.name).copied().unwrap_or(YAxis::All) {
@@ -1187,21 +1294,15 @@ pub fn plot_panel(ui: &mut egui::Ui, state: &mut PlotState, src: Source<'_>) -> 
 
     // ----- time cursors and bookmarks: lines through the lanes; their tags
     // and the Δt between neighbours in a strip of their own above the lanes
-    // (owner, 2026-10-25: not over the values) -----
-    let amber = Color32::from_rgb(230, 150, 20);
-    let red = Color32::from_rgb(220, 60, 60);
+    // (owner, 2026-10-25: not over the values); the lines are drawn under
+    // the lanes, above -----
+    // Over enum bands, which hide them: faint, so a change stays visible.
+    for area in &band_areas {
+        draw_verticals(&painter.with_clip_rect(*area), 0.45);
+    }
     let mut placed: Vec<(String, f64)> = state.cursors.iter().enumerate().map(|(i, &c)| (cursor_name(i), c)).collect();
     placed.extend(marks.iter().map(|m| (m.name(), m.x)));
     placed.sort_by(|a, b| a.1.total_cmp(&b.1));
-    for &c in state.cursors.iter().filter(|c| (x0..=x1).contains(*c)) {
-        let px = to_px(c, x0, x1);
-        let line = [pos2(px, strip.min.y), pos2(px, axis_y)];
-        painter.extend(egui::Shape::dashed_line(&line, Stroke::new(1.5, amber), 5.0, 3.0));
-    }
-    for m in marks.iter().filter(|m| (x0..=x1).contains(&m.x)) {
-        let px = to_px(m.x, x0, x1);
-        painter.line_segment([pos2(px, strip.min.y), pos2(px, axis_y)], Stroke::new(1.5, red));
-    }
     // Tags, left to right, in rows: one that would hide the name of the one
     // before it goes a row down (owner, 2026-11-02: two bookmarks on one x
     // are two). Each is cut where the next one in its row starts (hover:
@@ -1767,23 +1868,39 @@ fn cursor_menu(
     ui: &mut egui::Ui,
     cursors: &mut Vec<f64>,
     x: Option<f64>,
+    snapped: Option<&str>,
     row: Option<(LineNo, String)>,
-    note: &mut String,
-) -> Option<(LineNo, String)> {
+    (name, note): (&mut String, &mut String),
+) -> Option<(LineNo, String, String)> {
     let mut bookmark = None;
     if let Some((line, lane)) = row {
         ui.label(egui::RichText::new("Bookmark").strong());
-        ui.add(egui::TextEdit::singleline(note).hint_text("note").desired_width(200.0));
+        // The name is what the plot's tag and the Bookmarks panel show
+        // first; the note says more (hover).
+        egui::Grid::new("bookmark-fields").num_columns(2).show(ui, |ui| {
+            ui.label("name");
+            ui.add(egui::TextEdit::singleline(name).hint_text("B1, B2… if empty").desired_width(160.0));
+            ui.end_row();
+            ui.label("note");
+            ui.add(egui::TextEdit::singleline(note).hint_text("optional").desired_width(160.0));
+            ui.end_row();
+        });
         let r = ui.button(format!("🔖 Bookmark line {}", line + 1));
         if r.on_hover_text(format!("The event of @{lane} nearest to where you clicked")).clicked() {
-            bookmark = Some((line, note.trim().to_owned()));
+            bookmark = Some((line, name.trim().to_owned(), note.trim().to_owned()));
             ui.close();
         }
         ui.separator();
     }
     ui.label(egui::RichText::new("Time cursors").strong());
     let Some(x) = x else { return bookmark };
-    if ui.button(format!("Place cursor {} here", cursor_name(cursors.len()))).clicked() {
+    let place = match snapped {
+        Some(lane) => format!("Place cursor {} at the change of @{lane}", cursor_name(cursors.len())),
+        None => format!("Place cursor {} here", cursor_name(cursors.len())),
+    };
+    let tip = "Near a change of a signal (the lane under the pointer first), a cursor goes onto it; \
+               hold Alt to place or drag it freely";
+    if ui.button(place).on_hover_text(tip).clicked() {
         cursors.push(x);
         ui.close();
     }
@@ -1799,6 +1916,30 @@ fn cursor_menu(
         ui.close();
     }
     bookmark
+}
+
+/// The change of a signal nearest to `x`, at most `tol` away, in `lanes`:
+/// an event whose value differs from the one before it (the first event
+/// too). Returns its x and the lane's name.
+fn snap_to_change(lanes: &[&Lane], x: f64, tol: f64) -> Option<(f64, String)> {
+    /// Events looked at per lane, at most (zoomed far out, many are near).
+    const MAX_LOOK: usize = 4096;
+    let mut best: Option<(f64, f64, &str)> = None;
+    for lane in lanes {
+        let from = lane.xs.partition_point(|&v| v < x - tol);
+        let to = lane.xs.partition_point(|&v| v <= x + tol).min(from + MAX_LOOK);
+        for i in from..to {
+            let changed = i == 0 || {
+                let (a, b) = (lane.ys[i - 1], lane.ys[i]);
+                a != b && !(a.is_nan() && b.is_nan())
+            };
+            let d = (lane.xs[i] - x).abs();
+            if changed && best.is_none_or(|(bd, ..)| d < bd) {
+                best = Some((d, lane.xs[i], &lane.name));
+            }
+        }
+    }
+    best.map(|(_, at, name)| (at, name.to_owned()))
 }
 
 /// The y-axis menu of a number lane; `all` is the range of all its values.
@@ -1994,6 +2135,70 @@ fn short_num(v: f64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Cursors snap to where a value changes, not to an event that repeats
+    /// it; the nearest change of the lanes given, within the tolerance.
+    #[test]
+    fn cursors_snap_to_the_nearest_change() {
+        let lane = |name: &str, xs: &[f64], ys: &[f64]| {
+            let n = xs.len();
+            Lane::new(
+                name.into(),
+                name.into(),
+                SignalKind::Num,
+                xs.to_vec(),
+                ys.to_vec(),
+                (0..n as u64).collect(),
+                vec![false; n],
+                Vec::new(),
+            )
+        };
+        // 0/1 signal: changes at 0 (its first event), 3 and 7; 1, 2, 5 repeat.
+        let bit = lane("bit", &[0.0, 1.0, 2.0, 3.0, 5.0, 7.0], &[0.0, 0.0, 0.0, 1.0, 1.0, 0.0]);
+        let other = lane("other", &[4.4], &[9.0]);
+        assert_eq!(snap_to_change(&[&bit], 2.6, 0.5), Some((3.0, "bit".into())));
+        assert_eq!(snap_to_change(&[&bit], 5.1, 0.5), None, "5 repeats the value: no change");
+        assert_eq!(snap_to_change(&[&bit], 4.0, 0.5), None, "too far: placed where clicked");
+        assert_eq!(snap_to_change(&[&bit, &other], 4.0, 0.5), Some((4.4, "other".into())));
+        assert_eq!(snap_to_change(&[&bit, &other], 3.6, 0.8), Some((3.0, "bit".into())), "the nearer one");
+        assert_eq!(snap_to_change(&[], 3.0, 1.0), None);
+    }
+
+    /// The plot's window opens where it was: maximized as it was left, else
+    /// at its last position and size; a minimized window changes nothing.
+    #[test]
+    fn the_plot_window_placement_follows_the_window() {
+        let rect = |x: f32, y: f32, w: f32, h: f32| Some(egui::Rect::from_min_size(egui::pos2(x, y), egui::vec2(w, h)));
+        let mut p = Placement::default();
+        let normal = egui::ViewportInfo {
+            maximized: Some(false),
+            minimized: Some(false),
+            outer_rect: rect(100.0, 50.0, 820.0, 430.0),
+            inner_rect: rect(110.0, 80.0, 800.0, 400.0),
+            ..Default::default()
+        };
+        p.update(&normal);
+        assert_eq!(
+            p,
+            Placement {
+                maximized: Some(false),
+                pos: Some(egui::pos2(100.0, 50.0)),
+                size: Some(egui::vec2(800.0, 400.0))
+            }
+        );
+        let max =
+            egui::ViewportInfo { maximized: Some(true), outer_rect: rect(0.0, 0.0, 1920.0, 1040.0), ..normal.clone() };
+        p.update(&max);
+        assert_eq!(p.maximized, Some(true));
+        assert_eq!(p.size, Some(egui::vec2(800.0, 400.0)), "the size to go back to is kept");
+        p.update(&egui::ViewportInfo { minimized: Some(true), maximized: Some(false), ..normal.clone() });
+        assert_eq!(p.maximized, Some(true), "minimized: still maximized when shown again");
+        let b = p.builder(true);
+        assert_eq!(b.maximized, Some(true));
+        assert_eq!(b.position, Some(egui::pos2(100.0, 50.0)));
+        assert_eq!(b.inner_size, Some(egui::vec2(800.0, 400.0)));
+        assert_eq!(Placement::default().builder(false).inner_size, Some(egui::vec2(1100.0, 460.0)));
+    }
 
     /// Review 2026-11-14, P2: a lane is built again only when what it shows
     /// changed (its signal's events, the clock); another lane plotted or

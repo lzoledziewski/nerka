@@ -14,6 +14,11 @@ powershell -ExecutionPolicy Bypass -File tools/screenshot.ps1 -Out shot.png -App
 .EXAMPLE
 # Open the About dialog (F1) before capturing; -Keys uses SendKeys syntax.
 powershell -ExecutionPolicy Bypass -File tools/screenshot.ps1 -Out about.png -Keys '{F1}'
+
+.EXAMPLE
+# Click a point of the window's content (x,y in its pixels, as the app's
+# own --screenshot shows them), then capture the content alone.
+powershell -ExecutionPolicy Bypass -File tools/screenshot.ps1 -Out edit.png -Clicks '956,233' -Client
 #>
 param(
     [Parameter(Mandatory)] [string]$Out,
@@ -25,7 +30,12 @@ param(
     [int]$Wait = 3,
     [switch]$KeepOpen,
     # Keystrokes sent to the window before capturing (SendKeys syntax, e.g. '{F1}', '^g').
-    [string]$Keys = ''
+    [string]$Keys = '',
+    # Left clicks before capturing, in order: 'x,y' in the window's content
+    # (its client area), in its pixels.
+    [string[]]$Clicks = @(),
+    # Capture the content alone (no title bar or borders), as --screenshot does.
+    [switch]$Client
 )
 $ErrorActionPreference = 'Stop'
 if (-not $Exe) { $Exe = Join-Path (Split-Path -Parent $MyInvocation.MyCommand.Path) '..\target\debug\nerka-gui.exe' }
@@ -38,6 +48,11 @@ public class NerkaShotWin32 {
   [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr h, out RECT r);
   [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);
   [DllImport("user32.dll")] public static extern bool SetProcessDPIAware();
+  [StructLayout(LayoutKind.Sequential)] public struct POINT { public int X, Y; }
+  [DllImport("user32.dll")] public static extern bool GetClientRect(IntPtr h, out RECT r);
+  [DllImport("user32.dll")] public static extern bool ClientToScreen(IntPtr h, ref POINT p);
+  [DllImport("user32.dll")] public static extern bool SetCursorPos(int x, int y);
+  [DllImport("user32.dll")] public static extern void mouse_event(uint flags, uint dx, uint dy, uint data, UIntPtr extra);
 }
 "@
 # Physical pixels, so the capture matches the window at any display scaling.
@@ -75,7 +90,31 @@ try {
         (New-Object -ComObject WScript.Shell).SendKeys($Keys)
         Start-Sleep -Milliseconds 700
     }
+    foreach ($c in $Clicks) {
+        $xy = $c -split ','
+        $pt = New-Object NerkaShotWin32+POINT
+        $pt.X = [int]$xy[0]; $pt.Y = [int]$xy[1]
+        [NerkaShotWin32]::ClientToScreen($p.MainWindowHandle, [ref]$pt) | Out-Null
+        [NerkaShotWin32]::SetCursorPos($pt.X, $pt.Y) | Out-Null
+        Start-Sleep -Milliseconds 150
+        [NerkaShotWin32]::mouse_event(0x02, 0, 0, 0, [UIntPtr]::Zero)
+        Start-Sleep -Milliseconds 60
+        [NerkaShotWin32]::mouse_event(0x04, 0, 0, 0, [UIntPtr]::Zero)
+        Start-Sleep -Milliseconds 700
+    }
+    if ($Clicks) {
+        # The pointer out of the way: no hover highlight or tooltip in the picture.
+        [NerkaShotWin32]::SetCursorPos(0, 0) | Out-Null
+        Start-Sleep -Milliseconds 500
+    }
     [NerkaShotWin32]::GetWindowRect($p.MainWindowHandle, [ref]$r) | Out-Null
+    if ($Client) {
+        $cr = New-Object NerkaShotWin32+RECT
+        [NerkaShotWin32]::GetClientRect($p.MainWindowHandle, [ref]$cr) | Out-Null
+        $o = New-Object NerkaShotWin32+POINT
+        [NerkaShotWin32]::ClientToScreen($p.MainWindowHandle, [ref]$o) | Out-Null
+        $r.L = $o.X; $r.T = $o.Y; $r.R = $o.X + $cr.R; $r.B = $o.Y + $cr.B
+    }
     $w = $r.R - $r.L; $h = $r.B - $r.T
     $bmp = New-Object System.Drawing.Bitmap $w, $h
     $g = [System.Drawing.Graphics]::FromImage($bmp)

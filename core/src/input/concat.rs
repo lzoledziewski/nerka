@@ -253,7 +253,7 @@ impl LogSource for Concat {
     /// Its parts': protocols each once, notes with the file they're about.
     fn info(&self) -> super::SourceInfo {
         let mut out = super::SourceInfo::default();
-        for (p, file) in self.parts.iter().zip(&self.files) {
+        for ((p, file), &first) in self.parts.iter().zip(&self.files).zip(&self.starts) {
             let i = p.info();
             for proto in i.protocols {
                 if !out.protocols.iter().any(|o| o.eq_ignore_ascii_case(&proto)) {
@@ -262,6 +262,15 @@ impl LogSource for Concat {
             }
             out.notes.extend(i.notes.into_iter().map(|n| format!("{file}: {n}")));
             out.no_sender += i.no_sender;
+            // Skips on the view's lines, with their file.
+            let mapped = i.skips.iter().map(|s| super::Skip {
+                line: s.line.map(|l| l + first),
+                file: file.clone(),
+                ..s.clone()
+            });
+            std::sync::Arc::make_mut(&mut out.skips).extend(mapped);
+            out.skips_more += i.skips_more;
+            out.about.extend(i.about.into_iter().map(|a| format!("{file}: {a}")));
         }
         out.files = self.files.clone();
         out

@@ -21,7 +21,7 @@ Options for opening files (below) go before or after the command.
 | `search PATTERN FILE…` | print the lines a regex matches, like `grep -n` |
 | `lines FILE FROM TO` | print a range of lines (1-based, inclusive) |
 | `marks FILE` | list the bookmarks saved for a file |
-| `expand` | turn [pack](packs.md) picks into plain NFD |
+| `expand` | turn [Library](library.md) picks into plain NFD |
 | `packs` | list the loaded packs and their queries |
 | `check FILE…` | run the [checks](checks.md) (`--check`): issues and facts |
 | `lifecycles FILE…` | print the [lifecycles](lifecycles.md) (`--lifecycle`) and their findings |

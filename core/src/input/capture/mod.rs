@@ -29,7 +29,8 @@ use super::proto::{
     Framed, LoadedProtocol, MAX_CHANNELS, MAX_ORIGINS, MAX_PROTOCOLS, MAX_SENDERS, Origins, ProtoId, Protocol, Records,
     someip::SomeIp, syslog::Syslog,
 };
-use crate::{Error, Progress, Result};
+use super::{Skip, SkipKind, Skips};
+use crate::{Error, LineNo, Progress, Result};
 use net::{Net, NetStats, Payload};
 use route::{Datagram, Match, Route};
 use std::borrow::Cow;
@@ -96,6 +97,31 @@ pub struct CaptureOptions {
     pub mf4_local_time: bool,
 }
 
+impl CaptureOptions {
+    /// For a report: the ports, the protocol definitions, the rules and
+    /// what is turned off.
+    pub fn describe(&self) -> String {
+        let ports = |p: &[u16]| p.iter().map(u16::to_string).collect::<Vec<_>>().join(",");
+        let mut out = format!(
+            "DLT ports {}; SOME/IP ports {}; syslog ports {}",
+            ports(&self.dlt_udp_ports),
+            ports(&self.someip_udp_ports),
+            ports(&self.syslog_udp_ports)
+        );
+        for p in &self.protocols {
+            let rules: Vec<String> = p.routes.iter().map(|r| r.to_string()).collect();
+            out.push_str(&format!("; definition {} ({})", p.protocol.name(), rules.join(" ")));
+        }
+        for r in &self.routes {
+            out.push_str(&format!("; rule {}:{}", r.protocol, r.rule));
+        }
+        if !self.disabled.is_empty() {
+            out.push_str(&format!("; off: {}", self.disabled.join(",")));
+        }
+        out
+    }
+}
+
 impl Default for CaptureOptions {
     fn default() -> Self {
         Self {
@@ -126,10 +152,48 @@ pub struct CaptureStats {
     /// Messages whose datagram's sender wasn't kept (more than
     /// [`MAX_SENDERS`] senders): they have no `net.*` fields.
     pub senders_not_kept: u64,
+    /// What a pcapng file's interface statistics say the capture dropped
+    /// (none: a pcap or MF4 file, which can't say; empty: a pcapng without
+    /// statistics).
+    pub drops: Option<Vec<pcap::Drops>>,
 }
 
 impl CaptureStats {
     /// What was dropped, for people (empty: nothing).
+    /// What the capture's own statistics say it dropped, for a report:
+    /// whether what is missing was lost before the capture or by it.
+    pub fn drops_report(&self) -> String {
+        let Some(drops) = &self.drops else {
+            return "capture drops: unknown (pcap and MF4 files don't record them)".into();
+        };
+        if drops.is_empty() {
+            return "capture drops: unknown (no interface statistics in this pcapng)".into();
+        }
+        let n = |v: Option<u64>| v.map_or_else(|| "?".into(), |v| v.to_string());
+        let each: Vec<String> = drops
+            .iter()
+            .map(|d| {
+                format!(
+                    "interface {}: received {}, dropped {} by the interface, {} by the system",
+                    d.interface,
+                    n(d.received),
+                    n(d.by_interface),
+                    n(d.by_system)
+                )
+            })
+            .collect();
+        let total: u64 = drops.iter().map(pcap::Drops::total).sum();
+        let counted = drops.iter().any(|d| d.by_interface.is_some() || d.by_system.is_some());
+        let verdict = if !counted {
+            "unknown: the statistics don't count drops"
+        } else if total == 0 {
+            "none: what is missing was lost before the capture saw it"
+        } else {
+            "some: what is missing may have been dropped by the capture"
+        };
+        format!("capture drops: {verdict} ({})", each.join("; "))
+    }
+
     pub fn notes(&self) -> Vec<String> {
         let mut out = Vec::new();
         if self.msg_skipped > 0 {
@@ -140,6 +204,12 @@ impl CaptureStats {
         }
         if self.net.incomplete > 0 {
             out.push(format!("{} datagrams lost a fragment: not read", self.net.incomplete));
+        }
+        let dropped: u64 = self.drops.iter().flatten().map(pcap::Drops::total).sum();
+        if dropped > 0 {
+            out.push(format!(
+                "the capture itself dropped {dropped} packets (its interface statistics): they aren't in the file"
+            ));
         }
         if self.senders_not_kept > 0 {
             out.push(format!(
@@ -161,7 +231,19 @@ pub fn is_capture(head: &[u8]) -> bool {
 pub fn open(path: impl AsRef<Path>, options: &CaptureOptions, progress: &Progress) -> Result<(Records, CaptureStats)> {
     let path = path.as_ref();
     let data = Bytes::map(path)?;
-    read(path.display().to_string(), Some(path.to_path_buf()), data, options, progress)
+    read(path.display().to_string(), Some(path.to_path_buf()), data, options, progress, Skips::default())
+}
+
+/// Read a capture again for its skips only, each into `skips` (an export:
+/// none kept); returns what it found.
+pub(crate) fn read_skips(
+    path: &Path,
+    options: &CaptureOptions,
+    progress: &Progress,
+    skips: Skips,
+) -> Result<CaptureStats> {
+    let data = Bytes::map(path)?;
+    Ok(read(path.display().to_string(), Some(path.to_path_buf()), data, options, progress, skips)?.1)
 }
 
 /// In-memory capture, handy for tests.
@@ -170,7 +252,7 @@ pub fn from_bytes(
     bytes: Vec<u8>,
     options: &CaptureOptions,
 ) -> Result<(Records, CaptureStats)> {
-    read(name.into(), None, Bytes::Owned(bytes), options, &Progress::new())
+    read(name.into(), None, Bytes::Owned(bytes), options, &Progress::new(), Skips::default())
 }
 
 fn read(
@@ -179,6 +261,7 @@ fn read(
     data: Bytes,
     options: &CaptureOptions,
     progress: &Progress,
+    mut skips: Skips,
 ) -> Result<(Records, CaptureStats)> {
     let file = data.bytes();
     // Compressed MF4 data: unpacked, and the messages point into that.
@@ -195,7 +278,7 @@ fn read(
     let protos = protocols(options)?;
     let rules = rules(options, &protos);
     let mut sink = Sink {
-        net: Net::default(),
+        net: Net::with_skips(skips.share()),
         c: Collector {
             base: bytes,
             delimited: protos.iter().map(|p| p.delimited()).collect(),
@@ -206,6 +289,10 @@ fn read(
             found: Vec::new(),
             origins: OriginTable::default(),
             sized: false,
+            skips: skips.share(),
+            frame: None,
+            cut: None,
+            file_offsets: unpacked.is_none(),
         },
         options,
         rules: &rules,
@@ -219,7 +306,13 @@ fn read(
         mf4::read(file, bytes, layout, progress, &mut sink)?
     } else {
         let buf = file;
-        pcap::frames(buf, progress, &mut |fr| sink.link_frame(fr.link, fr.data, fr.secs, fr.usecs, fr.channel))?
+        let read = pcap::frames(buf, progress, &mut |fr| {
+            sink.c.frame = Some(fr.number);
+            sink.c.cut = (fr.wire_len > fr.data.len()).then_some((fr.data.len() as u64, fr.wire_len as u64));
+            sink.link_frame(fr.link, fr.data, fr.secs, fr.usecs, fr.channel)
+        })?;
+        sink.c.stats.drops = read.drops;
+        read.skipped
     };
     if sink.too_far {
         return Err(Error::Format("capture too large to index (offsets over 1 TiB)".into()));
@@ -230,6 +323,27 @@ fn read(
     let mut stats = c.stats;
     stats.net = net.stats;
     stats.file_skipped = file_skipped;
+    skips.append(c.skips);
+    skips.append(net.skips);
+    if file_skipped > 0 {
+        // What follows can't be read: the rest of a pcap / pcapng file (an
+        // MF4's are blocks here and there).
+        let mf4 = mf4::is_mf4(file);
+        let at = file.len().saturating_sub(file_skipped as usize);
+        skips.push(Skip {
+            kind: SkipKind::Unreadable,
+            line: None,
+            time: None,
+            frame: None,
+            offset: (!mf4).then_some(at as u64),
+            bytes: file_skipped,
+            detail: if mf4 { "MF4 blocks".into() } else { "the rest of the file".into() },
+            file: String::new(),
+            head: if mf4 { Vec::new() } else { Skip::head_of(&file[at..]) },
+            cut: None,
+        });
+    }
+    skips.finish();
     let (mut msgs, mut side) = (c.msgs, c.side);
     msgs.shrink_to_fit();
     side.shrink_to_fit();
@@ -240,7 +354,9 @@ fn read(
         None => data,
     };
     let records = Records::framed(name, path, data, msgs, side, origins, protos, skipped)
-        .with_notes(stats.notes(), stats.senders_not_kept);
+        .with_notes(stats.notes(), stats.senders_not_kept)
+        .with_about(vec![stats.drops_report()])
+        .with_skips(skips);
     Ok((records, stats))
 }
 
@@ -258,6 +374,7 @@ pub(crate) struct Sink<'a, 'o> {
 impl<'a> Sink<'a, '_> {
     /// A link-layer frame (pcap): transport, then the router.
     fn link_frame(&mut self, link: u32, data: &'a [u8], secs: u32, usecs: i32, channel: usize) {
+        self.net.at = (self.c.frame, self.c.msgs.len() as LineNo);
         let (c, rules, too_far) = (&mut self.c, self.rules, &mut self.too_far);
         self.net.frame(link, data, secs, &mut |dg, payload| {
             if let Some(proto) = route(rules, dg) {
@@ -268,6 +385,7 @@ impl<'a> Sink<'a, '_> {
 
     /// An Ethernet frame's payload with its EtherType (MF4 `ETH_Frame`).
     fn ether(&mut self, ethertype: u16, data: Cow<'a, [u8]>, secs: u32, usecs: i32, channel: usize) {
+        self.net.at = (None, self.c.msgs.len() as LineNo);
         let (c, rules, too_far) = (&mut self.c, self.rules, &mut self.too_far);
         match data {
             Cow::Borrowed(d) => self.net.ether_frame(ethertype, d, secs, &mut |dg, payload| {
@@ -360,6 +478,14 @@ struct Collector<'a> {
     origins: OriginTable,
     /// `msgs` was sized for the whole file (from its first messages).
     sized: bool,
+    /// Bytes of datagrams that weren't messages, one by one.
+    skips: Skips,
+    /// The number of the frame at hand in a pcap / pcapng file.
+    frame: Option<u64>,
+    /// The frame at hand was cut by the capture: bytes kept, on the wire.
+    cut: Option<(u64, u64)>,
+    /// `base` is the file (not unpacked MF4 data): its offsets are the file's.
+    file_offsets: bool,
 }
 
 /// Builds a capture's [`Origins`]: each sender and each (channel, sender)
@@ -420,6 +546,51 @@ impl OriginTable {
 }
 
 impl Collector<'_> {
+    /// The last `skipped` bytes of `bytes`, a datagram of `proto` whose
+    /// `messages` messages before them were read: one skip, with why.
+    #[allow(clippy::too_many_arguments)]
+    fn skip(
+        &mut self,
+        bytes: &[u8],
+        skipped: usize,
+        proto: ProtoId,
+        sender: Option<&Datagram>,
+        messages: usize,
+        secs: u32,
+        usecs: i32,
+    ) {
+        let start = bytes.len() - skipped;
+        let rest = &bytes[start..];
+        let name = self.protos[proto].name();
+        let mut detail = match sender {
+            Some(d) => format!("{name} {}", d.describe()),
+            None => name.to_owned(),
+        };
+        detail.push_str(&format!(", datagram of {} bytes, {messages} messages read before", bytes.len()));
+        if proto == DLT {
+            detail.push_str(&format!("; {}", crate::input::dlt::why_not_message(rest)));
+        }
+        if let Some((kept, wire)) = self.cut {
+            detail.push_str(&format!("; the capture cut its frame: {kept} of {wire} bytes kept (its snap length)"));
+        }
+        // Within the file (not copied out of it): where.
+        let base = self.base.as_ptr() as usize;
+        let at = rest.as_ptr() as usize;
+        let offset = (self.file_offsets && at >= base && at < base + self.base.len()).then(|| (at - base) as u64);
+        self.skips.push(Skip {
+            kind: SkipKind::NotMessages,
+            line: Some((self.msgs.len() + messages) as LineNo),
+            time: Some(f64::from(secs) + f64::from(usecs) / 1e6),
+            frame: self.frame,
+            offset,
+            bytes: skipped as u64,
+            detail,
+            file: String::new(),
+            head: Skip::head_of(rest),
+            cut: self.cut,
+        });
+    }
+
     /// Index the messages of one datagram of protocol `proto`, from
     /// `sender` (`None`: not a UDP datagram). Returns false if an offset
     /// doesn't fit the index.
@@ -454,6 +625,9 @@ impl Collector<'_> {
         let bytes = payload.bytes();
         let skipped = self.protos[proto].split(bytes, found);
         self.stats.msg_skipped += skipped as u64;
+        if skipped > 0 {
+            self.skip(bytes, skipped, proto, sender, found.len(), secs, usecs);
+        }
         if found.is_empty() {
             return true;
         }

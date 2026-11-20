@@ -79,11 +79,12 @@ the filter, search, selection and the line you are on.
 
 | Button | Opens |
 |---|---|
-| 📚 Library (`Ctrl+Shift+L`) | the library of query packs and this tab's selection ([Query packs](packs.md)) |
+| 📚 Library (`Ctrl+Shift+L`) | the Library of queries and this tab's selection ([The Library](library.md)) |
 | 📈 Signals | signals and lifecycles of this tab ([Signals](signals.md), [Lifecycles](lifecycles.md)) |
 | ✔ Checks | checks and their results ([Checks](checks.md)) |
 | 📈 Plot | the plot of this tab's signals |
 | 📷 (`Ctrl+Shift+S`) | copies a screenshot of the window to the clipboard |
+| ⚠ after the file's size in the top bar | what wasn't read, one by one, with an export for a bug report ([What wasn't read](formats.md#what-wasnt-read)) |
 | ⚙ (`Ctrl+,`) | settings ([Settings](settings.md)) |
 | ℹ About (`F1`) | version, licence, the repository |
 
@@ -137,7 +138,7 @@ nerka-gui [OPTIONS] [FILE]...
 | `--marker NAME=VALUE[:LABEL]`, `--cursor TIME` | a line in a plotted lane, a time cursor |
 | `--fibex FILE` | a FIBEX file for DLT non-verbose messages |
 | `--new-window`, `--name NAME` | a window of its own, its name |
-| `--screenshot PATH` | once the files are loaded, the signals collected and the plot drawn, save the window as a PNG and close it (for checks without a person at the screen) |
+| `--screenshot PATH` | once the files are loaded, the signals collected and the plot drawn, save the window as a PNG and close it (for checks without a person at the screen); a plot in its own window is saved too, as `PATH-plot.png` (`shot.png` → `shot-plot.png`) |
 | `-h, --help`, `-V, --version` | |
 
 A `--signal`, `--lifecycle` or `--check` that doesn't parse is listed in an

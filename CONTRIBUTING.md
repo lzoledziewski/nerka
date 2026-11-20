@@ -24,6 +24,26 @@ libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libgl1-mesa-dev`.
 CI runs the same checks on Linux and Windows, plus a licence and advisory
 check of the dependencies (`cargo deny check`) and the sign-off check below.
 
+The binaries are `target/release/nerka-gui` and `target/release/nerka`
+after `cargo build --release --workspace` (on Windows, the MSVC toolchain
+with the "Desktop development with C++" build tools).
+
+The user guide's screenshots of the demo trace are made again with
+`bash tools/docs-shots.sh` (the trace: `cargo run -p nerka-core --example
+gen_demo -- demo.dlt`, its queries: `examples/packs/demo.nerka-pack`).
+
+## The project's working notes
+
+`docs/dev/` is not part of the user guide; it holds what working on nerka
+needs:
+
+- [CLAUDE.md](CLAUDE.md): commands and rules, for contributors and AI agents.
+- [docs/dev/status.md](docs/dev/status.md): current state, pending decisions and next steps.
+- [docs/dev/gui-decisions.md](docs/dev/gui-decisions.md) and [docs/dev/features.md](docs/dev/features.md): the decisions behind the GUI and the features.
+- [docs/dev/architecture-analysis.md](docs/dev/architecture-analysis.md): architecture and the [original spec](docs/dev/nerka_architecture_implementation_spec_v_0.md).
+- Designs: [search manager](docs/dev/search-manager.md), [search modes](docs/dev/search-modes.md), [sources and signals](docs/dev/sources-and-signals.md), [protocol definitions](docs/dev/protocol-definitions.md), [lifecycles](docs/dev/lifecycles.md), [checks](docs/dev/checks.md), [bundles](docs/dev/bundles.md), [text profiles](docs/dev/text-profiles.md) (not built).
+- [docs/dev/history.md](docs/dev/history.md): the dated log; reviews in [docs/dev/review/](docs/dev/review/).
+
 ## Rules of the code base
 
 - `core/` holds **all** filtering, parsing and format logic. The CLI and the
@@ -56,7 +76,8 @@ check of the dependencies (`cargo deny check`) and the sign-off check below.
 ## Pull requests
 
 - One topic per pull request; describe what changes and why.
-- Update the docs in `docs/dev/` (and `README.md`) when behaviour changes.
+- Update the user guide (`docs/user/`, and `README.md`) when behaviour
+  changes.
 - Fill in the checklist of the pull request template.
 
 ## Sign your commits (DCO)

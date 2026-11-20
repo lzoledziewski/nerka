@@ -8,6 +8,8 @@
 //! [`MAX_PENDING`] are waiting, and counted.
 
 use super::route::Datagram;
+use crate::LineNo;
+use crate::input::{Skip, SkipKind, Skips};
 use std::collections::HashMap;
 
 /// Seconds of capture time an incomplete datagram may wait for fragments.
@@ -60,6 +62,8 @@ struct Partial {
     last: u32,
     /// Addresses and VLAN tags (ports come with the reassembled datagram).
     meta: Datagram,
+    /// Where its first fragment came: frame, line, time.
+    first: (Option<u64>, LineNo, u32),
 }
 
 /// The transport state (pending fragments) of one capture.
@@ -68,9 +72,19 @@ pub struct Net {
     pending: HashMap<FragKey, Partial>,
     pub stats: NetStats,
     now: u32,
+    /// The frame being read (its number in the file) and the line the
+    /// next message gets: where a datagram that loses a fragment was.
+    pub(crate) at: (Option<u64>, LineNo),
+    /// Datagrams that lost a fragment, one by one.
+    pub(crate) skips: Skips,
 }
 
 impl Net {
+    /// A transport whose lost datagrams go to `skips`.
+    pub(crate) fn with_skips(skips: Skips) -> Net {
+        Net { skips, ..Net::default() }
+    }
+
     /// One frame of link type `link` captured at `secs`: calls `out` with
     /// the addresses, ports and VLAN tags and the payload of every UDP
     /// datagram it completes.
@@ -126,15 +140,43 @@ impl Net {
 
     /// Drop the datagrams still incomplete (end of capture).
     pub fn finish(&mut self) {
-        self.stats.incomplete += self.pending.len() as u64;
-        self.pending.clear();
+        let mut left: Vec<Partial> = self.pending.drain().map(|(_, p)| p).collect();
+        left.sort_by_key(|p| p.first.1);
+        left.into_iter().for_each(|p| self.lost(p));
     }
 
     fn expire(&mut self) {
         let now = self.now;
-        let before = self.pending.len();
-        self.pending.retain(|_, p| now.saturating_sub(p.last) <= FRAGMENT_TIMEOUT_SECS);
-        self.stats.incomplete += (before - self.pending.len()) as u64;
+        let stale: Vec<FragKey> = (self.pending.iter())
+            .filter(|(_, p)| now.saturating_sub(p.last) > FRAGMENT_TIMEOUT_SECS)
+            .map(|(k, _)| *k)
+            .collect();
+        for k in stale {
+            let p = self.pending.remove(&k).expect("listed");
+            self.lost(p);
+        }
+    }
+
+    /// A datagram whose fragments didn't all arrive: counted, and listed
+    /// with the bytes that did.
+    fn lost(&mut self, p: Partial) {
+        self.stats.incomplete += 1;
+        let (frame, line, secs) = p.first;
+        let head = p.parts.iter().find(|(o, _)| *o == 0).map_or_else(Vec::new, |(_, b)| Skip::head_of(b));
+        let got: usize = p.parts.iter().map(|(_, b)| b.len()).sum();
+        let total = p.total.map_or_else(|| "?".into(), |t| t.to_string());
+        self.skips.push(Skip {
+            kind: SkipKind::LostFragment,
+            line: Some(line),
+            time: Some(f64::from(secs)),
+            frame,
+            offset: None,
+            bytes: got as u64,
+            detail: format!("{}, {} of {total} bytes in {} fragments", p.meta.describe(), got, p.parts.len()),
+            file: String::new(),
+            head,
+            cut: None,
+        });
     }
 
     fn ether_payload<'a>(&mut self, mut ty: u16, mut d: &'a [u8], out: &mut dyn FnMut(&Datagram, Payload<'a>)) -> bool {
@@ -253,12 +295,18 @@ impl Net {
         if self.pending.len() >= MAX_PENDING && !self.pending.contains_key(&key) {
             // Make room: drop the stalest datagram.
             if let Some(k) = self.pending.iter().min_by_key(|(_, p)| p.last).map(|(k, _)| *k) {
-                self.pending.remove(&k);
-                self.stats.incomplete += 1;
+                let p = self.pending.remove(&k).expect("found");
+                self.lost(p);
             }
         }
-        let now = self.now;
-        let p = self.pending.entry(key).or_insert_with(|| Partial { parts: Vec::new(), total: None, last: now, meta });
+        let (now, first) = (self.now, (self.at.0, self.at.1, self.now));
+        let p = self.pending.entry(key).or_insert_with(|| Partial {
+            parts: Vec::new(),
+            total: None,
+            last: now,
+            meta,
+            first,
+        });
         p.last = now;
         if !more {
             p.total = Some(offset + body.len());

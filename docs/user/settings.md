@@ -31,8 +31,8 @@ Nothing is stored in the cloud. Your configuration folder is
 
 | File or folder | Holds |
 |---|---|
-| `packs\` | [query packs](packs.md) (`*.nerka-pack`) |
-| `presets\` | [presets](packs.md#presets) (`*.nerka-preset`) |
+| `packs\` | the [Library](library.md)'s packs (`*.nerka-pack`) |
+| `presets\` | [presets](library.md#presets) (`*.nerka-preset`) |
 | `plots\` | kept [plots](signals.md#plots) |
 | `signals` | saved signals and lifecycles, one spec per line |
 | `checks` | saved [checks](checks.md), one spec per line |
