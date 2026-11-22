@@ -241,6 +241,20 @@ check fewer words.
 - **First-line rule**: the regex is tried on the file's first non-empty
   line; several profiles matching: the first in list order wins (name
   rules before first-line rules).
+- **A field `profile`** on every line of a text file (its profile's name),
+  for filters (`profile == app`); a JSON key `profile` is then
+  `json.profile`.
+- **A profile's signals are like the built-in ones** in the Signals panel:
+  shown as `profile NAME`, read-only, changed in Profiles…. Each reads only
+  its profile's files (`profile == NAME AND (QUERY)`); two profiles giving a
+  name with the same options are one signal (each file its own query),
+  with other options the first file's profile wins. A name taken by
+  another source: saved / `--signal` over the file's `@time`, over a
+  profile's, over a FIBEX argument, over a query's group; the winner shows
+  ⚠ with what it hides (the CLI: a note).
+- **A record split belongs to its file** (owner's report): a tab's
+  Records… sets and remembers it for the tab's text files only, and a file
+  opened beside them keeps its own.
 
 ## Open questions
 

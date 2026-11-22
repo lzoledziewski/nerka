@@ -517,6 +517,20 @@ fn text_with_times_merges_with_dlt() {
         s(&log),
     ]);
     assert_eq!(out(&o).lines().count(), 2, "{}{}", out(&o), err(&o));
+    // `profile` is a field; a --signal of the name hides the profile's, said.
+    let o = nerka(&["--merge", "filter", "-c", "profile == default", s(&dlt), s(&log)]);
+    assert_eq!(out(&o), "4\n", "{}", err(&o));
+    let o = nerka(&[
+        "--signal",
+        "word:enum=/(?<word>gps)/",
+        "--profile",
+        "app: name app.*; time auto; signal word:enum=/app (?<word>\\w+)/",
+        "filter",
+        "-c",
+        "@word.event",
+        s(&log),
+    ]);
+    assert!(err(&o).contains("@word of profile app isn't used: a signal of that name is given already"), "{}", err(&o));
     // Errors say what to write.
     let o = nerka(&["--profile", "nope", "filter", "x", s(&log)]);
     assert!(err(&o).contains("--profile nope: no such profile"), "{}", err(&o));

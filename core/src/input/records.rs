@@ -217,7 +217,9 @@ impl JsonFields {
         let (mut schema, mut paths) = (Vec::new(), Vec::new());
         for (p, keys, kind) in seen.into_iter().filter(|(p, _, _)| usable(p)) {
             paths.push(keys);
-            let name = if matches!(p.as_str(), "raw" | "level" | "bookmark") { format!("json.{p}") } else { p };
+            // `profile`: the field every text file has (`input::timed`).
+            let name =
+                if matches!(p.as_str(), "raw" | "level" | "bookmark" | "profile") { format!("json.{p}") } else { p };
             schema.push(FieldDef::owned(name, kind, false));
         }
         JsonFields { schema, paths, level }

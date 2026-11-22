@@ -230,9 +230,10 @@ fn json_is_found_unless_lines_are_asked_for() {
     let auto = crate::OpenOptions::default();
     let lines = crate::OpenOptions { records: Some(RecordSplit::Lines), ..Default::default() };
     let open = |path: &Path, o: &crate::OpenOptions| crate::open_with(path, o, &p).unwrap();
-    assert_eq!((open(&j, &auto).line_count(), open(&j, &auto).schema().len()), (4, 8));
-    assert_eq!((open(&j, &lines).line_count(), open(&j, &lines).schema().len()), (5, 0));
-    assert_eq!((open(&t, &auto).line_count(), open(&t, &auto).schema().len()), (2, 0), "[INFO] is text");
+    // Opened files have `profile` too.
+    assert_eq!((open(&j, &auto).line_count(), open(&j, &auto).schema().len()), (4, 9));
+    assert_eq!((open(&j, &lines).line_count(), open(&j, &lines).schema().len()), (5, 1));
+    assert_eq!((open(&t, &auto).line_count(), open(&t, &auto).schema().len()), (2, 1), "[INFO] is text");
     assert_eq!(RecordSplit::parse_choice("auto").unwrap(), None);
     assert_eq!(RecordSplit::parse_choice("json").unwrap(), Some(RecordSplit::Json));
     std::fs::remove_dir_all(&dir).ok();
@@ -242,12 +243,13 @@ fn json_is_found_unless_lines_are_asked_for() {
 /// `bookmark` is then ambiguous, and says how to write either.
 #[test]
 fn keys_named_like_nfd_fields_are_written_json_dot() {
-    let text = r#"{"raw": "r1", "level": "warn", "bookmark": "b1", "msg": "hello"}
-{"raw": "r2", "level": "error", "bookmark": "b2", "msg": "bye"}
+    let text = r#"{"raw": "r1", "level": "warn", "bookmark": "b1", "msg": "hello", "profile": "p1"}
+{"raw": "r2", "level": "error", "bookmark": "b2", "msg": "bye", "profile": "p2"}
 "#;
     let f = json(text);
     let names: Vec<&str> = f.schema().iter().map(|d| d.name.as_ref()).collect();
-    assert_eq!(names, ["json.raw", "json.level", "json.bookmark", "msg"]);
+    // `profile` is the field every opened text file has (its profile).
+    assert_eq!(names, ["json.raw", "json.level", "json.bookmark", "msg", "json.profile"]);
     let q = |s: &str| run_on(&f, &Filter::Query(Query::compile(s).unwrap()));
     assert_eq!(q("json.raw == r2"), [1]);
     assert_eq!(q("json.level == warn"), [0], "the key's text");

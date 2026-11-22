@@ -598,6 +598,19 @@ pub fn query_warnings(query: &crate::Query, source: &dyn LogSource) -> Vec<Strin
             });
         }
     }
+    let mut profiles: Vec<&str> = Vec::new();
+    for r in info.reading.iter().filter(|r| !r.profile.is_empty()) {
+        if !profiles.contains(&r.profile.as_str()) {
+            profiles.push(&r.profile);
+        }
+    }
+    if !profiles.is_empty() {
+        for v in query.values_compared(timed::PROFILE_FIELD) {
+            if !profiles.iter().any(|p| p.eq_ignore_ascii_case(&v)) {
+                out.push(format!("no file here is read with profile '{v}' (there are: {})", profiles.join(", ")));
+            }
+        }
+    }
     out
 }
 

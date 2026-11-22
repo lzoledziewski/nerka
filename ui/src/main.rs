@@ -760,6 +760,8 @@ struct Tab {
     /// (remembered per file; a file not listed: automatic, JSON if it looks
     /// like JSON, else its profile's). Never one file's for another.
     records_for: Vec<(PathBuf, nerka_core::input::records::RecordSplit)>,
+    /// Per signal, what of the same name it hides (Signals panel: ⚠).
+    signal_hidden: std::collections::HashMap<String, Vec<String>>,
     /// The Records window, while it is open.
     records_edit: Option<records::Edit>,
     /// The files are being read in a new order or set.
@@ -1386,6 +1388,7 @@ impl Tab {
             arg_picks: Vec::new(),
             files_edit: None,
             records_for,
+            signal_hidden: Default::default(),
             records_edit: None,
             files_undo: None,
             merge,
@@ -1701,14 +1704,30 @@ impl Tab {
         }
         self.signals_key = Some(key);
         let mut s = Signals::default().for_source(&*file);
+        let mut hidden: std::collections::HashMap<String, Vec<String>> = Default::default();
+        // What a signal of a name taken already would have been: said on
+        // the one that has it.
+        let mut hide = |name: &str, what: String| hidden.entry(name.to_ascii_lowercase()).or_default().push(what);
         // The saved ones switched on (owner, 2026-11-07: off keeps them).
         for d in saved.iter().filter(|d| d.is_on()) {
+            if d.name() == "time" && s.get("time").is_some_and(|t| t.is_from_source()) {
+                hide("time", "the file's own time (built in)".into());
+            }
             s.set((**d).clone());
         }
-        // Those the files' profiles switch on (a saved one of the name wins).
-        for d in profiles::current().signals_for(&file.info().reading) {
+        // Those the files' profiles switch on, each for its files only (a
+        // saved one of the name wins).
+        let from_profiles = profiles::current().signals_for(&file.info().reading);
+        for c in &from_profiles.clashes {
+            if let Some(name) = c.strip_prefix('@').and_then(|c| c.split(':').next()) {
+                hide(name, c.clone());
+            }
+        }
+        for d in from_profiles.signals {
             if s.get(d.name()).is_none() {
                 s.set(d);
+            } else {
+                hide(d.name(), format!("profile {}'s: {}", d.profiles().join(", "), d.spec()));
             }
         }
         // FIBEX arguments picked in the Signals panel.
@@ -1721,9 +1740,9 @@ impl Tab {
             // By the signal's name, which is lower case (an argument's may not be).
             let options = self.query_options.get(&a.name.to_ascii_lowercase()).cloned().unwrap_or_default();
             let kind = options.kind.unwrap_or(a.ty.kind());
-            if s.get(&a.name).is_none()
-                && let Ok(d) = nerka_core::SignalDef::argument(&a.name, kind, &query, a.index, &from)
-            {
+            if s.get(&a.name).is_some() {
+                hide(&a.name, format!("the FIBEX argument {} ({from})", a.name));
+            } else if let Ok(d) = nerka_core::SignalDef::argument(&a.name, kind, &query, a.index, &from) {
                 // A default that doesn't fit the kind is left out.
                 let without_default = nerka_core::SignalOptions { default: None, ..options.clone() };
                 if let Ok(d) = options.apply(d.clone()).or_else(|_| without_default.apply(d)) {
@@ -1764,6 +1783,8 @@ impl Tab {
                 // A saved signal of the same name wins.
                 if s.get(d.name()).is_none() {
                     s.set(d);
+                } else {
+                    hide(d.name(), format!("the group (?<{}>…) of query {}", d.group(), d.queries().join(", ")));
                 }
             }
         }
@@ -1771,6 +1792,7 @@ impl Tab {
         if let Some(e) = s.resolve_lifecycles(lib).into_iter().next() {
             self.status = e;
         }
+        self.signal_hidden = hidden;
         // The same definitions as before, on this file (a Selection change
         // that makes no signal: an Exclude query, one without named
         // groups): nothing changed, so the checks, filters and the plot
@@ -5677,6 +5699,7 @@ impl App {
                         chosen: &tab.query_options,
                         pack_options: &tab.pack_options,
                         conflicts: &tab.option_conflicts,
+                        hidden: &tab.signal_hidden,
                     };
                     signals::signals_panel(ui, &mut tab.signals_ui, input)
                 })
@@ -5734,6 +5757,10 @@ impl App {
                 && tab.set_filter("query", &nfd)
             {
                 tab.start_search(ui.ctx());
+            }
+            // A profile's signal clicked: where it is edited.
+            if out.open_profiles {
+                self.profiles_edit = Some(profiles::Editor::open());
             }
             // A check's signal clicked: the check in the Checks pane.
             if let Some(name) = out.open_check {
@@ -6402,6 +6429,7 @@ query timeouts  labels: vision
                         chosen: &tab.query_options,
                         pack_options: &tab.pack_options,
                         conflicts: &tab.option_conflicts,
+                        hidden: &tab.signal_hidden,
                     };
                     changed = signals::signals_panel(ui, &mut tab.signals_ui, input).args_changed;
                 });

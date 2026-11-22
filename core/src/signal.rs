@@ -671,6 +671,9 @@ pub struct SignalDef {
     /// The value is this argument of the matching lines' messages
     /// ([`LogSource::argument`]), not a capture.
     argument: Option<usize>,
+    /// The profiles it comes from (a text file's `signal` clause), each
+    /// file's own: edited there, not in the Signals panel.
+    profiles: Vec<String>,
 }
 
 impl SignalDef {
@@ -713,6 +716,7 @@ impl SignalDef {
             off: false,
             queries: Vec::new(),
             argument: None,
+            profiles: Vec::new(),
         })
     }
 
@@ -745,12 +749,24 @@ impl SignalDef {
             off: false,
             queries: vec![from.to_owned()],
             argument: Some(index),
+            profiles: Vec::new(),
         })
     }
 
     /// The message argument it takes, for one made by [`Self::argument`].
     pub fn argument_index(&self) -> Option<usize> {
         self.argument
+    }
+
+    /// The profiles it comes from (empty: not a profile's).
+    pub fn profiles(&self) -> &[String] {
+        &self.profiles
+    }
+
+    /// Marked as coming from these profiles.
+    pub fn with_profiles(mut self, profiles: Vec<String>) -> SignalDef {
+        self.profiles = profiles;
+        self
     }
 
     /// The same signal with its events from `scope`.
@@ -812,6 +828,7 @@ impl SignalDef {
             off: false,
             queries: Vec::new(),
             argument: None,
+            profiles: Vec::new(),
         }
     }
 

@@ -65,7 +65,13 @@ pub struct Timed {
     reading: FileReading,
     /// Its table's first column is the time (DLT, captures): moved too.
     time_column: bool,
+    /// Text: the inner source's fields and [`PROFILE_FIELD`] last.
+    schema: Vec<FieldDef>,
 }
+
+/// The field a text file's lines have: the name of the profile it is read
+/// with (`profile == app`).
+pub const PROFILE_FIELD: &str = "profile";
 
 impl Timed {
     /// `inner` (a text file) read with `profile`, its times moved by
@@ -129,6 +135,8 @@ impl Timed {
                 true
             }
         };
+        let mut schema = inner.schema().to_vec();
+        schema.push(FieldDef::new(PROFILE_FIELD, crate::event::FieldKind::Str, false));
         Ok(Timed {
             inner,
             rule: on.then_some(rule),
@@ -138,6 +146,7 @@ impl Timed {
             first: first.filter(|_| on),
             reading,
             time_column: false,
+            schema,
         })
     }
 
@@ -155,6 +164,7 @@ impl Timed {
             first: None,
             reading,
             time_column,
+            schema: Vec::new(),
         }
     }
 
@@ -257,10 +267,13 @@ impl LogSource for Timed {
     }
 
     fn schema(&self) -> &[FieldDef] {
-        self.inner.schema()
+        if self.schema.is_empty() { self.inner.schema() } else { &self.schema }
     }
 
     fn field(&self, line: LineNo, id: FieldId) -> Option<FieldValue<'_>> {
+        if !self.schema.is_empty() && id == self.schema.len() - 1 {
+            return (line < self.inner.line_count()).then(|| FieldValue::Str(self.reading.profile.as_bytes().into()));
+        }
         self.inner.field(line, id)
     }
 

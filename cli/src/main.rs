@@ -1041,9 +1041,18 @@ fn profiles(given: &[String], forced: &mut Option<String>) -> Result<nerka_core:
 fn signals_for(source: &dyn LogSource) -> Signals {
     let mut s = SIGNALS.get_or_init(Default::default).for_source(source);
     let options = OPEN_OPTIONS.get_or_init(Default::default);
-    for d in options.profiles.signals_for(&source.info().reading) {
-        if s.get(d.name()).is_none() {
-            s.set(d);
+    let from = options.profiles.signals_for(&source.info().reading);
+    for c in &from.clashes {
+        eprintln!("nerka: note: {c}");
+    }
+    for d in from.signals {
+        match s.get(d.name()) {
+            None => s.set(d),
+            Some(_) => eprintln!(
+                "nerka: note: @{} of profile {} isn't used: a signal of that name is given already",
+                d.name(),
+                d.profiles().join(", ")
+            ),
         }
     }
     s

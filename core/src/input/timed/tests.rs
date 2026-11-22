@@ -147,6 +147,36 @@ fn timed_text_joins_dlt_in_the_mixed_layout() {
     assert_eq!(run_on(&m, &t), [3, 4, 5, 6, 7]);
 }
 
+/// Owner, 2026-11-22: a field `profile` on text files' lines, and a
+/// profile's signals reading only its files.
+#[test]
+fn the_profile_is_a_field_and_its_signals_read_its_files_only() {
+    let app = Profile::parse_spec(r"app: time auto; signal word:enum=/(?<word>ERROR|seen)/").unwrap();
+    let t = Timed::text(text("app.log", LOG), &app, Why::Name, 0.0, &Progress::new()).unwrap();
+    assert_eq!(t.schema().last().unwrap().name, "profile");
+    let d = dlt("ecu.dlt", &[(2, "NAV", "nav up"), (4, "NAV", "nav ERROR seen")]);
+    let m = Merged::new(Concat::new(vec![Box::new(t), d]).unwrap(), &Progress::new()).unwrap();
+    let q = |nfd: &str, s: &Signals| {
+        Filter::Query(Query::compile_in(nfd, m.schema(), s).unwrap_or_else(|e| panic!("{nfd}: {e}")))
+    };
+    let none = Signals::default();
+    // Rows: header, start, nav up, failed, frame one, frame two, nav ERROR seen, done.
+    assert_eq!(run_on(&m, &q("profile == app", &none)), [0, 1, 3, 4, 5, 7]);
+    assert_eq!(run_on(&m, &q("profile == app AND /ERROR/", &none)), [3]);
+    assert_eq!(run_on(&m, &q("profile != app", &none)), [2, 6]);
+    // The DLT's "ERROR seen" isn't an event of the text's profile signal.
+    let (ps, _) = Profiles::parse_text(&format!("{}\n", app.spec()));
+    let reading = m.info().reading;
+    let mut s = Signals::default().for_source(&m);
+    for d in ps.signals_for(&reading).signals {
+        s.set(d);
+    }
+    assert_eq!(run_on(&m, &q("@word.event", &s)), [3]);
+    // A profile no file is read with: said.
+    let w = crate::input::query_warnings(&Query::compile_for("profile == other", m.schema()).unwrap(), &m);
+    assert_eq!(w, ["no file here is read with profile 'other' (there are: app)"]);
+}
+
 #[test]
 fn text_without_a_time_is_refused_beside_dlt() {
     let p = Profile::parse_spec("p: time none").unwrap();

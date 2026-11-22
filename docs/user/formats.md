@@ -54,7 +54,7 @@ CLAUSES`, the clauses separated by `;`:
 | `time none` | no time |
 | `zone utc`, `zone local`, `zone +02:00` | the zone of times written without one (default: as shown, [Times](#times)) |
 | `numbers s`, `ms`, `us`, `ns`, `auto` | a time written as a plain number (`1760695201250`, `[ 12.345]`): seconds, milliseconds, microseconds or nanoseconds since 1970 (or since boot: give the file an [offset](#a-files-offset)); `auto` (the default) guesses by its size: up to 11 digits seconds, then ms, µs, ns |
-| `signal SPEC` | a [signal](signals.md) switched on for its files (repeatable) |
+| `signal SPEC` | a [signal](signals.md) for its files (repeatable): it reads only their lines, never another file's in the same view |
 
 ```
 app: name app-*.log; records start=/\d{4}-/; time /^(?<time>\S+ \S+)/; zone local
@@ -72,7 +72,17 @@ over the profile's `records`.
 
 GUI: ⚙ Settings → **Profiles…** (kept in `profiles` in the configuration
 folder, part of [settings bundles](bundles.md)); the tab's **Files…** shows
-each file's profile and why it was chosen. CLI: `--profile 'NAME: CLAUSES'`
+each file's profile and why it was chosen. Each line of a text file has
+the field `profile`, its profile's name: `profile == app` keeps one kind of
+log in a view of several ([Queries](queries.md#fields)).
+
+**Signals of profiles** are shown in the Signals panel as `profile app`,
+read-only: change them in Profiles…. Two profiles in one view giving a
+signal of one name with the same options are one signal, each file its own
+profile's regex; with other options the first file's profile is used. A
+signal of yours (saved, or `--signal`) of the same name wins over a
+profile's, and a profile's over a query's group or a FIBEX argument: the
+signal that wins shows ⚠, its hover says what it hides (the CLI: a note). CLI: `--profile 'NAME: CLAUSES'`
 defines one for the run, `--profile NAME` forces one; `nerka open` says how
 each file's time is read.
 

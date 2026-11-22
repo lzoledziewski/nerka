@@ -70,7 +70,7 @@ Design, the owner's decisions and what is still open: `text-profiles.md` (its "B
 
 - **Core:** `input::profile` (spec lines, `Profiles::choose`: forced, name, first line, default; the built-in default `time auto`), `input::timed::Timed` (a text file's time from its profile, sampled at open: half of the first 200 lines for `time auto`, one for a regex; carried to lines without one; an offset for any file, a table's time column moved too), `LogSource::own_time` / `has_time`, text with a time in `Concat`'s mixed layout (`TEXT_PROTO`; its fast path off there, its level from its own line), `Merged` reading times in parallel. `time::{Zone, Numbers, leading_time, parse_offset}`. Bundles: kind `profile`.
 - **CLI:** `--profile NAME|SPEC`, `--offset FILE=OFFSET`; `nerka open` prints a `time:` line per file.
-- **GUI:** ⚙ Settings → Profiles… (`ui/src/profiles.rs`); Files… per file: a forced profile, an offset, how its time was read; remembered in `records` (`profile=` / `offset=` lines, records lines first so an older nerka still reads them); a profile's signals join the tab's (a saved one of the name wins).
+- **GUI:** ⚙ Settings → Profiles… (`ui/src/profiles.rs`); Files… per file: a forced profile, an offset, how its time was read; remembered in `records` (`profile=` / `offset=` lines, records lines first so an older nerka still reads them); a profile's signals join the tab's, each for its files only (`Profiles::signals_for`), shown read-only as `profile NAME`; a name taken by two sources shows ⚠ on the winner (`Tab::signal_hidden`). Text files have the field `profile` (`timed::PROFILE_FIELD`).
 
 ## FIBEX (built: core, CLI, GUI)
 

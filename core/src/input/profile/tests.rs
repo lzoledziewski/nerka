@@ -114,3 +114,43 @@ fn time_rules_read_lines() {
         Some(day + 36_001.0)
     );
 }
+
+fn reading(profiles: &[&str]) -> Vec<crate::input::timed::FileReading> {
+    profiles
+        .iter()
+        .map(|p| crate::input::timed::FileReading { profile: (*p).to_owned(), ..Default::default() })
+        .collect()
+}
+
+/// A profile's signal reads only its files (`profile == NAME`); two
+/// profiles giving one name with the same options are one signal, each
+/// file its own query; with other options the first file's wins, said.
+#[test]
+fn profile_signals_are_scoped_merged_and_clashes_said() {
+    let (ps, errors) = Profiles::parse_text(concat!(
+        r"a: name *.a; signal t:enum=/T=(?<t>\w+)/",
+        "\n",
+        r"b: name *.b; signal t:enum=/thread (?<t>\w+)/; signal n=/n=(?<n>\d+)/",
+        "\n",
+        r"c: name *.c; signal n:enum=/N(?<n>\w)/",
+        "\n",
+    ));
+    assert!(errors.is_empty(), "{errors:?}");
+    let got = ps.signals_for(&reading(&["a", "b", "a", "default"]));
+    let specs: Vec<String> = got.signals.iter().map(|d| d.spec()).collect();
+    assert_eq!(
+        specs,
+        [
+            r"t:enum=(profile == a AND (/T=(?<t>\w+)/)) OR (profile == b AND (/thread (?<t>\w+)/))",
+            r"n:num=(profile == b AND (/n=(?<n>\d+)/))",
+        ]
+    );
+    assert_eq!(got.signals[0].profiles(), ["a", "b"]);
+    assert!(got.clashes.is_empty());
+    // c gives `n` as an enum: b's (the first file's) is used, and said.
+    let got = ps.signals_for(&reading(&["b", "c"]));
+    assert_eq!(got.signals.len(), 2);
+    assert_eq!(got.signals[1].profiles(), ["b"]);
+    assert_eq!(got.clashes.len(), 1);
+    assert!(got.clashes[0].starts_with("@n: profile c defines it otherwise than profile b"), "{:?}", got.clashes);
+}

@@ -46,8 +46,9 @@ defaults to the signal's name. Parts:
   captures, text files whose [profile](formats.md#profiles) reads a time:
   by default the date-time each line starts with), moved by the file's
   [offset](formats.md#a-files-offset);
-- a text file's [profile](formats.md#profiles): its `signal` clauses (a
-  signal of yours with the same name wins);
+- a text file's [profile](formats.md#profiles): its `signal` clauses, for
+  its files only, shown as `profile NAME` and changed in ⚙ Settings →
+  Profiles… (a signal of yours with the same name wins);
 - [lifecycles](lifecycles.md) (`@ecu1`, the lifecycle's number) and
   [checks](checks.md) (`@storm`, a count of what the check found).
 
@@ -89,6 +90,12 @@ written to a pack without that click. A signal several queries capture
 merges their events; if they give it different options, its row shows ⚠
 (hover: who gives what), the first picked query's options are used, and
 💾 writes them into all of them so they agree.
+
+**One name, several sources:** a name has one signal. Yours (saved, or
+`--signal`) win over the file's own `@time`, a
+[profile's](formats.md#profiles) over a FIBEX argument's, and those over a
+query's group. The one that wins shows ⚠ after its name; the hover says
+what it hides.
 
 ## Plots
 

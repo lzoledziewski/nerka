@@ -296,6 +296,17 @@ impl Profile {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Profiles(Vec<Profile>);
 
+/// A profile's name and its signal's query.
+type ProfileQuery = (String, String);
+
+/// The signals a view's profiles switch on ([`Profiles::signals_for`]).
+#[derive(Default)]
+pub struct ProfileSignals {
+    pub signals: Vec<SignalDef>,
+    /// Signals of one name that profiles define differently, for people.
+    pub clashes: Vec<String>,
+}
+
 /// Why a profile was chosen, for people.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Why {
@@ -386,15 +397,48 @@ impl Profiles {
     }
 
     /// The signals the profiles of a view's files switch on
-    /// ([`super::SourceInfo::reading`]), each name once (the first file's).
-    pub fn signals_for(&self, reading: &[super::timed::FileReading]) -> Vec<SignalDef> {
-        let mut out: Vec<SignalDef> = Vec::new();
+    /// ([`super::SourceInfo::reading`]). Each takes its events only from
+    /// its profile's files (`profile == NAME AND (QUERY)`), so in a view
+    /// with DLT or other text it never reads their lines. Profiles giving
+    /// a name with the same options are one signal, each file its own
+    /// profile's query (OR); with other options the first file's profile
+    /// wins and the clash is said.
+    pub fn signals_for(&self, reading: &[super::timed::FileReading]) -> ProfileSignals {
+        // Per name: the spec before its query, and (profile, query) each.
+        let mut acc: Vec<(String, String, Vec<ProfileQuery>)> = Vec::new();
+        let mut out = ProfileSignals::default();
+        let mut done: Vec<&str> = Vec::new();
         for r in reading {
+            if done.contains(&r.profile.as_str()) {
+                continue;
+            }
+            done.push(&r.profile);
             let Some(p) = self.get(&r.profile) else { continue };
             for d in p.signals() {
-                if !out.iter().any(|o| o.name() == d.name()) {
-                    out.push(d);
+                let (spec, query) = (d.spec(), d.query().source().to_owned());
+                let head = spec[..spec.len() - query.len()].to_owned();
+                match acc.iter_mut().find(|a| a.0 == d.name()) {
+                    Some(a) if a.1 == head => a.2.push((p.name().to_owned(), query)),
+                    Some(a) => out.clashes.push(format!(
+                        "@{}: profile {} defines it otherwise than profile {} ({} / {}); profile {}'s is used",
+                        d.name(),
+                        p.name(),
+                        a.2[0].0,
+                        head.trim_end_matches('='),
+                        a.1.trim_end_matches('='),
+                        a.2[0].0
+                    )),
+                    None => acc.push((d.name().to_owned(), head, vec![(p.name().to_owned(), query)])),
                 }
+            }
+        }
+        for (_, head, parts) in acc {
+            let scoped: Vec<String> =
+                parts.iter().map(|(p, q)| format!("({} == {p} AND ({q}))", super::timed::PROFILE_FIELD)).collect();
+            let spec = format!("{head}{}", scoped.join(" OR "));
+            match SignalDef::parse_spec(&spec) {
+                Ok(d) => out.signals.push(d.with_profiles(parts.into_iter().map(|(p, _)| p).collect())),
+                Err(e) => out.clashes.push(format!("{spec}: {e}")),
             }
         }
         out

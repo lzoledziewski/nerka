@@ -349,7 +349,8 @@ fn open_picks_reader_from_content() {
     let (a, b) = (crate::open(&dlt, &p).unwrap(), crate::open(&txt, &p).unwrap());
     // DLT's fields, and `proto`.
     assert_eq!((a.line_count(), a.schema().len()), (1, SCHEMA.len() + 1));
-    assert_eq!((b.line_count(), b.schema().len()), (2, 0));
+    // Text: `profile` only.
+    assert_eq!((b.line_count(), b.schema().len()), (2, 1));
     drop((a, b));
     let _ = std::fs::remove_dir_all(dir);
 }
