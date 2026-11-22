@@ -7476,6 +7476,35 @@ gear=D
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// The Files window's per-file choices as a tab keeps them: offsets
+    /// parsed (an error names the file), empty and zero ones dropped,
+    /// choices of files no longer in the list left out.
+    #[test]
+    fn files_window_offsets_and_profiles_read_back() {
+        let (a, b, gone) = (PathBuf::from("a.log"), PathBuf::from("b.dlt"), PathBuf::from("gone.log"));
+        let mut e = FilesEdit {
+            paths: vec![a.clone(), b.clone()],
+            captures: Vec::new(),
+            off: Vec::new(),
+            profile: Vec::new(),
+            offset: Vec::new(),
+            reading: Vec::new(),
+            error: None,
+        };
+        *e.offset_of(&a) = "+3h".into();
+        *e.offset_of(&b) = " ".into();
+        *e.offset_of(&gone) = "+1s".into();
+        *e.profile_of(&a) = "app".into();
+        *e.profile_of(&gone) = "x".into();
+        assert_eq!(e.offset_for().unwrap(), [(a.clone(), 10_800_000_000_000)]);
+        assert_eq!(e.profile_for(), [(a.clone(), "app".to_owned())]);
+        *e.offset_of(&b) = "-0s".into();
+        assert_eq!(e.offset_for().unwrap().len(), 1, "zero is none");
+        *e.offset_of(&b) = "soon".into();
+        let err = e.offset_for().unwrap_err();
+        assert!(err.starts_with("b.dlt: 'soon' isn't an offset"), "{err}");
+    }
+
     /// Owner, 2026-11-22: a profile's signal is the tab's, marked as the
     /// profile's (read-only in the panel); a saved signal of its name wins
     /// and says what it hides.
