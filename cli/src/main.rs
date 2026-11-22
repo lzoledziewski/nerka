@@ -121,7 +121,7 @@ struct Cli {
     /// How text files are read (repeatable): `NAME` forces that profile
     /// on every text file (a saved one, or `default`); `NAME: CLAUSES`
     /// defines one for this run, chosen by its rules before the saved ones,
-    /// e.g. 'app: name *.log; time /^(?<time>\S+ \S+)/; zone local'.
+    /// e.g. `'app: name *.log; time /^(?<time>\S+ \S+)/; zone local'`.
     /// Clauses: name GLOBS, first /REGEX/, records SPEC, time auto|none|/REGEX/,
     /// zone utc|local|+HH:MM, numbers s|ms|us|ns|auto, signal SPEC.
     #[arg(long, global = true, value_name = "NAME|SPEC")]

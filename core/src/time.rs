@@ -92,6 +92,12 @@ pub fn parse_time(s: &str) -> Option<f64> {
 /// (seconds as if UTC) into the instant.
 fn parse_in(s: &str, zoneless: &dyn Fn(f64) -> f64) -> Option<f64> {
     let s = s.trim();
+    // Times are ASCII, and the readers below cut by byte position (fuzz,
+    // 2026-11-22: `2026-10-1€…` panicked once every text line's start was
+    // read).
+    if !s.is_ascii() {
+        return None;
+    }
     if let Ok(n) = s.parse::<f64>() {
         return n.is_finite().then(|| epoch_seconds(n));
     }
@@ -776,6 +782,15 @@ mod tests {
         for no in ["12 files copied", "[   12.345678] usb", "ERROR 2025-10-17 10:00:01", "", "   ", "[INFO] 10:00"] {
             assert_eq!(leading_time(no, Zone::Utc), None, "{no}");
         }
+        // Not ASCII where a date or a zone is cut: no time, no panic.
+        for s in ["2026-10-1€ 00:00:00", "2026-10-17 0€:00", "17.10.20€5 10:00", "10:00:00+0€", "20251017T10€001"]
+        {
+            assert_eq!(parse_time(s), None, "{s}");
+        }
+        assert_eq!(leading_time("2026-10-1€ 00:00:00", Zone::Utc), None);
+        // The date before the cut word still is one.
+        assert_eq!(leading_time("2025-10-17 1€:00 x", Zone::Utc), Some(20_378.0 * 86_400.0));
+        assert_eq!(leading_time("2025-10-17 10:00:01.25 żółw", Zone::Utc), Some(at));
         // Only the line's start is read.
         let long = format!("{} 2025-10-17", "x".repeat(100));
         assert_eq!(leading_time(&long, Zone::Utc), None);
