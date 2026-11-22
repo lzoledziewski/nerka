@@ -195,6 +195,20 @@ fn files_on_disk_get_their_profile_and_offset() {
     assert_eq!(one.info().reading[0].why, "by the file's name");
     let moved = crate::open_with(&ecu, &o, &p).unwrap();
     assert_eq!(moved.time(0), Some(T0 + 5.0));
+    // A split chosen for one file is that file's only; one that finds
+    // nothing to split at says so.
+    let other = dir.join("other.log");
+    std::fs::write(&other, "x\ny\n").unwrap();
+    let start = crate::input::records::RecordSplit::parse("start=/\\d{4}-/").unwrap();
+    o.records_for = vec![(log.clone(), start.clone())];
+    assert_eq!(crate::open_with(&log, &o, &p).unwrap().line_count(), 3, "the header, two records");
+    let plain = crate::open_with(&other, &o, &p).unwrap();
+    assert_eq!((plain.line_count(), plain.format()), (2, "text".to_owned()));
+    o.records_for = vec![(other.clone(), start)];
+    let one = crate::open_with(&other, &o, &p).unwrap();
+    assert_eq!(one.line_count(), 1);
+    assert!(one.info().notes[0].starts_with("start=/\\d{4}-/ matched no line: the whole file is one record"));
+    o.records_for.clear();
     // Forced: the default, whatever the name says.
     o.profile_for = vec![(log.clone(), "default".into())];
     assert!(crate::open_with(&log, &o, &p).unwrap().has_time());

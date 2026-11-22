@@ -31,9 +31,13 @@ A stack trace belongs to its message. Read text as **records**:
 | `lines` | is one line |
 | `auto` | JSON if the file looks like JSON, else lines (the default) |
 
-GUI: the tab's menu → **Records…** (remembered per file). CLI: `--records
-SPEC`. A record's level is read from its first line; a regex can span its
-lines.
+GUI: the tab's menu → **Records…**, for the tab's text files (also beside
+DLT files and captures), remembered for each of them; **Automatic** forgets
+it. A file opened later with one of them keeps its own. CLI: `--records
+SPEC` (every text file). A record's level is read from its first line; a
+regex can span its lines. A `start=` or `sep=` that matches no line of a
+file leaves it one record, and the status bar (`nerka open`: a note) says
+so.
 
 ### Profiles
 

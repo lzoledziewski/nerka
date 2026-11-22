@@ -756,9 +756,10 @@ struct Tab {
     arg_picks: Vec<nerka_core::Argument>,
     /// The Files window: the tab's files as they are being edited.
     files_edit: Option<FilesEdit>,
-    /// How the tab's text files are split into rows (remembered per file;
-    /// `None`: automatic, JSON if a file looks like JSON).
-    records: Option<nerka_core::input::records::RecordSplit>,
+    /// How each text file of the tab is split into rows, by path
+    /// (remembered per file; a file not listed: automatic, JSON if it looks
+    /// like JSON, else its profile's). Never one file's for another.
+    records_for: Vec<(PathBuf, nerka_core::input::records::RecordSplit)>,
     /// The Records window, while it is open.
     records_edit: Option<records::Edit>,
     /// The files are being read in a new order or set.
@@ -1288,12 +1289,13 @@ impl Tab {
         let ps = paths.clone();
         let mut options = prefs.open_options();
         options.fibex = fibex;
-        // As the first file was read last time: lines or records.
-        let split = records::remembered(&paths[0]);
+        // As each file was read last time: lines or records.
+        let records_for: Vec<(PathBuf, nerka_core::input::records::RecordSplit)> =
+            paths.iter().filter_map(|p| Some((p.clone(), records::remembered(p)?))).collect();
         // The last choice is for several files; one file starts unsorted
         // (its menu's Sort by time).
         let merge = prefs.merge_by_time && paths.len() > 1;
-        options.records = split.clone();
+        options.records_for = records_for.clone();
         // What the Files window chose for each file, last time.
         let profile_for: Vec<(PathBuf, String)> =
             paths.iter().filter_map(|p| Some((p.clone(), records::remembered_profile(p)?))).collect();
@@ -1383,7 +1385,7 @@ impl Tab {
             offset_for,
             arg_picks: Vec::new(),
             files_edit: None,
-            records: split,
+            records_for,
             records_edit: None,
             files_undo: None,
             merge,
@@ -1536,10 +1538,29 @@ impl Tab {
         true
     }
 
+    /// The tab's text files (those read with a profile; before the files
+    /// are read, those that aren't captures or `.dlt`).
+    fn text_paths(&self) -> Vec<PathBuf> {
+        match self.info.reading.as_slice() {
+            r if r.len() == self.paths.len() => {
+                (self.paths.iter().zip(r)).filter(|(_, r)| !r.profile.is_empty()).map(|(p, _)| p.clone()).collect()
+            }
+            _ => (self.paths.iter())
+                .filter(|p| !protocols::is_capture(p) && !p.extension().is_some_and(|e| e.eq_ignore_ascii_case("dlt")))
+                .cloned()
+                .collect(),
+        }
+    }
+
+    /// The split chosen for `path`, if one is.
+    fn split_of(&self, path: &Path) -> Option<&nerka_core::input::records::RecordSplit> {
+        self.records_for.iter().find(|(p, _)| p == path).map(|(_, s)| s)
+    }
+
     /// What the tab chose for its files: records, protocols, profiles,
     /// offsets.
     fn file_options(&self, options: &mut nerka_core::OpenOptions) {
-        options.records = self.records.clone();
+        options.records_for = self.records_for.clone();
         options.disabled_for = self.disabled_for.clone();
         options.profile_for = self.profile_for.clone();
         options.offset_for = self.offset_for.clone();
@@ -4740,8 +4761,10 @@ impl App {
                             files = Some(i);
                         }
                         let text = t.file.as_ref().is_some_and(|f| f.columns().is_empty());
+                        // A text file in a view with DLT or captures too.
+                        let has_text = text || !t.text_paths().is_empty();
                         if ui
-                            .add_enabled(text, egui::Button::new("Records…"))
+                            .add_enabled(has_text, egui::Button::new("Records…"))
                             .on_hover_text("One row per line, or multi-line records (text files)")
                             .clicked()
                         {
@@ -4802,7 +4825,8 @@ impl App {
         if let Some(i) = records_edit {
             self.active = i;
             let t = &mut self.tabs[i];
-            t.records_edit = Some(records::Edit::of(t.records.as_ref()));
+            let first = t.text_paths().into_iter().find_map(|p| t.split_of(&p).cloned());
+            t.records_edit = Some(records::Edit::of(first.as_ref()));
         }
         if let Some(i) = close {
             self.close(i);
@@ -5050,18 +5074,26 @@ impl App {
         let (prefs, fibex) = (&self.prefs, self.fibex.clone());
         let Some(t) = self.tabs.get_mut(self.active) else { return };
         let title = t.title();
+        let files = t.text_paths();
         let Some(edit) = &mut t.records_edit else { return };
-        match records::window(ctx, &title, edit) {
+        let names: Vec<String> = (files.iter())
+            .map(|p| p.file_name().map_or_else(|| p.display().to_string(), |n| n.to_string_lossy().into_owned()))
+            .collect();
+        match records::window(ctx, &title, &names, edit) {
             records::Outcome::Open => {}
             records::Outcome::Close => t.records_edit = None,
             records::Outcome::Apply(split) => {
                 t.records_edit = None;
-                for p in &t.paths {
+                // The tab's text files only, each remembered on its own.
+                for p in &files {
                     if let Err(e) = records::remember(p, split.as_ref()) {
                         t.status = format!("Could not remember how {} is read: {e}", p.display());
                     }
+                    t.records_for.retain(|(q, _)| q != p);
+                    if let Some(s) = &split {
+                        t.records_for.push((p.clone(), s.clone()));
+                    }
                 }
-                t.records = split;
                 t.reopen(ctx, prefs, fibex);
             }
         }
@@ -7460,6 +7492,41 @@ gear=D
         let edit = FilesEdit::of(t);
         let text = edit.reading.iter().find(|(p, _)| *p == a).map(|(_, r)| r.clone()).unwrap();
         assert_eq!((text.profile.as_str(), text.time.as_str()), ("default", "the time each line starts with"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A split chosen for one file is that file's only (owner's report,
+    /// 2026-11-22: a `start=` chosen once spread to every .txt opened with
+    /// it, each then one record); Records… is there for the text file of a
+    /// view that also holds DLT.
+    #[test]
+    fn a_split_is_one_files_and_records_is_offered_beside_dlt() {
+        let dir = std::env::temp_dir().join(format!("nerka-gui-split-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (a, b, d) = (dir.join("a.txt"), dir.join("b.txt"), dir.join("d.dlt"));
+        std::fs::write(&a, "REC one\n  more\nREC two\n").unwrap();
+        std::fs::write(&b, "x\ny\nz\n").unwrap();
+        let ctx = egui::Context::default();
+        let mut t = Tab::open_many(&ctx, vec![a.clone(), b.clone()], &SearchPrefs::default(), None);
+        settle(&mut t, &ctx);
+        t.records_for = vec![(a.clone(), nerka_core::input::records::RecordSplit::parse("start=/REC/").unwrap())];
+        t.reopen(&ctx, &SearchPrefs::default(), None);
+        settle(&mut t, &ctx);
+        // a: two records; b: its three lines, not one record.
+        assert_eq!(t.part_files, [(0, 2), (2, 3)]);
+        assert_eq!(t.text_paths(), [a.clone(), b.clone()]);
+        assert!(t.split_of(&b).is_none());
+        // Text with a time beside DLT: a table, and still a text file.
+        let c = dir.join("c.txt");
+        std::fs::write(&c, "2025-10-18T00:00:00Z one\n").unwrap();
+        let mut buf = Vec::new();
+        nerka_core::input::dlt::writer::Msg::log(nerka_core::Level::Info, "E", "A", "C", vec![]).encode(&mut buf);
+        std::fs::write(&d, buf).unwrap();
+        let mut m = Tab::open_many(&ctx, vec![c.clone(), d.clone()], &SearchPrefs::default(), None);
+        settle(&mut m, &ctx);
+        assert!(!m.file.as_ref().unwrap().columns().is_empty(), "{}", m.status);
+        assert_eq!(m.text_paths(), std::slice::from_ref(&c));
+        drop((t, m));
         std::fs::remove_dir_all(&dir).ok();
     }
 

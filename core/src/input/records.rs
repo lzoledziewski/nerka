@@ -478,6 +478,22 @@ impl LogSource for RecordFile {
         }
     }
 
+    /// A split that found nothing to split at says so: the whole file is
+    /// one record (a `start=` regex chosen for another file).
+    fn info(&self) -> super::SourceInfo {
+        let mut info = super::SourceInfo::default();
+        let one = self.starts.len() == 1
+            && matches!(self.split, RecordSplit::Start(_) | RecordSplit::Separator(_))
+            && self.line_bytes(0).is_some_and(|r| r.contains(&b'\n'));
+        if one {
+            info.notes.push(format!(
+                "{} matched no line: the whole file is one record (Records…: one row per line, or automatic)",
+                self.split.spec()
+            ));
+        }
+        info
+    }
+
     /// The record, its line breaks included.
     fn line_bytes(&self, line: LineNo) -> Option<Cow<'_, [u8]>> {
         let i = usize::try_from(line).ok()?;

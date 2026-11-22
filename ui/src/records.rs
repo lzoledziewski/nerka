@@ -141,8 +141,8 @@ pub enum Outcome {
     Close,
 }
 
-/// The Records window of the tab `title`.
-pub fn window(ctx: &egui::Context, title: &str, edit: &mut Edit) -> Outcome {
+/// The Records window of the tab `title`, for its text files `files`.
+pub fn window(ctx: &egui::Context, title: &str, files: &[String], edit: &mut Edit) -> Outcome {
     let (mut open, mut apply, mut cancel) = (true, false, false);
     egui::Window::new(format!("Records of {title}"))
         .id(egui::Id::unique("records-window"))
@@ -151,6 +151,11 @@ pub fn window(ctx: &egui::Context, title: &str, edit: &mut Edit) -> Outcome {
         .resizable(false)
         .show(ctx, |ui| {
             ui.weak("How the tab's text files are split into rows. A record of several lines is one row: filters and searches see all of it, and Enter shows it whole.");
+            if files.len() > 1 {
+                ui.weak(format!("For {}; remembered for each of them.", files.join(", ")));
+            } else {
+                ui.weak("Remembered for the file.");
+            }
             ui.separator();
             ui.radio_value(&mut edit.kind, Kind::Auto, "Automatic: JSON if the file looks like JSON, else one row per line");
             ui.radio_value(&mut edit.kind, Kind::Lines, "One row per line");

@@ -30,9 +30,14 @@ pub struct OpenOptions {
     pub capture: capture::CaptureOptions,
     /// Descriptions of DLT non-verbose messages (FIBEX).
     pub fibex: Option<std::sync::Arc<dlt::fibex::Fibex>>,
-    /// How a text file is split into rows: lines, multi-line records or
-    /// JSON; `None`: JSON if the file looks like JSON, else lines.
+    /// How every text file is split into rows (the CLI's `--records`):
+    /// lines, multi-line records or JSON; `None`: as [`Self::records_for`]
+    /// or the file's profile says, else JSON if the file looks like JSON,
+    /// else lines.
     pub records: Option<records::RecordSplit>,
+    /// How single text files are split (by path): a choice made for the
+    /// file (the GUI's Records…), never another file's.
+    pub records_for: Vec<(std::path::PathBuf, records::RecordSplit)>,
     /// Protocols turned off for single captures (by path), instead of
     /// [`capture::CaptureOptions::disabled`]: a choice made when opening
     /// several files.
@@ -58,6 +63,12 @@ impl OpenOptions {
             }
             None => std::borrow::Cow::Borrowed(&self.capture),
         }
+    }
+
+    /// The split chosen for `path`, if one is: its own, else the one for
+    /// every file.
+    pub fn records_for(&self, path: &Path) -> Option<&records::RecordSplit> {
+        self.records_for.iter().find(|(p, _)| p == path).map(|(_, s)| s).or(self.records.as_ref())
     }
 
     /// The profile forced for `path`, if one is.
@@ -97,7 +108,7 @@ pub fn open_with(path: impl AsRef<Path>, options: &OpenOptions, progress: &Progr
         let n = File::open(path)?.read(&mut start)?;
         let (profile, why) = options.profiles.choose(options.profile_for(path), path, &start[..n]);
         // A split chosen for the file wins over its profile's.
-        let choice = options.records.as_ref().or(profile.records());
+        let choice = options.records_for(path).or(profile.records());
         let text: Box<dyn LogSource> = match records::RecordSplit::choose(choice, &start[..n]) {
             records::RecordSplit::Lines => Box::new(text::TextFile::open(path, progress)?),
             split => Box::new(records::RecordFile::open(path, split, progress)?),
