@@ -1,6 +1,6 @@
 ---
 title: "The command line"
-description: "The nerka command line: filter, search, open, lines, check, lifecycles, export and import, with every option for DLT, pcap, MF4, JSON and text logs."
+description: "The nerka command line: filter, search, open, lines, check, lifecycles, patterns, export and import, with every option for DLT, pcap, MF4, JSON and text logs."
 ---
 
 # The command line
@@ -25,6 +25,7 @@ Options for opening files (below) go before or after the command.
 | `packs` | list the loaded packs and their queries |
 | `check FILE…` | run the [checks](checks.md) (`--check`): issues and facts |
 | `lifecycles FILE…` | print the [lifecycles](lifecycles.md) (`--lifecycle`) and their findings |
+| `patterns FILE…` | group lines into message patterns (experimental), each with its count and a query |
 | `export` | write your setup as a [settings bundle](bundles.md) |
 | `import FILE` | read a settings bundle into your setup |
 
@@ -84,6 +85,51 @@ nerka --pack examples/packs/ search --in 'level >= WARN' -l ota -p cam=CAM1 app.
 | `--strict` | exit status 1 when an issue (or a finding) shows up |
 | `check -e, --evidence N` | print up to N places per result, with their lines |
 | `lifecycles --count QUERY` | count a query's lines per lifecycle |
+
+## `patterns` (experimental)
+
+`patterns` groups lines by the message they print, whatever values they
+carry, and keeps the values. `connection established peer=10.0.3.7` and
+`… peer=10.0.9.12` are one pattern, `connection established peer=<*>`;
+`gear=D`, `gear=P` and `gear=N` are one, `gear={D|P|N}`: a part with a few
+values that repeat is a **state**, shown with its values (most lines
+first), while a part with many (users, addresses, numbers) shows as `<*>`.
+
+How: values holding a digit (numbers, hex, times, addresses) are masked
+first; messages of the same length, first word and fields (DLT `apid`,
+`ctid`, …) that are alike enough join a template, the words where they
+differ becoming slots. Then templates are aligned atom by atom (words and
+single characters), so a varying part can also sit inside a word
+(`gear=D`), come first (`{RUNNING|IDLE} state entered`) or have different
+lengths (`thermal throttling {engaged at <*> C|released}`, `job done
+{∅|fast}`, `∅`: nothing there). Two templates join when they share enough
+words and differ, at each place, by one word at most on one side.
+
+A DLT message's `payload` is grouped (other files: the line), and fields
+such as `apid` that tell the patterns apart print with them. Each pattern
+prints its count, its share, its first line and the template, most lines
+first.
+
+| Option | |
+|---|---|
+| `--in FILTER` | only the lines an NFD filter keeps |
+| `--rare` | the rarest patterns first: the odd message out |
+| `--values` | also each slot's values: lines, first and last line |
+| `--queries` | also each pattern's NFD query, to `filter` its lines |
+| `-n, --top N` | print at most N patterns (default 30; `0`: all) |
+| `--field NAME` | group this field's text (`raw`: the line) |
+| `--similarity S` | how alike (0–1, default 0.5) a message must be to join a template |
+| `--no-merge` | don't align templates (only messages of the same length join) |
+| `--stats` | timing on stderr |
+
+```
+nerka patterns app.log
+nerka patterns --values --in 'apid == NAV' trace.dlt
+nerka patterns --rare --in 'level >= WARN' --queries trace.dlt
+```
+
+Non-verbose DLT messages without a [FIBEX](formats.md) have no text to
+group, only their bytes.
 
 ## `export` and `import`
 

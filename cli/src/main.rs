@@ -22,6 +22,7 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use nerka_core::bundle::{Bundle, Choice, Item, Kind, Status, Store};
 use nerka_core::pack::{self, Expansion, Library, ParamValue, Pick, Role, Selection};
+use nerka_core::pattern::PatternOptions;
 use nerka_core::{
     Bookmarks, Filter, LineNo, LogSource, Matcher, MatcherOptions, Progress, Query, SearchSet, SignalDef, Signals,
     search, search_within,
@@ -177,6 +178,42 @@ enum Cmd {
         files: Vec<PathBuf>,
         #[command(flatten)]
         out: OutputArgs,
+    },
+    /// Group lines into patterns (experimental): message templates with
+    /// `<*>` where the values differ, most lines first, each with its count,
+    /// first line and (with --queries) an NFD query finding its lines.
+    Patterns {
+        /// The files (several: one view).
+        #[arg(required = true, value_name = "FILE")]
+        files: Vec<PathBuf>,
+        /// Only the lines matching this NFD filter.
+        #[arg(long = "in", value_name = "FILTER")]
+        within: Option<String>,
+        /// Group this field's text (default: `payload` if the file has it,
+        /// else the line).
+        #[arg(long)]
+        field: Option<String>,
+        /// How alike a message must be to join a pattern (0–1).
+        #[arg(long, default_value_t = 0.5)]
+        similarity: f32,
+        /// Print at most this many patterns (0: all).
+        #[arg(short = 'n', long, default_value_t = 30)]
+        top: usize,
+        /// The rarest patterns first.
+        #[arg(long)]
+        rare: bool,
+        /// Also print each slot's values: lines, first and last line.
+        #[arg(long)]
+        values: bool,
+        /// Don't merge templates by alignment (Drain's templates only).
+        #[arg(long)]
+        no_merge: bool,
+        /// Also print each pattern's NFD query.
+        #[arg(long)]
+        queries: bool,
+        /// Print timing to stderr.
+        #[arg(long)]
+        stats: bool,
     },
     /// Expand pack picks into plain NFD and print it.
     Expand {
@@ -1209,6 +1246,70 @@ fn run() -> Result<()> {
         }
         Cmd::Filter { query, files, out: o } => {
             run_filter(&files, |source| Ok(Filter::Query(compile(&query, source)?)), &o, &mut out)?;
+        }
+        Cmd::Patterns { files, within, field, similarity, top, rare, values, no_merge, queries, stats } => {
+            let view = open(&files)?;
+            let f = &*view.source;
+            let lines = match &within {
+                Some(w) => Some(search(f, &with_marks(Filter::Query(compile(w, f)?), &view)?, &Progress::new())?.lines),
+                None => None,
+            };
+            let t = Instant::now();
+            let options = PatternOptions { field, similarity, merge: !no_merge };
+            let mut ps = nerka_core::pattern::detect(f, lines.as_deref(), &options, &Progress::new())?;
+            let took = t.elapsed();
+            if rare {
+                ps.patterns.sort_by(|a, b| a.count.cmp(&b.count).then(a.first.cmp(&b.first)));
+            }
+            let at = locator(f);
+            let shown = if top == 0 { ps.patterns.len() } else { top.min(ps.patterns.len()) };
+            let place = |l: LineNo| {
+                if view.paths.len() > 1 {
+                    let (k, l) = at(l);
+                    format!("{}:{}", view.paths[k].display(), l + 1)
+                } else {
+                    (l + 1).to_string()
+                }
+            };
+            for p in &ps.patterns[..shown] {
+                let first = place(p.first);
+                let share = 100.0 * p.count as f64 / ps.lines.max(1) as f64;
+                write!(out, "{:>9} {share:>5.1}%  {first:>7}  ", p.count)?;
+                for (name, value) in &p.fields {
+                    write!(out, "{name}={value} ")?;
+                }
+                writeln!(out, "{}", p.template())?;
+                if values {
+                    for (k, s) in p.slots().enumerate() {
+                        let kind = if s.is_state() { "state" } else { "values" };
+                        let more = if s.overflow { ", more not kept" } else { "" };
+                        writeln!(out, "{:28}slot {} ({kind}{more}):", "", k + 1)?;
+                        for v in &s.values {
+                            let lines = if v.first == v.last {
+                                place(v.first)
+                            } else {
+                                format!("{}–{}", place(v.first), place(v.last))
+                            };
+                            writeln!(out, "{:30}{:>9}  {:<24} {lines}", "", v.count, v.value())?;
+                        }
+                    }
+                }
+                if queries {
+                    writeln!(out, "{:28}{}", "", ps.query(p))?;
+                }
+            }
+            if shown < ps.patterns.len() {
+                writeln!(out, "… {} more (-n 0: all)", ps.patterns.len() - shown)?;
+            }
+            if stats {
+                out.flush()?;
+                eprintln!(
+                    "{} patterns in {} lines | index {:.2?} | patterns {took:.2?}",
+                    ps.patterns.len(),
+                    ps.lines,
+                    view.took
+                );
+            }
         }
         Cmd::Expand { picks, parts } => {
             if picks.is_empty() {

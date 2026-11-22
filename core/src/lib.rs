@@ -21,6 +21,8 @@
 //!   events and states; [`time`] — reading and showing times.
 //! * [`lifecycle`] — an entity's lifecycles (boots), found from its lines.
 //! * [`check`] — checks: issues and facts, overall and per lifecycle.
+//! * [`pattern`] — pattern detection (experimental): lines grouped by
+//!   message template, each with an NFD query.
 //! * [`session`] — a view's filter, search and colours, and what to rerun.
 //! * [`bookmarks`] — bookmarks/notes persisted in a sidecar file.
 //! * [`history`] — recently used filters; [`preset`], [`plot`] — saved
@@ -43,6 +45,7 @@ pub mod history;
 pub mod input;
 pub mod lifecycle;
 pub mod pack;
+pub mod pattern;
 pub mod plot;
 pub mod preset;
 pub mod session;
