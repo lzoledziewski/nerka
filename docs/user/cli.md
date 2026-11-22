@@ -100,8 +100,11 @@ These apply to every command:
 
 | Option | |
 |---|---|
-| `--merge` | several files: their lines sorted by time (files that know their times: DLT, captures; ties in the order given); else one after another |
+| `--merge` | several files: their lines sorted by time (files that know their times: DLT, captures, text with a time; ties in the order given); else one after another |
 | `--records SPEC` | read text as records: `start=/REGEX/`, `blank`, `sep=/REGEX/`, `json`, `lines` or `auto` ([Files and formats](formats.md)) |
+| `--profile NAME` | read every text file with this [profile](formats.md#profiles) (a saved one, or `default`) |
+| `--profile 'NAME: CLAUSES'` | define a profile for the run, chosen by its rules before the saved ones (repeatable) |
+| `--offset FILE=OFFSET` | move a file's times (`trace.dlt=+3h`, `app.log=-0.250s`; the file as given or its name; repeatable) |
 | `--dlt-port PORT`, `--someip-port PORT`, `--syslog-port PORT` | UDP ports of these protocols in captures (repeatable; defaults 3490, 30490, 514) |
 | `--protocol FILE` | a [protocol definition](protocol-definitions.md) (`.ksy`) |
 | `--protocol-port NAME=PORT` | a protocol's UDP port (short for `--route NAME:PORT`) |

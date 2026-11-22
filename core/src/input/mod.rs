@@ -9,9 +9,11 @@ pub mod concat;
 pub mod dlt;
 pub mod json;
 pub mod merged;
+pub mod profile;
 pub mod proto;
 pub mod records;
 pub(crate) mod schema;
+pub mod timed;
 
 use crate::event::{FieldDef, FieldId, FieldValue, Level};
 use crate::{LineNo, Progress, Result};
@@ -35,6 +37,15 @@ pub struct OpenOptions {
     /// [`capture::CaptureOptions::disabled`]: a choice made when opening
     /// several files.
     pub disabled_for: Vec<(std::path::PathBuf, Vec<String>)>,
+    /// The profiles text files are read with ([`profile::Profiles::choose`]).
+    pub profiles: std::sync::Arc<profile::Profiles>,
+    /// A profile forced for every text file (the CLI's `--profile NAME`).
+    pub profile: Option<String>,
+    /// A profile forced for single files (by path): the tab's Files window,
+    /// remembered in `records`.
+    pub profile_for: Vec<(std::path::PathBuf, String)>,
+    /// Seconds added to single files' times (by path), in nanoseconds.
+    pub offset_for: Vec<(std::path::PathBuf, i64)>,
 }
 
 impl OpenOptions {
@@ -48,6 +59,16 @@ impl OpenOptions {
             None => std::borrow::Cow::Borrowed(&self.capture),
         }
     }
+
+    /// The profile forced for `path`, if one is.
+    pub fn profile_for(&self, path: &Path) -> Option<&str> {
+        self.profile_for.iter().find(|(p, _)| p == path).map(|(_, n)| n.as_str()).or(self.profile.as_deref())
+    }
+
+    /// Seconds added to `path`'s times.
+    pub fn offset_for(&self, path: &Path) -> f64 {
+        self.offset_for.iter().find(|(p, _)| p == path).map_or(0.0, |(_, ns)| *ns as f64 / 1e9)
+    }
 }
 
 /// Open `path` with the reader its content calls for (default
@@ -58,13 +79,15 @@ pub fn open(path: impl AsRef<Path>, progress: &Progress) -> Result<Box<dyn LogSo
 
 /// Open `path` with the reader its content calls for: DLT if it starts
 /// with a DLT storage header, the DLT inside a pcap / pcapng / MF4 capture,
-/// plain text otherwise.
+/// plain text otherwise, read with its profile ([`profile`]: records and
+/// time). The file's offset ([`OpenOptions::offset_for`]) moves its times.
 pub fn open_with(path: impl AsRef<Path>, options: &OpenOptions, progress: &Progress) -> Result<Box<dyn LogSource>> {
     let path = path.as_ref();
     let mut head = [0u8; 16];
     let n = File::open(path)?.read(&mut head)?;
     let head = &head[..n];
-    Ok(if dlt::is_dlt(head) {
+    let offset = options.offset_for(path);
+    let timed: Box<dyn LogSource> = if dlt::is_dlt(head) {
         Box::new(dlt::DltFile::open(path, progress)?.with_fibex(options.fibex.clone()))
     } else if capture::is_capture(head) {
         Box::new(capture::open(path, &options.capture_for(path), progress)?.0.with_fibex(options.fibex.clone()))
@@ -72,11 +95,16 @@ pub fn open_with(path: impl AsRef<Path>, options: &OpenOptions, progress: &Progr
         // JSON is told from the start of the file (a first value whole).
         let mut start = vec![0u8; 64 * 1024];
         let n = File::open(path)?.read(&mut start)?;
-        match records::RecordSplit::choose(options.records.as_ref(), &start[..n]) {
+        let (profile, why) = options.profiles.choose(options.profile_for(path), path, &start[..n]);
+        // A split chosen for the file wins over its profile's.
+        let choice = options.records.as_ref().or(profile.records());
+        let text: Box<dyn LogSource> = match records::RecordSplit::choose(choice, &start[..n]) {
             records::RecordSplit::Lines => Box::new(text::TextFile::open(path, progress)?),
             split => Box::new(records::RecordFile::open(path, split, progress)?),
-        }
-    })
+        };
+        return Ok(Box::new(timed::Timed::text(text, &profile, why, offset, progress)?));
+    };
+    Ok(if offset != 0.0 { Box::new(timed::Timed::shifted(timed, offset)) } else { timed })
 }
 
 /// A [`LogSource::data_id`] no other source has had in this process.
@@ -170,6 +198,9 @@ pub struct SourceInfo {
     /// What the files say about themselves that helps tell why something
     /// is missing: a capture's own drop counts.
     pub about: Vec<String>,
+    /// How each file's time is read (its profile, its offset), in file
+    /// order; empty for sources opened without [`open_with`].
+    pub reading: Vec<timed::FileReading>,
 }
 
 /// A piece of a file a reader couldn't read, and where it was: what the
@@ -678,10 +709,24 @@ pub trait LogSource: Send + Sync {
     }
 
     /// The time of `line` as the source knows it, in seconds since the Unix
-    /// epoch (UTC): DLT's storage (receive) time. Plain text has none: a
-    /// tab captures it with a `time` signal instead.
+    /// epoch (UTC): DLT's storage (receive) time; a text file's from its
+    /// profile ([`timed::Timed`]: a line without one has the time of the
+    /// line before it). Plain text read without a profile has none: a tab
+    /// captures it with a `time` signal instead.
     fn time(&self, _line: LineNo) -> Option<f64> {
         None
+    }
+
+    /// The time `line` itself holds: [`Self::time`], except that a text
+    /// line without a time of its own has none here.
+    fn own_time(&self, line: LineNo) -> Option<f64> {
+        self.time(line)
+    }
+
+    /// Whether its lines have times ([`Self::time`]): any line has one
+    /// (sources that never do say so at once).
+    fn has_time(&self) -> bool {
+        (0..self.line_count()).any(|l| self.time(l).is_some())
     }
 
     /// Argument `index` of `line`'s message, if the source knows the

@@ -1319,7 +1319,7 @@ impl Signals {
     pub fn for_source(&self, source: &dyn LogSource) -> Signals {
         let mut s = self.clone();
         let some = source.line_count() > 0;
-        if some && source.time(0).is_some() && s.get("time").is_none() {
+        if some && source.has_time() && s.get("time").is_none() {
             s.0.insert(0, Arc::new(SignalDef::source_time()));
         }
         s.link();
@@ -1547,7 +1547,7 @@ impl Clock {
     /// collected and there are none: its regex doesn't fit the file) is
     /// skipped, so it can't leave every line without a time.
     pub fn of(source: &dyn LogSource, signals: &Signals) -> Clock {
-        if source.line_count() > 0 && source.time(0).is_some() {
+        if source.has_time() {
             return Clock::Source;
         }
         let usable = |d: &&Arc<SignalDef>| {

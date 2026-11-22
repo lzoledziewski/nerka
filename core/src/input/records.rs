@@ -489,6 +489,10 @@ impl LogSource for RecordFile {
         Some(self.data.bytes())
     }
 
+    fn has_time(&self) -> bool {
+        false
+    }
+
     /// The record an offset falls in, or the one before a gap.
     fn line_of_offset(&self, offset: u64) -> LineNo {
         self.starts.partition_point(|&s| s <= offset).saturating_sub(1) as LineNo

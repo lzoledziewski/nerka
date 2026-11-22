@@ -1,11 +1,29 @@
-# Text profiles (design, not built)
+# Text profiles (first slice built 2026-11-22)
 
 A **profile** says how a text file is read: how its lines group into records,
 and where a line's level and time are. It picks up
 review 2026-11-09 R11 (levels in text are upper case only) and "Decisions
 pending" 1 in `status.md`, and comes with **adjusting a file's time** (Time
-per file, below). Discussed with the owner on 2026-11-11; nothing is built
-yet, and the open questions below are the owner's to settle.
+per file, below). Discussed with the owner on 2026-11-11, 2026-11-14 and
+2026-11-22; the open questions below are the owner's to settle.
+
+**Built (2026-11-22, branch `claude/text-profiles`)**: profiles as spec
+lines (`name`, `first`, `records`, `time auto|none|/REGEX/`, `zone`,
+`numbers`, `signal`; `core/src/input/profile.rs`, the user guide's
+`formats.md` → Profiles), chosen forced / by name / by first line /
+default, the built-in default `time auto`; a text file's time from its
+profile as the file's own (`LogSource::time`, `own_time`, `has_time`;
+`input::timed::Timed`); an offset per file for any file (the time column
+of a table moved too); text with a time in the mixed layout with DLT and
+captures (`proto` `TEXT`, its line the payload) and merged by time; the
+CLI's `--profile` and `--offset`, `nerka open` saying how each file's time
+is read; the GUI's ⚙ Settings → Profiles… (the file's lines as text) and
+per file in **Files…** (a forced profile, an offset, how its time was
+read), both remembered in `records`; profiles in settings bundles (kind
+`profile`, format 1). **Not built**: the level rule (marked forms, a regex
+with a word map), JSON without a level key having none, protocol level
+maps, a zone or number unit per file (only per profile), anchors, midnight
+roll-over of times of day.
 
 ## What is there today
 
@@ -201,25 +219,46 @@ check fewer words.
   first, then profiles, then views of several files (`status.md`, "Next
   steps").
 
+## Settled (owner, 2026-11-22)
+
+- **A built-in default reads a time**: a text file no profile of the
+  user's matches gets the date-time its lines start with (`time auto`); a
+  profile named `default` replaces the built-in one.
+- **Best effort when a time can't be read**: the built-in rule is used for
+  a file only if at least half of its first 200 non-empty lines start with
+  a time (a profile's own regex: if any does), else the file has no time
+  and Files… / `nerka open` say so; a line without a time of its own has
+  the time of the line before it (lines before the first time: the first),
+  so it stays with its neighbours when sorted or merged and has `@time`;
+  the time column of a merged view shows only a line's own time; a time of
+  day without a date stays on 1970-01-01 (no midnight roll-over) until the
+  file gets an offset.
+- **CLI**: one flag, `--profile NAME` forces a profile on every text file,
+  `--profile 'NAME: CLAUSES'` defines one for the run (chosen by its rules
+  before the saved ones).
+- **A file's offset is remembered per file** (in `records`, like a forced
+  profile), one per file in a view of several.
+- **First-line rule**: the regex is tried on the file's first non-empty
+  line; several profiles matching: the first in list order wins (name
+  rules before first-line rules).
+
 ## Open questions
 
-1. **First-line rule**: how many lines it reads; several profiles matching
-   (the first in list order?).
-2. **Protocol level maps**: in profiles, or in the protocols' own settings (⚙
+1. **Protocol level maps**: in profiles, or in the protocols' own settings (⚙
    → Captures).
-3. **R11 before profiles**: make marked forms the default now, or wait for
-   profiles.
-4. **JSON's fallback**: drop it now (a small change of behaviour), or with
-   profiles.
-5. **CLI**: `--profile NAME` and an inline spec.
-6. **A file's offset**: remembered per file or for the session; in a view of
-   several files, one per file (as Merge by time needs).
-7. **Anchors in the GUI**: "this line was at …", "this line is the same
+2. **R11 before profiles**: make marked forms the default now, or with the
+   profiles' level rule.
+3. **JSON's fallback**: drop it now (a small change of behaviour), or with
+   the profiles' level rule.
+4. **Anchors in the GUI**: "this line was at …", "this line is the same
    moment as that one", and how an anchored file shows that it was moved.
-8. **Seconds since boot**: shown as uptime until anchored, or placed on the
-    timeline only with an anchor; a file with several boots (lifecycles).
-9. **Zone per file and the GUI's Local time / UTC switch** (R12): whether a
-    file's zone replaces the switch for that file.
+5. **Seconds since boot**: shown as uptime until anchored, or placed on the
+   timeline only with an anchor; a file with several boots (lifecycles).
+6. **Zone per file and the GUI's Local time / UTC switch** (R12): a
+   profile's `zone` replaces the switch for its files (built); whether a
+   file can have its own zone besides its profile's. Seen 2026-11-22: in
+   the GUI's local time a text log written in UTC lands hours away from
+   the DLT it was merged with unless its profile says `zone utc`.
 
 Prior art: lnav's log formats (a regex with named groups, a level map and a
 time format per format, chosen by trying each on the file's lines).

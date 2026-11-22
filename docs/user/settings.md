@@ -15,14 +15,21 @@ description: "nerka's settings and where it keeps them: time zones, capture prot
   are each one's (rules by port, range, address, VLAN; the most specific
   wins); load your [protocol definitions](protocol-definitions.md). A tab's
   **Files…** turns protocols on or off per capture.
+- **Text files → Profiles…:** how text files are read, one
+  [profile](formats.md#profiles) per line, checked as you type; **Save**
+  applies to files opened from then on (a tab's **Reload** reads its files
+  again).
 - **Compressed MF4:** the unpack cache's size limit, its use, **Clear**.
-- **Reload configuration:** read packs, presets, plots, checks, signals and
-  preferences again (after editing a file by hand, or after another window
-  changed them).
+- **Reload configuration:** read packs, presets, plots, checks, signals,
+  profiles and preferences again (after editing a file by hand, or after
+  another window changed them).
 
 Each tab's menu has **Records…** (how its text files are split into rows),
-**Files…** (its files, their order, protocols), **Reload**, and
-**Sort by time** (its files' lines in time order, one file or several).
+**Files…** (its files, their order, protocols; for each file the
+[profile](formats.md#profiles) it is read with, an
+[offset](formats.md#a-files-offset) for its times, and how its time was
+read), **Reload**, and **Sort by time** (its files' lines in time order,
+one file or several).
 
 ## Where things are kept
 
@@ -36,8 +43,9 @@ Nothing is stored in the cloud. Your configuration folder is
 | `plots\` | kept [plots](signals.md#plots) |
 | `signals` | saved signals and lifecycles, one spec per line |
 | `checks` | saved [checks](checks.md), one spec per line |
+| `profiles` | [profiles](formats.md#profiles) for text files, one per line |
 | `protocols\` | protocol definitions loaded in Settings |
-| `records` | how each text file was last split into records |
+| `records` | per file: how it was last split into records, a profile forced on it, its offset |
 | `prefs` | preferences (modes, times, ports, …) |
 | `history`, `search-history` | the Filter and Search boxes' histories |
 

@@ -43,6 +43,7 @@ mod plot;
 mod plots;
 mod prefs;
 mod presets;
+mod profiles;
 mod protocols;
 mod recall;
 mod records;
@@ -745,6 +746,12 @@ struct Tab {
     /// Protocols turned off per capture (its Files window); kept when the
     /// files are read again.
     disabled_for: Vec<(PathBuf, Vec<String>)>,
+    /// Profiles forced on single files (the Files window; remembered in
+    /// `records`).
+    profile_for: Vec<(PathBuf, String)>,
+    /// Offsets of single files' times, in nanoseconds (the Files window;
+    /// remembered in `records`).
+    offset_for: Vec<(PathBuf, i64)>,
     /// FIBEX arguments used as signals (picked in the Signals panel).
     arg_picks: Vec<nerka_core::Argument>,
     /// The Files window: the tab's files as they are being edited.
@@ -1172,15 +1179,77 @@ struct FilesEdit {
     paths: Vec<PathBuf>,
     captures: Vec<PathBuf>,
     off: Vec<(PathBuf, Vec<String>)>,
+    /// The profile forced on a file ("": chosen by its rules).
+    profile: Vec<(PathBuf, String)>,
+    /// A file's offset as typed ("": none).
+    offset: Vec<(PathBuf, String)>,
+    /// How each file was read when the window opened (by path).
+    reading: Vec<(PathBuf, nerka_core::input::timed::FileReading)>,
+    error: Option<String>,
 }
 
 impl FilesEdit {
-    fn of(paths: &[PathBuf], disabled_for: &[(PathBuf, Vec<String>)]) -> FilesEdit {
+    fn of(t: &Tab) -> FilesEdit {
+        let paths = &t.paths;
+        let offset = (t.offset_for.iter())
+            .map(|(p, ns)| (p.clone(), nerka_core::time::format_offset(*ns as f64 / 1e9)))
+            .collect();
+        let reading = match t.info.reading.as_slice() {
+            r if r.len() == paths.len() => paths.iter().cloned().zip(r.iter().cloned()).collect(),
+            _ => Vec::new(),
+        };
         FilesEdit {
             paths: paths.to_vec(),
             captures: paths.iter().filter(|p| protocols::is_capture(p)).cloned().collect(),
-            off: disabled_for.to_vec(),
+            off: t.disabled_for.to_vec(),
+            profile: t.profile_for.clone(),
+            offset,
+            reading,
+            error: None,
         }
+    }
+
+    /// The profile forced on `path`, as edited ("": none).
+    fn profile_of(&mut self, path: &Path) -> &mut String {
+        let i = match self.profile.iter().position(|(p, _)| p == path) {
+            Some(i) => i,
+            None => {
+                self.profile.push((path.to_path_buf(), String::new()));
+                self.profile.len() - 1
+            }
+        };
+        &mut self.profile[i].1
+    }
+
+    fn offset_of(&mut self, path: &Path) -> &mut String {
+        let i = match self.offset.iter().position(|(p, _)| p == path) {
+            Some(i) => i,
+            None => {
+                self.offset.push((path.to_path_buf(), String::new()));
+                self.offset.len() - 1
+            }
+        };
+        &mut self.offset[i].1
+    }
+
+    /// The forced profiles as a tab keeps them.
+    fn profile_for(&self) -> Vec<(PathBuf, String)> {
+        self.profile.iter().filter(|(p, n)| !n.is_empty() && self.paths.contains(p)).cloned().collect()
+    }
+
+    /// The offsets as a tab keeps them (nanoseconds), or the first that
+    /// isn't one.
+    fn offset_for(&self) -> Result<Vec<(PathBuf, i64)>, String> {
+        let mut out = Vec::new();
+        for (p, text) in self.offset.iter().filter(|(p, t)| !t.trim().is_empty() && self.paths.contains(p)) {
+            let name = p.file_name().map_or_else(|| p.display().to_string(), |n| n.to_string_lossy().into_owned());
+            let d = nerka_core::time::parse_offset(text)
+                .ok_or_else(|| format!("{name}: '{text}' isn't an offset (+3h, -0.250s, 90s, -2m)"))?;
+            if d != 0.0 {
+                out.push((p.clone(), (d * 1e9).round() as i64));
+            }
+        }
+        Ok(out)
     }
 
     fn off_for(&mut self, path: &Path) -> &mut Vec<String> {
@@ -1225,6 +1294,15 @@ impl Tab {
         // (its menu's Sort by time).
         let merge = prefs.merge_by_time && paths.len() > 1;
         options.records = split.clone();
+        // What the Files window chose for each file, last time.
+        let profile_for: Vec<(PathBuf, String)> =
+            paths.iter().filter_map(|p| Some((p.clone(), records::remembered_profile(p)?))).collect();
+        let offset_for: Vec<(PathBuf, i64)> = (paths.iter())
+            .map(|p| (p.clone(), (records::remembered_offset(p) * 1e9).round() as i64))
+            .filter(|(_, ns)| *ns != 0)
+            .collect();
+        options.profile_for = profile_for.clone();
+        options.offset_for = offset_for.clone();
         Self {
             path: paths[0].clone(),
             paths,
@@ -1301,6 +1379,8 @@ impl Tab {
             views: signals::Views::default(),
             reopen_at: None,
             disabled_for: Vec::new(),
+            profile_for,
+            offset_for,
             arg_picks: Vec::new(),
             files_edit: None,
             records: split,
@@ -1456,6 +1536,15 @@ impl Tab {
         true
     }
 
+    /// What the tab chose for its files: records, protocols, profiles,
+    /// offsets.
+    fn file_options(&self, options: &mut nerka_core::OpenOptions) {
+        options.records = self.records.clone();
+        options.disabled_for = self.disabled_for.clone();
+        options.profile_for = self.profile_for.clone();
+        options.offset_for = self.offset_for.clone();
+    }
+
     /// Read the tab's files again (other FIBEX files): filter, search and
     /// selection stay, and so does the current line.
     fn reopen(&mut self, ctx: &egui::Context, prefs: &SearchPrefs, fibex: Option<Arc<nerka_core::Fibex>>) {
@@ -1464,8 +1553,7 @@ impl Tab {
         let ps = self.paths.clone();
         let mut options = prefs.open_options();
         options.fibex = fibex;
-        options.records = self.records.clone();
-        options.disabled_for = self.disabled_for.clone();
+        self.file_options(&mut options);
         self.file = None;
         self.reopen_at = Some(line);
         self.open_error = None;
@@ -1503,8 +1591,7 @@ impl Tab {
         self.files_undo = Some(FilesUndo { old, at });
         let mut options = prefs.open_options();
         options.fibex = fibex;
-        options.records = self.records.clone();
-        options.disabled_for = self.disabled_for.clone();
+        self.file_options(&mut options);
         self.open_error = None;
         self.loading = Some(self.open_job(ctx, ps, options));
     }
@@ -1596,6 +1683,12 @@ impl Tab {
         // The saved ones switched on (owner, 2026-11-07: off keeps them).
         for d in saved.iter().filter(|d| d.is_on()) {
             s.set((**d).clone());
+        }
+        // Those the files' profiles switch on (a saved one of the name wins).
+        for d in profiles::current().signals_for(&file.info().reading) {
+            if s.get(d.name()).is_none() {
+                s.set(d);
+            }
         }
         // FIBEX arguments picked in the Signals panel.
         for a in &self.arg_picks {
@@ -3200,6 +3293,8 @@ struct App {
     window_name: Option<String>,
     /// The Settings window is open.
     settings_open: bool,
+    /// The Profiles window (Settings → Profiles…), while it is open.
+    profiles_edit: Option<profiles::Editor>,
     /// Listener for files other `nerka-gui` starts hand to this window.
     server: Option<instance::Server>,
     /// Tabs moved to new windows so far (temp file names).
@@ -3308,6 +3403,8 @@ struct SettingsChange {
     reload: bool,
     /// The theme changed.
     theme: bool,
+    /// Profiles… clicked.
+    profiles: bool,
 }
 
 /// What the Settings window shows: this window's name, the unpack cache
@@ -3404,8 +3501,18 @@ fn settings_ui(ui: &mut egui::Ui, f: SettingsFields<'_>) -> SettingsChange {
             }
         });
         ui.end_row();
+        ui.label(RichText::new("Text files").strong());
+        ui.end_row();
+        ui.label("Profiles");
+        save.profiles = ui
+            .button("Profiles…")
+            .on_hover_text(
+                "How text files are read: which lines are a record, where a line's time is (so it can be merged by time with DLT files and captures), signals switched on for them",
+            )
+            .clicked();
+        ui.end_row();
         ui.label(RichText::new("Settings bundle").strong()).on_hover_text(
-            "Packs, presets, plots, checks and signals as one .nerka-bundle file: to share them or move them \
+            "Packs, presets, plots, checks, signals and profiles as one .nerka-bundle file: to share them or move them \
              to another computer",
         );
         ui.end_row();
@@ -3422,7 +3529,7 @@ fn settings_ui(ui: &mut egui::Ui, f: SettingsFields<'_>) -> SettingsChange {
         save.reload = ui
             .button("Reload configuration")
             .on_hover_text(
-                "Read packs, presets, plots, checks, signals and settings again, as another nerka window or an \
+                "Read packs, presets, plots, checks, signals, profiles and settings again, as another nerka window or an \
                  editor left them (a bar says so when this window gets the focus back). Open tabs keep how \
                  their files were read",
             )
@@ -3929,6 +4036,9 @@ impl App {
     /// selection, checks on, draft plots) stay. Open tabs keep how their
     /// files were read (ports, protocols); new tabs use the prefs read.
     fn reload_settings(&mut self) {
+        if let Some(e) = profiles::load().into_iter().next() {
+            self.status = format!("Profiles: {e}");
+        }
         self.load_library();
         self.presets.load();
         self.plots.load();
@@ -4066,6 +4176,16 @@ impl App {
         }
     }
 
+    /// Settings → Profiles….
+    fn profiles_window(&mut self, ctx: &egui::Context) {
+        let Some(edit) = &mut self.profiles_edit else { return };
+        match profiles::window(ctx, edit) {
+            profiles::Outcome::Open => {}
+            profiles::Outcome::Close => self.profiles_edit = None,
+            profiles::Outcome::Saved(said) => self.status = said,
+        }
+    }
+
     fn settings_window(&mut self, ctx: &egui::Context) {
         if !self.settings_open {
             return;
@@ -4105,6 +4225,9 @@ impl App {
             if let Some(t) = self.tabs.get_mut(self.active) {
                 t.status = "Configuration read again".into();
             }
+        }
+        if save.profiles {
+            self.profiles_edit = Some(profiles::Editor::open());
         }
         if save.export {
             match nerka_core::bundle::Store::user() {
@@ -4646,7 +4769,7 @@ impl App {
         if let Some(i) = files {
             self.active = i;
             let t = &mut self.tabs[i];
-            t.files_edit = Some(FilesEdit::of(&t.paths, &t.disabled_for));
+            t.files_edit = Some(FilesEdit::of(t));
         }
         if let Some(i) = reload {
             self.active = i;
@@ -4714,8 +4837,7 @@ impl App {
             skips::Asked::None => {}
             skips::Asked::Goto(line) => t.goto_line(line),
             skips::Asked::Export(to) => {
-                options.records = t.records.clone();
-                options.disabled_for = t.disabled_for.clone();
+                t.file_options(&mut options);
                 // Several files: each row names its own, as the view does.
                 let files: Vec<(PathBuf, String)> = (t.paths.iter().enumerate())
                     .map(|(i, p)| {
@@ -4738,6 +4860,7 @@ impl App {
 
     fn files_window(&mut self, ctx: &egui::Context) {
         let names = protocols::names(&self.prefs);
+        let profile_names = profiles::names();
         let Some(t) = self.tabs.get_mut(self.active) else { return };
         if t.files_edit.is_none() {
             return;
@@ -4752,15 +4875,18 @@ impl App {
             .default_width(640.0)
             .show(ctx, |ui| {
                 ui.weak(
-                    "The tab shows these files as one view, one after another in this order. Plain text opens only \
-                     with plain text, and JSON with JSON of the same keys; DLT files and captures mix, whatever \
-                     their protocols (messages of other protocols share one table). In a capture, only the \
-                     highlighted protocols are read (Settings → Captures: protocols says which datagrams are whose).",
+                    "The tab shows these files as one view, one after another in this order (or by time: its menu's \
+                     Sort by time). Text opens with text, and JSON with JSON of the same keys; DLT files and \
+                     captures mix, whatever their protocols (messages of other protocols share one table), and a \
+                     text file joins them once it has a time (its profile reads it from its lines). In a capture, \
+                     only the highlighted protocols are read (Settings → Captures: protocols says which datagrams \
+                     are whose). A profile (Settings → Profiles…) says how a text file is read; an offset moves a \
+                     file's times (+3h, -0.250s): both are remembered for the file.",
                 );
                 ui.separator();
                 let (n, mut moved, mut removed) = (edit.paths.len(), None, None);
                 egui::ScrollArea::vertical().max_height(360.0).show(ui, |ui| {
-                    egui::Grid::new("files-grid").num_columns(6).striped(true).show(ui, |ui| {
+                    egui::Grid::new("files-grid").num_columns(8).striped(true).show(ui, |ui| {
                         let paths = edit.paths.clone();
                         for (i, p) in paths.iter().enumerate() {
                             ui.weak(format!("{}", i + 1));
@@ -4792,10 +4918,67 @@ impl App {
                             } else {
                                 ui.weak("");
                             }
+                            let reading = edit.reading.iter().find(|(q, _)| q == p).map(|(_, r)| r.clone());
+                            let dlt = p.extension().is_some_and(|e| e.eq_ignore_ascii_case("dlt"));
+                            let text = reading
+                                .as_ref()
+                                .map_or(!edit.captures.contains(p) && !dlt, |r| !r.profile.is_empty());
+                            if text {
+                                let chosen = edit.profile_of(p);
+                                let shown = if chosen.is_empty() {
+                                    reading.as_ref().map_or("auto".to_owned(), |r| format!("auto: {}", r.profile))
+                                } else {
+                                    chosen.clone()
+                                };
+                                egui::ComboBox::from_id_salt(("profile", i))
+                                    .selected_text(shown)
+                                    .width(140.0)
+                                    .show_ui(ui, |ui| {
+                                        ui.selectable_value(chosen, String::new(), "auto")
+                                            .on_hover_text("Chosen by the profiles' rules: name, first line, default");
+                                        for n in &profile_names {
+                                            ui.selectable_value(chosen, n.clone(), n);
+                                        }
+                                    })
+                                    .response
+                                    .on_hover_text("The profile this text file is read with");
+                            } else {
+                                ui.weak("");
+                            }
+                            let offset = edit.offset_of(p);
+                            ui.add(egui::TextEdit::singleline(offset).hint_text("+0s").desired_width(70.0))
+                                .on_hover_text("Move this file's times: +3h, -0.250s, 90s, -2m");
                             ui.end_row();
                         }
                     });
                 });
+                // How each file's time was read when the window opened.
+                if !edit.reading.is_empty() {
+                    ui.separator();
+                    egui::Grid::new("files-times").num_columns(2).spacing([12.0, 2.0]).show(ui, |ui| {
+                        for (p, r) in &edit.reading {
+                            let name = p
+                                .file_name()
+                                .map_or_else(|| p.display().to_string(), |f| f.to_string_lossy().into());
+                            ui.weak(name);
+                            let profile = if r.profile.is_empty() {
+                                String::new()
+                            } else {
+                                format!("profile {} ({}): ", r.profile, r.why)
+                            };
+                            let moved = if r.offset == 0.0 {
+                                String::new()
+                            } else {
+                                format!(", moved {}", nerka_core::time::format_offset(r.offset))
+                            };
+                            ui.weak(format!("{profile}time: {}{moved}", r.time));
+                            ui.end_row();
+                        }
+                    });
+                }
+                if let Some(e) = &edit.error {
+                    ui.colored_label(ui.visuals().error_fg_color, e);
+                }
                 if let Some((a, b)) = moved {
                     edit.paths.swap(a, b);
                 }
@@ -4806,7 +4989,10 @@ impl App {
                 ui.horizontal(|ui| {
                     add = ui.button("+ Add files…").clicked();
                     ui.separator();
-                    let changed = edit.paths != t.paths || edit.disabled_for() != t.disabled_for;
+                    let changed = edit.paths != t.paths
+                        || edit.disabled_for() != t.disabled_for
+                        || edit.profile_for() != t.profile_for
+                        || edit.offset_for().map_or(true, |o| o != t.offset_for);
                     apply = ui
                         .add_enabled(changed, egui::Button::new("Apply"))
                         .on_hover_text("Read the files again: in this order, with these protocols; filter, search and selection stay")
@@ -4824,9 +5010,28 @@ impl App {
                 }
             }
         }
+        let offsets = if apply { edit.offset_for() } else { Ok(Vec::new()) };
+        if let Err(e) = &offsets {
+            edit.error = Some(e.clone());
+        }
+        let apply = apply && offsets.is_ok();
         if apply {
             let (paths, off) = (edit.paths.clone(), edit.disabled_for());
-            let reread = off != t.disabled_for && paths == t.paths;
+            let (profile_for, offset_for) = (edit.profile_for(), offsets.unwrap_or_default());
+            let reread = (off != t.disabled_for || profile_for != t.profile_for || offset_for != t.offset_for)
+                && paths == t.paths;
+            // Remembered per file (owner, 2026-11-22), as Records… is.
+            for p in &paths {
+                let name = profile_for.iter().find(|(q, _)| q == p).map(|(_, n)| n.as_str());
+                let ns = offset_for.iter().find(|(q, _)| q == p).map_or(0, |(_, ns)| *ns);
+                if let Err(e) =
+                    records::remember_profile(p, name).and_then(|()| records::remember_offset(p, ns as f64 / 1e9))
+                {
+                    t.status = format!("Could not remember how {} is read: {e}", p.display());
+                }
+            }
+            t.profile_for = profile_for;
+            t.offset_for = offset_for;
             t.disabled_for = off;
             if reread {
                 t.reopen(ctx, &self.prefs, self.fibex.clone());
@@ -5140,6 +5345,7 @@ impl App {
         self.about_dialog(&ctx);
         self.open_errors_dialog(&ctx);
         self.settings_window(&ctx);
+        self.profiles_window(&ctx);
         self.bundle_windows(&ctx);
         if let Some(t) = self.tabs.get_mut(self.active)
             && let Some(d) = &mut t.detail
@@ -7210,6 +7416,53 @@ gear=D
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// A text log whose lines start with times shares a tab with a DLT file,
+    /// merged by time; the Files window shows how each file's time is read.
+    #[test]
+    fn text_with_times_shares_a_tab_with_dlt() {
+        let dir = std::env::temp_dir().join(format!("nerka-gui-timed-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (a, d) = (dir.join("a.log"), dir.join("d.dlt"));
+        std::fs::write(&a, "2025-10-18T00:00:00.500Z INFO text first\n2025-10-18T00:00:01.500Z INFO text second\n")
+            .unwrap();
+        let mut buf = Vec::new();
+        for (i, text) in ["dlt first", "dlt second"].into_iter().enumerate() {
+            let mut m = nerka_core::input::dlt::writer::Msg::log(
+                nerka_core::Level::Info,
+                "E",
+                "A",
+                "C",
+                vec![nerka_core::input::dlt::writer::Value::Str(text.into()).into()],
+            );
+            m.secs += i as u32; // 2025-10-18 00:00:00 and :01
+            m.encode(&mut buf);
+        }
+        std::fs::write(&d, buf).unwrap();
+        let ctx = egui::Context::default();
+        let mut app = App::default();
+        app.prefs.merge_by_time = true;
+        app.open_files(&ctx, vec![a.clone(), d.clone()]);
+        settle_app(&mut app, &ctx);
+        assert_eq!(app.tabs.len(), 1, "{}", app.tabs[0].status);
+        let t = &app.tabs[0];
+        let f = t.file.as_ref().unwrap();
+        let payloads: Vec<String> =
+            (0..f.line_count()).map(|l| f.line_text(l).unwrap().rsplit('\t').next().unwrap().to_owned()).collect();
+        assert_eq!(
+            payloads,
+            [
+                "dlt first",
+                "2025-10-18T00:00:00.500Z INFO text first",
+                "dlt second",
+                "2025-10-18T00:00:01.500Z INFO text second"
+            ]
+        );
+        let edit = FilesEdit::of(t);
+        let text = edit.reading.iter().find(|(p, _)| *p == a).map(|(_, r)| r.clone()).unwrap();
+        assert_eq!((text.profile.as_str(), text.time.as_str()), ("default", "the time each line starts with"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     #[test]
     fn files_of_different_kinds_open_as_separate_tabs() {
         let dir = std::env::temp_dir().join(format!("nerka-gui-mixed-{}", std::process::id()));
@@ -7232,7 +7485,7 @@ gear=D
         // Each tab says why once read (its "Indexed …" replaced the reason).
         for t in &app.tabs {
             assert!(
-                t.status.starts_with("Opened as separate tabs: a.log is plain text but d.dlt is DLT")
+                t.status.starts_with("Opened as separate tabs: a.log has no time, so it can't share a view with d.dlt")
                     && t.status.contains(" · Indexed "),
                 "{}",
                 t.status
@@ -7951,14 +8204,16 @@ query clock  signals: t:time
         settle(&mut tab, &ctx);
         let mut saved = Signals::default();
         tab.refresh_signals(&ctx, &lib, &saved, 0);
-        assert!(tab.signals.is_empty(), "nothing picked, no time in the file");
+        // Nothing picked: only the time its lines start with (the built-in
+        // profile: three of its four lines have one).
+        assert_eq!(tab.signals.iter().map(|d| d.name()).collect::<Vec<_>>(), ["time"]);
 
         // A signal pick: its groups are signals; the filter stays empty.
         tab.picks.add(&lib, "p.speed", Use::Signal, None);
         tab.picks.add(&lib, "p.clock", Use::Signal, None);
         tab.refresh_signals(&ctx, &lib, &saved, 0);
         let kinds: Vec<(&str, &str)> = tab.signals.iter().map(|d| (d.name(), d.kind().as_str())).collect();
-        assert_eq!(kinds, [("v", "num"), ("gear", "enum"), ("t", "time")]);
+        assert_eq!(kinds, [("time", "time"), ("v", "num"), ("gear", "enum"), ("t", "time")]);
         assert_eq!(tab.picks.expand(&lib).unwrap().exp.nfd, "");
         tab.mode = Mode::Query;
         tab.pattern = "@gear == D AND level >= WARN".into();

@@ -73,6 +73,10 @@ impl LogSource for TextFile {
         Some(self.data.bytes())
     }
 
+    fn has_time(&self) -> bool {
+        false
+    }
+
     fn line_of_offset(&self, offset: u64) -> LineNo {
         self.index.line_of_offset(offset)
     }

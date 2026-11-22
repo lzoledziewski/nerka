@@ -43,7 +43,11 @@ defaults to the signal's name. Parts:
   name uses the parameter (`drops_$cam`: `@drops_CAM1`, `@drops_CAM2`;
   [instances](library.md#instances-of-a-parameterised-query));
 - the file: `@time` for files that know their lines' times (DLT,
-  captures);
+  captures, text files whose [profile](formats.md#profiles) reads a time:
+  by default the date-time each line starts with), moved by the file's
+  [offset](formats.md#a-files-offset);
+- a text file's [profile](formats.md#profiles): its `signal` clauses (a
+  signal of yours with the same name wins);
 - [lifecycles](lifecycles.md) (`@ecu1`, the lifecycle's number) and
   [checks](checks.md) (`@storm`, a count of what the check found).
 

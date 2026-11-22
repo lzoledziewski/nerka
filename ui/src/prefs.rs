@@ -214,6 +214,7 @@ impl SearchPrefs {
         o.capture.protocols = self.protocols.clone();
         o.capture.routes = self.routes.iter().filter_map(|r| r.parse().ok()).collect();
         o.capture.disabled = self.disabled_protocols.clone();
+        o.profiles = crate::profiles::current();
         o
     }
 

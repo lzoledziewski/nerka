@@ -597,6 +597,7 @@ impl LogSource for Records {
             skips: self.skips.clone(),
             skips_more: self.skips_more,
             about: self.about.clone(),
+            reading: Vec::new(),
         }
     }
 

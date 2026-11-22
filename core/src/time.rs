@@ -120,6 +120,196 @@ fn parse_in(s: &str, zoneless: &dyn Fn(f64) -> f64) -> Option<f64> {
     })
 }
 
+/// The zone of a file's times written without one (a profile's `zone`).
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub enum Zone {
+    /// As the process shows times ([`is_local`]: the GUI's Local time /
+    /// UTC switch, the CLI's `--local-time`).
+    #[default]
+    Shown,
+    Utc,
+    /// This computer's zone, whatever the switch says.
+    Local,
+    /// A fixed offset ahead of UTC, in seconds (`+02:00`).
+    Fixed(f64),
+}
+
+impl Zone {
+    /// `utc`, `local`, `shown`, or an offset: `+02:00`, `-0530`, `+2`.
+    pub fn parse(s: &str) -> Option<Zone> {
+        let s = s.trim();
+        Some(match s.to_ascii_lowercase().as_str() {
+            "utc" | "z" | "gmt" => Zone::Utc,
+            "local" => Zone::Local,
+            "shown" => Zone::Shown,
+            _ => {
+                let sign = match s.as_bytes().first()? {
+                    b'+' => 1.0,
+                    b'-' => -1.0,
+                    _ => return None,
+                };
+                let z = &s[1..];
+                let (h, m) = match z.split_once(':') {
+                    Some((h, m)) => (num(h)?, num(m)?),
+                    None if z.len() == 4 => (num(&z[..2])?, num(&z[2..])?),
+                    None => (num(z)?, 0),
+                };
+                if h > 14 || m > 59 {
+                    return None;
+                }
+                Zone::Fixed(sign * (h * 3600 + m * 60) as f64)
+            }
+        })
+    }
+
+    /// As [`Self::parse`] reads it back.
+    pub fn spec(self) -> String {
+        match self {
+            Zone::Shown => "shown".into(),
+            Zone::Utc => "utc".into(),
+            Zone::Local => "local".into(),
+            Zone::Fixed(off) => {
+                let (sign, a) = if off < 0.0 { ('-', -off) } else { ('+', off) };
+                let a = a as i64;
+                format!("{sign}{:02}:{:02}", a / 3600, a % 3600 / 60)
+            }
+        }
+    }
+
+    /// The instant of a wall time `t` in this zone (seconds as if UTC).
+    pub fn to_utc(self, t: f64) -> f64 {
+        match self {
+            Zone::Shown if is_local() => local_to_utc(t),
+            Zone::Shown | Zone::Utc => t,
+            Zone::Local => local_to_utc(t),
+            Zone::Fixed(off) => t - off,
+        }
+    }
+}
+
+/// What a plain number in a file's times counts (a profile's `numbers`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Numbers {
+    /// Seconds since 1970, or ms / µs / ns when too large for seconds.
+    #[default]
+    Auto,
+    S,
+    Ms,
+    Us,
+    Ns,
+}
+
+impl Numbers {
+    pub fn parse(s: &str) -> Option<Numbers> {
+        Some(match s.trim().to_ascii_lowercase().as_str() {
+            "auto" => Numbers::Auto,
+            "s" => Numbers::S,
+            "ms" => Numbers::Ms,
+            "us" | "µs" => Numbers::Us,
+            "ns" => Numbers::Ns,
+            _ => return None,
+        })
+    }
+
+    pub fn spec(self) -> &'static str {
+        match self {
+            Numbers::Auto => "auto",
+            Numbers::S => "s",
+            Numbers::Ms => "ms",
+            Numbers::Us => "us",
+            Numbers::Ns => "ns",
+        }
+    }
+
+    fn seconds(self, n: f64) -> f64 {
+        match self {
+            Numbers::Auto => epoch_seconds(n),
+            Numbers::S => n,
+            Numbers::Ms => n / 1e3,
+            Numbers::Us => n / 1e6,
+            Numbers::Ns => n / 1e9,
+        }
+    }
+}
+
+/// [`parse_time`] for a file's times: a date-time without a zone in
+/// `zone`, a plain number counted as `numbers` says.
+pub fn parse_time_as(s: &str, zone: Zone, numbers: Numbers) -> Option<f64> {
+    let t = s.trim();
+    if let Ok(n) = t.parse::<f64>() {
+        return n.is_finite().then(|| numbers.seconds(n));
+    }
+    parse_in(t, &|t| zone.to_utc(t))
+}
+
+/// Bytes of a line's start that [`leading_time`] looks at.
+const LEADING_BYTES: usize = 64;
+
+/// The time a line starts with, as most text logs write it: a date-time
+/// (or a time of day) before the message, perhaps in brackets
+/// (`2025-10-17 10:00:01.250 ERROR …`, `[2025-10-17T10:00:01Z] …`, `Oct 17
+/// 10:00:01 host …`). The longest run of its first five words that
+/// [`parse_time_as`] reads, trailing `,:;|-` aside. A plain number isn't
+/// taken (`12 files copied`): a profile's own rule can read numbers.
+pub fn leading_time(line: &str, zone: Zone) -> Option<f64> {
+    let mut end = line.len().min(LEADING_BYTES);
+    while !line.is_char_boundary(end) {
+        end -= 1;
+    }
+    let head = line[..end].trim_start();
+    // In brackets: what they hold.
+    if let Some(rest) = head.strip_prefix(['[', '(']) {
+        let close = rest.find([']', ')'])?;
+        let inner = rest[..close].trim();
+        return (inner.parse::<f64>().is_err()).then(|| parse_time_as(inner, zone, Numbers::Auto)).flatten();
+    }
+    let mut best = None;
+    let mut words = 0;
+    let mut in_word = false;
+    for (i, c) in head.char_indices().chain(std::iter::once((head.len(), ' '))) {
+        let space = c.is_whitespace();
+        if space && in_word {
+            words += 1;
+            let cand = head[..i].trim_end_matches([',', ':', ';', '|', '-', ']']);
+            if cand.parse::<f64>().is_err()
+                && let Some(t) = parse_time_as(cand, zone, Numbers::Auto)
+            {
+                best = Some(t);
+            }
+            if words == 5 {
+                break;
+            }
+        }
+        in_word = !space;
+    }
+    best
+}
+
+/// A signed amount of time: `+3h`, `-0.250s`, `90`, `-1.5m`, `500ms`
+/// ([`crate::lifecycle::parse_duration`] with a sign).
+pub fn parse_offset(s: &str) -> Option<f64> {
+    let s = s.trim();
+    let (sign, rest) = match s.as_bytes().first()? {
+        b'-' => (-1.0, &s[1..]),
+        b'+' => (1.0, &s[1..]),
+        _ => (1.0, s),
+    };
+    crate::lifecycle::parse_duration(rest).map(|d| sign * d)
+}
+
+/// An offset as [`parse_offset`] reads it back: `+3h`, `-0.25s`, `+0s`.
+pub fn format_offset(d: f64) -> String {
+    let (sign, a) = if d < 0.0 { ('-', -d) } else { ('+', d) };
+    let round = |x: f64| (x * 1e9).round() / 1e9;
+    if a >= 3600.0 && (a / 3600.0).fract() == 0.0 {
+        format!("{sign}{}h", a / 3600.0)
+    } else if a >= 60.0 && (a / 60.0).fract() == 0.0 {
+        format!("{sign}{}m", a / 60.0)
+    } else {
+        format!("{sign}{}s", round(a))
+    }
+}
+
 /// A plain number as seconds: one too large for seconds (after the year
 /// 5000) is milliseconds, microseconds or nanoseconds since the epoch.
 fn epoch_seconds(n: f64) -> f64 {
@@ -561,6 +751,71 @@ mod tests {
         // An explicit zone wins; a time of day is never converted.
         assert_eq!(parse_in("2025-10-17T10:00:01Z", &cest), Some(day + 36_001.0));
         assert_eq!(parse_in("10:00:01", &cest), Some(36_001.0));
+    }
+
+    #[test]
+    fn leading_times_as_logs_write_them() {
+        let at = 20_378.0 * 86_400.0 + 36_001.25; // 2025-10-17 10:00:01.25 UTC
+        for line in [
+            "2025-10-17 10:00:01.250 ERROR failed",
+            "2025-10-17T10:00:01.25Z [main] INFO x",
+            "  2025-10-17 10:00:01,250 | WARN | y",
+            "[2025-10-17 10:00:01.250] [info] z",
+            "(2025-10-17T12:00:01.25+02:00) z",
+            "2025-10-17 12:00:01.25 +0200 host app: z",
+            "Fri Oct 17 10:00:01.25 2025 a b c",
+            "17/Oct/2025:10:00:01.25 +0000 GET /",
+            "2025-10-17 10:00:01.25: message",
+        ] {
+            assert_eq!(leading_time(line, Zone::Utc), Some(at), "{line}");
+        }
+        assert_eq!(leading_time("10:00:01.25 INFO x", Zone::Utc), Some(36_001.25));
+        // A zone for times written without one; a written zone wins.
+        assert_eq!(leading_time("2025-10-17 12:00:01.25 x", Zone::Fixed(7200.0)), Some(at));
+        assert_eq!(leading_time("2025-10-17T10:00:01.25Z x", Zone::Fixed(7200.0)), Some(at));
+        for no in ["12 files copied", "[   12.345678] usb", "ERROR 2025-10-17 10:00:01", "", "   ", "[INFO] 10:00"] {
+            assert_eq!(leading_time(no, Zone::Utc), None, "{no}");
+        }
+        // Only the line's start is read.
+        let long = format!("{} 2025-10-17", "x".repeat(100));
+        assert_eq!(leading_time(&long, Zone::Utc), None);
+        assert_eq!(leading_time("żółw 10:00", Zone::Utc), None);
+    }
+
+    #[test]
+    fn zones_numbers_and_offsets_read_back() {
+        for (s, z) in [
+            ("utc", Zone::Utc),
+            ("local", Zone::Local),
+            ("shown", Zone::Shown),
+            ("+02:00", Zone::Fixed(7200.0)),
+            ("-05:30", Zone::Fixed(-19_800.0)),
+        ] {
+            assert_eq!(Zone::parse(s), Some(z), "{s}");
+            assert_eq!(z.spec(), s);
+        }
+        assert_eq!(Zone::parse("+0200"), Some(Zone::Fixed(7200.0)));
+        assert_eq!(Zone::parse("+2"), Some(Zone::Fixed(7200.0)));
+        assert_eq!(Zone::parse("UTC"), Some(Zone::Utc));
+        for bad in ["", "mars", "+25", "02:00", "+02:60"] {
+            assert_eq!(Zone::parse(bad), None, "{bad}");
+        }
+        for n in ["auto", "s", "ms", "us", "ns"] {
+            assert_eq!(Numbers::parse(n).unwrap().spec(), n);
+        }
+        assert_eq!(parse_time_as("12.5", Zone::Utc, Numbers::S), Some(12.5));
+        assert_eq!(parse_time_as("1500", Zone::Utc, Numbers::Ms), Some(1.5));
+        assert_eq!(parse_time_as("1760695201250", Zone::Utc, Numbers::Auto), Some(1_760_695_201.25));
+        for (s, d) in [("+3h", 10_800.0), ("-0.25s", -0.25), ("90", 90.0), ("-2m", -120.0), ("500ms", 0.5)] {
+            assert_eq!(parse_offset(s), Some(d), "{s}");
+        }
+        assert_eq!(parse_offset("x"), None);
+        assert_eq!(parse_offset(""), None);
+        for d in [10_800.0, -0.25, 90.0, -120.0, 0.0, 1.0e-3, 86_400.0 * 365.0 * 55.0] {
+            assert_eq!(parse_offset(&format_offset(d)), Some(d), "{d}: {}", format_offset(d));
+        }
+        assert_eq!(format_offset(10_800.0), "+3h");
+        assert_eq!(format_offset(-0.25), "-0.25s");
     }
 
     #[test]

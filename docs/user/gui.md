@@ -64,7 +64,11 @@ they find their lines again in a changed file (one that can't is marked
 Files opened together (multi-select in **Open…**, dropping several,
 `nerka-gui a.dlt b.pcap`) become **one tab**, one after another in the
 order given. The tab's menu → **Files…** lists them: move, remove or add
-files, turn protocols on or off per capture. **Sort by time** in the
+files, turn protocols on or off per capture, pick a text file's
+[profile](formats.md#profiles), move a file's times by an
+[offset](formats.md#a-files-offset); below the list, how each file's time
+was read. A text file whose lines have times shares a tab with DLT files
+and captures. **Sort by time** in the
 menu sorts all their lines by time (files that know it; lines of one time
 in the order of the files, then of each file), for one file too. Files
 that can't be sorted (one with lines but no times) leave the box
