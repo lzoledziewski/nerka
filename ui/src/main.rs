@@ -7135,10 +7135,19 @@ gear=D
         // Reload: the window is still shown, with no input until it is read.
         let prefs = app.prefs.clone();
         app.tabs[0].reopen(&ctx, &prefs, None);
+        // Held while the frame runs: a fast machine read the file before
+        // it (macOS CI).
+        let (release, held) = std::sync::mpsc::channel::<()>();
+        let read = app.tabs[0].loading.replace(Job::spawn(&ctx, move |_| {
+            let _ = held.recv();
+            Err(nerka_core::Error::Cancelled)
+        }));
         run(&mut app);
         assert!(app.tabs[0].file.is_none(), "still reading");
         assert_eq!(shown_in(&app), Some(first + 2), "shown while reading");
         assert!(app.plot_win.lock().unwrap().input.is_none());
+        drop(release);
+        app.tabs[0].loading = read;
         settle_app(&mut app, &ctx);
         run(&mut app);
         assert_eq!(shown_in(&app), Some(first + 3));
