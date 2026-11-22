@@ -3237,6 +3237,9 @@ struct App {
     plot_win_builder: Option<(u64, egui::ViewportBuilder)>,
     /// Whether the plot's window was maximized, as it last said.
     plot_win_maximized: Option<bool>,
+    /// The plot's window just opened: the pass it opened in, whether it is
+    /// to be maximized, whether it was asked to be (`show_plot_window`).
+    plot_win_settle: Option<(u64, bool, bool)>,
 }
 
 /// The plot window's title: the window's name first, as in the main
@@ -3251,22 +3254,42 @@ fn plot_window_title(window_name: Option<&str>, tab: &str) -> String {
 /// Show the plot's own window. Opened (again), it goes where it was
 /// (`plot::Placement`); while it stays open it keeps the builder it was
 /// opened with, as a changed builder would move or resize it.
+///
+/// Maximized, it is asked to be once it is shown (two passes later): a
+/// window made maximized on Windows took the maximized place but kept its
+/// own size (winit). Until it settles (`plot_win_settle`, ten passes),
+/// what it says about being maximized isn't remembered.
 fn show_plot_window(
     ctx: &egui::Context,
     shared: &Arc<std::sync::Mutex<plot::Detached>>,
     kept: &mut Option<(u64, egui::ViewportBuilder)>,
+    settle: &mut Option<(u64, bool, bool)>,
     maximized: bool,
     title: String,
 ) {
     let pass = ctx.cumulative_pass_nr();
     let builder = match kept.take() {
         Some((last, b)) if last + 1 >= pass => b,
-        _ => shared.lock().unwrap_or_else(|e| e.into_inner()).placed.builder(maximized),
+        _ => {
+            *settle = Some((pass, maximized, false));
+            shared.lock().unwrap_or_else(|e| e.into_inner()).placed.builder()
+        }
     };
     *kept = Some((pass, builder.clone()));
-    let shared = shared.clone();
     let id = egui::ViewportId::from_hash_of("nerka-plot");
+    let shared = shared.clone();
     ctx.show_viewport_deferred(id, builder.with_title(title), move |ui, _| plot::window_ui(ui, &shared));
+    if let Some((opened, max, asked)) = settle {
+        if *max && !*asked && pass >= *opened + 2 {
+            ctx.send_viewport_cmd_to(id, egui::ViewportCommand::Maximized(true));
+            *asked = true;
+        }
+        if pass >= *opened + 10 {
+            *settle = None;
+        } else {
+            ctx.request_repaint();
+        }
+    }
 }
 
 /// What the Settings window changed.
@@ -5308,7 +5331,8 @@ impl App {
                 } else {
                     let title = plot_window_title(self.window_name.as_deref(), &tab.title());
                     let max = self.prefs.plot_window_maximized;
-                    show_plot_window(&ctx, &self.plot_win, &mut self.plot_win_builder, max, title);
+                    let (kept, settle) = (&mut self.plot_win_builder, &mut self.plot_win_settle);
+                    show_plot_window(&ctx, &self.plot_win, kept, settle, max, title);
                 }
             }
             egui::CentralPanel::default().show(ui, |ui| {
@@ -5594,14 +5618,15 @@ impl App {
                 asked
             };
             let title = plot_window_title(self.window_name.as_deref(), &tab.title());
-            show_plot_window(&ctx, &self.plot_win, &mut self.plot_win_builder, self.prefs.plot_window_maximized, title);
+            let (kept, settle) = (&mut self.plot_win_builder, &mut self.plot_win_settle);
+            show_plot_window(&ctx, &self.plot_win, kept, settle, self.prefs.plot_window_maximized, title);
             if toggle {
                 self.plot_window = false;
                 self.plot_win_key = None;
                 toggled = true;
             }
             // Maximized or not, as the user last left it: for the next window.
-            if maximized.is_some() && maximized != self.plot_win_maximized {
+            if maximized.is_some() && maximized != self.plot_win_maximized && self.plot_win_settle.is_none() {
                 self.plot_win_maximized = maximized;
                 if let Some(m) = maximized.filter(|&m| m != self.prefs.plot_window_maximized) {
                     self.prefs.plot_window_maximized = m;
@@ -6825,8 +6850,18 @@ gear=D
         plot::lock(&app.tabs[0].plot).shown = true;
         run(&mut app);
         let shown_in = |app: &App| app.plot_win_builder.as_ref().map(|(pass, _)| *pass);
-        let first = shown_in(&app).expect("the window is shown");
         assert!(app.plot_win.lock().unwrap().input.is_some());
+        // Just opened: what it says about being maximized waits until it
+        // settles (it says "not maximized" before it is asked to be).
+        assert!(matches!(app.plot_win_settle, Some((_, false, false))));
+        app.plot_win.lock().unwrap().placed.maximized = Some(true);
+        run(&mut app);
+        assert!(!app.prefs.plot_window_maximized, "not while it settles");
+        for _ in 0..10 {
+            run(&mut app);
+        }
+        assert!(app.plot_win_settle.is_none());
+        let first = shown_in(&app).expect("the window is shown");
         // Maximized by the user: remembered.
         app.plot_win.lock().unwrap().placed.maximized = Some(true);
         run(&mut app);
@@ -6849,6 +6884,17 @@ gear=D
         app.plot_win.lock().unwrap().out.toggle_window = true;
         run(&mut app);
         assert!(!app.plot_window && !app.prefs.plot_window, "docked");
+        // In a window again, maximized as last left: asked to be once shown,
+        // not when made (Windows kept such a window's own size).
+        run(&mut app);
+        app.plot_window = true;
+        run(&mut app);
+        let b = &app.plot_win_builder.as_ref().expect("shown").1;
+        assert_eq!(b.maximized, None);
+        assert!(matches!(app.plot_win_settle, Some((_, true, false))));
+        run(&mut app);
+        run(&mut app);
+        assert!(matches!(app.plot_win_settle, Some((_, true, true))), "asked to be maximized");
         std::fs::remove_dir_all(&dir).ok();
     }
 

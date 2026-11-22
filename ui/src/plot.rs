@@ -87,14 +87,14 @@ impl Placement {
         }
     }
 
-    /// A new window where this one was (maximized as `maximized` says).
-    pub fn builder(&self, maximized: bool) -> egui::ViewportBuilder {
+    /// A new window where this one was, at its size when not maximized
+    /// (maximized once it is shown: `show_plot_window` in main.rs).
+    pub fn builder(&self) -> egui::ViewportBuilder {
         let b = egui::ViewportBuilder::default().with_inner_size(self.size.unwrap_or(egui::vec2(1100.0, 460.0)));
-        let b = match self.pos {
+        match self.pos {
             Some(p) => b.with_position(p),
             None => b,
-        };
-        b.with_maximized(maximized)
+        }
     }
 }
 
@@ -2355,11 +2355,11 @@ mod tests {
         assert_eq!(p.size, Some(egui::vec2(800.0, 400.0)), "the size to go back to is kept");
         p.update(&egui::ViewportInfo { minimized: Some(true), maximized: Some(false), ..normal.clone() });
         assert_eq!(p.maximized, Some(true), "minimized: still maximized when shown again");
-        let b = p.builder(true);
-        assert_eq!(b.maximized, Some(true));
+        let b = p.builder();
+        assert_eq!(b.maximized, None, "maximized once shown, not when made");
         assert_eq!(b.position, Some(egui::pos2(100.0, 50.0)));
         assert_eq!(b.inner_size, Some(egui::vec2(800.0, 400.0)));
-        assert_eq!(Placement::default().builder(false).inner_size, Some(egui::vec2(1100.0, 460.0)));
+        assert_eq!(Placement::default().builder().inner_size, Some(egui::vec2(1100.0, 460.0)));
     }
 
     /// Review 2026-11-14, P2: a lane is built again only when what it shows
