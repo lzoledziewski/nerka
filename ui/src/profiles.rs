@@ -86,10 +86,20 @@ pub fn window(ctx: &egui::Context, edit: &mut Editor) -> Outcome {
                 for (c, what) in [
                     ("name *.log, app-*.txt", "files whose name matches (any case)"),
                     ("first /REGEX/", "files whose first non-empty line matches"),
-                    ("records start=/REGEX/", "rows: lines, start=/…/, sep=/…/, blank, json, auto"),
+                    ("records lines", "one row per line"),
+                    ("records start=/REGEX/", "a record starts at each line matching"),
+                    ("records sep=/REGEX/", "records between lines matching (not part of them)"),
+                    (
+                        "records blank | json | auto",
+                        "records between blank lines; JSON values; JSON or lines (default)",
+                    ),
                     ("time auto | none | /REGEX/", "the time a line starts with; none; a regex's group time"),
                     ("zone utc | local | +02:00", "the zone of times written without one (default: as shown)"),
-                    ("numbers s | ms | us | ns | auto", "what a plain number counts"),
+                    (
+                        "numbers s | ms | us | ns",
+                        "a time written as a number (1760695201250, [ 12.345]) is s, ms, µs or ns since 1970",
+                    ),
+                    ("numbers auto", "… guessed by its size (default): up to 11 digits seconds, then ms, µs, ns"),
                     ("signal SPEC", "a signal on for its files, as in the Signals panel (repeatable)"),
                 ] {
                     ui.monospace(c);

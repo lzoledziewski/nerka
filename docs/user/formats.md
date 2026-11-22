@@ -48,12 +48,12 @@ CLAUSES`, the clauses separated by `;`:
 |---|---|
 | `name *.log, app-*.txt` | the profile is for files whose name matches (`*`, `?`; any case) |
 | `first /REGEX/` | … whose first non-empty line matches |
-| `records SPEC` | how lines group into rows (the specs above; `auto` by default) |
+| `records lines`, `start=/REGEX/`, `sep=/REGEX/`, `blank`, `json`, `auto` | how lines group into rows ([Multi-line records](#multi-line-records); `auto` by default) |
 | `time auto` | a line's time is the date-time it starts with |
 | `time /REGEX/` | a line's time is the regex's group `time` (or the whole match) |
 | `time none` | no time |
 | `zone utc`, `zone local`, `zone +02:00` | the zone of times written without one (default: as shown, [Times](#times)) |
-| `numbers s`, `ms`, `us`, `ns`, `auto` | what a plain number counts: seconds since 1970 (or since boot), … |
+| `numbers s`, `ms`, `us`, `ns`, `auto` | a time written as a plain number (`1760695201250`, `[ 12.345]`): seconds, milliseconds, microseconds or nanoseconds since 1970 (or since boot: give the file an [offset](#a-files-offset)); `auto` (the default) guesses by its size: up to 11 digits seconds, then ms, µs, ns |
 | `signal SPEC` | a [signal](signals.md) switched on for its files (repeatable) |
 
 ```
