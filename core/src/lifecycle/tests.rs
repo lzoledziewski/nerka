@@ -449,6 +449,26 @@ mod signals {
     }
 
     #[test]
+    fn signals_say_when_their_lifecycle_failed() {
+        // A field this source hasn't: no lifecycles, ever.
+        let sig = signals(&["lifecycle a: lines nope == A; reset uptime", OTA]);
+        let src = ota();
+        let (a, ota) = (sig.get("a").unwrap(), sig.get("ota").unwrap());
+        // Not tried yet: nothing to say (a UI waits).
+        assert_eq!(a.failed(&src), None);
+        assert!(a.as_lifecycle().unwrap().lifecycles(&src, &Progress::new()).is_err());
+        let e = a.failed(&src).expect("the lifecycle says why");
+        assert!(e.contains("unknown field 'nope'"), "{e}");
+        assert_eq!(ota.failed(&src), Some(format!("its lifecycle @a: {e}")));
+        assert!(ota.cached_series(&src).is_none());
+        // One that was found fails nothing.
+        let ok = signals(&[ECU_A, OTA]);
+        ok.get("ota").unwrap().series(&src, &Progress::new()).unwrap();
+        assert_eq!(ok.get("ota").unwrap().failed(&src), None);
+        assert_eq!(ok.get("a").unwrap().failed(&src), None);
+    }
+
+    #[test]
     fn there_is_no_built_in_uptime_signal() {
         // Whose uptime would it be? Lifecycles read it from their own lines.
         let sig = Signals::default().for_source(&ota());

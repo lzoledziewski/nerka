@@ -1175,6 +1175,14 @@ impl SignalDef {
         Ok(SignalSeries { key: source_key(source), parts, life, default })
     }
 
+    /// Why it has no series on `source` and won't get one: the lifecycle
+    /// it is, or is `per`, wasn't found (a UI then stops waiting for it).
+    pub fn failed(&self, source: &dyn LogSource) -> Option<String> {
+        let l = self.as_lifecycle().or(self.life.as_ref())?;
+        let e = l.done(source)?.err()?;
+        Some(if self.as_lifecycle().is_some() { e } else { format!("its lifecycle @{}: {e}", l.name()) })
+    }
+
     /// The series if every file's events are cached already (a UI can
     /// show values without waiting).
     pub fn cached_series(&self, source: &dyn LogSource) -> Option<SignalSeries> {

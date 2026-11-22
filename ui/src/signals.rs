@@ -506,9 +506,15 @@ pub fn signals_panel(ui: &mut egui::Ui, st: &mut SignalsUi, input: Input<'_>) ->
                                         .on_hover_text(format!("No event before line {}", line + 1));
                                 }
                             },
-                            None => {
-                                ui.add(egui::Spinner::new().size(12.0)).on_hover_text("Collecting events");
-                            }
+                            // Its lifecycle failed: no events will come.
+                            None => match d.failed(file) {
+                                Some(e) => {
+                                    ui.colored_label(ui.visuals().error_fg_color, "error").on_hover_text(e);
+                                }
+                                None => {
+                                    ui.add(egui::Spinner::new().size(12.0)).on_hover_text("Collecting events");
+                                }
+                            },
                         },
                         Some(Err(e)) => {
                             ui.colored_label(ui.visuals().error_fg_color, "error").on_hover_text(e);

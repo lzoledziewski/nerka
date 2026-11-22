@@ -581,6 +581,10 @@ fn build(
     let mut ready = Vec::new();
     for name in &state.plotted {
         let Some(def) = signals.get(name) else { continue };
+        // Failed for good: said, not waited for (no "…").
+        if let Some(e) = def.failed(file) {
+            return Err(format!("@{name} can't be plotted: {e}"));
+        }
         let r = match def.as_lifecycle() {
             Some(life) => Ready::Lives(life.cached(file).ok_or("Finding lifecycles…")?),
             None => Ready::Events(series_of(def).ok_or("Collecting events…")?),
@@ -837,6 +841,12 @@ pub fn plot_panel(ui: &mut egui::Ui, state: &mut PlotState, src: Source<'_>) -> 
             // Built on a thread: the plot as it was until then.
             Err(why) if why == BUILDING && state.data.is_some() => {
                 busy(ui, &why);
+            }
+            // What is waited for ends with "…"; anything else failed.
+            Err(why) if !why.ends_with('…') => {
+                state.data = None;
+                ui.colored_label(ui.visuals().error_fg_color, why);
+                return out;
             }
             Err(why) => {
                 state.data = None;
@@ -2407,6 +2417,41 @@ mod tests {
         let fifth = lanes(&state, &mut cache, &kept_few, &sig);
         assert!(!Arc::ptr_eq(&first["v"], &fifth["v"]));
         assert_eq!(fifth["v"].kind, SignalKind::Enum);
+    }
+
+    /// A lifecycle that failed (a field the file hasn't): the plot of it, or
+    /// of a signal bound to it, says why instead of waiting for good.
+    #[test]
+    fn a_failed_lifecycle_is_said_not_waited_for() {
+        let file = nerka_core::TextFile::from_bytes("t", b"s=up\ns=down\n".to_vec());
+        let mut signals = Signals::default();
+        for spec in ["lifecycle a: lines ecu == A; reset uptime", r"s:enum:per(a)=/s=(?<s>\w+)/"] {
+            signals.set(SignalDef::parse_spec(spec).unwrap());
+        }
+        let try_build = |plotted: &str| {
+            let state = PlotState { plotted: vec![plotted.into()], ..Default::default() };
+            let mut series_of = |d: &SignalDef| d.cached_series(&file).map(Arc::new);
+            build(
+                &state,
+                &mut HashMap::new(),
+                &signals,
+                &file,
+                &Clock::of(&file, &signals),
+                &mut series_of,
+                &mut build_here(&file),
+            )
+            .err()
+            .unwrap()
+        };
+        // Not tried yet: waited for.
+        assert!(try_build("s").ends_with('…'));
+        let life = signals.get("a").unwrap().as_lifecycle().unwrap();
+        assert!(life.lifecycles(&file, &nerka_core::Progress::new()).is_err());
+        for name in ["s", "a"] {
+            let why = try_build(name);
+            assert!(why.starts_with(&format!("@{name} can't be plotted: ")), "{why}");
+            assert!(why.contains("unknown field 'ecu'") && !why.ends_with('…'), "{why}");
+        }
     }
 
     /// A signal bound to a lifecycle of two ECUs: a lane per ECU, a
