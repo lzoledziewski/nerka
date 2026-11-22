@@ -45,6 +45,8 @@ cargo run --release -p nerka-cli -- --unpack-dir cache filter -c --stats 'apid =
 cargo run --release -p nerka-core --example probe_capture -- trace.pcapng log.mf4   # structure of real captures, no payload
 powershell -ExecutionPolicy Bypass -File tools/screenshot.ps1 -Out shot.png -AppArgs app.log  # GUI screenshot (Windows)
 cargo run -p nerka-gui -- nv.dlt --fibex nv.xml --plot m0_speed --screenshot shot.png   # the app saves its own window, then closes (any OS; CI)
+cargo run -p nerka-core --example gen_demo -- demo.dlt   # the demo drive (+ examples/packs/demo.nerka-pack); in release archives
+bash tools/docs-shots.sh                              # the user guide's screenshots of it (docs/user/img/plot.png, library.png)
 bash tools/review-gate.sh --full                      # review gate: build gates, fuzz, metrics (docs/dev/review/)
 bash tools/bench.sh target/bench 1024 5 > bench.tsv   # the benchmark above as TSV; `tools/bench.sh compare a.tsv b.tsv`
 KSY=1 bash tools/bench.sh target/bench 1024 5 > bench.tsv   # + the DLT definition against native DLT (NERKA_BIN: binaries elsewhere)

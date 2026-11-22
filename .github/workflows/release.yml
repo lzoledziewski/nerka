@@ -53,6 +53,10 @@ jobs:
         run: cargo test --workspace --release --locked
       - name: Build
         run: cargo build --release --workspace --locked
+      # A demo trace to try nerka on (the user guide's screenshots), copied
+      # with examples/ below.
+      - name: Demo trace
+        run: cargo run --release --locked -p nerka-core --example gen_demo -- examples/demo.dlt
       - name: Package (Linux, macOS)
         if: runner.os != 'Windows'
         run: |

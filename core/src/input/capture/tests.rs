@@ -465,3 +465,103 @@ fn senders_past_the_cap_are_not_kept() {
     assert!(src(n).is_some(), "a known sender");
     assert_eq!(field_named(&f, n as LineNo - 1, "apid"), Some(crate::FieldValue::Str(b"S".as_slice().into())));
 }
+
+/// What the notes count is listed one by one, to be found: the frame (as
+/// Wireshark numbers it), the time, the sender, why, and the bytes' start.
+#[test]
+fn skips_say_where_and_why() {
+    let cut = dlt("CUT", &"c".repeat(100));
+    let short = &cut[..40];
+    let lost = fragments(9, &udp(3490, &dlt("LOST", &"z".repeat(500))), 304);
+    let frames = vec![
+        (100, eth(0x0800, &ipv4(17, 1, 0, &udp(3490, &dlt("NAV", "first"))))),
+        // A message cut short after a whole one.
+        (101, eth(0x0800, &ipv4(17, 2, 0, &udp(3490, &[dlt("OK", "whole"), short.to_vec()].concat())))),
+        (102, eth(0x0800, &lost[0])),
+        (103, eth(0x0800, &ipv4(17, 3, 0, &udp(3490, &[0x00, 0x01, 0x02, 0x03, 0x04])))),
+        (104, eth(0x0800, &ipv4(17, 4, 0, &udp(3490, &dlt("LAST", "after"))))),
+    ];
+    let (f, s) = from_bytes("t.pcap", pcap_file(1, &frames), &CaptureOptions::default()).unwrap();
+    let info = f.info();
+    assert_eq!((s.net.incomplete, info.skips.len(), info.skips_more), (1, 3, 0));
+    let k: Vec<_> = info.skips.iter().map(|s| (s.kind, s.frame, s.line)).collect();
+    assert_eq!(
+        k,
+        [
+            (crate::input::SkipKind::NotMessages, Some(2), Some(2)),
+            (crate::input::SkipKind::LostFragment, Some(3), Some(2)),
+            (crate::input::SkipKind::NotMessages, Some(4), Some(2)),
+        ]
+    );
+    let cut_short = &info.skips[0];
+    assert_eq!(cut_short.bytes, 40);
+    assert_eq!(cut_short.time, Some(101.25));
+    assert!(cut_short.detail.starts_with("DLT 10.0.0.1:50000 → 10.0.0.2:3490"), "{}", cut_short.detail);
+    assert!(cut_short.detail.contains("1 messages read before"), "{}", cut_short.detail);
+    assert!(cut_short.detail.contains("cut short"), "{}", cut_short.detail);
+    assert_eq!(cut_short.head, short[..16]);
+    // In the file: the bytes are where the offset says.
+    let o = cut_short.offset.unwrap() as usize;
+    assert_eq!(&f.file_bytes()[o..o + 40], short);
+    let frag = &info.skips[1];
+    assert!(frag.detail.starts_with("10.0.0.1 → 10.0.0.2, 304 of ? bytes in 1 fragments"), "{}", frag.detail);
+    assert!(info.skips[2].detail.contains("no DLT header"), "{}", info.skips[2].detail);
+    assert_eq!(lines(&f).len(), 3);
+}
+
+/// A frame the capture cut (its snap length) says so on the skip it
+/// leaves: what was kept and how long the frame was.
+#[test]
+fn a_frame_cut_by_the_capture_says_so() {
+    let whole = eth(0x0800, &ipv4(17, 1, 0, &udp(3490, &[dlt("OK", "whole"), dlt("CUT", &"c".repeat(300))].concat())));
+    let kept = 200;
+    let mut file = pcap_file(1, &[(100, whole[..kept].to_vec())]);
+    // The record's length on the wire: the whole frame.
+    file[24 + 12..24 + 16].copy_from_slice(&(whole.len() as u32).to_le_bytes());
+    let (f, s) = from_bytes("t.pcap", file, &CaptureOptions::default()).unwrap();
+    assert_eq!(lines(&f).len(), 1);
+    let info = f.info();
+    let skip = &info.skips[0];
+    assert_eq!(skip.cut, Some((kept as u64, whole.len() as u64)));
+    assert!(skip.detail.contains("cut short"), "{}", skip.detail);
+    assert!(skip.detail.contains(&format!("the capture cut its frame: {kept} of {} bytes kept", whole.len())));
+    assert!(crate::input::skip_tsv(skip).contains(&format!("\t{kept}/{}\t", whole.len())));
+    assert_eq!(s.drops_report(), "capture drops: unknown (pcap and MF4 files don't record them)");
+}
+
+/// A pcapng's interface statistics say whether the capture itself dropped
+/// packets: the last block of each interface counts.
+#[test]
+fn pcapng_interface_statistics_tell_the_capture_drops() {
+    let frame = eth(0x0800, &ipv4(17, 1, 0, &udp(3490, &dlt("NAV", "x"))));
+    let isb = |recv: u64, ifdrop: u64, osdrop: u64| {
+        let mut b = 0u32.to_le_bytes().to_vec();
+        b.extend_from_slice(&[0; 8]);
+        for (code, v) in [(4u16, recv), (5, ifdrop), (7, osdrop)] {
+            b.extend_from_slice(&code.to_le_bytes());
+            b.extend_from_slice(&8u16.to_le_bytes());
+            b.extend_from_slice(&v.to_le_bytes());
+        }
+        b.extend_from_slice(&[0; 4]);
+        block(5, b)
+    };
+    let plain = pcapng_file(&[(0, 10, frame.clone())]);
+    let (_, s) = from_bytes("t.pcapng", plain.clone(), &CaptureOptions::default()).unwrap();
+    assert_eq!(s.drops_report(), "capture drops: unknown (no interface statistics in this pcapng)");
+    // Counting from the start: the second block replaces the first.
+    let with = [plain.clone(), isb(50, 1, 0), isb(100, 7, 2)].concat();
+    let (f, s) = from_bytes("t.pcapng", with, &CaptureOptions::default()).unwrap();
+    let d = s.drops.as_ref().unwrap();
+    assert_eq!((d.len(), d[0].received, d[0].total()), (1, Some(100), 9));
+    assert!(s.drops_report().starts_with("capture drops: some"), "{}", s.drops_report());
+    let info = f.info();
+    assert!(info.notes.iter().any(|n| n.starts_with("the capture itself dropped 9 packets")), "{:?}", info.notes);
+    assert!(info.about[0].contains("interface 0: received 100, dropped 7 by the interface, 2 by the system"));
+    let none = [plain, isb(100, 0, 0)].concat();
+    let (_, s) = from_bytes("t.pcapng", none, &CaptureOptions::default()).unwrap();
+    assert!(
+        s.drops_report().starts_with("capture drops: none: what is missing was lost before"),
+        "{}",
+        s.drops_report()
+    );
+}

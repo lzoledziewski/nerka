@@ -43,11 +43,13 @@ mod plot;
 mod plots;
 mod prefs;
 mod presets;
+mod profiles;
 mod protocols;
 mod recall;
 mod records;
 mod shot;
 mod signals;
+mod skips;
 mod sync;
 mod view;
 
@@ -100,7 +102,8 @@ Options:
       --new-window         A new window, even if one is open
       --name NAME          The window's name
       --screenshot PATH    Once loaded and drawn, save the window as a PNG
-                           and close (checks and CI)
+                           and close (checks and CI); the plot's own window
+                           goes to PATH-plot.png
   -h, --help               This text
   -V, --version            The version
 ";
@@ -316,6 +319,8 @@ fn main() -> eframe::Result {
             let upgraded = nerka_core::bundle::Store::user().and_then(|s| s.upgrade().message());
             app.load_history();
             app.load_prefs();
+            // Docked or in a window, as last chosen (`--plot-window`: in one).
+            app.plot_window |= app.prefs.plot_window;
             app.load_saved_signals();
             app.load_checks();
             if !fibex.is_empty() {
@@ -624,6 +629,8 @@ struct Tab {
     /// The file's protocols and what reading it dropped, once it is read
     /// (review 2026-11-09, R3: counted, never said).
     info: nerka_core::SourceInfo,
+    /// The list of what its files couldn't be read (⚠ in the top bar).
+    skips_ui: skips::SkipsUi,
     /// The files being read, and their paths in the order read.
     loading: Option<Job<Opened>>,
     /// The lines the filter keeps (all lines without a filter).
@@ -739,13 +746,22 @@ struct Tab {
     /// Protocols turned off per capture (its Files window); kept when the
     /// files are read again.
     disabled_for: Vec<(PathBuf, Vec<String>)>,
+    /// Profiles forced on single files (the Files window; remembered in
+    /// `records`).
+    profile_for: Vec<(PathBuf, String)>,
+    /// Offsets of single files' times, in nanoseconds (the Files window;
+    /// remembered in `records`).
+    offset_for: Vec<(PathBuf, i64)>,
     /// FIBEX arguments used as signals (picked in the Signals panel).
     arg_picks: Vec<nerka_core::Argument>,
     /// The Files window: the tab's files as they are being edited.
     files_edit: Option<FilesEdit>,
-    /// How the tab's text files are split into rows (remembered per file;
-    /// `None`: automatic, JSON if a file looks like JSON).
-    records: Option<nerka_core::input::records::RecordSplit>,
+    /// How each text file of the tab is split into rows, by path
+    /// (remembered per file; a file not listed: automatic, JSON if it looks
+    /// like JSON, else its profile's). Never one file's for another.
+    records_for: Vec<(PathBuf, nerka_core::input::records::RecordSplit)>,
+    /// Per signal, what of the same name it hides (Signals panel: ⚠).
+    signal_hidden: std::collections::HashMap<String, Vec<String>>,
     /// The Records window, while it is open.
     records_edit: Option<records::Edit>,
     /// The files are being read in a new order or set.
@@ -1166,15 +1182,77 @@ struct FilesEdit {
     paths: Vec<PathBuf>,
     captures: Vec<PathBuf>,
     off: Vec<(PathBuf, Vec<String>)>,
+    /// The profile forced on a file ("": chosen by its rules).
+    profile: Vec<(PathBuf, String)>,
+    /// A file's offset as typed ("": none).
+    offset: Vec<(PathBuf, String)>,
+    /// How each file was read when the window opened (by path).
+    reading: Vec<(PathBuf, nerka_core::input::timed::FileReading)>,
+    error: Option<String>,
 }
 
 impl FilesEdit {
-    fn of(paths: &[PathBuf], disabled_for: &[(PathBuf, Vec<String>)]) -> FilesEdit {
+    fn of(t: &Tab) -> FilesEdit {
+        let paths = &t.paths;
+        let offset = (t.offset_for.iter())
+            .map(|(p, ns)| (p.clone(), nerka_core::time::format_offset(*ns as f64 / 1e9)))
+            .collect();
+        let reading = match t.info.reading.as_slice() {
+            r if r.len() == paths.len() => paths.iter().cloned().zip(r.iter().cloned()).collect(),
+            _ => Vec::new(),
+        };
         FilesEdit {
             paths: paths.to_vec(),
             captures: paths.iter().filter(|p| protocols::is_capture(p)).cloned().collect(),
-            off: disabled_for.to_vec(),
+            off: t.disabled_for.to_vec(),
+            profile: t.profile_for.clone(),
+            offset,
+            reading,
+            error: None,
         }
+    }
+
+    /// The profile forced on `path`, as edited ("": none).
+    fn profile_of(&mut self, path: &Path) -> &mut String {
+        let i = match self.profile.iter().position(|(p, _)| p == path) {
+            Some(i) => i,
+            None => {
+                self.profile.push((path.to_path_buf(), String::new()));
+                self.profile.len() - 1
+            }
+        };
+        &mut self.profile[i].1
+    }
+
+    fn offset_of(&mut self, path: &Path) -> &mut String {
+        let i = match self.offset.iter().position(|(p, _)| p == path) {
+            Some(i) => i,
+            None => {
+                self.offset.push((path.to_path_buf(), String::new()));
+                self.offset.len() - 1
+            }
+        };
+        &mut self.offset[i].1
+    }
+
+    /// The forced profiles as a tab keeps them.
+    fn profile_for(&self) -> Vec<(PathBuf, String)> {
+        self.profile.iter().filter(|(p, n)| !n.is_empty() && self.paths.contains(p)).cloned().collect()
+    }
+
+    /// The offsets as a tab keeps them (nanoseconds), or the first that
+    /// isn't one.
+    fn offset_for(&self) -> Result<Vec<(PathBuf, i64)>, String> {
+        let mut out = Vec::new();
+        for (p, text) in self.offset.iter().filter(|(p, t)| !t.trim().is_empty() && self.paths.contains(p)) {
+            let name = p.file_name().map_or_else(|| p.display().to_string(), |n| n.to_string_lossy().into_owned());
+            let d = nerka_core::time::parse_offset(text)
+                .ok_or_else(|| format!("{name}: '{text}' isn't an offset (+3h, -0.250s, 90s, -2m)"))?;
+            if d != 0.0 {
+                out.push((p.clone(), (d * 1e9).round() as i64));
+            }
+        }
+        Ok(out)
     }
 
     fn off_for(&mut self, path: &Path) -> &mut Vec<String> {
@@ -1213,12 +1291,22 @@ impl Tab {
         let ps = paths.clone();
         let mut options = prefs.open_options();
         options.fibex = fibex;
-        // As the first file was read last time: lines or records.
-        let split = records::remembered(&paths[0]);
+        // As each file was read last time: lines or records.
+        let records_for: Vec<(PathBuf, nerka_core::input::records::RecordSplit)> =
+            paths.iter().filter_map(|p| Some((p.clone(), records::remembered(p)?))).collect();
         // The last choice is for several files; one file starts unsorted
         // (its menu's Sort by time).
         let merge = prefs.merge_by_time && paths.len() > 1;
-        options.records = split.clone();
+        options.records_for = records_for.clone();
+        // What the Files window chose for each file, last time.
+        let profile_for: Vec<(PathBuf, String)> =
+            paths.iter().filter_map(|p| Some((p.clone(), records::remembered_profile(p)?))).collect();
+        let offset_for: Vec<(PathBuf, i64)> = (paths.iter())
+            .map(|p| (p.clone(), (records::remembered_offset(p) * 1e9).round() as i64))
+            .filter(|(_, ns)| *ns != 0)
+            .collect();
+        options.profile_for = profile_for.clone();
+        options.offset_for = offset_for.clone();
         Self {
             path: paths[0].clone(),
             paths,
@@ -1228,6 +1316,7 @@ impl Tab {
             filter_failed: None,
             load_note: None,
             info: Default::default(),
+            skips_ui: Default::default(),
             file: None,
             // Files that know their times (DLT, captures) in the order they
             // start, their lines interleaved by time if that was last chosen.
@@ -1294,9 +1383,12 @@ impl Tab {
             views: signals::Views::default(),
             reopen_at: None,
             disabled_for: Vec::new(),
+            profile_for,
+            offset_for,
             arg_picks: Vec::new(),
             files_edit: None,
-            records: split,
+            records_for,
+            signal_hidden: Default::default(),
             records_edit: None,
             files_undo: None,
             merge,
@@ -1449,6 +1541,34 @@ impl Tab {
         true
     }
 
+    /// The tab's text files (those read with a profile; before the files
+    /// are read, those that aren't captures or `.dlt`).
+    fn text_paths(&self) -> Vec<PathBuf> {
+        match self.info.reading.as_slice() {
+            r if r.len() == self.paths.len() => {
+                (self.paths.iter().zip(r)).filter(|(_, r)| !r.profile.is_empty()).map(|(p, _)| p.clone()).collect()
+            }
+            _ => (self.paths.iter())
+                .filter(|p| !protocols::is_capture(p) && !p.extension().is_some_and(|e| e.eq_ignore_ascii_case("dlt")))
+                .cloned()
+                .collect(),
+        }
+    }
+
+    /// The split chosen for `path`, if one is.
+    fn split_of(&self, path: &Path) -> Option<&nerka_core::input::records::RecordSplit> {
+        self.records_for.iter().find(|(p, _)| p == path).map(|(_, s)| s)
+    }
+
+    /// What the tab chose for its files: records, protocols, profiles,
+    /// offsets.
+    fn file_options(&self, options: &mut nerka_core::OpenOptions) {
+        options.records_for = self.records_for.clone();
+        options.disabled_for = self.disabled_for.clone();
+        options.profile_for = self.profile_for.clone();
+        options.offset_for = self.offset_for.clone();
+    }
+
     /// Read the tab's files again (other FIBEX files): filter, search and
     /// selection stay, and so does the current line.
     fn reopen(&mut self, ctx: &egui::Context, prefs: &SearchPrefs, fibex: Option<Arc<nerka_core::Fibex>>) {
@@ -1457,8 +1577,7 @@ impl Tab {
         let ps = self.paths.clone();
         let mut options = prefs.open_options();
         options.fibex = fibex;
-        options.records = self.records.clone();
-        options.disabled_for = self.disabled_for.clone();
+        self.file_options(&mut options);
         self.file = None;
         self.reopen_at = Some(line);
         self.open_error = None;
@@ -1496,8 +1615,7 @@ impl Tab {
         self.files_undo = Some(FilesUndo { old, at });
         let mut options = prefs.open_options();
         options.fibex = fibex;
-        options.records = self.records.clone();
-        options.disabled_for = self.disabled_for.clone();
+        self.file_options(&mut options);
         self.open_error = None;
         self.loading = Some(self.open_job(ctx, ps, options));
     }
@@ -1586,9 +1704,31 @@ impl Tab {
         }
         self.signals_key = Some(key);
         let mut s = Signals::default().for_source(&*file);
+        let mut hidden: std::collections::HashMap<String, Vec<String>> = Default::default();
+        // What a signal of a name taken already would have been: said on
+        // the one that has it.
+        let mut hide = |name: &str, what: String| hidden.entry(name.to_ascii_lowercase()).or_default().push(what);
         // The saved ones switched on (owner, 2026-11-07: off keeps them).
         for d in saved.iter().filter(|d| d.is_on()) {
+            if d.name() == "time" && s.get("time").is_some_and(|t| t.is_from_source()) {
+                hide("time", "the file's own time (built in)".into());
+            }
             s.set((**d).clone());
+        }
+        // Those the files' profiles switch on, each for its files only (a
+        // saved one of the name wins).
+        let from_profiles = profiles::current().signals_for(&file.info().reading);
+        for c in &from_profiles.clashes {
+            if let Some(name) = c.strip_prefix('@').and_then(|c| c.split(':').next()) {
+                hide(name, c.clone());
+            }
+        }
+        for d in from_profiles.signals {
+            if s.get(d.name()).is_none() {
+                s.set(d);
+            } else {
+                hide(d.name(), format!("profile {}'s: {}", d.profiles().join(", "), d.spec()));
+            }
         }
         // FIBEX arguments picked in the Signals panel.
         for a in &self.arg_picks {
@@ -1600,9 +1740,9 @@ impl Tab {
             // By the signal's name, which is lower case (an argument's may not be).
             let options = self.query_options.get(&a.name.to_ascii_lowercase()).cloned().unwrap_or_default();
             let kind = options.kind.unwrap_or(a.ty.kind());
-            if s.get(&a.name).is_none()
-                && let Ok(d) = nerka_core::SignalDef::argument(&a.name, kind, &query, a.index, &from)
-            {
+            if s.get(&a.name).is_some() {
+                hide(&a.name, format!("the FIBEX argument {} ({from})", a.name));
+            } else if let Ok(d) = nerka_core::SignalDef::argument(&a.name, kind, &query, a.index, &from) {
                 // A default that doesn't fit the kind is left out.
                 let without_default = nerka_core::SignalOptions { default: None, ..options.clone() };
                 if let Ok(d) = options.apply(d.clone()).or_else(|_| without_default.apply(d)) {
@@ -1643,6 +1783,8 @@ impl Tab {
                 // A saved signal of the same name wins.
                 if s.get(d.name()).is_none() {
                     s.set(d);
+                } else {
+                    hide(d.name(), format!("the group (?<{}>…) of query {}", d.group(), d.queries().join(", ")));
                 }
             }
         }
@@ -1650,6 +1792,7 @@ impl Tab {
         if let Some(e) = s.resolve_lifecycles(lib).into_iter().next() {
             self.status = e;
         }
+        self.signal_hidden = hidden;
         // The same definitions as before, on this file (a Selection change
         // that makes no signal: an Exclude query, one without named
         // groups): nothing changed, so the checks, filters and the plot
@@ -1874,9 +2017,9 @@ impl Tab {
                             if let Some(first) = self.info.notes.first() {
                                 self.status += &format!(" · ⚠ {first}");
                                 if self.info.notes.len() > 1 {
-                                    self.status +=
-                                        &format!(" (and {} more: hover the top bar)", self.info.notes.len() - 1);
+                                    self.status += &format!(" (and {} more)", self.info.notes.len() - 1);
                                 }
+                                self.status += ": click ⚠ in the top bar for where";
                             }
                             self.part_files = f.part_files();
                             self.bookmarks = self.load_bookmarks(&*f).unwrap_or_else(|e| {
@@ -2362,11 +2505,16 @@ impl Tab {
     }
 
     /// Bookmark `line` with `note` (a bookmark already there gets the note).
-    fn set_bookmark(&mut self, line: LineNo, note: String) {
+    /// Bookmark `line` (from the plot): its note, and its name unless
+    /// `name` is empty (a new one: the next free `B<n>`).
+    fn set_bookmark(&mut self, line: LineNo, name: &str, note: String) {
         if !self.bookmarks.contains(line) {
             self.bookmarks.toggle(line);
         }
         self.bookmarks.set_note(line, note);
+        if !name.is_empty() {
+            self.bookmarks.set_name(line, name);
+        }
         self.status = format!("Bookmark on line {}", line + 1);
         self.save_bookmarks();
     }
@@ -3188,6 +3336,8 @@ struct App {
     window_name: Option<String>,
     /// The Settings window is open.
     settings_open: bool,
+    /// The Profiles window (Settings → Profiles…), while it is open.
+    profiles_edit: Option<profiles::Editor>,
     /// Listener for files other `nerka-gui` starts hand to this window.
     server: Option<instance::Server>,
     /// Tabs moved to new windows so far (temp file names).
@@ -3220,6 +3370,64 @@ struct App {
     plot_win: Arc<std::sync::Mutex<plot::Detached>>,
     /// What the plot's window was last asked to repaint for.
     plot_win_key: Option<plot::WindowKey>,
+    /// The plot window's builder while it is open, with the pass it was
+    /// last shown in (`show_plot_window`).
+    plot_win_builder: Option<(u64, egui::ViewportBuilder)>,
+    /// Whether the plot's window was maximized, as it last said.
+    plot_win_maximized: Option<bool>,
+    /// The plot's window just opened: the pass it opened in, whether it is
+    /// to be maximized, whether it was asked to be (`show_plot_window`).
+    plot_win_settle: Option<(u64, bool, bool)>,
+}
+
+/// The plot window's title: the window's name first, as in the main
+/// window's title.
+fn plot_window_title(window_name: Option<&str>, tab: &str) -> String {
+    match window_name.map(str::trim).filter(|n| !n.is_empty()) {
+        Some(n) => format!("{n} · Plot · {tab} — nerka"),
+        None => format!("Plot · {tab} — nerka"),
+    }
+}
+
+/// Show the plot's own window. Opened (again), it goes where it was
+/// (`plot::Placement`); while it stays open it keeps the builder it was
+/// opened with, as a changed builder would move or resize it.
+///
+/// Maximized, it is asked to be once it is shown (two passes later): a
+/// window made maximized on Windows took the maximized place but kept its
+/// own size (winit). Until it settles (`plot_win_settle`, ten passes),
+/// what it says about being maximized isn't remembered.
+fn show_plot_window(
+    ctx: &egui::Context,
+    shared: &Arc<std::sync::Mutex<plot::Detached>>,
+    kept: &mut Option<(u64, egui::ViewportBuilder)>,
+    settle: &mut Option<(u64, bool, bool)>,
+    maximized: bool,
+    title: String,
+) {
+    let pass = ctx.cumulative_pass_nr();
+    let builder = match kept.take() {
+        Some((last, b)) if last + 1 >= pass => b,
+        _ => {
+            *settle = Some((pass, maximized, false));
+            shared.lock().unwrap_or_else(|e| e.into_inner()).placed.builder()
+        }
+    };
+    *kept = Some((pass, builder.clone()));
+    let id = egui::ViewportId::from_hash_of("nerka-plot");
+    let shared = shared.clone();
+    ctx.show_viewport_deferred(id, builder.with_title(title), move |ui, _| plot::window_ui(ui, &shared));
+    if let Some((opened, max, asked)) = settle {
+        if *max && !*asked && pass >= *opened + 2 {
+            ctx.send_viewport_cmd_to(id, egui::ViewportCommand::Maximized(true));
+            *asked = true;
+        }
+        if pass >= *opened + 10 {
+            *settle = None;
+        } else {
+            ctx.request_repaint();
+        }
+    }
 }
 
 /// What the Settings window changed.
@@ -3238,6 +3446,8 @@ struct SettingsChange {
     reload: bool,
     /// The theme changed.
     theme: bool,
+    /// Profiles… clicked.
+    profiles: bool,
 }
 
 /// What the Settings window shows: this window's name, the unpack cache
@@ -3334,8 +3544,18 @@ fn settings_ui(ui: &mut egui::Ui, f: SettingsFields<'_>) -> SettingsChange {
             }
         });
         ui.end_row();
+        ui.label(RichText::new("Text files").strong());
+        ui.end_row();
+        ui.label("Profiles");
+        save.profiles = ui
+            .button("Profiles…")
+            .on_hover_text(
+                "How text files are read: which lines are a record, where a line's time is (so it can be merged by time with DLT files and captures), signals switched on for them",
+            )
+            .clicked();
+        ui.end_row();
         ui.label(RichText::new("Settings bundle").strong()).on_hover_text(
-            "Packs, presets, plots, checks and signals as one .nerka-bundle file: to share them or move them \
+            "Packs, presets, plots, checks, signals and profiles as one .nerka-bundle file: to share them or move them \
              to another computer",
         );
         ui.end_row();
@@ -3352,7 +3572,7 @@ fn settings_ui(ui: &mut egui::Ui, f: SettingsFields<'_>) -> SettingsChange {
         save.reload = ui
             .button("Reload configuration")
             .on_hover_text(
-                "Read packs, presets, plots, checks, signals and settings again, as another nerka window or an \
+                "Read packs, presets, plots, checks, signals, profiles and settings again, as another nerka window or an \
                  editor left them (a bar says so when this window gets the focus back). Open tabs keep how \
                  their files were read",
             )
@@ -3859,6 +4079,9 @@ impl App {
     /// selection, checks on, draft plots) stay. Open tabs keep how their
     /// files were read (ports, protocols); new tabs use the prefs read.
     fn reload_settings(&mut self) {
+        if let Some(e) = profiles::load().into_iter().next() {
+            self.status = format!("Profiles: {e}");
+        }
         self.load_library();
         self.presets.load();
         self.plots.load();
@@ -3996,6 +4219,16 @@ impl App {
         }
     }
 
+    /// Settings → Profiles….
+    fn profiles_window(&mut self, ctx: &egui::Context) {
+        let Some(edit) = &mut self.profiles_edit else { return };
+        match profiles::window(ctx, edit) {
+            profiles::Outcome::Open => {}
+            profiles::Outcome::Close => self.profiles_edit = None,
+            profiles::Outcome::Saved(said) => self.status = said,
+        }
+    }
+
     fn settings_window(&mut self, ctx: &egui::Context) {
         if !self.settings_open {
             return;
@@ -4035,6 +4268,9 @@ impl App {
             if let Some(t) = self.tabs.get_mut(self.active) {
                 t.status = "Configuration read again".into();
             }
+        }
+        if save.profiles {
+            self.profiles_edit = Some(profiles::Editor::open());
         }
         if save.export {
             match nerka_core::bundle::Store::user() {
@@ -4127,6 +4363,8 @@ impl App {
             bookmark_notes: self.prefs.bookmark_notes,
             merge_by_time: self.prefs.merge_by_time,
             theme: self.prefs.theme,
+            plot_window: self.prefs.plot_window,
+            plot_window_maximized: self.prefs.plot_window_maximized,
             routes: self.prefs.routes.clone(),
             disabled_protocols: self.prefs.disabled_protocols.clone(),
             protocols: self.prefs.protocols.clone(),
@@ -4545,8 +4783,10 @@ impl App {
                             files = Some(i);
                         }
                         let text = t.file.as_ref().is_some_and(|f| f.columns().is_empty());
+                        // A text file in a view with DLT or captures too.
+                        let has_text = text || !t.text_paths().is_empty();
                         if ui
-                            .add_enabled(text, egui::Button::new("Records…"))
+                            .add_enabled(has_text, egui::Button::new("Records…"))
                             .on_hover_text("One row per line, or multi-line records (text files)")
                             .clicked()
                         {
@@ -4574,7 +4814,7 @@ impl App {
         if let Some(i) = files {
             self.active = i;
             let t = &mut self.tabs[i];
-            t.files_edit = Some(FilesEdit::of(&t.paths, &t.disabled_for));
+            t.files_edit = Some(FilesEdit::of(t));
         }
         if let Some(i) = reload {
             self.active = i;
@@ -4607,7 +4847,8 @@ impl App {
         if let Some(i) = records_edit {
             self.active = i;
             let t = &mut self.tabs[i];
-            t.records_edit = Some(records::Edit::of(t.records.as_ref()));
+            let first = t.text_paths().into_iter().find_map(|p| t.split_of(&p).cloned());
+            t.records_edit = Some(records::Edit::of(first.as_ref()));
         }
         if let Some(i) = close {
             self.close(i);
@@ -4625,8 +4866,47 @@ impl App {
     /// view in order, to move up and down, remove and add to, and for each
     /// capture the protocols read in it. Apply reads them again as one view
     /// (`Tab::set_files`). Sorting the files by their time is not done yet.
+    /// The active tab's list of what wasn't read; exports finishing in
+    /// any tab say so in it.
+    fn skips_window(&mut self, ctx: &egui::Context) {
+        for t in &mut self.tabs {
+            if let Some(said) = t.skips_ui.poll() {
+                t.status = said;
+            }
+        }
+        let mut options = self.prefs.open_options();
+        options.fibex = self.fibex.clone();
+        let Some(t) = self.tabs.get_mut(self.active) else { return };
+        let name = t.path.file_stem().map_or_else(|| "nerka".into(), |s| s.to_string_lossy().into_owned());
+        let title = t.title();
+        match skips::window(ctx, &mut t.skips_ui, &title, &t.info, &name) {
+            skips::Asked::None => {}
+            skips::Asked::Goto(line) => t.goto_line(line),
+            skips::Asked::Export(to) => {
+                t.file_options(&mut options);
+                // Several files: each row names its own, as the view does.
+                let files: Vec<(PathBuf, String)> = (t.paths.iter().enumerate())
+                    .map(|(i, p)| {
+                        let label = t.info.files.get(i).cloned().unwrap_or_else(|| {
+                            p.file_name().map_or_else(|| p.display().to_string(), |n| n.to_string_lossy().into())
+                        });
+                        (p.clone(), label)
+                    })
+                    .collect();
+                let path = to.clone();
+                let job = Job::spawn(ctx, move |progress| {
+                    let out = Box::new(std::io::BufWriter::new(std::fs::File::create(&path)?));
+                    nerka_core::input::export_skips(&files, &options, out, progress)
+                });
+                t.status = format!("Exporting what wasn't read to {}…", to.display());
+                t.skips_ui.exporting(job, to);
+            }
+        }
+    }
+
     fn files_window(&mut self, ctx: &egui::Context) {
         let names = protocols::names(&self.prefs);
+        let profile_names = profiles::names();
         let Some(t) = self.tabs.get_mut(self.active) else { return };
         if t.files_edit.is_none() {
             return;
@@ -4641,15 +4921,18 @@ impl App {
             .default_width(640.0)
             .show(ctx, |ui| {
                 ui.weak(
-                    "The tab shows these files as one view, one after another in this order. Plain text opens only \
-                     with plain text, and JSON with JSON of the same keys; DLT files and captures mix, whatever \
-                     their protocols (messages of other protocols share one table). In a capture, only the \
-                     highlighted protocols are read (Settings → Captures: protocols says which datagrams are whose).",
+                    "The tab shows these files as one view, one after another in this order (or by time: its menu's \
+                     Sort by time). Text opens with text, and JSON with JSON of the same keys; DLT files and \
+                     captures mix, whatever their protocols (messages of other protocols share one table), and a \
+                     text file joins them once it has a time (its profile reads it from its lines). In a capture, \
+                     only the highlighted protocols are read (Settings → Captures: protocols says which datagrams \
+                     are whose). A profile (Settings → Profiles…) says how a text file is read; an offset moves a \
+                     file's times (+3h, -0.250s): both are remembered for the file.",
                 );
                 ui.separator();
                 let (n, mut moved, mut removed) = (edit.paths.len(), None, None);
                 egui::ScrollArea::vertical().max_height(360.0).show(ui, |ui| {
-                    egui::Grid::new("files-grid").num_columns(6).striped(true).show(ui, |ui| {
+                    egui::Grid::new("files-grid").num_columns(8).striped(true).show(ui, |ui| {
                         let paths = edit.paths.clone();
                         for (i, p) in paths.iter().enumerate() {
                             ui.weak(format!("{}", i + 1));
@@ -4681,10 +4964,67 @@ impl App {
                             } else {
                                 ui.weak("");
                             }
+                            let reading = edit.reading.iter().find(|(q, _)| q == p).map(|(_, r)| r.clone());
+                            let dlt = p.extension().is_some_and(|e| e.eq_ignore_ascii_case("dlt"));
+                            let text = reading
+                                .as_ref()
+                                .map_or(!edit.captures.contains(p) && !dlt, |r| !r.profile.is_empty());
+                            if text {
+                                let chosen = edit.profile_of(p);
+                                let shown = if chosen.is_empty() {
+                                    reading.as_ref().map_or("auto".to_owned(), |r| format!("auto: {}", r.profile))
+                                } else {
+                                    chosen.clone()
+                                };
+                                egui::ComboBox::from_id_salt(("profile", i))
+                                    .selected_text(shown)
+                                    .width(140.0)
+                                    .show_ui(ui, |ui| {
+                                        ui.selectable_value(chosen, String::new(), "auto")
+                                            .on_hover_text("Chosen by the profiles' rules: name, first line, default");
+                                        for n in &profile_names {
+                                            ui.selectable_value(chosen, n.clone(), n);
+                                        }
+                                    })
+                                    .response
+                                    .on_hover_text("The profile this text file is read with");
+                            } else {
+                                ui.weak("");
+                            }
+                            let offset = edit.offset_of(p);
+                            ui.add(egui::TextEdit::singleline(offset).hint_text("+0s").desired_width(70.0))
+                                .on_hover_text("Move this file's times: +3h, -0.250s, 90s, -2m");
                             ui.end_row();
                         }
                     });
                 });
+                // How each file's time was read when the window opened.
+                if !edit.reading.is_empty() {
+                    ui.separator();
+                    egui::Grid::new("files-times").num_columns(2).spacing([12.0, 2.0]).show(ui, |ui| {
+                        for (p, r) in &edit.reading {
+                            let name = p
+                                .file_name()
+                                .map_or_else(|| p.display().to_string(), |f| f.to_string_lossy().into());
+                            ui.weak(name);
+                            let profile = if r.profile.is_empty() {
+                                String::new()
+                            } else {
+                                format!("profile {} ({}): ", r.profile, r.why)
+                            };
+                            let moved = if r.offset == 0.0 {
+                                String::new()
+                            } else {
+                                format!(", moved {}", nerka_core::time::format_offset(r.offset))
+                            };
+                            ui.weak(format!("{profile}time: {}{moved}", r.time));
+                            ui.end_row();
+                        }
+                    });
+                }
+                if let Some(e) = &edit.error {
+                    ui.colored_label(ui.visuals().error_fg_color, e);
+                }
                 if let Some((a, b)) = moved {
                     edit.paths.swap(a, b);
                 }
@@ -4695,7 +5035,10 @@ impl App {
                 ui.horizontal(|ui| {
                     add = ui.button("+ Add files…").clicked();
                     ui.separator();
-                    let changed = edit.paths != t.paths || edit.disabled_for() != t.disabled_for;
+                    let changed = edit.paths != t.paths
+                        || edit.disabled_for() != t.disabled_for
+                        || edit.profile_for() != t.profile_for
+                        || edit.offset_for().map_or(true, |o| o != t.offset_for);
                     apply = ui
                         .add_enabled(changed, egui::Button::new("Apply"))
                         .on_hover_text("Read the files again: in this order, with these protocols; filter, search and selection stay")
@@ -4713,9 +5056,28 @@ impl App {
                 }
             }
         }
+        let offsets = if apply { edit.offset_for() } else { Ok(Vec::new()) };
+        if let Err(e) = &offsets {
+            edit.error = Some(e.clone());
+        }
+        let apply = apply && offsets.is_ok();
         if apply {
             let (paths, off) = (edit.paths.clone(), edit.disabled_for());
-            let reread = off != t.disabled_for && paths == t.paths;
+            let (profile_for, offset_for) = (edit.profile_for(), offsets.unwrap_or_default());
+            let reread = (off != t.disabled_for || profile_for != t.profile_for || offset_for != t.offset_for)
+                && paths == t.paths;
+            // Remembered per file (owner, 2026-11-22), as Records… is.
+            for p in &paths {
+                let name = profile_for.iter().find(|(q, _)| q == p).map(|(_, n)| n.as_str());
+                let ns = offset_for.iter().find(|(q, _)| q == p).map_or(0, |(_, ns)| *ns);
+                if let Err(e) =
+                    records::remember_profile(p, name).and_then(|()| records::remember_offset(p, ns as f64 / 1e9))
+                {
+                    t.status = format!("Could not remember how {} is read: {e}", p.display());
+                }
+            }
+            t.profile_for = profile_for;
+            t.offset_for = offset_for;
             t.disabled_for = off;
             if reread {
                 t.reopen(ctx, &self.prefs, self.fibex.clone());
@@ -4734,18 +5096,26 @@ impl App {
         let (prefs, fibex) = (&self.prefs, self.fibex.clone());
         let Some(t) = self.tabs.get_mut(self.active) else { return };
         let title = t.title();
+        let files = t.text_paths();
         let Some(edit) = &mut t.records_edit else { return };
-        match records::window(ctx, &title, edit) {
+        let names: Vec<String> = (files.iter())
+            .map(|p| p.file_name().map_or_else(|| p.display().to_string(), |n| n.to_string_lossy().into_owned()))
+            .collect();
+        match records::window(ctx, &title, &names, edit) {
             records::Outcome::Open => {}
             records::Outcome::Close => t.records_edit = None,
             records::Outcome::Apply(split) => {
                 t.records_edit = None;
-                for p in &t.paths {
+                // The tab's text files only, each remembered on its own.
+                for p in &files {
                     if let Err(e) = records::remember(p, split.as_ref()) {
                         t.status = format!("Could not remember how {} is read: {e}", p.display());
                     }
+                    t.records_for.retain(|(q, _)| q != p);
+                    if let Some(s) = &split {
+                        t.records_for.push((p.clone(), s.clone()));
+                    }
                 }
-                t.records = split;
                 t.reopen(ctx, prefs, fibex);
             }
         }
@@ -4905,8 +5275,13 @@ struct Shoot {
     started: std::time::Instant,
     /// Frames drawn with nothing loading.
     quiet: u32,
-    requested: bool,
+    /// When the pictures were asked for.
+    asked: Option<std::time::Instant>,
     image: Arc<std::sync::Mutex<Option<egui::ColorImage>>>,
+    /// The main window's picture is saved.
+    saved: bool,
+    /// The plot's own window's picture, while it is awaited.
+    plot: Option<Arc<std::sync::Mutex<Option<egui::ColorImage>>>>,
 }
 
 impl Shoot {
@@ -4916,13 +5291,29 @@ impl Shoot {
     const PATIENCE: Duration = Duration::from_secs(600);
 
     fn new(path: PathBuf) -> Shoot {
-        Shoot { path, started: std::time::Instant::now(), quiet: 0, requested: false, image: Default::default() }
+        Shoot {
+            path,
+            started: std::time::Instant::now(),
+            quiet: 0,
+            asked: None,
+            image: Default::default(),
+            saved: false,
+            plot: None,
+        }
+    }
+
+    /// Where the plot's own window goes: `shot.png` → `shot-plot.png`.
+    fn plot_path(path: &Path) -> PathBuf {
+        let stem = path.file_stem().map_or_else(Default::default, |s| s.to_string_lossy());
+        let ext = path.extension().map_or_else(|| "png".into(), |e| e.to_string_lossy());
+        path.with_file_name(format!("{stem}-plot.{ext}"))
     }
 }
 
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.frame(ui);
+        view::clean_copies(ui.ctx());
     }
 }
 
@@ -4931,19 +5322,36 @@ impl App {
     /// close the window.
     fn shoot_step(&mut self, ctx: &egui::Context) {
         let busy = self.tabs.iter().any(|t| t.is_busy());
+        let plot_window = self.plot_window && self.tabs.get(self.active).is_some_and(|t| plot::lock(&t.plot).shown);
         let Some(s) = &mut self.shoot else { return };
         ctx.request_repaint();
-        let taken = s.image.lock().unwrap_or_else(|e| e.into_inner()).take();
-        if let Some(image) = taken {
-            if let Err(e) = nerka_core::write_atomic(&s.path, shot::png(&image)) {
-                console::error(&format!("nerka-gui: --screenshot {}: {e}\n", s.path.display()));
+        let save = |path: &Path, slot: &Arc<std::sync::Mutex<Option<egui::ColorImage>>>| {
+            let image = slot.lock().unwrap_or_else(|e| e.into_inner()).take();
+            let saved = image.is_some();
+            if let Some(image) = image
+                && let Err(e) = nerka_core::write_atomic(path, shot::png(&image))
+            {
+                console::error(&format!("nerka-gui: --screenshot {}: {e}\n", path.display()));
                 std::process::exit(1);
             }
-            self.shoot = None;
-            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-            return;
+            saved
+        };
+        s.saved |= save(&s.path, &s.image);
+        if let Some(slot) = &s.plot
+            && save(&Shoot::plot_path(&s.path), slot)
+        {
+            s.plot = None;
         }
-        if s.requested {
+        if let Some(asked) = s.asked {
+            // The plot's window may be gone: the main window's picture alone.
+            if s.plot.is_some() && asked.elapsed() > Duration::from_secs(10) {
+                console::error("nerka-gui: --screenshot: the plot's window drew nothing; not saved\n");
+                s.plot = None;
+            }
+            if s.saved && s.plot.is_none() {
+                self.shoot = None;
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
             return;
         }
         s.quiet = if busy { 0 } else { s.quiet + 1 };
@@ -4952,8 +5360,15 @@ impl App {
             console::error("nerka-gui: --screenshot: still loading; taken as it is\n");
         }
         if s.quiet >= Shoot::QUIET || late {
-            s.requested = true;
+            s.asked = Some(std::time::Instant::now());
             shot::request_into(ctx, s.image.clone());
+            // The plot in its own window: that window too.
+            if plot_window {
+                let slot = Arc::new(std::sync::Mutex::new(None));
+                self.plot_win.lock().unwrap_or_else(|e| e.into_inner()).shoot = Some(slot.clone());
+                s.plot = Some(slot);
+                ctx.request_repaint_of(egui::ViewportId::from_hash_of("nerka-plot"));
+            }
         }
     }
 
@@ -4979,10 +5394,12 @@ impl App {
         self.update_title(&ctx);
         self.goto_dialog(&ctx);
         self.files_window(&ctx);
+        self.skips_window(&ctx);
         self.records_window(&ctx);
         self.about_dialog(&ctx);
         self.open_errors_dialog(&ctx);
         self.settings_window(&ctx);
+        self.profiles_window(&ctx);
         self.bundle_windows(&ctx);
         if let Some(t) = self.tabs.get_mut(self.active)
             && let Some(d) = &mut t.detail
@@ -5013,6 +5430,8 @@ impl App {
             }
         }
 
+        // The ⚠ in the top bar was clicked: the list of what wasn't read.
+        let mut open_skips = false;
         egui::Panel::top("toolbar").show(ui, |ui| {
             ui.horizontal(|ui| {
                 if ui.button("📂 Open…").on_hover_text("Ctrl+O").clicked() {
@@ -5056,15 +5475,21 @@ impl App {
                     if !t.info.protocols.is_empty() {
                         tip += &format!("\nProtocols: {}", t.info.protocols.join(", "));
                     }
-                    // What reading it dropped (review 2026-11-09, R3).
-                    if !t.info.notes.is_empty() {
+                    // What reading it dropped (review 2026-11-09, R3); a
+                    // click lists it, one by one.
+                    let warned = !t.info.notes.is_empty();
+                    if warned {
                         text += " · ⚠";
                         tip += "\n\nNot read:";
                         for n in &t.info.notes {
                             tip += &format!("\n• {n}");
                         }
+                        tip += "\n\nClick: where, one by one (and an export for a bug report)";
                     }
-                    ui.label(text).on_hover_text(tip);
+                    let r = ui.add(egui::Label::new(text).sense(egui::Sense::click())).on_hover_text(tip);
+                    if warned && r.clicked() {
+                        open_skips = true;
+                    }
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui.button("ℹ About").on_hover_text("F1").clicked() {
@@ -5088,6 +5513,9 @@ impl App {
                 });
             });
         });
+        if open_skips && let Some(t) = self.tabs.get_mut(self.active) {
+            t.skips_ui.open = true;
+        }
 
         self.config_notice_bar(ui);
         if !self.tabs.is_empty() {
@@ -5145,6 +5573,28 @@ impl App {
             return;
         };
         let Some(file) = tab.file.clone() else {
+            // A plot in its own window stays open while its tab reads its
+            // files again (Reload, Settings' times): closed and opened
+            // again, it lost where it was (maximized).
+            if self.plot_window && plot::lock(&tab.plot).shown {
+                let closed = {
+                    let mut d = self.plot_win.lock().unwrap_or_else(|e| e.into_inner());
+                    if d.input.take().is_some() {
+                        ctx.request_repaint_of(egui::ViewportId::from_hash_of("nerka-plot"));
+                    }
+                    d.out = plot::Output::default();
+                    std::mem::take(&mut d.closed)
+                };
+                self.plot_win_key = None;
+                if closed {
+                    plot::lock(&tab.plot).shown = false;
+                } else {
+                    let title = plot_window_title(self.window_name.as_deref(), &tab.title());
+                    let max = self.prefs.plot_window_maximized;
+                    let (kept, settle) = (&mut self.plot_win_builder, &mut self.plot_win_settle);
+                    show_plot_window(&ctx, &self.plot_win, kept, settle, max, title);
+                }
+            }
             egui::CentralPanel::default().show(ui, |ui| {
                 ui.centered_and_justified(|ui| ui.label("Indexing…"));
             });
@@ -5249,6 +5699,7 @@ impl App {
                         chosen: &tab.query_options,
                         pack_options: &tab.pack_options,
                         conflicts: &tab.option_conflicts,
+                        hidden: &tab.signal_hidden,
                     };
                     signals::signals_panel(ui, &mut tab.signals_ui, input)
                 })
@@ -5306,6 +5757,10 @@ impl App {
                 && tab.set_filter("query", &nfd)
             {
                 tab.start_search(ui.ctx());
+            }
+            // A profile's signal clicked: where it is edited.
+            if out.open_profiles {
+                self.profiles_edit = Some(profiles::Editor::open());
             }
             // A check's signal clicked: the check in the Checks pane.
             if let Some(name) = out.open_check {
@@ -5394,13 +5849,14 @@ impl App {
             (p.shown, self.plots.listed(&p))
         };
         let mut plot_out = plot::Output::default();
+        let (mut toggled, mut save_prefs) = (false, false);
         if !(plotted && self.plot_window) {
             self.plot_win_key = None;
         }
         if plotted && self.plot_window {
             // The plot's own window: what it draws now, and what it asked.
             let line = tab.current_line();
-            let (goto, toggle, closed) = {
+            let (goto, toggle, closed, maximized) = {
                 let mut d = self.plot_win.lock().unwrap_or_else(|e| e.into_inner());
                 let input = plot::WindowInput {
                     plot: tab.plot.clone(),
@@ -5419,25 +5875,28 @@ impl App {
                 }
                 d.input = Some(input);
                 let mut out = std::mem::take(&mut d.out);
-                if let Some((l, note)) = out.bookmark.take() {
-                    tab.set_bookmark(l, note);
+                if let Some((l, name, note)) = out.bookmark.take() {
+                    tab.set_bookmark(l, &name, note);
                 }
-                let asked = (out.goto, out.toggle_window, std::mem::take(&mut d.closed));
+                let asked = (out.goto, out.toggle_window, std::mem::take(&mut d.closed), d.placed.maximized);
                 plot_out = out;
                 asked
             };
-            let shared = self.plot_win.clone();
-            // The window's name first, as in the main window's title.
-            let title = match self.window_name.as_deref().map(str::trim).filter(|n| !n.is_empty()) {
-                Some(n) => format!("{n} · Plot · {} — nerka", tab.title()),
-                None => format!("Plot · {} — nerka", tab.title()),
-            };
-            let builder = egui::ViewportBuilder::default().with_title(title).with_inner_size([1100.0, 460.0]);
-            let id = egui::ViewportId::from_hash_of("nerka-plot");
-            ctx.show_viewport_deferred(id, builder, move |ui, _| plot::window_ui(ui, &shared));
+            let title = plot_window_title(self.window_name.as_deref(), &tab.title());
+            let (kept, settle) = (&mut self.plot_win_builder, &mut self.plot_win_settle);
+            show_plot_window(&ctx, &self.plot_win, kept, settle, self.prefs.plot_window_maximized, title);
             if toggle {
                 self.plot_window = false;
                 self.plot_win_key = None;
+                toggled = true;
+            }
+            // Maximized or not, as the user last left it: for the next window.
+            if maximized.is_some() && maximized != self.plot_win_maximized && self.plot_win_settle.is_none() {
+                self.plot_win_maximized = maximized;
+                if let Some(m) = maximized.filter(|&m| m != self.prefs.plot_window_maximized) {
+                    self.prefs.plot_window_maximized = m;
+                    save_prefs = true;
+                }
             }
             // Its window closed: the plot closes (owner, 2026-11-12: it
             // docked before); 📈 Plot shows it in its own window again.
@@ -5476,14 +5935,26 @@ impl App {
                 .inner;
             if out.toggle_window {
                 self.plot_window = !self.plot_window;
+                toggled = true;
             }
-            if let Some((l, note)) = out.bookmark.take() {
-                tab.set_bookmark(l, note);
+            if let Some((l, name, note)) = out.bookmark.take() {
+                tab.set_bookmark(l, &name, note);
             }
             if let Some(line) = out.goto.take() {
                 tab.goto_line(line);
             }
             plot_out = out;
+        }
+        // Docked or in a window: the last choice, for new plots and next runs.
+        if toggled && self.prefs.plot_window != self.plot_window {
+            self.prefs.plot_window = self.plot_window;
+            save_prefs = true;
+        }
+        if save_prefs
+            && let Some(path) = prefs_path()
+            && let Err(e) = sync::save_prefs(&mut self.prefs, &mut self.prefs_base, &path)
+        {
+            tab.status = format!("Could not save preferences: {e}");
         }
         if plot_out.close {
             plot::lock(&tab.plot).shown = false;
@@ -5958,6 +6429,7 @@ query timeouts  labels: vision
                         chosen: &tab.query_options,
                         pack_options: &tab.pack_options,
                         conflicts: &tab.option_conflicts,
+                        hidden: &tab.signal_hidden,
                     };
                     changed = signals::signals_panel(ui, &mut tab.signals_ui, input).args_changed;
                 });
@@ -6572,6 +7044,135 @@ gear=D
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// What wasn't read is listed one by one (the ⚠ in the top bar), and an
+    /// export writes every skip with a header and a summary.
+    #[test]
+    fn what_was_not_read_is_listed_and_exported() {
+        use nerka_core::input::dlt::writer::{Msg, Value};
+        let dir = std::env::temp_dir().join(format!("nerka-gui-skips-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut bytes = Vec::new();
+        for i in 0..20u32 {
+            let mut m =
+                Msg::log(nerka_core::Level::Info, "ECU1", "NAV", "POS", vec![Value::Str(format!("m{i}")).into()]);
+            m.secs = 1_760_000_000 + i;
+            m.encode(&mut bytes);
+            if i % 5 == 4 {
+                bytes.extend_from_slice(b"broken");
+            }
+        }
+        let log = dir.join("broken.dlt");
+        std::fs::write(&log, &bytes).unwrap();
+        let ctx = egui::Context::default();
+        let mut app = App::default();
+        app.open(&ctx, log.clone());
+        settle_app(&mut app, &ctx);
+        let t = &app.tabs[0];
+        assert_eq!(t.info.skips.len(), 4);
+        assert!(t.status.contains("click ⚠ in the top bar"), "{}", t.status);
+        assert_eq!(t.info.skips.iter().map(|s| s.line).collect::<Vec<_>>(), [Some(5), Some(10), Some(15), None]);
+
+        // The export, as the window starts it, to the end.
+        let out = dir.join("skips.tsv");
+        let files = vec![(log.clone(), "broken.dlt".to_owned())];
+        let to = out.clone();
+        let job = Job::spawn(&ctx, move |p| {
+            let w = Box::new(std::io::BufWriter::new(std::fs::File::create(&to)?));
+            nerka_core::input::export_skips(&files, &nerka_core::OpenOptions::default(), w, p)
+        });
+        app.tabs[0].skips_ui.exporting(job, out.clone());
+        let said = loop {
+            if let Some(s) = app.tabs[0].skips_ui.poll() {
+                break s;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        assert!(said.starts_with("4 skips exported to "), "{said}");
+        let text = std::fs::read_to_string(&out).unwrap();
+        assert!(text.contains("# file: broken.dlt (") && text.contains("# summary"), "{text}");
+        assert_eq!(text.lines().filter(|l| l.starts_with("not whole messages\t")).count(), 4);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The plot's own window stays open while its tab reads its files again
+    /// (closed and opened again, it was no longer maximized); docked or not
+    /// and maximized or not are remembered for the next plot.
+    #[test]
+    fn the_plot_window_stays_through_a_reload_and_is_remembered() {
+        let dir = std::env::temp_dir().join(format!("nerka-gui-plotwin-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("a.log");
+        std::fs::write(&log, (0..50).map(|i| format!("v={i}\n")).collect::<String>()).unwrap();
+        let ctx = egui::Context::default();
+        let mut app = App { plot_window: true, ..Default::default() };
+        let run = |app: &mut App| {
+            let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1200.0, 800.0));
+            let input = egui::RawInput { screen_rect: Some(screen), ..Default::default() };
+            let mut out = ctx.run_ui(input, |ui| app.frame(ui));
+            out.textures_delta.clear();
+        };
+        app.open(&ctx, log);
+        settle_app(&mut app, &ctx);
+        plot::lock(&app.tabs[0].plot).shown = true;
+        run(&mut app);
+        let shown_in = |app: &App| app.plot_win_builder.as_ref().map(|(pass, _)| *pass);
+        assert!(app.plot_win.lock().unwrap().input.is_some());
+        // Just opened: what it says about being maximized waits until it
+        // settles (it says "not maximized" before it is asked to be).
+        assert!(matches!(app.plot_win_settle, Some((_, false, false))));
+        app.plot_win.lock().unwrap().placed.maximized = Some(true);
+        run(&mut app);
+        assert!(!app.prefs.plot_window_maximized, "not while it settles");
+        for _ in 0..10 {
+            run(&mut app);
+        }
+        assert!(app.plot_win_settle.is_none());
+        let first = shown_in(&app).expect("the window is shown");
+        // Maximized by the user: remembered.
+        app.plot_win.lock().unwrap().placed.maximized = Some(true);
+        run(&mut app);
+        assert!(app.prefs.plot_window_maximized);
+        // Reload: the window is still shown, with no input until it is read.
+        let prefs = app.prefs.clone();
+        app.tabs[0].reopen(&ctx, &prefs, None);
+        // Held while the frame runs: a fast machine read the file before
+        // it (macOS CI).
+        let (release, held) = std::sync::mpsc::channel::<()>();
+        let read = app.tabs[0].loading.replace(Job::spawn(&ctx, move |_| {
+            let _ = held.recv();
+            Err(nerka_core::Error::Cancelled)
+        }));
+        run(&mut app);
+        assert!(app.tabs[0].file.is_none(), "still reading");
+        assert_eq!(shown_in(&app), Some(first + 2), "shown while reading");
+        assert!(app.plot_win.lock().unwrap().input.is_none());
+        drop(release);
+        app.tabs[0].loading = read;
+        settle_app(&mut app, &ctx);
+        run(&mut app);
+        assert_eq!(shown_in(&app), Some(first + 3));
+        assert!(app.plot_win.lock().unwrap().input.is_some());
+        assert!(plot::lock(&app.tabs[0].plot).shown);
+        // ⧉ Dock: remembered for the next plots.
+        assert!(!app.prefs.plot_window);
+        app.prefs.plot_window = true;
+        app.plot_win.lock().unwrap().out.toggle_window = true;
+        run(&mut app);
+        assert!(!app.plot_window && !app.prefs.plot_window, "docked");
+        // In a window again, maximized as last left: asked to be once shown,
+        // not when made (Windows kept such a window's own size).
+        run(&mut app);
+        app.plot_window = true;
+        run(&mut app);
+        let b = &app.plot_win_builder.as_ref().expect("shown").1;
+        assert_eq!(b.maximized, None);
+        assert!(matches!(app.plot_win_settle, Some((_, true, false))));
+        run(&mut app);
+        run(&mut app);
+        assert!(matches!(app.plot_win_settle, Some((_, true, true))), "asked to be maximized");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     /// Owner, 2026-10-28: a plot kept in one tab opens in another with all
     /// its lanes. One whose signal that tab lacks stays (it was dropped when
     /// the tab's signals were built again); one the loaded FIBEX files
@@ -6884,6 +7485,157 @@ gear=D
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// The Files window's per-file choices as a tab keeps them: offsets
+    /// parsed (an error names the file), empty and zero ones dropped,
+    /// choices of files no longer in the list left out.
+    #[test]
+    fn files_window_offsets_and_profiles_read_back() {
+        let (a, b, gone) = (PathBuf::from("a.log"), PathBuf::from("b.dlt"), PathBuf::from("gone.log"));
+        let mut e = FilesEdit {
+            paths: vec![a.clone(), b.clone()],
+            captures: Vec::new(),
+            off: Vec::new(),
+            profile: Vec::new(),
+            offset: Vec::new(),
+            reading: Vec::new(),
+            error: None,
+        };
+        *e.offset_of(&a) = "+3h".into();
+        *e.offset_of(&b) = " ".into();
+        *e.offset_of(&gone) = "+1s".into();
+        *e.profile_of(&a) = "app".into();
+        *e.profile_of(&gone) = "x".into();
+        assert_eq!(e.offset_for().unwrap(), [(a.clone(), 10_800_000_000_000)]);
+        assert_eq!(e.profile_for(), [(a.clone(), "app".to_owned())]);
+        *e.offset_of(&b) = "-0s".into();
+        assert_eq!(e.offset_for().unwrap().len(), 1, "zero is none");
+        *e.offset_of(&b) = "soon".into();
+        let err = e.offset_for().unwrap_err();
+        assert!(err.starts_with("b.dlt: 'soon' isn't an offset"), "{err}");
+    }
+
+    /// Owner, 2026-11-22: a profile's signal is the tab's, marked as the
+    /// profile's (read-only in the panel); a saved signal of its name wins
+    /// and says what it hides.
+    #[test]
+    fn profile_signals_join_the_tab_and_clashes_are_said() {
+        let dir = std::env::temp_dir().join(format!("nerka-gui-profsig-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("prof-sig-test.log");
+        std::fs::write(&log, "2025-10-18T00:00:00Z tick 1\n2025-10-18T00:00:01Z tick 2\n").unwrap();
+        let (mut ps, _) = nerka_core::input::profile::Profiles::parse_text("");
+        ps.set(
+            nerka_core::input::profile::Profile::parse_spec(
+                r"ptest: name prof-sig-test.log; time auto; signal tick=/tick (?<tick>\d+)/",
+            )
+            .unwrap(),
+        );
+        profiles::set(ps);
+        let ctx = egui::Context::default();
+        let mut tab = Tab::open(&ctx, log, &SearchPrefs::default());
+        settle(&mut tab, &ctx);
+        let lib = Library::new();
+        let mut saved = Signals::default();
+        tab.refresh_signals(&ctx, &lib, &saved, 0);
+        let d = tab.signals.get("tick").expect("the profile's signal");
+        assert_eq!(d.profiles(), ["ptest"]);
+        assert!(tab.signal_hidden.is_empty());
+        tab.mode = Mode::Query;
+        tab.pattern = "profile == ptest AND @tick == 2".into();
+        tab.start_search(&ctx);
+        settle(&mut tab, &ctx);
+        assert_eq!(tab.result().unwrap().lines, [1]);
+        // A saved one of the name: it wins, and says what it hides.
+        saved.set(nerka_core::SignalDef::parse_spec(r"tick=/(?<tick>\d)$/").unwrap());
+        tab.refresh_signals(&ctx, &lib, &saved, 1);
+        assert!(tab.signals.get("tick").unwrap().profiles().is_empty());
+        let hides = &tab.signal_hidden["tick"];
+        assert!(hides[0].starts_with("profile ptest's: "), "{hides:?}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A text log whose lines start with times shares a tab with a DLT file,
+    /// merged by time; the Files window shows how each file's time is read.
+    #[test]
+    fn text_with_times_shares_a_tab_with_dlt() {
+        let dir = std::env::temp_dir().join(format!("nerka-gui-timed-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (a, d) = (dir.join("a.log"), dir.join("d.dlt"));
+        std::fs::write(&a, "2025-10-18T00:00:00.500Z INFO text first\n2025-10-18T00:00:01.500Z INFO text second\n")
+            .unwrap();
+        let mut buf = Vec::new();
+        for (i, text) in ["dlt first", "dlt second"].into_iter().enumerate() {
+            let mut m = nerka_core::input::dlt::writer::Msg::log(
+                nerka_core::Level::Info,
+                "E",
+                "A",
+                "C",
+                vec![nerka_core::input::dlt::writer::Value::Str(text.into()).into()],
+            );
+            m.secs += i as u32; // 2025-10-18 00:00:00 and :01
+            m.encode(&mut buf);
+        }
+        std::fs::write(&d, buf).unwrap();
+        let ctx = egui::Context::default();
+        let mut app = App::default();
+        app.prefs.merge_by_time = true;
+        app.open_files(&ctx, vec![a.clone(), d.clone()]);
+        settle_app(&mut app, &ctx);
+        assert_eq!(app.tabs.len(), 1, "{}", app.tabs[0].status);
+        let t = &app.tabs[0];
+        let f = t.file.as_ref().unwrap();
+        let payloads: Vec<String> =
+            (0..f.line_count()).map(|l| f.line_text(l).unwrap().rsplit('\t').next().unwrap().to_owned()).collect();
+        assert_eq!(
+            payloads,
+            [
+                "dlt first",
+                "2025-10-18T00:00:00.500Z INFO text first",
+                "dlt second",
+                "2025-10-18T00:00:01.500Z INFO text second"
+            ]
+        );
+        let edit = FilesEdit::of(t);
+        let text = edit.reading.iter().find(|(p, _)| *p == a).map(|(_, r)| r.clone()).unwrap();
+        assert_eq!((text.profile.as_str(), text.time.as_str()), ("default", "the time each line starts with"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A split chosen for one file is that file's only (owner's report,
+    /// 2026-11-22: a `start=` chosen once spread to every .txt opened with
+    /// it, each then one record); Records… is there for the text file of a
+    /// view that also holds DLT.
+    #[test]
+    fn a_split_is_one_files_and_records_is_offered_beside_dlt() {
+        let dir = std::env::temp_dir().join(format!("nerka-gui-split-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (a, b, d) = (dir.join("a.txt"), dir.join("b.txt"), dir.join("d.dlt"));
+        std::fs::write(&a, "REC one\n  more\nREC two\n").unwrap();
+        std::fs::write(&b, "x\ny\nz\n").unwrap();
+        let ctx = egui::Context::default();
+        let mut t = Tab::open_many(&ctx, vec![a.clone(), b.clone()], &SearchPrefs::default(), None);
+        settle(&mut t, &ctx);
+        t.records_for = vec![(a.clone(), nerka_core::input::records::RecordSplit::parse("start=/REC/").unwrap())];
+        t.reopen(&ctx, &SearchPrefs::default(), None);
+        settle(&mut t, &ctx);
+        // a: two records; b: its three lines, not one record.
+        assert_eq!(t.part_files, [(0, 2), (2, 3)]);
+        assert_eq!(t.text_paths(), [a.clone(), b.clone()]);
+        assert!(t.split_of(&b).is_none());
+        // Text with a time beside DLT: a table, and still a text file.
+        let c = dir.join("c.txt");
+        std::fs::write(&c, "2025-10-18T00:00:00Z one\n").unwrap();
+        let mut buf = Vec::new();
+        nerka_core::input::dlt::writer::Msg::log(nerka_core::Level::Info, "E", "A", "C", vec![]).encode(&mut buf);
+        std::fs::write(&d, buf).unwrap();
+        let mut m = Tab::open_many(&ctx, vec![c.clone(), d.clone()], &SearchPrefs::default(), None);
+        settle(&mut m, &ctx);
+        assert!(!m.file.as_ref().unwrap().columns().is_empty(), "{}", m.status);
+        assert_eq!(m.text_paths(), std::slice::from_ref(&c));
+        drop((t, m));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     #[test]
     fn files_of_different_kinds_open_as_separate_tabs() {
         let dir = std::env::temp_dir().join(format!("nerka-gui-mixed-{}", std::process::id()));
@@ -6906,7 +7658,7 @@ gear=D
         // Each tab says why once read (its "Indexed …" replaced the reason).
         for t in &app.tabs {
             assert!(
-                t.status.starts_with("Opened as separate tabs: a.log is plain text but d.dlt is DLT")
+                t.status.starts_with("Opened as separate tabs: a.log has no time, so it can't share a view with d.dlt")
                     && t.status.contains(" · Indexed "),
                 "{}",
                 t.status
@@ -7399,10 +8151,17 @@ query nav
         assert_eq!(tab.result().unwrap().lines, [1, 3]);
         assert!(hits(&tab).is_empty());
 
-        tab.set_bookmark(5, "look here".into());
+        tab.set_bookmark(5, "", "look here".into());
         settle(&mut tab, &ctx);
         assert_eq!(tab.result().unwrap().lines, [1, 3, 5]);
         assert_eq!(hits(&tab).iter().map(|(l, _)| *l).collect::<Vec<_>>(), [5]);
+        let auto = tab.bookmarks.name(5).unwrap().to_owned();
+        assert!(auto.starts_with('B'), "no name given: the next free one ({auto})");
+        // From the plot's menu: a name and a note, apart.
+        tab.set_bookmark(5, "crash", "look here".into());
+        assert_eq!((tab.bookmarks.name(5), tab.bookmarks.note(5)), (Some("crash"), Some("look here")));
+        tab.set_bookmark(5, "", "only the note changes".into());
+        assert_eq!(tab.bookmarks.name(5), Some("crash"), "an empty name keeps the one it has");
 
         // The box's text changed since: the filter that ran is kept.
         tab.pattern = "disk".into();
@@ -7618,14 +8377,16 @@ query clock  signals: t:time
         settle(&mut tab, &ctx);
         let mut saved = Signals::default();
         tab.refresh_signals(&ctx, &lib, &saved, 0);
-        assert!(tab.signals.is_empty(), "nothing picked, no time in the file");
+        // Nothing picked: only the time its lines start with (the built-in
+        // profile: three of its four lines have one).
+        assert_eq!(tab.signals.iter().map(|d| d.name()).collect::<Vec<_>>(), ["time"]);
 
         // A signal pick: its groups are signals; the filter stays empty.
         tab.picks.add(&lib, "p.speed", Use::Signal, None);
         tab.picks.add(&lib, "p.clock", Use::Signal, None);
         tab.refresh_signals(&ctx, &lib, &saved, 0);
         let kinds: Vec<(&str, &str)> = tab.signals.iter().map(|d| (d.name(), d.kind().as_str())).collect();
-        assert_eq!(kinds, [("v", "num"), ("gear", "enum"), ("t", "time")]);
+        assert_eq!(kinds, [("time", "time"), ("v", "num"), ("gear", "enum"), ("t", "time")]);
         assert_eq!(tab.picks.expand(&lib).unwrap().exp.nfd, "");
         tab.mode = Mode::Query;
         tab.pattern = "@gear == D AND level >= WARN".into();

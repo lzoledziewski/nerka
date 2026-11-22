@@ -17,7 +17,10 @@ use super::{NO_CHANNEL, Origin, Protocol};
 use crate::event::{FieldDef, FieldId, FieldKind, FieldValue, Level};
 use crate::input::ColumnDef;
 use crate::input::capture::route::Match;
-use model::{CExpr, Def, Lit, Src, Ty, as_expr, as_map, as_seq, as_text, err, intern, parse_int};
+use model::{
+    CExpr, Def, Lit, Src, Ty, as_expr, as_map, as_seq, as_text, err, intern, lit_ty, mixes_bool, not_bool_name,
+    parse_int,
+};
 use run::{Eval, Val};
 use std::borrow::Cow;
 use std::fmt;
@@ -432,6 +435,14 @@ fn spec_at(
                     "false" => Lit::Bool(false),
                     t => parse_int(t).map_or_else(|| Lit::Bytes(intern(t.as_bytes())), Lit::Int),
                 };
+                if mixes_bool(ty, lit_ty(&key)) {
+                    let m = if ty == Ty::Bool {
+                        "this value is a boolean: its `map` keys are `true` and `false`".to_owned()
+                    } else {
+                        format!("this value is {}: a `map` key isn't `true` / `false`", not_bool_name(ty, Ty::Bool))
+                    };
+                    return Err(err(k.line, k.col, m));
+                }
                 out.push((key, intern(as_text(v, "a name")?.as_bytes())));
             }
             Some(out)

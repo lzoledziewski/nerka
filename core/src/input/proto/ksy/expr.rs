@@ -73,6 +73,32 @@ pub enum BinOp {
     Mod,
 }
 
+impl BinOp {
+    /// As written in an expression.
+    pub fn symbol(self) -> &'static str {
+        match self {
+            BinOp::Or => "or",
+            BinOp::And => "and",
+            BinOp::Eq => "==",
+            BinOp::Ne => "!=",
+            BinOp::Lt => "<",
+            BinOp::Le => "<=",
+            BinOp::Gt => ">",
+            BinOp::Ge => ">=",
+            BinOp::BitOr => "|",
+            BinOp::BitXor => "^",
+            BinOp::BitAnd => "&",
+            BinOp::Shl => "<<",
+            BinOp::Shr => ">>",
+            BinOp::Add => "+",
+            BinOp::Sub => "-",
+            BinOp::Mul => "*",
+            BinOp::Div => "/",
+            BinOp::Mod => "%",
+        }
+    }
+}
+
 /// What is wrong, at a byte offset of the expression's text.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExprError {

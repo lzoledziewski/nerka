@@ -794,7 +794,7 @@ impl LifecycleDef {
                 self.name
             )));
         }
-        let time_series = match (&self.time_sig, source.line_count() > 0 && source.time(0).is_some()) {
+        let time_series = match (&self.time_sig, source.has_time()) {
             (Some(d), false) => Some(d.series(source, progress)?),
             _ => None,
         };

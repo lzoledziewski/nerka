@@ -349,7 +349,8 @@ fn open_picks_reader_from_content() {
     let (a, b) = (crate::open(&dlt, &p).unwrap(), crate::open(&txt, &p).unwrap());
     // DLT's fields, and `proto`.
     assert_eq!((a.line_count(), a.schema().len()), (1, SCHEMA.len() + 1));
-    assert_eq!((b.line_count(), b.schema().len()), (2, 0));
+    // Text: `profile` only.
+    assert_eq!((b.line_count(), b.schema().len()), (2, 1));
     drop((a, b));
     let _ = std::fs::remove_dir_all(dir);
 }
@@ -480,4 +481,57 @@ fn fibex_arguments_are_signals() {
     assert!(
         run_on(&raw, &Filter::Query(Query::compile("@speed.event").unwrap().with_signals(&sig).unwrap())).is_empty()
     );
+}
+
+/// Bytes between messages of a `.dlt` file are listed one run each: where
+/// (offset, the line after), when (the message before), and how they
+/// start. Past [`crate::input::Skips::MAX`] they are counted, and an export
+/// reads the file again and writes every one, nothing kept.
+#[test]
+fn skips_of_a_dlt_file_are_listed_and_exported() {
+    let msg = |secs: u32, text: &str| {
+        let mut m = Msg::log(Level::Info, "ECU1", "NAV", "POS", vec![Value::Str(text.into()).into()]);
+        m.secs = secs;
+        let mut b = Vec::new();
+        m.encode(&mut b);
+        b
+    };
+    let junk = b"garbage!".to_vec();
+    let bytes = [msg(10, "a"), junk.clone(), msg(11, "b"), vec![0x55; 3]].concat();
+    let f = DltFile::from_bytes("t.dlt", bytes.clone());
+    let info = f.info();
+    assert_eq!(f.line_count(), 2);
+    let s: Vec<_> = info.skips.iter().map(|s| (s.offset, s.bytes, s.line, s.time)).collect();
+    let (a, b) = (msg(10, "a").len() as u64, msg(11, "b").len() as u64);
+    // The garbage, one run although read piece by piece; the tail after
+    // the last message, with no line after it.
+    assert_eq!(s, [(Some(a), 8, Some(1), Some(10.0)), (Some(a + 8 + b), 3, None, Some(11.0))]);
+    assert_eq!(info.skips[0].head, junk);
+
+    // Many: listed up to the cap, every one in an export.
+    let n = crate::input::Skips::MAX + 5;
+    let many: Vec<u8> = (0..n).flat_map(|i| [msg(1_760_000_000 + i as u32, "m"), vec![0xEE]].concat()).collect();
+    let f = DltFile::from_bytes("many.dlt", many.clone());
+    let info = f.info();
+    assert_eq!((info.skips.len(), info.skips_more), (crate::input::Skips::MAX, 5));
+    let dir = std::env::temp_dir().join(format!("nerka-skips-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("many.dlt");
+    std::fs::write(&path, &many).unwrap();
+    let out = dir.join("skips.tsv");
+    let w = Box::new(std::io::BufWriter::new(std::fs::File::create(&out).unwrap()));
+    let files = [(path.clone(), "many.dlt".to_owned())];
+    let written = crate::input::export_skips(&files, &crate::OpenOptions::default(), w, &Progress::new()).unwrap();
+    assert_eq!(written, n as u64);
+    let text = std::fs::read_to_string(&out).unwrap();
+    assert!(text.starts_with("# nerka "), "{}", &text[..200]);
+    assert!(text.contains("# file: many.dlt ("), "the name, not the path");
+    assert!(!text.contains(&dir.display().to_string()), "no folder in the report");
+    let rows: Vec<&str> = text.lines().filter(|l| !l.starts_with('#')).collect();
+    assert_eq!(rows[0], crate::input::SKIPS_TSV_HEADER);
+    assert_eq!(rows.len(), n + 1);
+    assert!(rows[1].starts_with("not whole messages\t2\t2025-10-09 08:53:20.000000\t\t"), "{}", rows[1]);
+    assert!(rows[1].ends_with("\tee"), "{}", rows[1]);
+    assert!(text.contains(&format!("# not whole messages: {n} skips, {n} bytes")), "{}", &text[text.len() - 300..]);
+    std::fs::remove_dir_all(&dir).ok();
 }

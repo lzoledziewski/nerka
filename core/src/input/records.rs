@@ -217,7 +217,9 @@ impl JsonFields {
         let (mut schema, mut paths) = (Vec::new(), Vec::new());
         for (p, keys, kind) in seen.into_iter().filter(|(p, _, _)| usable(p)) {
             paths.push(keys);
-            let name = if matches!(p.as_str(), "raw" | "level" | "bookmark") { format!("json.{p}") } else { p };
+            // `profile`: the field every text file has (`input::timed`).
+            let name =
+                if matches!(p.as_str(), "raw" | "level" | "bookmark" | "profile") { format!("json.{p}") } else { p };
             schema.push(FieldDef::owned(name, kind, false));
         }
         JsonFields { schema, paths, level }
@@ -478,6 +480,22 @@ impl LogSource for RecordFile {
         }
     }
 
+    /// A split that found nothing to split at says so: the whole file is
+    /// one record (a `start=` regex chosen for another file).
+    fn info(&self) -> super::SourceInfo {
+        let mut info = super::SourceInfo::default();
+        let one = self.starts.len() == 1
+            && matches!(self.split, RecordSplit::Start(_) | RecordSplit::Separator(_))
+            && self.line_bytes(0).is_some_and(|r| r.contains(&b'\n'));
+        if one {
+            info.notes.push(format!(
+                "{} matched no line: the whole file is one record (Records…: one row per line, or automatic)",
+                self.split.spec()
+            ));
+        }
+        info
+    }
+
     /// The record, its line breaks included.
     fn line_bytes(&self, line: LineNo) -> Option<Cow<'_, [u8]>> {
         let i = usize::try_from(line).ok()?;
@@ -487,6 +505,10 @@ impl LogSource for RecordFile {
 
     fn contiguous(&self) -> Option<&[u8]> {
         Some(self.data.bytes())
+    }
+
+    fn has_time(&self) -> bool {
+        false
     }
 
     /// The record an offset falls in, or the one before a gap.

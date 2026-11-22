@@ -16,6 +16,43 @@ pub struct Frame<'a> {
     pub usecs: i32,
     /// pcapng interface (numbered across sections); 0 for pcap.
     pub channel: usize,
+    /// Its number in the file, from 1: Wireshark's `frame.number`.
+    pub number: u64,
+    /// Its length on the wire; more than `data` holds when the capture cut
+    /// it (its snap length).
+    pub wire_len: usize,
+}
+
+/// What a pcapng file's interface statistics say the capture itself
+/// dropped (the last statistics block of each interface: they count from
+/// the capture's start).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Drops {
+    /// The interface (numbered across sections, as frames' channels).
+    pub interface: usize,
+    /// Packets the interface received (`isb_ifrecv`).
+    pub received: Option<u64>,
+    /// Dropped by the interface for lack of resources (`isb_ifdrop`).
+    pub by_interface: Option<u64>,
+    /// Dropped by the operating system (`isb_osdrop`).
+    pub by_system: Option<u64>,
+}
+
+impl Drops {
+    pub fn total(&self) -> u64 {
+        self.by_interface.unwrap_or(0) + self.by_system.unwrap_or(0)
+    }
+}
+
+/// What reading a pcap or pcapng file found besides its frames.
+#[derive(Debug, Default)]
+pub struct FileRead {
+    /// Bytes that couldn't be read (a truncated last record, corrupt
+    /// blocks).
+    pub skipped: u64,
+    /// Interface statistics (none: a pcap, which has none; empty: a
+    /// pcapng without them).
+    pub drops: Option<Vec<Drops>>,
 }
 
 pub fn is_pcap(head: &[u8]) -> bool {
@@ -34,13 +71,13 @@ pub fn is_pcapng(head: &[u8]) -> bool {
 const REPORT: usize = 4 << 20;
 
 /// Call `f` for every frame of the pcap or pcapng file in `buf`. Returns
-/// the bytes that couldn't be read (a truncated last record, corrupt blocks).
-pub fn frames<'a>(buf: &'a [u8], progress: &Progress, f: &mut dyn FnMut(Frame<'a>)) -> Result<u64> {
+/// the bytes that couldn't be read and the interfaces' drop counts.
+pub fn frames<'a>(buf: &'a [u8], progress: &Progress, f: &mut dyn FnMut(Frame<'a>)) -> Result<FileRead> {
     progress.set_total(buf.len() as u64);
     if is_pcapng(buf) {
         pcapng(buf, progress, f)
     } else if is_pcap(buf) {
-        pcap(buf, progress, f)
+        Ok(FileRead { skipped: pcap(buf, progress, f)?, drops: None })
     } else {
         Err(Error::Format("not a pcap or pcapng file".into()))
     }
@@ -77,7 +114,7 @@ fn pcap<'a>(buf: &'a [u8], progress: &Progress, f: &mut dyn FnMut(Frame<'a>)) ->
     let nanos = matches!(magic, 0xA1B2_3C4D | 0x4D3C_B2A1);
     // The link type's upper bits may carry FCS information.
     let link = u32_at(buf, 20, be) & 0x0FFF_FFFF;
-    let (mut pos, mut reported) = (24, 0);
+    let (mut pos, mut reported, mut number) = (24, 0, 0u64);
     while pos + 16 <= buf.len() {
         let (sec, frac, incl) = (u32_at(buf, pos, be), u32_at(buf, pos + 4, be), u32_at(buf, pos + 8, be) as usize);
         let start = pos + 16;
@@ -85,7 +122,10 @@ fn pcap<'a>(buf: &'a [u8], progress: &Progress, f: &mut dyn FnMut(Frame<'a>)) ->
             break;
         }
         let usecs = if nanos { frac / 1000 } else { frac };
-        f(Frame { link, data: &buf[start..start + incl], secs: sec, usecs: usecs as i32, channel: 0 });
+        number += 1;
+        let data = &buf[start..start + incl];
+        let wire_len = (u32_at(buf, pos + 12, be) as usize).max(incl);
+        f(Frame { link, data, secs: sec, usecs: usecs as i32, channel: 0, number, wire_len });
         pos = start + incl;
         tick(progress, pos, &mut reported)?;
     }
@@ -112,11 +152,14 @@ impl Interface {
     }
 }
 
-fn pcapng<'a>(buf: &'a [u8], progress: &Progress, f: &mut dyn FnMut(Frame<'a>)) -> Result<u64> {
+fn pcapng<'a>(buf: &'a [u8], progress: &Progress, f: &mut dyn FnMut(Frame<'a>)) -> Result<FileRead> {
     let (mut pos, mut reported, mut skipped) = (0usize, 0usize, 0u64);
+    let mut drops: Vec<Drops> = Vec::new();
     let mut be = false;
     let mut ifaces: Vec<Interface> = Vec::new();
     let mut channels = 0;
+    // Packet blocks counted as Wireshark numbers frames.
+    let mut number = 0u64;
     while pos + 12 <= buf.len() {
         let raw_ty = u32::from_le_bytes(buf[pos..pos + 4].try_into().unwrap());
         if raw_ty == 0x0A0D_0D0A {
@@ -176,18 +219,59 @@ fn pcapng<'a>(buf: &'a [u8], progress: &Progress, f: &mut dyn FnMut(Frame<'a>)) 
                 let id = if ty == 6 { u32_at(body, 0, be) as usize } else { u16_at(body, 0, be) as usize };
                 let ts = ((u32_at(body, 4, be) as u64) << 32) | u32_at(body, 8, be) as u64;
                 let cap = u32_at(body, 12, be) as usize;
+                number += 1;
                 if let Some(i) = ifaces.get(id) {
                     let (secs, usecs) = i.time(ts);
                     let data = &body[20..(20 + cap).min(body.len())];
-                    f(Frame { link: i.link, data, secs, usecs, channel: i.channel });
+                    let wire_len = (u32_at(body, 16, be) as usize).max(data.len());
+                    f(Frame { link: i.link, data, secs, usecs, channel: i.channel, number, wire_len });
+                }
+            }
+            // Interface statistics: the last one of an interface counts.
+            5 if body.len() >= 12 => {
+                if let Some(i) = ifaces.get(u32_at(body, 0, be) as usize) {
+                    let mut d = Drops { interface: i.channel, ..Drops::default() };
+                    let mut at = 12;
+                    while at + 4 <= body.len() {
+                        let (code, olen) = (u16_at(body, at, be), u16_at(body, at + 2, be) as usize);
+                        if code == 0 || at + 4 + olen > body.len() {
+                            break;
+                        }
+                        let v = &body[at + 4..at + 4 + olen];
+                        let n = (olen >= 8).then(|| {
+                            let x = v[..8].try_into().unwrap();
+                            if be { u64::from_be_bytes(x) } else { u64::from_le_bytes(x) }
+                        });
+                        match code {
+                            4 => d.received = n,
+                            5 => d.by_interface = n,
+                            7 => d.by_system = n,
+                            _ => {}
+                        }
+                        at += 4 + olen.div_ceil(4) * 4;
+                    }
+                    match drops.iter_mut().find(|x| x.interface == d.interface) {
+                        Some(x) => *x = d,
+                        None => drops.push(d),
+                    }
                 }
             }
             // Simple packet block: interface 0, no timestamp.
             3 if body.len() >= 4 => {
+                number += 1;
                 if let Some(i) = ifaces.first() {
                     let orig = u32_at(body, 0, be) as usize;
                     let cap = orig.min(i.snaplen.max(1) as usize).min(body.len() - 4);
-                    f(Frame { link: i.link, data: &body[4..4 + cap], secs: 0, usecs: 0, channel: i.channel });
+                    let data = &body[4..4 + cap];
+                    f(Frame {
+                        link: i.link,
+                        data,
+                        secs: 0,
+                        usecs: 0,
+                        channel: i.channel,
+                        number,
+                        wire_len: orig.max(cap),
+                    });
                 }
             }
             _ => {}
@@ -196,5 +280,5 @@ fn pcapng<'a>(buf: &'a [u8], progress: &Progress, f: &mut dyn FnMut(Frame<'a>)) 
         tick(progress, pos, &mut reported)?;
     }
     progress.add((buf.len() - reported) as u64);
-    Ok(skipped + (buf.len() - pos) as u64)
+    Ok(FileRead { skipped: skipped + (buf.len() - pos) as u64, drops: Some(drops) })
 }

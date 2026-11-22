@@ -44,8 +44,11 @@ pub struct Concat {
     /// the `file` field is the whole's own).
     fields: Vec<Vec<Option<FieldId>>>,
     /// Per part, whether its lines are rendered into the mixed layout
-    /// (they have columns of their own).
+    /// (they have columns of their own, or are text).
     convert: Vec<bool>,
+    /// Per part, whether it is text in the mixed layout: its line is the
+    /// payload, after its own time and `TEXT`.
+    text: Vec<bool>,
     /// Its own, not its address: a view read again may land where the
     /// last one was, and caches and the GUI tell them apart by it.
     data_id: usize,
@@ -64,6 +67,14 @@ fn kind(s: &dyn LogSource) -> (Vec<&str>, Vec<(&str, FieldKind)>) {
 fn has_proto(s: &dyn LogSource) -> bool {
     !s.columns().is_empty() && s.schema().iter().any(|f| f.name == PROTO_FIELD.name)
 }
+
+/// Text (lines, records, JSON): no columns of its own.
+fn is_text(s: &dyn LogSource) -> bool {
+    s.columns().is_empty()
+}
+
+/// The `proto` of a text file's lines in the mixed layout.
+pub const TEXT_PROTO: &str = "TEXT";
 
 /// A readable kind for messages: plain text, text records, JSON, DLT, or
 /// another table.
@@ -110,9 +121,26 @@ impl Concat {
         let Some(first) = parts.first() else { return Err(Error::Format("no files to open".into())) };
         let k = kind(first.as_ref());
         let differ = parts.iter().any(|p| kind(p.as_ref()) != k);
-        // Only messages of protocols mix; plain text or JSON with anything
-        // of another kind doesn't.
-        let lone = parts.iter().position(|p| !has_proto(p.as_ref()));
+        // Only messages of protocols mix, and text with a time (its profile
+        // gives it one) with them; text without one, or text of another
+        // kind with text, doesn't.
+        let with_proto = parts.iter().any(|p| has_proto(p.as_ref()));
+        // Text that can join them: with a time, or without lines (nothing
+        // to place: owner, 2026-11-15, a file without lines doesn't count).
+        let joins = |p: &dyn LogSource| is_text(p) && (p.has_time() || p.line_count() == 0);
+        if differ
+            && with_proto
+            && let Some(t) = parts.iter().find(|p| is_text(p.as_ref()) && !joins(p.as_ref()))
+        {
+            let other = parts.iter().find(|p| has_proto(p.as_ref())).expect("one has");
+            return Err(Error::MixedKinds(format!(
+                "{} has no time, so it can't share a view with {} ({}): a profile with a time rule gives it one",
+                file_name(t.name()),
+                file_name(other.name()),
+                kind_name(other.as_ref())
+            )));
+        }
+        let lone = parts.iter().position(|p| !has_proto(p.as_ref()) && !(with_proto && joins(p.as_ref())));
         if let (true, Some(i)) = (differ, lone) {
             let (first, k) = (&parts[i], kind(parts[i].as_ref()));
             let other = parts.iter().find(|p| kind(p.as_ref()) != k).expect("they differ");
@@ -158,6 +186,7 @@ impl Concat {
         let fields = parts.iter().zip(&quals).map(|(p, q)| map.ids(q, p.schema())).collect();
         let mut schema = map.schema;
         let convert = parts.iter().map(|p| mixed && p.columns() != MIXED_COLUMNS).collect();
+        let text: Vec<bool> = parts.iter().map(|p| mixed && is_text(p.as_ref())).collect();
         let columns = if mixed { MIXED_COLUMNS.to_vec() } else { first.columns().to_vec() };
         schema.push(FieldDef::new(FILE_FIELD, FieldKind::Str, false));
         let (mut starts, mut total) = (Vec::with_capacity(parts.len()), 0);
@@ -168,7 +197,7 @@ impl Concat {
         let files = short_names(&parts.iter().map(|p| p.name()).collect::<Vec<_>>());
         let name = parts.iter().map(|p| p.name()).collect::<Vec<_>>().join(" + ");
         let data_id = super::new_data_id();
-        Ok(Concat { name, parts, starts, files, total, schema, mixed, mapped, columns, fields, convert, data_id })
+        Ok(Concat { name, parts, starts, files, total, schema, mixed, mapped, columns, fields, convert, text, data_id })
     }
 
     /// Whether parts of different protocols share the mixed layout.
@@ -183,6 +212,17 @@ impl Concat {
         let own = self.parts[k].line_bytes(l)?;
         if !self.convert[k] {
             return Some(own);
+        }
+        if self.text[k] {
+            // Its own time only: a line carrying the one before it shows none.
+            let mut out = self.text_time(k, l).into_bytes();
+            out.extend_from_slice(b"\t");
+            out.extend_from_slice(TEXT_PROTO.as_bytes());
+            out.extend_from_slice(b"\t\t");
+            // One row: a record's line breaks as spaces (the line window
+            // keeps them).
+            out.extend(own.iter().map(|&b| if b == b'\n' || b == b'\r' { b' ' } else { b }));
+            return Some(Cow::Owned(out));
         }
         let own = String::from_utf8_lossy(&own);
         let (time, rest) = own.split_once('\t').unwrap_or((&own, ""));
@@ -201,6 +241,10 @@ impl Concat {
     /// Part `k`'s detailed line, in the mixed layout when it needs one.
     fn part_detail(&self, k: usize, l: LineNo) -> Option<Vec<String>> {
         let mut cells = self.parts[k].line_detail(l)?;
+        if self.text[k] {
+            let text = cells.join("\t");
+            return Some(vec![self.text_time(k, l), TEXT_PROTO.into(), String::new(), text]);
+        }
         if !self.convert[k] || cells.is_empty() {
             return Some(cells);
         }
@@ -210,8 +254,25 @@ impl Concat {
         Some(vec![time, String::from_utf8_lossy(&self.proto_of(k, l)).into_owned(), info, payload])
     }
 
+    /// A text part's time cell: its line's own time.
+    fn text_time(&self, k: usize, l: LineNo) -> String {
+        self.parts[k].own_time(l).map_or_else(String::new, |t| crate::time::format_time(t, 6))
+    }
+
+    /// The level of part `k`'s line `l`: a text part's from its own line,
+    /// not from the row the mixed layout makes of it.
+    fn part_level(&self, k: usize, l: LineNo) -> Option<Option<Level>> {
+        match self.parts[k].supplied_level(l) {
+            None if self.text[k] => Some(crate::event::detect_level(&self.parts[k].line_bytes(l)?)),
+            s => s,
+        }
+    }
+
     /// The protocol of part `k`'s line `l` (its `proto` field).
     fn proto_of(&self, k: usize, l: LineNo) -> Vec<u8> {
+        if self.text[k] {
+            return TEXT_PROTO.as_bytes().to_vec();
+        }
         let p = self.parts[k].schema().iter().position(|d| d.name == PROTO_FIELD.name);
         match p.and_then(|p| self.parts[k].field(l, p)) {
             Some(FieldValue::Str(s)) => s.into_owned(),
@@ -223,6 +284,10 @@ impl Concat {
     fn part_field(&self, k: usize, l: LineNo, id: FieldId) -> Option<FieldValue<'_>> {
         if id == self.file_id() {
             return Some(FieldValue::Str(self.files[k].as_bytes().into()));
+        }
+        if self.text[k] && self.mixed && id == 0 {
+            // `proto` comes first in the mixed layout.
+            return Some(FieldValue::Str(TEXT_PROTO.as_bytes().into()));
         }
         if !self.mapped {
             // One kind: the parts' fields are the whole's.
@@ -253,7 +318,7 @@ impl LogSource for Concat {
     /// Its parts': protocols each once, notes with the file they're about.
     fn info(&self) -> super::SourceInfo {
         let mut out = super::SourceInfo::default();
-        for (p, file) in self.parts.iter().zip(&self.files) {
+        for ((p, file), &first) in self.parts.iter().zip(&self.files).zip(&self.starts) {
             let i = p.info();
             for proto in i.protocols {
                 if !out.protocols.iter().any(|o| o.eq_ignore_ascii_case(&proto)) {
@@ -262,6 +327,25 @@ impl LogSource for Concat {
             }
             out.notes.extend(i.notes.into_iter().map(|n| format!("{file}: {n}")));
             out.no_sender += i.no_sender;
+            // Skips on the view's lines, with their file.
+            let mapped = i.skips.iter().map(|s| super::Skip {
+                line: s.line.map(|l| l + first),
+                file: file.clone(),
+                ..s.clone()
+            });
+            std::sync::Arc::make_mut(&mut out.skips).extend(mapped);
+            out.skips_more += i.skips_more;
+            out.about.extend(i.about.into_iter().map(|a| format!("{file}: {a}")));
+            let own = if p.has_time() { "the file's own" } else { "none" };
+            let reading = if i.reading.is_empty() {
+                vec![super::timed::FileReading { time: own.into(), ..Default::default() }]
+            } else {
+                i.reading
+            };
+            out.reading.extend(reading.into_iter().map(|r| super::timed::FileReading { file: file.clone(), ..r }));
+        }
+        if self.text.iter().any(|&t| t) {
+            out.protocols.push(TEXT_PROTO.into());
         }
         out.files = self.files.clone();
         out
@@ -318,12 +402,22 @@ impl LogSource for Concat {
 
     fn supplied_level(&self, line: LineNo) -> Option<Option<Level>> {
         let (k, l) = self.locate(line)?;
-        self.parts[k].supplied_level(l)
+        self.part_level(k, l)
     }
 
     fn time(&self, line: LineNo) -> Option<f64> {
         let (k, l) = self.locate(line)?;
         self.parts[k].time(l)
+    }
+
+    fn own_time(&self, line: LineNo) -> Option<f64> {
+        let (k, l) = self.locate(line)?;
+        self.parts[k].own_time(l)
+    }
+
+    /// Any of its files has times.
+    fn has_time(&self) -> bool {
+        self.parts.iter().any(|p| p.has_time())
     }
 
     fn argument(&self, line: LineNo, index: usize) -> Option<crate::signal::SignalValue> {
@@ -404,11 +498,19 @@ impl LogSource for View<'_> {
     }
 
     fn supplied_level(&self, line: LineNo) -> Option<Option<Level>> {
-        self.part().supplied_level(line)
+        self.whole.part_level(self.k, line)
     }
 
     fn time(&self, line: LineNo) -> Option<f64> {
         self.part().time(line)
+    }
+
+    fn own_time(&self, line: LineNo) -> Option<f64> {
+        self.part().own_time(line)
+    }
+
+    fn has_time(&self) -> bool {
+        self.part().has_time()
     }
 
     fn argument(&self, line: LineNo, index: usize) -> Option<crate::signal::SignalValue> {
@@ -420,7 +522,8 @@ impl LogSource for View<'_> {
     }
 
     fn contiguous(&self) -> Option<&[u8]> {
-        self.part().contiguous()
+        // A text part in the mixed layout: its rows aren't its bytes.
+        if self.whole.text[self.k] { None } else { self.part().contiguous() }
     }
 
     fn line_of_offset(&self, offset: u64) -> LineNo {
@@ -537,6 +640,9 @@ fn open_sorted(
 /// a capture whose first messages had no time kept a whole view from
 /// being merged).
 pub fn start_time(s: &dyn LogSource) -> Option<f64> {
+    if !s.has_time() {
+        return None;
+    }
     (0..s.line_count()).find_map(|l| s.time(l))
 }
 

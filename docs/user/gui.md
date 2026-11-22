@@ -64,7 +64,11 @@ they find their lines again in a changed file (one that can't is marked
 Files opened together (multi-select in **Open…**, dropping several,
 `nerka-gui a.dlt b.pcap`) become **one tab**, one after another in the
 order given. The tab's menu → **Files…** lists them: move, remove or add
-files, turn protocols on or off per capture. **Sort by time** in the
+files, turn protocols on or off per capture, pick a text file's
+[profile](formats.md#profiles), move a file's times by an
+[offset](formats.md#a-files-offset); below the list, how each file's time
+was read. A text file whose lines have times shares a tab with DLT files
+and captures. **Sort by time** in the
 menu sorts all their lines by time (files that know it; lines of one time
 in the order of the files, then of each file), for one file too. Files
 that can't be sorted (one with lines but no times) leave the box
@@ -79,11 +83,12 @@ the filter, search, selection and the line you are on.
 
 | Button | Opens |
 |---|---|
-| 📚 Library (`Ctrl+Shift+L`) | the library of query packs and this tab's selection ([Query packs](packs.md)) |
+| 📚 Library (`Ctrl+Shift+L`) | the Library of queries and this tab's selection ([The Library](library.md)) |
 | 📈 Signals | signals and lifecycles of this tab ([Signals](signals.md), [Lifecycles](lifecycles.md)) |
 | ✔ Checks | checks and their results ([Checks](checks.md)) |
 | 📈 Plot | the plot of this tab's signals |
 | 📷 (`Ctrl+Shift+S`) | copies a screenshot of the window to the clipboard |
+| ⚠ after the file's size in the top bar | what wasn't read, one by one, with an export for a bug report ([What wasn't read](formats.md#what-wasnt-read)) |
 | ⚙ (`Ctrl+,`) | settings ([Settings](settings.md)) |
 | ℹ About (`F1`) | version, licence, the repository |
 
@@ -137,7 +142,7 @@ nerka-gui [OPTIONS] [FILE]...
 | `--marker NAME=VALUE[:LABEL]`, `--cursor TIME` | a line in a plotted lane, a time cursor |
 | `--fibex FILE` | a FIBEX file for DLT non-verbose messages |
 | `--new-window`, `--name NAME` | a window of its own, its name |
-| `--screenshot PATH` | once the files are loaded, the signals collected and the plot drawn, save the window as a PNG and close it (for checks without a person at the screen) |
+| `--screenshot PATH` | once the files are loaded, the signals collected and the plot drawn, save the window as a PNG and close it (for checks without a person at the screen); a plot in its own window is saved too, as `PATH-plot.png` (`shot.png` → `shot-plot.png`) |
 | `-h, --help`, `-V, --version` | |
 
 A `--signal`, `--lifecycle` or `--check` that doesn't parse is listed in an

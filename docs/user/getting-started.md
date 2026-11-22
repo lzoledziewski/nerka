@@ -22,17 +22,11 @@ Download the archive for your system from the
   but not tried by hand.
 
 Each archive holds `nerka-gui` (the desktop viewer), `nerka` (the command
-line tool), the README, the licences, `examples/` (protocol definitions and
-sample query packs) and this guide (`docs/`). `SHA256SUMS` next to the
-archives on the release page checks them: `sha256sum -c SHA256SUMS`.
-
-To build from source you need a stable Rust toolchain
-([rustup.rs](https://rustup.rs)); on Windows, the MSVC toolchain with the
-"Desktop development with C++" build tools:
-
-```
-cargo build --release --workspace
-```
+line tool), the README, the licences, `examples/` (a demo trace, sample
+queries for the Library and protocol definitions) and this guide (`docs/`).
+`SHA256SUMS` next to the archives on the release page checks them:
+`sha256sum -c SHA256SUMS`. To build nerka from source, see
+[CONTRIBUTING.md](https://github.com/lzoledziewski/nerka/blob/main/CONTRIBUTING.md).
 
 ## Open a file
 
@@ -66,6 +60,23 @@ The **Search** box at the bottom finds lines among those the filter kept,
 lists them in the pane below and colours them in the view; `n` / `N` jump
 between hits.
 
+## Try the demo
+
+The archive's `examples/demo.dlt` is a made-up 20-minute drive: three
+devices, one of them booting three times (and crashing once), a speed, a
+gear, a temperature that makes a chip throttle, a battery voltage, an update
+in progress, and a few bookmarks. `examples/packs/demo.nerka-pack` holds
+queries for it. Open both, with the speed and temperature plotted:
+
+```
+nerka-gui examples/demo.dlt --pack examples/packs/demo.nerka-pack --library --signal-pick demo.speed --signal-pick demo.temperature --plot speed --plot temp
+```
+
+Then try the [Library](library.md#try-it) and the [plot](signals.md#plots):
+click a point in the plot to jump to its line, right-click to place time
+cursors. (In a source checkout, make the trace first:
+`cargo run -p nerka-core --example gen_demo -- examples/demo.dlt`.)
+
 ## The same from the command line
 
 ```
@@ -79,7 +90,7 @@ See [the command line](cli.md) for every command.
 
 ## Next
 
-- Keep queries you use again in a [query pack](packs.md).
+- Keep queries you use again in the [Library](library.md).
 - Plot values from your lines: [signals and plots](signals.md).
 - Follow a device's boots and check them: [lifecycles](lifecycles.md),
   [checks](checks.md).

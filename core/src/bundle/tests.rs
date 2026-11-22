@@ -197,13 +197,37 @@ fn export_then_import_into_an_empty_folder() {
     assert!(errors.is_empty() && signals.get("v").is_some() && signals.get("ecu1").is_some());
     assert_eq!(
         std::fs::read_to_string(root.join(FORMAT_FILE)).unwrap().lines().filter(|l| l.ends_with(" 1")).count(),
-        5
+        6
     );
     // Again: all the same, nothing to do.
     let again = to.plan(&b);
     assert!(again.items.iter().all(|p| p.status == Status::Same), "{:?}", labels(&again));
     assert_eq!(again.changes(), 0);
     assert_eq!(to.apply(&again).summary(), "nothing imported");
+}
+
+/// Profiles (`text-profiles.md`, owner 2026-11-14: part of settings
+/// bundles) are lines of `profiles`, as checks and signals are.
+#[test]
+fn profiles_export_and_import_as_lines() {
+    const PROFILE: &str = r"app: name *.log; time /^(?<time>\S+ \S+)/; zone local";
+    let from = filled("profiles-from");
+    std::fs::write(from.root().join("profiles"), format!("# nerka profiles\n{PROFILE}\n")).unwrap();
+    assert_eq!(item(Kind::Profile, PROFILE).name, "app");
+    assert!(Item::new(Kind::Profile, "app: when x").unwrap_err().contains("unknown clause"));
+    let r = renamed(Kind::Profile, &tidy(PROFILE), "app_imported").unwrap();
+    assert_eq!(r, format!("app_imported{}\n", &PROFILE[3..]));
+    let (b, errors) = from.export(&|i| i.kind == Kind::Profile);
+    assert!(errors.is_empty(), "{errors:?}");
+    let b = Bundle::parse("t", &b.to_text()).unwrap();
+    let to = Store::new(dir("profiles-to"));
+    let plan = to.plan(&b);
+    assert_eq!(labels(&plan), ["new profile app"]);
+    assert!(to.apply(&plan).errors.is_empty());
+    let text = std::fs::read_to_string(to.root().join("profiles")).unwrap();
+    let (ps, errors) = crate::input::profile::Profiles::parse_text(&text);
+    assert!(errors.is_empty() && ps.get("app").is_some(), "{text}");
+    assert!(text.starts_with("# nerka profiles"), "{text}");
 }
 
 #[test]

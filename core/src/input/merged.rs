@@ -39,19 +39,30 @@ impl Merged {
         let parts = inner.part_files();
         let total = inner.line_count();
         progress.set_total(total);
-        let mut times: Vec<f64> = Vec::with_capacity(total as usize);
+        // Each line's time, read in parallel (a text file's are read from
+        // its lines), then carried down each file.
+        const CHUNK: LineNo = 65_536;
+        let mut times: Vec<f64> = vec![f64::NAN; total as usize];
+        times.par_chunks_mut(CHUNK as usize).enumerate().try_for_each(|(c, out)| {
+            if progress.is_cancelled() {
+                return Err(Error::Cancelled);
+            }
+            let from = c as LineNo * CHUNK;
+            for (i, t) in out.iter_mut().enumerate() {
+                *t = inner.time(from + i as LineNo).unwrap_or(f64::NAN);
+            }
+            progress.add(out.len() as LineNo);
+            Ok(())
+        })?;
         for &(first, n) in &parts {
             let mut last = f64::NEG_INFINITY;
-            for l in 0..n {
-                if l % 65_536 == 0 && progress.is_cancelled() {
-                    return Err(Error::Cancelled);
+            for t in &mut times[first as usize..(first + n) as usize] {
+                if t.is_nan() {
+                    *t = last;
+                } else {
+                    last = *t;
                 }
-                if let Some(x) = inner.time(first + l) {
-                    last = x;
-                }
-                times.push(last);
             }
-            progress.add(n);
         }
         // The concatenation's order breaks ties: the files as given, then
         // their lines. Stable, in parallel, quick on runs already in order.
@@ -105,7 +116,17 @@ impl LogSource for Merged {
     }
 
     fn info(&self) -> super::SourceInfo {
-        self.inner.info()
+        let mut info = self.inner.info();
+        // Skips on the rows their next lines are on now (sorted by time:
+        // the list stays in file order).
+        let skips: Vec<super::Skip> = (info.skips.iter())
+            .map(|s| super::Skip {
+                line: s.line.and_then(|l| self.row_of.get(usize::try_from(l).ok()?).copied()),
+                ..s.clone()
+            })
+            .collect();
+        info.skips = std::sync::Arc::new(skips);
+        info
     }
 
     fn line_count(&self) -> LineNo {
@@ -151,6 +172,14 @@ impl LogSource for Merged {
 
     fn time(&self, row: LineNo) -> Option<f64> {
         self.inner.time(self.line(row)?)
+    }
+
+    fn own_time(&self, row: LineNo) -> Option<f64> {
+        self.inner.own_time(self.line(row)?)
+    }
+
+    fn has_time(&self) -> bool {
+        self.inner.has_time()
     }
 
     fn argument(&self, row: LineNo, index: usize) -> Option<crate::signal::SignalValue> {

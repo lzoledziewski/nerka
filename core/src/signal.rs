@@ -671,6 +671,9 @@ pub struct SignalDef {
     /// The value is this argument of the matching lines' messages
     /// ([`LogSource::argument`]), not a capture.
     argument: Option<usize>,
+    /// The profiles it comes from (a text file's `signal` clause), each
+    /// file's own: edited there, not in the Signals panel.
+    profiles: Vec<String>,
 }
 
 impl SignalDef {
@@ -713,6 +716,7 @@ impl SignalDef {
             off: false,
             queries: Vec::new(),
             argument: None,
+            profiles: Vec::new(),
         })
     }
 
@@ -745,12 +749,24 @@ impl SignalDef {
             off: false,
             queries: vec![from.to_owned()],
             argument: Some(index),
+            profiles: Vec::new(),
         })
     }
 
     /// The message argument it takes, for one made by [`Self::argument`].
     pub fn argument_index(&self) -> Option<usize> {
         self.argument
+    }
+
+    /// The profiles it comes from (empty: not a profile's).
+    pub fn profiles(&self) -> &[String] {
+        &self.profiles
+    }
+
+    /// Marked as coming from these profiles.
+    pub fn with_profiles(mut self, profiles: Vec<String>) -> SignalDef {
+        self.profiles = profiles;
+        self
     }
 
     /// The same signal with its events from `scope`.
@@ -812,6 +828,7 @@ impl SignalDef {
             off: false,
             queries: Vec::new(),
             argument: None,
+            profiles: Vec::new(),
         }
     }
 
@@ -1158,6 +1175,14 @@ impl SignalDef {
         Ok(SignalSeries { key: source_key(source), parts, life, default })
     }
 
+    /// Why it has no series on `source` and won't get one: the lifecycle
+    /// it is, or is `per`, wasn't found (a UI then stops waiting for it).
+    pub fn failed(&self, source: &dyn LogSource) -> Option<String> {
+        let l = self.as_lifecycle().or(self.life.as_ref())?;
+        let e = l.done(source)?.err()?;
+        Some(if self.as_lifecycle().is_some() { e } else { format!("its lifecycle @{}: {e}", l.name()) })
+    }
+
     /// The series if every file's events are cached already (a UI can
     /// show values without waiting).
     pub fn cached_series(&self, source: &dyn LogSource) -> Option<SignalSeries> {
@@ -1319,7 +1344,7 @@ impl Signals {
     pub fn for_source(&self, source: &dyn LogSource) -> Signals {
         let mut s = self.clone();
         let some = source.line_count() > 0;
-        if some && source.time(0).is_some() && s.get("time").is_none() {
+        if some && source.has_time() && s.get("time").is_none() {
             s.0.insert(0, Arc::new(SignalDef::source_time()));
         }
         s.link();
@@ -1547,7 +1572,7 @@ impl Clock {
     /// collected and there are none: its regex doesn't fit the file) is
     /// skipped, so it can't leave every line without a time.
     pub fn of(source: &dyn LogSource, signals: &Signals) -> Clock {
-        if source.line_count() > 0 && source.time(0).is_some() {
+        if source.has_time() {
             return Clock::Source;
         }
         let usable = |d: &&Arc<SignalDef>| {
@@ -1647,10 +1672,16 @@ pub(crate) fn first_group(q: &Query) -> Option<String> {
 }
 
 /// The text `group` captured in the first positive regex that has the
-/// group and matches its text (the line, or its field).
+/// group and matches its text (the line, or its field). In an OR, only a
+/// branch that holds gives it (2026-11-22: `(profile == a AND /x(?<v>…)/)
+/// OR (profile == b AND /y(?<v>…)/)` took a's capture on b's lines).
 fn capture(e: &Expr, group: &str, ev: &mut Event<'_>) -> Option<Vec<u8>> {
     match e {
-        Expr::And(xs) | Expr::Or(xs) => xs.iter().find_map(|x| capture(x, group, ev)),
+        Expr::And(xs) => xs.iter().find_map(|x| capture(x, group, ev)),
+        // A single condition holds where its regex captures: no second test.
+        Expr::Or(xs) => {
+            xs.iter().find_map(|x| if matches!(x, Expr::Cond(_)) || x.eval(ev) { capture(x, group, ev) } else { None })
+        }
         Expr::Not(_) => None,
         Expr::Cond(Cond::RawMatch(re)) if has_group(re, group) => {
             re.captures(ev.raw()).and_then(|c| c.name(group)).map(|m| m.as_bytes().to_vec())
@@ -1697,6 +1728,12 @@ mod tests {
         assert_eq!(value(r"v=/v=(?<v>\d+)/ AND /ok/", "v=1 ok"), Some(SignalValue::Num(1.0)));
         // Under OR, the branch that matched gives the value.
         assert_eq!(value(r"v=/a=(?<v>\d+)/ OR /b=(?<v>\d+)/", "b=7"), Some(SignalValue::Num(7.0)));
+        // … the branch as a whole: another branch's regex that captures on
+        // the line, its other conditions failing, gives nothing.
+        let two = r"v=(/^A/ AND /x=(?<v>\d+)/) OR (/^B/ AND /y=(?<v>\d+)/)";
+        assert_eq!(value(two, "B x=1 y=2"), Some(SignalValue::Num(2.0)));
+        assert_eq!(value(two, "A x=1 y=2"), Some(SignalValue::Num(1.0)));
+        assert_eq!(value(two, "C x=1 y=2"), None);
         assert_eq!(value(r"v=/v=(?<v>\d+)?/", "v="), None, "group took no part");
     }
 

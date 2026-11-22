@@ -1,5 +1,5 @@
 //! Settings bundles: the user's analysis setup (packs, presets, plots,
-//! checks, signals) as one text file to export, share and import, and the
+//! checks, signals, text profiles) as one text file to export, share and import, and the
 //! format numbers and migration steps that let a later nerka read what an
 //! earlier one wrote. Design: `docs/dev/bundles.md`.
 //!
@@ -27,7 +27,7 @@
 //! line   := any line; one starting with "@@" is written with one more "@"
 //! ```
 //!
-//! An item is a pack, preset or plot file, or one check or signal line, as
+//! An item is a pack, preset or plot file, or one check, signal or profile line, as
 //! it is. Its format number says which format its text is in; [`STEPS`]
 //! turn a kind's text from one format into the next, so an older item is
 //! upgraded ([`upgrade`]) before it is parsed. A [`Store`] is a config
@@ -35,6 +35,7 @@
 //! and an import planned ([`Store::plan`]) and applied ([`Store::apply`]).
 
 use crate::check::CheckDef;
+use crate::input::profile::Profile;
 use crate::pack::{PackError, is_name, parse_pack};
 use crate::plot::parse_plot;
 use crate::preset::{parse_preset, quote, words};
@@ -59,10 +60,11 @@ pub enum Kind {
     Plot,
     Check,
     Signal,
+    Profile,
 }
 
 impl Kind {
-    pub const ALL: [Kind; 5] = [Kind::Pack, Kind::Preset, Kind::Plot, Kind::Check, Kind::Signal];
+    pub const ALL: [Kind; 6] = [Kind::Pack, Kind::Preset, Kind::Plot, Kind::Check, Kind::Signal, Kind::Profile];
 
     pub fn as_str(self) -> &'static str {
         match self {
@@ -71,6 +73,7 @@ impl Kind {
             Kind::Plot => "plot",
             Kind::Check => "check",
             Kind::Signal => "signal",
+            Kind::Profile => "profile",
         }
     }
 
@@ -81,6 +84,7 @@ impl Kind {
             Kind::Plot => "plots",
             Kind::Check => "checks",
             Kind::Signal => "signals",
+            Kind::Profile => "profiles",
         }
     }
 
@@ -94,9 +98,10 @@ impl Kind {
         current(self, STEPS)
     }
 
-    /// Kinds kept one item per line in a shared file (`checks`, `signals`).
+    /// Kinds kept one item per line in a shared file (`checks`, `signals`,
+    /// `profiles`).
     pub fn is_line(self) -> bool {
-        matches!(self, Kind::Check | Kind::Signal)
+        matches!(self, Kind::Check | Kind::Signal | Kind::Profile)
     }
 
     /// The folder (pack, preset, plot) or file (check, signal) in a config folder.
@@ -109,7 +114,7 @@ impl Kind {
             Kind::Pack => crate::pack::PACK_EXTENSION,
             Kind::Preset => crate::preset::PRESET_EXTENSION,
             Kind::Plot => crate::plot::PLOT_EXTENSION,
-            Kind::Check | Kind::Signal => "",
+            Kind::Check | Kind::Signal | Kind::Profile => "",
         }
     }
 
@@ -118,6 +123,7 @@ impl Kind {
         match self {
             Kind::Check => crate::check::Checks::default().to_text(),
             Kind::Signal => crate::Signals::default().to_text(),
+            Kind::Profile => crate::input::profile::Profiles::default().to_text(),
             _ => String::new(),
         }
     }
@@ -236,6 +242,10 @@ pub fn name_of(kind: Kind, text: &str) -> Result<String, String> {
             let line = one_line(kind, text)?;
             SignalDef::parse_spec(&line).map(|d| d.name().to_owned()).map_err(|e| e.to_string())
         }
+        Kind::Profile => {
+            let line = one_line(kind, text)?;
+            Profile::parse_spec(&line).map(|p| p.name().to_owned()).map_err(|e| e.at(&line))
+        }
     }
 }
 
@@ -245,6 +255,7 @@ fn canonical(kind: Kind, text: &str) -> String {
     let spelled = match kind {
         Kind::Check => one_line(kind, text).ok().and_then(|l| CheckDef::parse_spec(&l).ok()).map(|c| c.spec()),
         Kind::Signal => one_line(kind, text).ok().and_then(|l| SignalDef::parse_spec(&l).ok()).map(|d| d.spec()),
+        Kind::Profile => one_line(kind, text).ok().and_then(|l| Profile::parse_spec(&l).ok()).map(|p| p.spec()),
         _ => None,
     };
     if let Some(s) = spelled {
@@ -280,6 +291,10 @@ pub fn renamed(kind: Kind, text: &str, new: &str) -> Result<String, String> {
             let group =
                 if life.is_empty() && !rest[end..].starts_with('(') { format!("({old})") } else { String::new() };
             format!("{off}{life}{new}{group}{}", &rest[end..])
+        }
+        Kind::Profile => {
+            let colon = line.find(':').ok_or("a profile without ':'")?;
+            format!("{new}{}", &line[colon..])
         }
     };
     let out = tidy(&lines.join("\n"));

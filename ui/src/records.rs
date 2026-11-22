@@ -3,6 +3,9 @@
 //! records, JSON), chosen per tab (its menu → Records…) and remembered per
 //! file in `<config>/nerka/records` (`spec<TAB>path` per line; a file read
 //! automatically isn't listed, so "lines" can turn JSON off for a file).
+//! The same file remembers what the tab's Files window chose for a file: a
+//! profile forced on it (`profile=NAME`) and its time's offset
+//! (`offset=+3h`), one line each.
 
 use eframe::egui;
 use nerka_core::input::records::RecordSplit;
@@ -18,22 +21,68 @@ fn read_memo() -> Vec<(PathBuf, String)> {
     text.lines().filter_map(|l| l.split_once('\t')).map(|(spec, path)| (PathBuf::from(path), spec.to_owned())).collect()
 }
 
-/// How `path` was last read: its remembered split; `None`: automatic.
-pub fn remembered(path: &Path) -> Option<RecordSplit> {
-    read_memo().into_iter().find(|(p, _)| p == path).and_then(|(_, spec)| RecordSplit::parse(&spec).ok())
+/// What a memo line remembers: `profile`, `offset`, or `records`.
+fn kind_of(spec: &str) -> &'static str {
+    if spec.starts_with("profile=") {
+        "profile"
+    } else if spec.starts_with("offset=") {
+        "offset"
+    } else {
+        "records"
+    }
 }
 
-/// Remember how `path` is read (`None`, automatic: forget it).
-pub fn remember(path: &Path, split: Option<&RecordSplit>) -> std::io::Result<()> {
+/// The remembered `kind` of `path` (its spec, without `kind=` for a
+/// profile or an offset).
+fn recall(path: &Path, kind: &str) -> Option<String> {
+    let (_, spec) = read_memo().into_iter().find(|(p, s)| p == path && kind_of(s) == kind)?;
+    Some(spec.strip_prefix(&format!("{kind}=")).map_or(spec.clone(), str::to_owned))
+}
+
+/// Remember `spec` as `path`'s `kind` (`None`: forget it). Records lines
+/// come first, so an older nerka finds them.
+fn keep(path: &Path, kind: &str, spec: Option<String>) -> std::io::Result<()> {
     let Some(file) = memo_path() else { return Ok(()) };
-    let mut memo: Vec<(PathBuf, String)> = read_memo().into_iter().filter(|(p, _)| p != path).collect();
-    if let Some(split) = split {
-        memo.push((path.to_path_buf(), split.spec()));
+    let mut memo: Vec<(PathBuf, String)> =
+        read_memo().into_iter().filter(|(p, s)| !(p == path && kind_of(s) == kind)).collect();
+    if let Some(spec) = spec {
+        memo.push((path.to_path_buf(), spec));
     }
+    memo.sort_by_key(|(_, s)| kind_of(s) != "records");
     if let Some(dir) = file.parent() {
         std::fs::create_dir_all(dir)?;
     }
     nerka_core::write_atomic(file, memo.iter().map(|(p, s)| format!("{s}\t{}\n", p.display())).collect::<String>())
+}
+
+/// How `path` was last read: its remembered split; `None`: automatic.
+pub fn remembered(path: &Path) -> Option<RecordSplit> {
+    recall(path, "records").and_then(|spec| RecordSplit::parse(&spec).ok())
+}
+
+/// Remember how `path` is read (`None`, automatic: forget it).
+pub fn remember(path: &Path, split: Option<&RecordSplit>) -> std::io::Result<()> {
+    keep(path, "records", split.map(RecordSplit::spec))
+}
+
+/// The profile forced on `path` (`None`: chosen by its rules).
+pub fn remembered_profile(path: &Path) -> Option<String> {
+    recall(path, "profile").filter(|n| !n.is_empty())
+}
+
+/// Remember the profile forced on `path` (`None`: forget it).
+pub fn remember_profile(path: &Path, name: Option<&str>) -> std::io::Result<()> {
+    keep(path, "profile", name.map(|n| format!("profile={n}")))
+}
+
+/// The offset of `path`'s times, in seconds (0: none).
+pub fn remembered_offset(path: &Path) -> f64 {
+    recall(path, "offset").and_then(|o| nerka_core::time::parse_offset(&o)).unwrap_or(0.0)
+}
+
+/// Remember the offset of `path`'s times (0: forget it).
+pub fn remember_offset(path: &Path, offset: f64) -> std::io::Result<()> {
+    keep(path, "offset", (offset != 0.0).then(|| format!("offset={}", nerka_core::time::format_offset(offset))))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -92,8 +141,8 @@ pub enum Outcome {
     Close,
 }
 
-/// The Records window of the tab `title`.
-pub fn window(ctx: &egui::Context, title: &str, edit: &mut Edit) -> Outcome {
+/// The Records window of the tab `title`, for its text files `files`.
+pub fn window(ctx: &egui::Context, title: &str, files: &[String], edit: &mut Edit) -> Outcome {
     let (mut open, mut apply, mut cancel) = (true, false, false);
     egui::Window::new(format!("Records of {title}"))
         .id(egui::Id::unique("records-window"))
@@ -102,6 +151,11 @@ pub fn window(ctx: &egui::Context, title: &str, edit: &mut Edit) -> Outcome {
         .resizable(false)
         .show(ctx, |ui| {
             ui.weak("How the tab's text files are split into rows. A record of several lines is one row: filters and searches see all of it, and Enter shows it whole.");
+            if files.len() > 1 {
+                ui.weak(format!("For {}; remembered for each of them.", files.join(", ")));
+            } else {
+                ui.weak("Remembered for the file.");
+            }
             ui.separator();
             ui.radio_value(&mut edit.kind, Kind::Auto, "Automatic: JSON if the file looks like JSON, else one row per line");
             ui.radio_value(&mut edit.kind, Kind::Lines, "One row per line");

@@ -1,12 +1,13 @@
 ---
 title: "Settings bundles"
-description: "Settings bundles: export and import nerka's query packs, presets, plots, checks and signals as one readable file, upgraded across versions."
+description: "Settings bundles: export and import nerka's query packs, presets, plots, checks, signals and profiles as one readable file, upgraded across versions."
 ---
 
 # Settings bundles
 
 A **settings bundle** is one readable text file (`.nerka-bundle`) holding
-your analysis setup: query packs, presets, kept plots, checks and signals.
+your analysis setup: query packs, presets, kept plots, checks, signals and
+text profiles.
 Export one to move your setup to another machine or share it; import one to
 take someone else's. Later versions of nerka read bundles that earlier ones
 wrote, and upgrade them on import.
@@ -23,6 +24,7 @@ The **analysis setup**, the user's own items in the per-user config folder
 | `plot`   | `plots/*.nerka-plot`              | a plot file      | its `plot NAME` line   |
 | `check`  | `checks` (a spec line each)       | one check line   | the text before `:`    |
 | `signal` | `signals` (a spec line each)      | one signal or lifecycle line | its name   |
+| `profile` | `profiles` (a spec line each)    | one [profile](formats.md#profiles) line | the text before `:` |
 
 Not in it: `prefs`, the filter and search histories,
 `query-usage`, the `records` memo (absolute paths), window registrations
@@ -58,7 +60,7 @@ v=/v=(?<v>\d+)/
 ```text
 file   := "nerka-bundle" VERSION NEWLINE ["nerka" TEXT NEWLINE] (comment | blank)* item*
 item   := "@@" KIND NAME "format" N NEWLINE line*      -- up to the next header or the end
-KIND   := "pack" | "preset" | "plot" | "check" | "signal"
+KIND   := "pack" | "preset" | "plot" | "check" | "signal" | "profile"
 NAME   := a word, or "…" with \" and \\              -- as in presets
 line   := any line; one that starts with "@@" is written with one more "@"
 ```
@@ -85,7 +87,7 @@ upgraded to the current format and parsed, is one of:
 | Status      | Meaning                                   | Choices                          | Auto        |
 |-------------|-------------------------------------------|----------------------------------|-------------|
 | new         | no item of that kind and name             | add / skip                       | add         |
-| same        | the same text as mine (line ends, trailing spaces and, for checks and signals, spelling aside) | — | skip |
+| same        | the same text as mine (line ends, trailing spaces and, for checks, signals and profiles, spelling aside) | — | skip |
 | different   | mine has the name, with other text        | keep both / take theirs / keep mine | keep both |
 | invalid     | doesn't upgrade or parse, or twice in the bundle | —                         | skip        |
 
@@ -101,7 +103,7 @@ bundle, `<config>/nerka/backups/before-import-<UTC time>.nerka-bundle`.
 
 Applying writes new pack, preset and plot files as `<name>.<extension>`
 (`<name>_2…` if a file of that name holds something else) and replaces a
-taken item in its own file; checks and signals are added to (or replaced
+taken item in its own file; checks, signals and profiles are added to (or replaced
 in) their files line by line, other lines kept. Every write is atomic.
 
 ## Where

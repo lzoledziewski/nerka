@@ -278,3 +278,66 @@ fn a_definition_names_its_datagrams() {
         .replace("  framing: datagram", "  framing: datagram\n  match: [ { port: 1, vlan: 0 } ]");
     assert_eq!(error(&bad).2, "VLAN id 0 isn't 1 to 4094");
 }
+
+#[test]
+fn booleans_meet_only_booleans() {
+    // Flags from instances, as a definition reads bits out of bytes.
+    let base = "meta:\n  id: t\n  endian: le\nseq:\n  - { id: ra, type: u1 }\n  - { id: rb, type: u1 }\ninstances:\n  fa: { value: ra & 0x10 != 0 }\n  fb: { value: rb & 0x10 != 0 }\n  ok: { value: fa & fb }\n-nerka:\n  name: T\n  framing: datagram\n  fields:\n    x: ok\n  columns: [x]\n";
+    let p = load(base);
+    // `&` of two booleans is a boolean, through an instance too.
+    assert_eq!(render(&p, &[0x10, 0x10]), "true");
+    assert_eq!(render(&p, &[0x10, 0]), "false");
+    let p = load(&base.replace("    x: ok", "    x: { from: ok, map: { true: yes, false: no } }"));
+    assert_eq!(render(&p, &[0x10, 0x10]), "yes");
+    assert_eq!(render(&p, &[0, 0]), "no");
+    for (expr, on, off) in [("fa and not fb", "1", "0"), ("fa == true", "1", "0"), ("fa != false", "1", "0")] {
+        let p = load(&base.replace("    x: ok", &format!("    x: {expr}")));
+        assert_eq!(
+            (field(&p, &[0x10, 0], "x").as_deref(), field(&p, &[0, 0], "x").as_deref()),
+            (Some(on), Some(off)),
+            "{expr}"
+        );
+    }
+    // `flag != 0` was always true and `flag == 0` never: an error now.
+    let never = "compares a boolean with a number, which is never equal; use the boolean as it is (`flag`, `not flag`) or compare it with `true` / `false`";
+    assert_eq!(error(&base.replace("    x: ok", "    x: fa != 0")), (15, 8, format!("`!=` {never}")));
+    assert_eq!(error(&base.replace("    x: ok", "    x: 1 == fb")), (15, 8, format!("`==` {never}")));
+    assert_eq!(
+        error(&base.replace("value: fa & fb", "value: fa & 1")),
+        (
+            10,
+            16,
+            "`&` mixes a boolean with a number; use `and` / `or` on booleans, or make the number one (`x != 0`)".into()
+        )
+    );
+    assert_eq!(error(&base.replace("    x: ok", "    x: fa + 1")).2, "`+` takes numbers, not a boolean");
+    assert_eq!(
+        error(&base.replace("    x: ok", "    x: \"fa == 'x'\"")).2,
+        format!("`==` {}", never.replace("a number", "bytes"))
+    );
+    assert_eq!(
+        error(&base.replace("    x: ok", "    x: { from: ok, map: { 1: yes } }")),
+        (15, 27, "this value is a boolean: its `map` keys are `true` and `false`".into())
+    );
+    assert_eq!(
+        error(&base.replace("    x: ok", "    x: { from: ra, map: { true: yes } }")).2,
+        "this value is a number: a `map` key isn't `true` / `false`"
+    );
+    // Numbers keep their truth in `and` / `or` / `not`.
+    let p = load(&base.replace("    x: ok", "    x: ra and not rb"));
+    assert_eq!(field(&p, &[3, 0], "x").as_deref(), Some("1"));
+
+    // A `b1`: its `valid` and the cases switching on it.
+    let bits = "meta:\n  id: t\n  endian: le\nseq:\n  - { id: f, type: b1 }\n  - { id: g, type: b1, enum: onoff }\n  - { id: body, type: { switch-on: f, cases: { true: u1, false: u2 } } }\nenums:\n  onoff: { 0: off, 1: on }\n-nerka:\n  name: T\n  framing: datagram\n  fields:\n    x: \"g == onoff::on and f\"\n  columns: [x]\n";
+    let p = load(bits);
+    assert_eq!(field(&p, &[0b1100_0000, 7], "x").as_deref(), Some("1"));
+    assert_eq!(
+        error(&bits.replace("{ id: f, type: b1 }", "{ id: f, type: b1, valid: 1 }")),
+        (5, 31, "a `b1` is a boolean: its `valid` is `true` or `false`".into())
+    );
+    let _ = load(&bits.replace("{ id: f, type: b1 }", "{ id: f, type: b1, valid: true }"));
+    assert_eq!(
+        error(&bits.replace("{ true: u1, false: u2 }", "{ 1: u1, 0: u2 }")).2,
+        "this switches on a boolean: its cases are `true` and `false`"
+    );
+}

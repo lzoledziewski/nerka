@@ -36,14 +36,19 @@ defaults to the signal's name. Parts:
 - signals you define: the 📈 **Signals** panel's form (saved for every tab
   in `%APPDATA%\nerka\signals`), `--signal SPEC` (CLI; GUI: for the session);
 - the **named groups of the queries in the selection** (Include or Signal
-  role, [Query packs](packs.md)): their kind is guessed from the first
+  role, [the Library](library.md)): their kind is guessed from the first
   values; the pack can give them options (`signals: t:time,
   s:enum:per(ecu1):default(idle)`), the panel can change them for the tab;
   instances of a parameterised query give a signal each where the group's
   name uses the parameter (`drops_$cam`: `@drops_CAM1`, `@drops_CAM2`;
-  [instances](packs.md#instances-of-a-parameterised-query));
+  [instances](library.md#instances-of-a-parameterised-query));
 - the file: `@time` for files that know their lines' times (DLT,
-  captures);
+  captures, text files whose [profile](formats.md#profiles) reads a time:
+  by default the date-time each line starts with), moved by the file's
+  [offset](formats.md#a-files-offset);
+- a text file's [profile](formats.md#profiles): its `signal` clauses, for
+  its files only, shown as `profile NAME` and changed in ⚙ Settings →
+  Profiles… (a signal of yours with the same name wins);
 - [lifecycles](lifecycles.md) (`@ecu1`, the lifecycle's number) and
   [checks](checks.md) (`@storm`, a count of what the check found).
 
@@ -86,7 +91,15 @@ merges their events; if they give it different options, its row shows ⚠
 (hover: who gives what), the first picked query's options are used, and
 💾 writes them into all of them so they agree.
 
+**One name, several sources:** a name has one signal. Yours (saved, or
+`--signal`) win over the file's own `@time`, a
+[profile's](formats.md#profiles) over a FIBEX argument's, and those over a
+query's group. The one that wins shows ⚠ after its name; the hover says
+what it hides.
+
 ## Plots
+
+![the plot in its own window: speed, temperature with a throttling threshold, gear and update state as coloured bands, battery voltage; three boots of ECU1 marked, two time cursors with Δt, bookmarks with notes](img/plot.png)
 
 Tick a signal's plot box (or `--plot NAME`) to plot it under the main view:
 one **lane** per signal on the time axis. A number is a step line, an enum
@@ -95,22 +108,41 @@ current line is a cursor. A lane shows the state as the panel does: before
 a signal's first event in each file (or lifecycle, with `per`), its
 default dashed (a pale band for an enum), or nothing if it has none.
 
+An enum's state too short to see at the zoom is never left out: a state
+narrower than 3 pixels is drawn 3 pixels wide, in a lighter shade of its
+colour and under a small ▼ notch on the lane's top edge (shorter than
+drawn), and several within one pixel become such a column split into
+their colours. A band without a notch is as long as it looks. Hovering
+there names them: *near here: error ×2, idle ×2 (4
+changes in 60 ms): zoom in to see them*.
+
 - **Navigate:** the wheel zooms, drag pans, double-click shows all; hover
   shows a value; click goes to the line.
 - **Time cursors:** right-click → place cursor A, B, …; Δt between them is
-  shown (like a logic analyser). Drag a cursor to move it.
+  shown (like a logic analyser). Drag a cursor to move it. Clicked near a
+  change of a signal (the lane under the pointer first, else any lane),
+  the menu also offers **Place cursor C at the change of @gear**: exactly
+  where the value changed.
 - **Value markers:** right-click a number lane's name → add a horizontal line
   at a value (a limit, a threshold); the same menu sets the y axis.
-- **Bookmarks** show as red lines with their notes and take part in Δt; the
-  plot's menu bookmarks the nearest event with a note.
+- **Bookmarks** show as red lines with their names and notes and take part
+  in Δt; the plot's menu bookmarks the nearest event of the lane you
+  clicked, or, clicked near a change, **the change of @ota** (the line
+  where the value changed), with a **name** (empty: `B1`, `B2`…, or the one
+  it has) and a **note**.
+- Cursor and bookmark lines are drawn under the signals, so a value
+  changing on the same x stays visible.
 - **Kept plots:** ⋮ → **Keep this plot as…** (this session, `•`) or **Save**;
   the list at the left switches between plots; a saved plot opens on other
   files with all its lanes. Changes to a kept plot are kept only with
   **Keep changes** / **Save**.
 - **⧉ Own window** moves the plot into a window of its own
   (`--plot-window`), titled with the window's name; **⧉ Dock** puts it
-  back, and closing that window closes the plot (📈 Plot opens it there
-  again). 📷 in its header copies it as an image.
+  back. The last choice is kept: new plots open docked or in a window as
+  you last left them, also after a restart. The window opens where it was,
+  maximized if it was, and stays open while its tab reads its files again
+  (Reload). Closing it closes the plot (📈 Plot opens it there again). 📷
+  in its header copies the plot as an image.
 - [Lifecycles](lifecycles.md) show as labelled spans on the plot.
 
 ```

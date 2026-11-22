@@ -258,7 +258,7 @@ impl Origins {
 }
 
 /// An IPv4 address (in the first 4 bytes) or an IPv6 one, as text.
-fn addr_text(a: &[u8; 16], v6: bool) -> String {
+pub(crate) fn addr_text(a: &[u8; 16], v6: bool) -> String {
     if v6 {
         std::net::Ipv6Addr::from(*a).to_string()
     } else {
@@ -349,6 +349,11 @@ pub struct Records {
     /// and how many messages have no sender.
     notes: Vec<String>,
     no_sender: u64,
+    /// What the notes count, one by one ([`super::Skips`]).
+    skips: Arc<Vec<super::Skip>>,
+    skips_more: u64,
+    /// [`super::SourceInfo::about`].
+    about: Vec<String>,
     /// The protocols its messages are of, found once when it is read.
     present: Vec<ProtoId>,
     data_id: usize,
@@ -379,6 +384,9 @@ impl Records {
             skipped,
             notes: Vec::new(),
             no_sender: 0,
+            skips: Arc::default(),
+            skips_more: 0,
+            about: Vec::new(),
             present: vec![0],
             data_id: new_data_id(),
         }
@@ -406,7 +414,24 @@ impl Records {
         let view = View::new(&protos, &present, !origins.senders.is_empty());
         let index = Index::Framed { msgs, side };
         let (notes, no_sender, data_id) = (Vec::new(), 0, new_data_id());
-        Records { name, path, data, index, origins, protos, view, skipped, notes, no_sender, present, data_id }
+        let (skips, skips_more) = (Arc::default(), 0);
+        Records {
+            name,
+            path,
+            data,
+            index,
+            origins,
+            protos,
+            view,
+            skipped,
+            notes,
+            no_sender,
+            skips,
+            skips_more,
+            about: Vec::new(),
+            present,
+            data_id,
+        }
     }
 
     /// The same messages with protocol `id`'s reader replaced (DLT with
@@ -448,6 +473,20 @@ impl Records {
 
     /// With what reading it dropped (`notes`), and how many messages have no
     /// sender.
+    /// With the skips its notes count.
+    pub(crate) fn with_skips(mut self, mut skips: super::Skips) -> Records {
+        let (list, more) = skips.take();
+        self.skips = Arc::new(list);
+        self.skips_more = more;
+        self
+    }
+
+    /// With what it says about itself ([`super::SourceInfo::about`]).
+    pub(crate) fn with_about(mut self, about: Vec<String>) -> Records {
+        self.about = about;
+        self
+    }
+
     pub(crate) fn with_notes(mut self, notes: Vec<String>, no_sender: u64) -> Records {
         self.notes = notes;
         self.no_sender = no_sender;
@@ -555,6 +594,10 @@ impl LogSource for Records {
             notes,
             no_sender: self.no_sender,
             files: Vec::new(),
+            skips: self.skips.clone(),
+            skips_more: self.skips_more,
+            about: self.about.clone(),
+            reading: Vec::new(),
         }
     }
 

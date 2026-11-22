@@ -378,7 +378,11 @@ fn import_says_what_it_cant_read() {
     assert_eq!(o.status.code(), Some(1));
     assert!(err(&o).contains("bad.nerka-bundle:1:1: not a nerka bundle"), "{}", err(&o));
     let o = nerka_at(&home, &["export", "--only", "prefs"]);
-    assert!(err(&o).contains("--only prefs: 'prefs' isn't pack, preset, plot, check or signal"), "{}", err(&o));
+    assert!(
+        err(&o).contains("--only prefs: 'prefs' isn't pack, preset, plot, check, signal or profile"),
+        "{}",
+        err(&o)
+    );
     let o = nerka_at(&home, &["export", "--only", "check:nope"]);
     assert!(err(&o).contains("--only check:nope: no such check"), "{}", err(&o));
 }
@@ -447,11 +451,95 @@ fn several_files_are_one_view() {
     assert!(out(&o).contains("\"times_go_back\": true"), "{}", out(&o));
     let o = nerka(&["--merge", "--check", "r: lines apid == NAV; rate 5 per 1s", "check", a, b]);
     assert!(!err(&o).contains("time goes backward"), "{}", err(&o));
-    // Files that don't go together are refused, saying why.
-    let log = log_file(&d);
-    let o = nerka(&["filter", "level >= WARN", s(&log), a]);
+    // Files that don't go together are refused, saying why: text without a
+    // time and DLT; text and JSON.
+    let plain = d.join("plain.log");
+    std::fs::write(&plain, "boot ok\nWARN disk\n").unwrap();
+    let o = nerka(&["filter", "level >= WARN", s(&plain), a]);
+    assert_eq!(o.status.code(), Some(1));
+    assert!(err(&o).contains("plain.log has no time, so it can't share a view with"), "{}", err(&o));
+    let json = d.join("j.json");
+    std::fs::write(&json, "{\"level\": \"warn\"}\n").unwrap();
+    let o = nerka(&["filter", "level >= WARN", s(&plain), s(&json)]);
     assert_eq!(o.status.code(), Some(1));
     assert!(err(&o).contains("only files of one kind open as one view"), "{}", err(&o));
+}
+
+/// A text log whose lines start with times gets a time from the built-in
+/// profile and interleaves with a DLT file by time (`--merge`); `--offset`
+/// moves a file, `--profile` defines or forces how text is read.
+#[test]
+fn text_with_times_merges_with_dlt() {
+    let d = dir("profiles");
+    let dlt = dlt_file(&d); // 2025-10-18 00:00:00 + 0..5 s
+    let log = d.join("app.log");
+    std::fs::write(
+        &log,
+        "2025-10-18 00:00:00.500 INFO app start\n\
+         2025-10-18 00:00:02.500 ERROR app failed\n\
+         \tcontinued\n\
+         2025-10-18 00:00:04.500 WARN app retry\n",
+    )
+    .unwrap();
+    let order = |o: &Output, words: &[&str]| {
+        let text = out(o);
+        let at: Vec<usize> = words.iter().map(|w| text.find(w).unwrap_or_else(|| panic!("{w} in {text}"))).collect();
+        assert!(at.windows(2).all(|w| w[0] < w[1]), "{words:?} in order: {text}");
+    };
+    let o = nerka(&["--merge", "filter", "level >= WARN", s(&dlt), s(&log)]);
+    assert!(o.status.success(), "{}", err(&o));
+    order(&o, &["gps lost", "retry 1", "app failed", "link down", "gps weak", "app retry"]);
+    assert!(!out(&o).contains("continued"), "a carried line keeps its own level (none)");
+    // Moved by ten seconds: after every DLT message.
+    let o = nerka(&["--merge", "--offset", "app.log=+10s", "filter", "proto == TEXT OR apid == COM", s(&dlt), s(&log)]);
+    order(&o, &["retry 1", "link down", "link up", "app start", "app failed", "continued", "app retry"]);
+    // `@time` on the text's lines.
+    let o = nerka(&["filter", "-c", "@time >= \"2025-10-18 00:00:02\"", s(&log)]);
+    assert_eq!(out(&o), "3\n", "{}", err(&o));
+    // How each file's time is read.
+    let o = nerka(&["--merge", "--offset", "trace.dlt=-1h", "open", s(&dlt), s(&log)]);
+    assert!(
+        out(&o).contains("time:        app.log: profile default (the default), the time each line starts with"),
+        "{}",
+        out(&o)
+    );
+    assert!(out(&o).contains("time:        trace.dlt: the file's own, moved -1h"), "{}", out(&o));
+    // A profile without a time, forced: the text can't join the DLT.
+    let o = nerka(&["--profile", "plain: time none", "--profile", "plain", "filter", "x", s(&log), s(&dlt)]);
+    assert_eq!(o.status.code(), Some(1));
+    assert!(err(&o).contains("app.log has no time"), "{}", err(&o));
+    // A profile chosen by its rules, with a signal of its own.
+    let o = nerka(&[
+        "--profile",
+        "app: name app.*; time auto; signal word:enum=/app (?<word>\\w+)/",
+        "filter",
+        "@word == failed",
+        s(&log),
+    ]);
+    assert_eq!(out(&o).lines().count(), 2, "{}{}", out(&o), err(&o));
+    // `profile` is a field; a --signal of the name hides the profile's, said.
+    let o = nerka(&["--merge", "filter", "-c", "profile == default", s(&dlt), s(&log)]);
+    assert_eq!(out(&o), "4\n", "{}", err(&o));
+    let o = nerka(&[
+        "--signal",
+        "word:enum=/(?<word>gps)/",
+        "--profile",
+        "app: name app.*; time auto; signal word:enum=/app (?<word>\\w+)/",
+        "filter",
+        "-c",
+        "@word.event",
+        s(&log),
+    ]);
+    assert!(err(&o).contains("@word of profile app isn't used: a signal of that name is given already"), "{}", err(&o));
+    // Errors say what to write.
+    let o = nerka(&["--profile", "nope", "filter", "x", s(&log)]);
+    assert!(err(&o).contains("--profile nope: no such profile"), "{}", err(&o));
+    let o = nerka(&["--profile", "a: when x", "filter", "x", s(&log)]);
+    assert!(err(&o).contains("unknown clause 'when'"), "{}", err(&o));
+    let o = nerka(&["--offset", "other.log=+1s", "filter", "x", s(&log)]);
+    assert!(err(&o).contains("no file given is other.log"), "{}", err(&o));
+    let o = nerka(&["--offset", "app.log", "filter", "x", s(&log)]);
+    assert!(err(&o).contains("expected FILE=OFFSET"), "{}", err(&o));
 }
 
 /// Owner, 2026-11-15: a parameter given several times has several values;

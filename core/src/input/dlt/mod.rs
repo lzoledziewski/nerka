@@ -23,9 +23,9 @@ mod payload;
 pub mod writer;
 
 use super::proto::{Origin, Protocol, Records};
-use super::{Bytes, ColumnDef};
+use super::{Bytes, ColumnDef, Skip, SkipKind, Skips};
 use crate::event::{FieldDef, FieldId, FieldKind, FieldValue, Level};
-use crate::{Progress, Result};
+use crate::{LineNo, Progress, Result};
 use fibex::{Fibex, Frame};
 use format::{MAGIC, MSTP_APP_TRACE, MSTP_CONTROL, MSTP_LOG, MSTP_NW_TRACE, Message, NO_ECU, STORAGE_LEN, Storage};
 use std::io::Write;
@@ -81,6 +81,26 @@ const SCHEMA: &[FieldDef] = &[
 /// `buf[0]` (no storage header), if one is there and fits.
 pub(crate) fn message_len(buf: &[u8]) -> Option<usize> {
     Message::parse_std(buf, Storage { secs: 0, usecs: 0, ecu: NO_ECU }).map(|m| m.len())
+}
+
+/// Why `b` (a datagram's bytes from where reading its messages stopped)
+/// isn't a DLT message, for a skip's detail.
+pub(crate) fn why_not_message(b: &[u8]) -> String {
+    if b.starts_with(MAGIC) {
+        return "a storage header without a whole message after it".into();
+    }
+    if b.len() < 4 {
+        return format!("{} bytes: too few for a header", b.len());
+    }
+    let version = (b[0] >> 5) & 0x07;
+    let len = u16::from_be_bytes([b[2], b[3]]) as usize;
+    if version != 1 {
+        format!("no DLT header here (version bits {version})")
+    } else if len > b.len() {
+        format!("a message of {len} bytes with {} left: cut short", b.len())
+    } else {
+        format!("a header that doesn't read (length {len})")
+    }
 }
 
 /// Does `head` (the first bytes of a file) look like a DLT file?
@@ -222,17 +242,20 @@ impl Records {
         let path = path.as_ref();
         let data = Bytes::map(path)?;
         super::prefault(data.bytes(), progress);
-        let (offsets, skipped) = build_index(data.bytes(), progress)?;
+        let mut skips = Skips::default();
+        let (offsets, skipped) = build_index(data.bytes(), progress, &mut skips)?;
         let name = path.display().to_string();
         let dlt = Arc::new(Dlt::default());
-        Ok(Records::stored(name, Some(path.to_path_buf()), data, offsets, storage_header, dlt, skipped))
+        let records = Records::stored(name, Some(path.to_path_buf()), data, offsets, storage_header, dlt, skipped);
+        Ok(records.with_skips(skips))
     }
 
     /// An in-memory `.dlt` file, handy for tests.
     pub fn from_bytes(name: impl Into<String>, bytes: Vec<u8>) -> Records {
-        let (offsets, skipped) = build_index(&bytes, &Progress::new()).expect("not cancelled");
+        let mut skips = Skips::default();
+        let (offsets, skipped) = build_index(&bytes, &Progress::new(), &mut skips).expect("not cancelled");
         let dlt = Arc::new(Dlt::default());
-        Records::stored(name.into(), None, Bytes::Owned(bytes), offsets, storage_header, dlt, skipped)
+        Records::stored(name.into(), None, Bytes::Owned(bytes), offsets, storage_header, dlt, skipped).with_skips(skips)
     }
 
     /// Decode DLT non-verbose messages with `fibex`: their payload as text,
@@ -249,7 +272,16 @@ impl Records {
     }
 }
 
-fn build_index(buf: &[u8], progress: &Progress) -> Result<(Vec<u64>, u64)> {
+/// Every skip of a `.dlt` file's bytes into `skips` (an export: the file
+/// read again, nothing kept).
+pub(crate) fn index_skips(buf: &[u8], progress: &Progress, mut skips: Skips) -> Result<()> {
+    build_index(buf, progress, &mut skips)?;
+    Ok(())
+}
+
+/// The offsets of a `.dlt` file's messages, how many bytes weren't
+/// messages, and where those were (`skips`).
+fn build_index(buf: &[u8], progress: &Progress, skips: &mut Skips) -> Result<(Vec<u64>, u64)> {
     const REPORT: usize = 4 << 20;
     progress.set_total(buf.len() as u64);
     let finder = memchr::memmem::Finder::new(MAGIC);
@@ -273,6 +305,21 @@ fn build_index(buf: &[u8], progress: &Progress) -> Result<(Vec<u64>, u64)> {
             None => {
                 let next = finder.find(&buf[pos + 1..]).map_or(buf.len(), |i| pos + 1 + i);
                 skipped += (next - pos) as u64;
+                // When: the time of the message before it.
+                let time = offsets.last().and_then(|&o| Storage::parse(&buf[o as usize..]));
+                skips.push_or_extend(Skip {
+                    kind: SkipKind::NotMessages,
+                    // The next message's (none after it: fixed below).
+                    line: Some(offsets.len() as LineNo),
+                    time: time.map(|s| f64::from(s.secs) + f64::from(s.usecs) / 1e6),
+                    frame: None,
+                    offset: Some(pos as u64),
+                    bytes: (next - pos) as u64,
+                    detail: "DLT".into(),
+                    file: String::new(),
+                    head: Skip::head_of(&buf[pos..next]),
+                    cut: None,
+                });
                 pos = next;
             }
         }
@@ -285,6 +332,12 @@ fn build_index(buf: &[u8], progress: &Progress) -> Result<(Vec<u64>, u64)> {
         }
     }
     progress.add((buf.len() - reported) as u64);
+    // Bytes at the end: no line after them.
+    let count = offsets.len() as LineNo;
+    if let Some(s) = skips.last_mut().filter(|s| s.line == Some(count)) {
+        s.line = None;
+    }
+    skips.finish();
     // Only a guess well off is worth the copy.
     if offsets.capacity() > offsets.len() + offsets.len() / 8 {
         offsets.shrink_to_fit();

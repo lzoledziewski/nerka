@@ -1415,11 +1415,58 @@ fn digits(n: u64) -> u32 {
     n.max(1).ilog10() + 1
 }
 
+/// Text for the clipboard (issue #31): control characters other than tabs
+/// and line breaks become `·`, as the views show them. A NUL ends the text
+/// on the Windows clipboard, so everything after it was lost.
+pub fn clipboard_text(s: &str) -> Cow<'_, str> {
+    let keep = |c: char| !c.is_control() || matches!(c, '\t' | '\n' | '\r');
+    if s.chars().all(keep) {
+        return Cow::Borrowed(s);
+    }
+    Cow::Owned(s.chars().map(|c| if keep(c) { c } else { '·' }).collect())
+}
+
+/// Makes every text copied in this frame safe for the clipboard
+/// (`clipboard_text`): the views, the line window and text fields alike.
+pub fn clean_copies(ctx: &egui::Context) {
+    ctx.output_mut(|o| {
+        for c in &mut o.commands {
+            if let egui::OutputCommand::CopyText(s) = c
+                && let Cow::Owned(clean) = clipboard_text(s)
+            {
+                *s = clean;
+            }
+        }
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     const TEXT: Cells<'static> = Cells { widths: &[] };
+
+    #[test]
+    fn copies_keep_text_after_control_characters() {
+        assert!(matches!(clipboard_text("a\tb\r\nc"), Cow::Borrowed("a\tb\r\nc")));
+        assert_eq!(clipboard_text("a\0b\u{1b}[0m\u{85}c"), "a·b·[0m·c");
+        let ctx = egui::Context::default();
+        let mut out = ctx.run_ui(egui::RawInput::default(), |ui| {
+            ui.ctx().copy_text("before\0after\nnext".into());
+            clean_copies(ui.ctx());
+        });
+        out.textures_delta.clear();
+        let copied: Vec<_> = out
+            .platform_output
+            .commands
+            .into_iter()
+            .filter_map(|c| match c {
+                egui::OutputCommand::CopyText(s) => Some(s),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(copied, ["before·after\nnext"]);
+    }
 
     #[test]
     fn columns_map_to_bytes() {

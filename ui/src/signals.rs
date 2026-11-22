@@ -222,6 +222,8 @@ pub struct Output {
     pub adopted: Option<String>,
     /// Show this check in the Checks pane (a check's signal was clicked).
     pub open_check: Option<String>,
+    /// A profile's signal was clicked: open Settings → Profiles….
+    pub open_profiles: bool,
     /// A kind chosen for a query signal.
     pub kind: Option<(String, SignalKind)>,
     /// A scope chosen for a signal.
@@ -312,6 +314,9 @@ pub struct Input<'a> {
     /// Groups whose queries give different options: each query and what it
     /// gives, the first wins (owner, 2026-11-15: shown, not resolved).
     pub conflicts: &'a HashMap<String, Vec<(String, SignalOptions)>>,
+    /// Per signal, what of the same name it hides (a profile's signal
+    /// behind a saved one, a query's group behind a profile's…).
+    pub hidden: &'a HashMap<String, Vec<String>>,
 }
 
 pub fn signals_panel(ui: &mut egui::Ui, st: &mut SignalsUi, input: Input<'_>) -> Output {
@@ -331,6 +336,7 @@ pub fn signals_panel(ui: &mut egui::Ui, st: &mut SignalsUi, input: Input<'_>) ->
         chosen,
         pack_options,
         conflicts,
+        hidden,
     } = input;
     let lifecycles: Vec<&str> = signals.iter().filter(|d| d.as_lifecycle().is_some()).map(|d| d.name()).collect();
     let mut out = Output::default();
@@ -415,7 +421,19 @@ pub fn signals_panel(ui: &mut egui::Ui, st: &mut SignalsUi, input: Input<'_>) ->
                     };
                     // Long names keep their end, where they differ.
                     let name = crate::plot::name_tail(&format!("@{}", d.name()), name_fit);
-                    ui.label(RichText::new(name).monospace().strong()).on_hover_text(format!("@{}\n{hover}", d.name()));
+                    // It hides another of its name: said, not resolved.
+                    match hidden.get(d.name()) {
+                        Some(h) => {
+                            let warn = ui.visuals().warn_fg_color;
+                            ui.label(RichText::new(format!("{name} ⚠")).monospace().strong().color(warn)).on_hover_text(
+                                format!("@{}\n{hover}\n\nIt hides another of its name:\n{}", d.name(), h.join("\n")),
+                            );
+                        }
+                        None => {
+                            ui.label(RichText::new(name).monospace().strong())
+                                .on_hover_text(format!("@{}\n{hover}", d.name()));
+                        }
+                    }
                     kind_cell(ui, d, &mut out);
                     scope_cell(ui, d, &mut out);
                     if d.is_from_source() {
@@ -488,9 +506,15 @@ pub fn signals_panel(ui: &mut egui::Ui, st: &mut SignalsUi, input: Input<'_>) ->
                                         .on_hover_text(format!("No event before line {}", line + 1));
                                 }
                             },
-                            None => {
-                                ui.add(egui::Spinner::new().size(12.0)).on_hover_text("Collecting events");
-                            }
+                            // Its lifecycle failed: no events will come.
+                            None => match d.failed(file) {
+                                Some(e) => {
+                                    ui.colored_label(ui.visuals().error_fg_color, "error").on_hover_text(e);
+                                }
+                                None => {
+                                    ui.add(egui::Spinner::new().size(12.0)).on_hover_text("Collecting events");
+                                }
+                            },
                         },
                         Some(Err(e)) => {
                             ui.colored_label(ui.visuals().error_fg_color, "error").on_hover_text(e);
@@ -504,6 +528,18 @@ pub fn signals_panel(ui: &mut egui::Ui, st: &mut SignalsUi, input: Input<'_>) ->
                         let tip = format!("{}\nClick: the check in the Checks pane", check_hover(c, d));
                         if ui.link(RichText::new("check").weak()).on_hover_text(tip).clicked() {
                             out.open_check = Some(c.to_owned());
+                        }
+                    } else if !d.profiles().is_empty() {
+                        // Read-only, as a check's: edited in its profile.
+                        let tip = format!(
+                            "From the signal clause of profile {}, for its files only (profile == …):\n{}\nClick: \
+                             Settings → Profiles… to change it",
+                            d.profiles().join(", "),
+                            d.spec()
+                        );
+                        let label = format!("profile {}", d.profiles().join(", "));
+                        if ui.link(RichText::new(label).weak()).on_hover_text(tip).clicked() {
+                            out.open_profiles = true;
                         }
                     } else if d.queries().is_empty() {
                         ui.horizontal(|ui| {
@@ -1119,6 +1155,8 @@ fn value_room(
             let changed = chosen.get(d.name()).is_some_and(|o| !o.is_empty());
             if d.check_name().is_some() || d.is_from_source() {
                 label("built in")
+            } else if !d.profiles().is_empty() {
+                label(&format!("profile {}", d.profiles().join(", ")))
             } else if d.queries().is_empty() {
                 button("☐") + button("✎") + button("−")
             } else if d.argument_index().is_some() {

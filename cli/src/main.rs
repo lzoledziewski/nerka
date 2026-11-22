@@ -118,6 +118,18 @@ struct Cli {
     /// after another, in the order given.
     #[arg(long, global = true)]
     merge: bool,
+    /// How text files are read (repeatable): `NAME` forces that profile
+    /// on every text file (a saved one, or `default`); `NAME: CLAUSES`
+    /// defines one for this run, chosen by its rules before the saved ones,
+    /// e.g. `'app: name *.log; time /^(?<time>\S+ \S+)/; zone local'`.
+    /// Clauses: name GLOBS, first /REGEX/, records SPEC, time auto|none|/REGEX/,
+    /// zone utc|local|+HH:MM, numbers s|ms|us|ns|auto, signal SPEC.
+    #[arg(long, global = true, value_name = "NAME|SPEC")]
+    profile: Vec<String>,
+    /// Move a file's times (repeatable): FILE=OFFSET, the file as given or
+    /// its name, e.g. 'ecu1.dlt=+3h' or 'app.log=-0.250s'.
+    #[arg(long, global = true, value_name = "FILE=OFFSET")]
+    offset: Vec<String>,
     #[command(subcommand)]
     cmd: Cmd,
 }
@@ -226,7 +238,7 @@ enum Cmd {
         count: Option<String>,
     },
     /// Export the analysis setup of the per-user config folder (packs,
-    /// presets, plots, checks, signals) as a settings bundle.
+    /// presets, plots, checks, signals, profiles) as a settings bundle.
     Export {
         /// Write the bundle to FILE (default: stdout).
         #[arg(short = 'o', long, value_name = "FILE")]
@@ -356,8 +368,8 @@ fn export(output: Option<&Path>, only: &[String], out: &mut impl Write) -> Resul
     let mut picks: Vec<(Kind, Option<&str>)> = Vec::new();
     for o in only {
         let (k, name) = o.split_once(':').map_or((o.as_str(), None), |(k, n)| (k, Some(n)));
-        let kind =
-            Kind::parse(k).with_context(|| format!("--only {o}: '{k}' isn't pack, preset, plot, check or signal"))?;
+        let kind = Kind::parse(k)
+            .with_context(|| format!("--only {o}: '{k}' isn't pack, preset, plot, check, signal or profile"))?;
         picks.push((kind, name));
     }
     let takes =
@@ -436,7 +448,7 @@ fn import(file: &Path, dry_run: bool, conflicts: Conflicts, out: &mut impl Write
 /// Compile an NFD query for a source, with a caret under the error.
 fn compile(query: &str, source: &dyn LogSource) -> Result<Query> {
     // `--signal` definitions, and `@time` on files that know their time.
-    let signals = SIGNALS.get_or_init(Default::default).for_source(source);
+    let signals = signals_for(source);
     let q = Query::compile_in(query, source.schema(), &signals)
         .map_err(|e| anyhow::anyhow!("{}\n  {query}\n  {}", e.at(query), e.caret(query)))?;
     // What it can't find, said before it finds nothing (review 2026-11-08 R8,
@@ -609,7 +621,7 @@ fn lifecycles(
 ) -> Result<usize> {
     use nerka_core::time::format_time;
     let f = open(files)?.source;
-    let signals = SIGNALS.get_or_init(Default::default).for_source(&*f);
+    let signals = signals_for(&*f);
     let mut defs: Vec<_> = signals.lifecycles().collect();
     if defs.is_empty() {
         anyhow::bail!("no lifecycle defined: use --lifecycle 'NAME: lines QUERY; reset uptime'");
@@ -769,7 +781,7 @@ fn checks(
     }
     let lib = if all.iter().any(|d| !d.unresolved().is_empty()) { library(packs)? } else { Default::default() };
     let f = open(files)?.source;
-    let signals = SIGNALS.get_or_init(Default::default).for_source(&*f);
+    let signals = signals_for(&*f);
     // Every check runs (one may use another's signal); the named one shows.
     let t = Instant::now();
     let run = all.run_all(&*f, &signals, &lib, &Progress::new())?;
@@ -956,7 +968,20 @@ fn open_silent(paths: &[PathBuf]) -> Result<Opened> {
         anyhow::bail!("{} is a folder: give a file", dir.display());
     }
     let t = Instant::now();
-    let options = OPEN_OPTIONS.get_or_init(Default::default);
+    let mut options = OPEN_OPTIONS.get_or_init(Default::default).clone();
+    // `--offset`s by the files as given, or their names.
+    for (file, ns) in offsets_mut().iter() {
+        let name = |p: &PathBuf| p.file_name().is_some_and(|n| n.to_string_lossy() == file.as_str());
+        match paths
+            .iter()
+            .find(|p| p.as_os_str().to_string_lossy() == file.as_str())
+            .or_else(|| paths.iter().find(|p| name(p)))
+        {
+            Some(p) => options.offset_for.push((p.clone(), *ns)),
+            None => anyhow::bail!("--offset {file}=…: no file given is {file}"),
+        }
+    }
+    let options = &options;
     let progress = Progress::new();
     let (source, paths) = match paths {
         [one] => (
@@ -971,6 +996,67 @@ fn open_silent(paths: &[PathBuf]) -> Result<Opened> {
 
 /// `--merge`, set once in `main`.
 static MERGE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+/// `--offset` (file as given, nanoseconds), read in `main`.
+static OFFSETS: std::sync::OnceLock<std::sync::Mutex<Vec<(String, i64)>>> = std::sync::OnceLock::new();
+
+fn offsets_mut() -> std::sync::MutexGuard<'static, Vec<(String, i64)>> {
+    OFFSETS.get_or_init(Default::default).lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// The saved profiles with `--profile` definitions first; a `--profile
+/// NAME` goes into `forced` (it must be one of them, or `default`).
+fn profiles(given: &[String], forced: &mut Option<String>) -> Result<nerka_core::input::profile::Profiles> {
+    use nerka_core::input::profile::{DEFAULT, Profile, Profiles};
+    let (mut ps, errors) = Profiles::load_saved();
+    for e in errors {
+        eprintln!("nerka: profiles: {e}");
+    }
+    for spec in given.iter().rev() {
+        if spec.contains(':') {
+            let p = Profile::parse_spec(spec).map_err(|e| {
+                anyhow::anyhow!("--profile: {}\n  {spec}\n  {}^", e.msg, " ".repeat(e.column(spec) - 1))
+            })?;
+            ps.put_first(p);
+        }
+    }
+    for name in given.iter().filter(|s| !s.contains(':')) {
+        let name = name.trim();
+        if ps.get(name).is_none() && !name.eq_ignore_ascii_case(DEFAULT) {
+            let known: Vec<&str> = ps.iter().map(|p| p.name()).collect();
+            anyhow::bail!(
+                "--profile {name}: no such profile (there are: {}); define one with --profile '{name}: CLAUSES'",
+                if known.is_empty() { "only default".into() } else { known.join(", ") + ", default" }
+            );
+        }
+        if forced.replace(name.to_owned()).is_some() {
+            anyhow::bail!("--profile {name}: one profile can be forced, not several");
+        }
+    }
+    Ok(ps)
+}
+
+/// The `--signal` definitions and `@time` for `source`, with the signals its
+/// files' profiles switch on (a `--signal` of the same name wins).
+fn signals_for(source: &dyn LogSource) -> Signals {
+    let mut s = SIGNALS.get_or_init(Default::default).for_source(source);
+    let options = OPEN_OPTIONS.get_or_init(Default::default);
+    let from = options.profiles.signals_for(&source.info().reading);
+    for c in &from.clashes {
+        eprintln!("nerka: note: {c}");
+    }
+    for d in from.signals {
+        match s.get(d.name()) {
+            None => s.set(d),
+            Some(_) => eprintln!(
+                "nerka: note: @{} of profile {} isn't used: a signal of that name is given already",
+                d.name(),
+                d.profiles().join(", ")
+            ),
+        }
+    }
+    s
+}
 
 fn mib_per_s(bytes: u64, d: std::time::Duration) -> f64 {
     bytes as f64 / 1024.0 / 1024.0 / d.as_secs_f64().max(1e-9)
@@ -1013,6 +1099,16 @@ fn run() -> Result<()> {
         options.records = nerka_core::input::records::RecordSplit::parse_choice(spec)?;
     }
     nerka_core::time::set_local(cli.local_time);
+    options.profiles = std::sync::Arc::new(profiles(&cli.profile, &mut options.profile)?);
+    for o in &cli.offset {
+        let parsed = (o.rsplit_once('='))
+            .filter(|(f, _)| !f.trim().is_empty())
+            .and_then(|(f, d)| Some((f, nerka_core::time::parse_offset(d)?)));
+        let Some((file, d)) = parsed else {
+            anyhow::bail!("--offset {o}: expected FILE=OFFSET, e.g. 'ecu1.dlt=+3h' or 'app.log=-0.250s'");
+        };
+        offsets_mut().push((file.to_owned(), (d * 1e9).round() as i64));
+    }
     if !cli.fibex.is_empty() {
         options.fibex = Some(std::sync::Arc::new(nerka_core::Fibex::load(&cli.fibex)?));
     }
@@ -1061,6 +1157,18 @@ fn run() -> Result<()> {
             }
             writeln!(out, "index mem:   {} KiB", f.index_memory_bytes() / 1024)?;
             writeln!(out, "index time:  {took:.2?} ({:.0} MiB/s)", mib_per_s(f.size_bytes(), took))?;
+            // How each text file was read, and each file's time.
+            for r in &info.reading {
+                let file = if r.file.is_empty() { String::new() } else { format!("{}: ", r.file) };
+                let profile =
+                    if r.profile.is_empty() { String::new() } else { format!("profile {} ({}), ", r.profile, r.why) };
+                let moved = if r.offset == 0.0 {
+                    String::new()
+                } else {
+                    format!(", moved {}", nerka_core::time::format_offset(r.offset))
+                };
+                writeln!(out, "time:        {file}{profile}{}{moved}", r.time)?;
+            }
             for n in &info.notes {
                 writeln!(out, "note:        {n}")?;
             }

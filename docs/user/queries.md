@@ -44,6 +44,7 @@ ignore case; values don't (except `proto`).
 | syslog | `facility host app pid msgid stamp payload` |
 | A protocol definition | its own ([Protocol definitions](protocol-definitions.md)) |
 | Captures | `proto` (the protocol's name; `==` ignores case), and where a datagram came from: `net.src`, `net.dst` (addresses), `net.sport`, `net.port` (ports), `net.vlan` |
+| Text and JSON | `profile`: the [profile](formats.md#profiles) the file is read with (`profile == app`, `profile == default`) |
 | JSON records | their keys (`ctx.user`, `latency`) |
 | Several files | `file` (below) |
 
@@ -53,8 +54,8 @@ comparison, and `~` / `!~` on their decimal text; a number with a fraction
 message, so nerka checks it after the cheap conditions.
 
 **Names that clash:** nerka's own fields can also be written `nfd.raw`,
-`nfd.level`, `nfd.bookmark`; a JSON key named like one of them is
-`json.raw`. In a view of several protocols, a field two protocols give
+`nfd.level`, `nfd.bookmark`; a JSON key named like one of them, or
+`profile`, is `json.raw`, `json.profile`. In a view of several protocols, a field two protocols give
 different kinds is written with the protocol's name: `dlt.type`,
 `sens.type` (a plain `type` says which to write).
 
@@ -75,7 +76,8 @@ file == "ecu1/trace.dlt"        # quoted: a / would start a regex
 file ~ /ecu1/
 ```
 
-A `file` value no file has is warned about, with what to write instead.
+A `file` value no file has is warned about, with what to write instead;
+so is a `profile` no file here is read with.
 
 ## Signals and bookmarks
 
