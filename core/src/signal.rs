@@ -1664,10 +1664,16 @@ pub(crate) fn first_group(q: &Query) -> Option<String> {
 }
 
 /// The text `group` captured in the first positive regex that has the
-/// group and matches its text (the line, or its field).
+/// group and matches its text (the line, or its field). In an OR, only a
+/// branch that holds gives it (2026-11-22: `(profile == a AND /x(?<v>…)/)
+/// OR (profile == b AND /y(?<v>…)/)` took a's capture on b's lines).
 fn capture(e: &Expr, group: &str, ev: &mut Event<'_>) -> Option<Vec<u8>> {
     match e {
-        Expr::And(xs) | Expr::Or(xs) => xs.iter().find_map(|x| capture(x, group, ev)),
+        Expr::And(xs) => xs.iter().find_map(|x| capture(x, group, ev)),
+        // A single condition holds where its regex captures: no second test.
+        Expr::Or(xs) => {
+            xs.iter().find_map(|x| if matches!(x, Expr::Cond(_)) || x.eval(ev) { capture(x, group, ev) } else { None })
+        }
         Expr::Not(_) => None,
         Expr::Cond(Cond::RawMatch(re)) if has_group(re, group) => {
             re.captures(ev.raw()).and_then(|c| c.name(group)).map(|m| m.as_bytes().to_vec())
@@ -1714,6 +1720,12 @@ mod tests {
         assert_eq!(value(r"v=/v=(?<v>\d+)/ AND /ok/", "v=1 ok"), Some(SignalValue::Num(1.0)));
         // Under OR, the branch that matched gives the value.
         assert_eq!(value(r"v=/a=(?<v>\d+)/ OR /b=(?<v>\d+)/", "b=7"), Some(SignalValue::Num(7.0)));
+        // … the branch as a whole: another branch's regex that captures on
+        // the line, its other conditions failing, gives nothing.
+        let two = r"v=(/^A/ AND /x=(?<v>\d+)/) OR (/^B/ AND /y=(?<v>\d+)/)";
+        assert_eq!(value(two, "B x=1 y=2"), Some(SignalValue::Num(2.0)));
+        assert_eq!(value(two, "A x=1 y=2"), Some(SignalValue::Num(1.0)));
+        assert_eq!(value(two, "C x=1 y=2"), None);
         assert_eq!(value(r"v=/v=(?<v>\d+)?/", "v="), None, "group took no part");
     }
 

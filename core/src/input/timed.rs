@@ -114,7 +114,7 @@ impl Timed {
                 false
             }
             _ if tried == 0 => {
-                reading.time = "none (no lines)".into();
+                reading.time = "none (no lines with text)".into();
                 false
             }
             TimeRule::Leading if found * 2 < tried => {

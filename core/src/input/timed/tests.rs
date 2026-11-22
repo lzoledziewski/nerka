@@ -177,6 +177,25 @@ fn the_profile_is_a_field_and_its_signals_read_its_files_only() {
     assert_eq!(w, ["no file here is read with profile 'other' (there are: app)"]);
 }
 
+/// Found in the scenario run (2026-11-22): a byte order mark hid the first
+/// line's time (it took the next line's), and an empty text file was
+/// refused beside DLT, though a file without lines doesn't count.
+#[test]
+fn a_bom_and_an_empty_file_are_no_trouble() {
+    let bom = timed("bom.log", "\u{feff}2025-10-17 10:00:01 a\n2025-10-17 10:00:02 b\n", "default: time auto", 0.0);
+    assert_eq!(bom.own_time(0), Some(T0 + 1.0));
+    let regex = timed("bom.log", "\u{feff}2025-10-17 10:00:01 a\n", r"p: time /^(?<time>\S+ \S+)/", 0.0);
+    assert_eq!(regex.own_time(0), Some(T0 + 1.0));
+    let empty = timed("empty.log", "", "default: time auto", 0.0);
+    assert!(!empty.has_time());
+    let blank = timed("blank.log", "  \n\n", "default: time auto", 0.0);
+    assert_eq!(blank.info().reading[0].time, "none (no lines with text)");
+    let c = Concat::new(vec![Box::new(empty), dlt("ecu.dlt", &[(1, "NAV", "x")])]).unwrap();
+    assert!(c.is_mixed());
+    let m = Merged::new(c, &Progress::new()).unwrap();
+    assert_eq!(m.line_count(), 1);
+}
+
 #[test]
 fn text_without_a_time_is_refused_beside_dlt() {
     let p = Profile::parse_spec("p: time none").unwrap();

@@ -7476,6 +7476,46 @@ gear=D
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// Owner, 2026-11-22: a profile's signal is the tab's, marked as the
+    /// profile's (read-only in the panel); a saved signal of its name wins
+    /// and says what it hides.
+    #[test]
+    fn profile_signals_join_the_tab_and_clashes_are_said() {
+        let dir = std::env::temp_dir().join(format!("nerka-gui-profsig-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("prof-sig-test.log");
+        std::fs::write(&log, "2025-10-18T00:00:00Z tick 1\n2025-10-18T00:00:01Z tick 2\n").unwrap();
+        let (mut ps, _) = nerka_core::input::profile::Profiles::parse_text("");
+        ps.set(
+            nerka_core::input::profile::Profile::parse_spec(
+                r"ptest: name prof-sig-test.log; time auto; signal tick=/tick (?<tick>\d+)/",
+            )
+            .unwrap(),
+        );
+        profiles::set(ps);
+        let ctx = egui::Context::default();
+        let mut tab = Tab::open(&ctx, log, &SearchPrefs::default());
+        settle(&mut tab, &ctx);
+        let lib = Library::new();
+        let mut saved = Signals::default();
+        tab.refresh_signals(&ctx, &lib, &saved, 0);
+        let d = tab.signals.get("tick").expect("the profile's signal");
+        assert_eq!(d.profiles(), ["ptest"]);
+        assert!(tab.signal_hidden.is_empty());
+        tab.mode = Mode::Query;
+        tab.pattern = "profile == ptest AND @tick == 2".into();
+        tab.start_search(&ctx);
+        settle(&mut tab, &ctx);
+        assert_eq!(tab.result().unwrap().lines, [1]);
+        // A saved one of the name: it wins, and says what it hides.
+        saved.set(nerka_core::SignalDef::parse_spec(r"tick=/(?<tick>\d)$/").unwrap());
+        tab.refresh_signals(&ctx, &lib, &saved, 1);
+        assert!(tab.signals.get("tick").unwrap().profiles().is_empty());
+        let hides = &tab.signal_hidden["tick"];
+        assert!(hides[0].starts_with("profile ptest's: "), "{hides:?}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     /// A text log whose lines start with times shares a tab with a DLT file,
     /// merged by time; the Files window shows how each file's time is read.
     #[test]

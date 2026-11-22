@@ -55,6 +55,8 @@ impl TimeRule {
 
     /// The time in `text` (a line, a record), as the rule reads it.
     pub fn read(&self, text: &str, zone: Zone, numbers: Numbers) -> Option<f64> {
+        // A file's first line may start with a byte order mark.
+        let text = text.strip_prefix('\u{feff}').unwrap_or(text);
         match self {
             TimeRule::None => None,
             TimeRule::Leading => crate::time::leading_time(text, zone),

@@ -125,9 +125,12 @@ impl Concat {
         // gives it one) with them; text without one, or text of another
         // kind with text, doesn't.
         let with_proto = parts.iter().any(|p| has_proto(p.as_ref()));
+        // Text that can join them: with a time, or without lines (nothing
+        // to place: owner, 2026-11-15, a file without lines doesn't count).
+        let joins = |p: &dyn LogSource| is_text(p) && (p.has_time() || p.line_count() == 0);
         if differ
             && with_proto
-            && let Some(t) = parts.iter().find(|p| is_text(p.as_ref()) && !p.has_time())
+            && let Some(t) = parts.iter().find(|p| is_text(p.as_ref()) && !joins(p.as_ref()))
         {
             let other = parts.iter().find(|p| has_proto(p.as_ref())).expect("one has");
             return Err(Error::MixedKinds(format!(
@@ -137,8 +140,7 @@ impl Concat {
                 kind_name(other.as_ref())
             )));
         }
-        let lone =
-            parts.iter().position(|p| !has_proto(p.as_ref()) && !(with_proto && is_text(p.as_ref()) && p.has_time()));
+        let lone = parts.iter().position(|p| !has_proto(p.as_ref()) && !(with_proto && joins(p.as_ref())));
         if let (true, Some(i)) = (differ, lone) {
             let (first, k) = (&parts[i], kind(parts[i].as_ref()));
             let other = parts.iter().find(|p| kind(p.as_ref()) != k).expect("they differ");

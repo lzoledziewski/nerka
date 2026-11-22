@@ -14,7 +14,12 @@ pub fn current() -> Arc<Profiles> {
     if let Some(p) = CURRENT.read().unwrap_or_else(|e| e.into_inner()).as_ref() {
         return p.clone();
     }
-    load();
+    // Tests don't read the user's profiles: their files would change them.
+    if cfg!(test) {
+        set(Profiles::default());
+    } else {
+        load();
+    }
     CURRENT.read().unwrap_or_else(|e| e.into_inner()).clone().unwrap_or_default()
 }
 
@@ -25,7 +30,8 @@ pub fn load() -> Vec<String> {
     errors
 }
 
-fn set(ps: Profiles) {
+/// Use `ps` from now on (tests: without saving).
+pub(crate) fn set(ps: Profiles) {
     *CURRENT.write().unwrap_or_else(|e| e.into_inner()) = Some(Arc::new(ps));
 }
 

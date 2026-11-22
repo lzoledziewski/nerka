@@ -1101,7 +1101,9 @@ fn run() -> Result<()> {
     nerka_core::time::set_local(cli.local_time);
     options.profiles = std::sync::Arc::new(profiles(&cli.profile, &mut options.profile)?);
     for o in &cli.offset {
-        let parsed = o.rsplit_once('=').and_then(|(f, d)| Some((f, nerka_core::time::parse_offset(d)?)));
+        let parsed = (o.rsplit_once('='))
+            .filter(|(f, _)| !f.trim().is_empty())
+            .and_then(|(f, d)| Some((f, nerka_core::time::parse_offset(d)?)));
         let Some((file, d)) = parsed else {
             anyhow::bail!("--offset {o}: expected FILE=OFFSET, e.g. 'ecu1.dlt=+3h' or 'app.log=-0.250s'");
         };
