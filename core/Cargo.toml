@@ -19,5 +19,8 @@ thiserror.workspace = true
 quick-xml.workspace = true
 miniz_oxide.workspace = true
 
+[target.'cfg(target_os = "linux")'.dependencies]
+libc.workspace = true
+
 [lints]
 workspace = true

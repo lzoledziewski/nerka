@@ -2,6 +2,10 @@
 
 The dated log of the project, newest first; append-only: add an entry at the top when `status.md` changes. Moved from `status.md` on 2026-11-10, word for word: its "Last update" line (each update with the ones before it) and its "Next steps" as they stood then, which tell what was built when and why. Where the moved text says "above", "below" or "this file", it means the old `status.md`: its sections are now `status.md` (state, pending decisions, limitations, licensing), `gui-decisions.md`, `features.md` and `history.md`.
 
+## 2026-11-23
+
+Filtering before background work (owner: filtering takes precedence, above all when I/O is slow; branch `claude/nfs-first-open-1722ad`): signals, checks and plot lanes run on an idle-priority pool that waits while an open, filter or search runs. Measured over loopback NFS in the Linux VM (`features.md`). The owner's "first open over NFS slow until Reload" is not reproduced yet: questions in `status.md`.
+
 ## 2026-11-22
 
 0.2.4 (a release, owner): text profiles and time per file as below, with a `profile` field to filter on, profile signals (read-only in the Signals panel, scoped to their profile's files, clashes said), records split per file (Records… beside DLT too); a signal's value only from an OR branch that holds; a failed lifecycle said instead of waited for; the plot window opening truly maximized, short enum states never hidden; `url` 2.5.9 (RUSTSEC-2026-0592, which failed `cargo deny` on `main` too). Before the bump: tests, clippy and fmt on Windows and in the Linux VM, the review gate `--full` (all passed but `cargo deny`, fixed by the `url` update), a 1 GiB benchmark against 0.2.3's base within noise.

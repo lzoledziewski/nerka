@@ -91,6 +91,12 @@ merges their events; if they give it different options, its row shows ⚠
 (hover: who gives what), the first picked query's options are used, and
 💾 writes them into all of them so they agree.
 
+**Filters first:** once a file is read, its signals' events, lifecycles,
+checks and plot lanes are worked out in the background. An open, a filter
+or a search goes first: the background work waits while one runs and only
+takes the CPU nothing else wants, so filtering and the window stay quick
+while it works, also on a slow disk or a network share.
+
 **One name, several sources:** a name has one signal. Yours (saved, or
 `--signal`) win over the file's own `@time`, a
 [profile's](formats.md#profiles) over a FIBEX argument's, and those over a
@@ -114,10 +120,13 @@ colour and under a small ▼ notch on the lane's top edge (shorter than
 drawn), and several within one pixel become such a column split into
 their colours. A band without a notch is as long as it looks. Hovering
 there names them: *near here: error ×2, idle ×2 (4
-changes in 60 ms): zoom in to see them*.
+changes in 60 ms): zoom in to see them*; values that came at the same time,
+which no zoom shows apart, are *4 changes at the same time*.
 
 - **Navigate:** the wheel zooms, drag pans, double-click shows all; hover
-  shows a value; click goes to the line.
+  shows a value; click goes to the line. The zoom stops where the times
+  can't be told apart any closer: a few tenths of a millisecond across
+  the plot for dated times (a DLT trace, a dated log), 1 ns for times from 0.
 - **Time cursors:** right-click → place cursor A, B, …; Δt between them is
   shown (like a logic analyser). Drag a cursor to move it. Clicked near a
   change of a signal (the lane under the pointer first, else any lane),

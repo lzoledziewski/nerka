@@ -293,6 +293,9 @@ pub struct PlotState {
     pub cursors: Vec<f64>,
     /// The cursor being dragged, and where the context menu was opened.
     drag_cursor: Option<usize>,
+    /// Where the drag began: a pan or a cursor follows the pointer from
+    /// there.
+    drag_from: Option<DragFrom>,
     menu_x: Option<f64>,
     /// The change of a signal nearest to where the menu was opened (its x,
     /// lane and line), offered for a cursor and a bookmark.
@@ -329,6 +332,48 @@ struct LaneKey {
     series: Arc<SignalSeries>,
     clock: String,
     clock_series: Option<SignalSeries>,
+}
+
+/// A drag's start: the pointer's x, the x range and the dragged cursor's x
+/// then. Each frame puts the view (or the cursor) where the whole drag so
+/// far takes it: adding each frame's step lost the steps finer than an f64
+/// holds at a time like 1.8e9 s (0.24 µs), and zoomed in far the view
+/// stopped panning.
+#[derive(Debug, Clone, Copy)]
+struct DragFrom {
+    px: f32,
+    range: (f64, f64),
+    cursor: f64,
+}
+
+/// Never narrower than this x span.
+const MIN_SPAN: f64 = 1e-9;
+
+/// The narrowest x span over `w` points around `range`: a point is at least
+/// one step of an f64 there (times since 1970 in seconds: 0.24 µs, about
+/// 0.15 ms over 650 points). Narrower, the times in view are a few f64
+/// values: the view jumped between them, and a drag couldn't move it.
+fn min_span((x0, x1): (f64, f64), w: f64) -> f64 {
+    let mag = x0.abs().max(x1.abs());
+    let step = if mag.is_finite() { f64::from_bits(mag.to_bits() + 1) - mag } else { 0.0 };
+    (step * w).max(MIN_SPAN)
+}
+
+/// `range` zoomed by `f` (below 1: in) around `at`, not narrower than
+/// `min`: there `at` stays where it is in the view, and a view at the limit
+/// stays as it is. (Before, a zoom past the limit was drawn for a frame and
+/// dropped on the next: the view jumped on every notch.)
+fn zoom_range((x0, x1): (f64, f64), at: f64, f: f64, min: f64) -> (f64, f64) {
+    let (a, b) = (at - (at - x0) * f, at + (x1 - at) * f);
+    if b - a >= min {
+        return (a, b);
+    }
+    if f >= 1.0 || x1 - x0 <= min * 1.01 {
+        return (x0, x1);
+    }
+    let k = ((at - x0) / (x1 - x0)).clamp(0.0, 1.0);
+    let a = at - min * k;
+    (a, a + min)
 }
 
 impl LaneKey {
@@ -823,7 +868,7 @@ pub fn plot_panel(ui: &mut egui::Ui, state: &mut PlotState, src: Source<'_>) -> 
                 }
             }
             let clock = clock.clone();
-            let work = crate::job::Job::spawn(&ctx, move |_| {
+            let work = crate::job::Job::background(&ctx, move |_| {
                 let refs: Vec<(&str, &SignalDef, &SignalSeries)> =
                     todo.iter().map(|(n, d, s)| (n.as_str(), &**d, &**s)).collect();
                 Ok(nerka_core::plot::lane::lanes_of_all(&refs, &*owned, &clock, clock_series.as_ref()))
@@ -984,7 +1029,10 @@ pub fn plot_panel(ui: &mut egui::Ui, state: &mut PlotState, src: Source<'_>) -> 
     }
     if response.drag_started() {
         // Where the press began: egui starts a drag only after some movement.
-        state.drag_cursor = ui.input(|i| i.pointer.press_origin()).and_then(near_cursor);
+        let origin = ui.input(|i| i.pointer.press_origin());
+        state.drag_cursor = origin.and_then(near_cursor);
+        let cursor = state.drag_cursor.map_or(0.0, |i| state.cursors[i]);
+        state.drag_from = origin.map(|p| DragFrom { px: p.x, range: (x0, x1), cursor });
     }
     // The change of a signal nearest to a right-click (the lane under the
     // pointer, else any lane), within a few pixels: the menu offers it
@@ -1001,12 +1049,19 @@ pub fn plot_panel(ui: &mut egui::Ui, state: &mut PlotState, src: Source<'_>) -> 
         snap_to_change(&lanes, x, tol)
     };
     if response.dragged() {
-        let dx = response.drag_delta().x as f64 * (x1 - x0) / w;
-        match state.drag_cursor {
-            Some(i) => state.cursors[i] += dx,
-            None => {
-                if dx != 0.0 {
-                    (x0, x1) = (x0 - dx, x1 - dx);
+        // From where the drag began (`DragFrom`), not this frame's step.
+        let moved = state.drag_from.zip(response.interact_pointer_pos()).map(|(from, p)| {
+            let (a, b) = from.range;
+            (from, (p.x - from.px) as f64 * (b - a) / w)
+        });
+        match (state.drag_cursor, moved) {
+            (Some(i), Some((from, dx))) => state.cursors[i] = from.cursor + dx,
+            (Some(_), None) => {}
+            (None, moved) => {
+                if let Some((from, dx)) = moved
+                    && (dx != 0.0 || state.range.is_some())
+                {
+                    (x0, x1) = (from.range.0 - dx, from.range.1 - dx);
                     state.range = Some((x0, x1));
                 }
                 // Up and down: through the lanes (owner, 2026-10-25).
@@ -1016,6 +1071,7 @@ pub fn plot_panel(ui: &mut egui::Ui, state: &mut PlotState, src: Source<'_>) -> 
     }
     if response.drag_stopped() {
         state.drag_cursor = None;
+        state.drag_from = None;
     }
     // Right-click in the plot: the time cursors' menu, at that x.
     if response.secondary_clicked()
@@ -1078,9 +1134,18 @@ pub fn plot_panel(ui: &mut egui::Ui, state: &mut PlotState, src: Source<'_>) -> 
         } else if notches != 0.0 {
             let at = x0 + (p.x - plot.min.x).clamp(0.0, plot.width()) as f64 / w * (x1 - x0);
             let f = 0.8f64.powf(notches as f64);
-            (x0, x1) = (at - (at - x0) * f, at + (x1 - at) * f);
-            if x1 - x0 > 1e-9 {
-                state.range = Some((x0, x1));
+            let zoomed = zoom_range((x0, x1), at, f, min_span((x0, x1), w));
+            if zoomed != (x0, x1) {
+                (x0, x1) = zoomed;
+                state.range = Some(zoomed);
+                // A drag goes on from the new view.
+                if let Some(d) = &mut state.drag_from {
+                    *d = DragFrom {
+                        px: p.x,
+                        range: zoomed,
+                        cursor: state.drag_cursor.map_or(0.0, |i| state.cursors[i]),
+                    };
+                }
             }
         }
     }
@@ -2183,6 +2248,12 @@ struct Hidden {
 impl Hidden {
     fn text(&self, is_time: bool) -> String {
         let states: Vec<String> = self.states.iter().map(|(s, n)| format!("{s} ×{n}")).collect();
+        // On one time (or line): no zoom shows them apart, so it doesn't
+        // say to zoom in (zooming in for them ran into the zoom's limit).
+        if self.span == 0.0 {
+            let when = if is_time { "at the same time" } else { "on the same line" };
+            return format!("near here: {} ({} changes {when})", states.join(", "), self.changes);
+        }
         format!(
             "near here: {} ({} changes in {}): zoom in to see them",
             states.join(", "),
@@ -3040,6 +3111,170 @@ mod tests {
         step(vec![press(to, false)], &mut st);
         let (y0, y1) = st.range.unwrap();
         assert!(y0 < x0 && (y1 - y0 - (x1 - x0)).abs() < 1e-9, "{y0} {y1}");
+    }
+
+    /// The zoom's limit: where an f64 runs out at the times in view (a step
+    /// per point), and there the view stays as it is.
+    #[test]
+    fn the_zoom_stops_where_the_times_run_out() {
+        let t = 1_795_428_010.0f64; // 2026-11-23, in seconds since 1970
+        let step = f64::from_bits(t.to_bits() + 1) - t;
+        let min = min_span((t, t + 1.0), 656.0);
+        assert!((min - 656.0 * step).abs() < 1e-12, "{min}");
+        // Times from 0: the fixed limit.
+        assert_eq!(min_span((0.0, 99.0), 656.0), MIN_SPAN);
+        // In by notches around a point a quarter in: never narrower, the
+        // point keeps its place, and at the limit nothing changes.
+        let mut r = (t, t + 1.0);
+        let at = t + 0.25;
+        for _ in 0..60 {
+            let next = zoom_range(r, at, 0.8, min);
+            assert!(next.1 - next.0 >= min * 0.999, "{next:?}");
+            assert!(((at - next.0) / (next.1 - next.0) - 0.25).abs() < 0.01, "{next:?}");
+            r = next;
+        }
+        assert_eq!(zoom_range(r, at, 0.8, min), r, "at the limit it stays");
+        assert_eq!(zoom_range(r, at, 0.5, min), r);
+        // Out again: wider.
+        let out = zoom_range(r, at, 1.25, min);
+        assert!(out.1 - out.0 > r.1 - r.0);
+    }
+
+    fn wheel_notches(y: f32) -> egui::Event {
+        egui::Event::MouseWheel {
+            unit: egui::MouseWheelUnit::Line,
+            delta: vec2(0.0, y),
+            phase: egui::TouchPhase::Move,
+            source: egui::MouseWheelSource::Wheel,
+            modifiers: egui::Modifiers::NONE,
+        }
+    }
+
+    fn primary(pos: Pos2, pressed: bool) -> egui::Event {
+        egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        }
+    }
+
+    /// Owner, 2026-11-23: zoomed in far, the plot didn't pan. Times since
+    /// 1970 (a dated log, DLT): the wheel went on to a span of two f64
+    /// steps (0.5 µs), where a drag's step per frame was finer than an f64
+    /// holds there and was lost. Now the zoom stops at a step per point and
+    /// a slow drag (a point per frame) pans it.
+    #[test]
+    fn zoomed_in_far_a_dated_plot_still_pans() {
+        let text: String =
+            (0..200).map(|i| format!("2026-11-23 10:00:{:02}.{}00000 v={}\n", i / 10, i % 10, i % 7)).collect();
+        let file = nerka_core::TextFile::from_bytes("t", text.into_bytes());
+        let mut sig = Signals::default();
+        sig.set(nerka_core::SignalDef::parse_spec(r"t:time=/^(?<t>\S+ \S+)/").unwrap());
+        sig.set(nerka_core::SignalDef::parse_spec(r"v=/v=(?<v>\d+)/").unwrap());
+        for d in sig.iter() {
+            d.series(&file, &nerka_core::Progress::new()).unwrap();
+        }
+        let mut st = PlotState::default();
+        st.toggle("v");
+        let ctx = egui::Context::default();
+        let mut t = 0.0;
+        let mut step = |events, st: &mut PlotState| {
+            t += 1.0 / 60.0;
+            frame(&ctx, t, events, st, &sig, &file)
+        };
+        step(vec![], &mut st);
+        let full = st.data.as_ref().map(|(_, d)| d.full).expect("built");
+        assert!(full.0 > 1e9, "times since 1970: {full:?}");
+        let at = pos2(GUTTER + 300.0, 60.0);
+        step(vec![egui::Event::PointerMoved(at)], &mut st);
+        for _ in 0..40 {
+            step(vec![wheel_notches(3.0)], &mut st);
+        }
+        let (x0, x1) = st.range.expect("zoomed in");
+        // The plot is 656 points wide here.
+        let w = 656.0;
+        let min = min_span((x0, x1), w);
+        assert!(x1 - x0 >= min * 0.99 && x1 - x0 < min * 1.1, "at the limit: {}", x1 - x0);
+        step(vec![wheel_notches(3.0)], &mut st);
+        assert_eq!(st.range, Some((x0, x1)), "more notches: the same view");
+        // A point per frame, 40 to the right: earlier times by 40 points.
+        step(vec![primary(at, true)], &mut st);
+        for k in 1..=40 {
+            step(vec![egui::Event::PointerMoved(at + vec2(k as f32, 0.0))], &mut st);
+        }
+        step(vec![primary(at + vec2(40.0, 0.0), false)], &mut st);
+        let (y0, y1) = st.range.unwrap();
+        let want = 40.0 * (x1 - x0) / w;
+        assert!(((x0 - y0) - want).abs() < want * 0.05, "panned {} of {want}", x0 - y0);
+        assert!(((y1 - y0) - (x1 - x0)).abs() <= 4.0 * (x1 - x0) / w, "the zoom stays");
+    }
+
+    /// Owner, 2026-11-23: an enum with several values on one time, zoomed
+    /// in: the view was unstable. The hover said to zoom in to see them, so
+    /// the wheel went to the zoom's limit, where each notch drew one frame
+    /// zoomed further and the next went back. Now the view stays at the
+    /// limit with the column under the pointer, pans there, and the hover
+    /// says they came at the same time.
+    #[test]
+    fn values_on_one_time_zoomed_in_keep_the_view_still() {
+        let mut text = String::new();
+        for i in 0..100 {
+            let s = ["idle", "busy"][(i / 20) % 2];
+            text.push_str(&format!("00:00:{:02}.{} st={s}\n", i / 10, i % 10));
+            if i == 50 {
+                for s in ["a", "b", "c", "d"] {
+                    text.push_str(&format!("00:00:05.0 st={s}\n"));
+                }
+            }
+        }
+        let file = nerka_core::TextFile::from_bytes("t", text.into_bytes());
+        let mut sig = Signals::default();
+        sig.set(nerka_core::SignalDef::parse_spec(r"t:time=/^(?<t>\S+)/").unwrap());
+        sig.set(nerka_core::SignalDef::parse_spec(r"st:enum=/st=(?<st>\w+)/").unwrap());
+        for d in sig.iter() {
+            d.series(&file, &nerka_core::Progress::new()).unwrap();
+        }
+        let mut st = PlotState::default();
+        st.toggle("st");
+        let ctx = egui::Context::default();
+        let mut t = 0.0;
+        let mut step = |events, st: &mut PlotState| {
+            t += 1.0 / 60.0;
+            frame(&ctx, t, events, st, &sig, &file)
+        };
+        step(vec![], &mut st);
+        let full = st.data.as_ref().map(|(_, d)| d.full).expect("built");
+        assert_eq!(full, (0.0, 9.9));
+        // The pointer on the values at 5.0 (the plot starts at GUTTER + 8).
+        let w = 656.0;
+        let at = pos2(GUTTER + 8.0 + (5.0 / 9.9 * w) as f32, 60.0);
+        step(vec![egui::Event::PointerMoved(at)], &mut st);
+        let mut seen = Vec::new();
+        for _ in 0..120 {
+            step(vec![wheel_notches(1.0)], &mut st);
+            seen.push(st.range.expect("zoomed in"));
+        }
+        let limit = seen[seen.len() - 1];
+        assert!((limit.1 - limit.0 - MIN_SPAN).abs() < 1e-12, "{limit:?}");
+        // Where the pointer is stays under it (5.0 s, to an f32 point's precision).
+        let x_at = (at.x - (GUTTER + 8.0)) as f64 / w * 9.9;
+        assert!((x_at - 5.0).abs() < 1e-5 && limit.0 <= x_at && x_at <= limit.1, "{x_at} {limit:?}");
+        let first = seen.iter().position(|r| *r == limit).expect("reached");
+        assert!(seen[first..].iter().all(|r| *r == limit), "at the limit the view stays");
+        // Panned there: 20 points right, earlier by 20 points' time.
+        step(vec![primary(at, true)], &mut st);
+        for k in 1..=10 {
+            step(vec![egui::Event::PointerMoved(at + vec2(2.0 * k as f32, 0.0))], &mut st);
+        }
+        step(vec![primary(at + vec2(20.0, 0.0), false)], &mut st);
+        let (y0, _) = st.range.unwrap();
+        let want = 20.0 * MIN_SPAN / w;
+        assert!(((limit.0 - y0) - want).abs() < want * 0.05, "panned {} of {want}", limit.0 - y0);
+        // The hover: on one time, not "zoom in".
+        let lane = &st.data.as_ref().unwrap().1.lanes[0];
+        let h = hidden_states(lane, 4.999, 5.001).expect("several");
+        assert_eq!(h.text(true), "near here: a ×1, b ×1, c ×1, d ×1 (4 changes at the same time)");
     }
 
     #[test]

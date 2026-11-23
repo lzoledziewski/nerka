@@ -2043,6 +2043,7 @@ dependencies = [
 name = "nerka-core"
 version = "0.2.4"
 dependencies = [
+ "libc",
  "memchr",
  "memmap2",
  "miniz_oxide 0.9.1",

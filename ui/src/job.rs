@@ -16,18 +16,43 @@ pub enum Poll<T> {
 }
 
 impl<T: Send + 'static> Job<T> {
-    /// Run `work` on a thread of its own. A panic in it is an error saying
+    /// Run `work`, which someone waits for (an open, a filter, a search),
+    /// on a thread of its own; background jobs wait while it runs
+    /// (`nerka_core::background`). A panic in it is an error saying
     /// so, not a cancel (review 2026-11-09, R8: a cancel is ignored, so the
     /// tab stayed on "loading" or kept its old result without a word).
     pub fn spawn(
         ctx: &eframe::egui::Context,
         work: impl FnOnce(&Progress) -> nerka_core::Result<T> + Send + 'static,
     ) -> Self {
+        Self::start(ctx, false, work)
+    }
+
+    /// Run `work`, which nobody waits for (a tab's signals, its checks,
+    /// the plot's lanes), as background work: it gives way to [`Self::spawn`]'s.
+    pub fn background(
+        ctx: &eframe::egui::Context,
+        work: impl FnOnce(&Progress) -> nerka_core::Result<T> + Send + 'static,
+    ) -> Self {
+        Self::start(ctx, true, work)
+    }
+
+    fn start(
+        ctx: &eframe::egui::Context,
+        background: bool,
+        work: impl FnOnce(&Progress) -> nerka_core::Result<T> + Send + 'static,
+    ) -> Self {
         let progress = Progress::new();
         let (tx, rx) = channel();
         let (p, ctx) = (progress.clone(), ctx.clone());
+        // Held from now (not from when the thread starts): a background
+        // job started in the same frame already waits.
+        let foreground = (!background).then(nerka_core::background::foreground);
         std::thread::spawn(move || {
-            let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| work(&p))).unwrap_or_else(|panic| {
+            let run = || std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| work(&p)));
+            let out = if background { nerka_core::background::run(run) } else { run() };
+            drop(foreground);
+            let out = out.unwrap_or_else(|panic| {
                 Err(nerka_core::Error::Format(format!("internal error: {}", message(&*panic))))
             });
             let _ = tx.send(out);
