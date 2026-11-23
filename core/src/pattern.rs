@@ -34,6 +34,12 @@
 //! Finally, what all of a slot's values begin or end with moves out of the
 //! slot (`{gear=D|gear=P}` → `gear={D|P}`).
 //!
+//! [`compare`] groups two sets of lines (two files, or two filters' lines)
+//! together, so a pattern is the same on both sides, and counts each side;
+//! [`differences`] ranks what changed between them: patterns and, inside a
+//! pattern, its slots' values (`undervoltage` in B only, while
+//! `{voltage=|undervoltage}` merged with the measurement holds steady).
+//!
 //! The message is a field's text (DLT: `payload`) or the line. Cheap text
 //! fields (DLT `ecu`, `apid`, `ctid`) with one value on every line of a
 //! pattern, where patterns differ in it, go into its query too.
@@ -52,10 +58,26 @@ const MASK: char = '\u{E000}';
 const MASK_STR: &str = "\u{E000}";
 const ANY: char = '\u{E001}';
 const EITHER: char = '\u{E002}';
+/// The rest of a message past [`MAX_TOKENS`].
+const REST: char = '\u{E003}';
+const REST_STR: &str = "\u{E003}";
 /// Lines grouped per task.
 const CHUNK: usize = 64 * 1024;
 /// Values a slot keeps.
 pub const MAX_VALUES: usize = 16;
+/// Tokens of a message looked at; the rest is one token, [`REST`].
+const MAX_TOKENS: usize = 64;
+/// Templates per chunk of lines (stage 1), and in all; past that, a line
+/// fitting none goes to the catch-all of its token count ([`Pattern::unsorted`]):
+/// lines that hardly repeat (binary read as text) cost neither time nor
+/// memory per line.
+const MAX_PER_CHUNK: usize = 8192;
+const MAX_TEMPLATES: usize = 65536;
+/// Templates per group (fields, token count, first literal token), so a
+/// line isn't compared with more.
+const MAX_GROUP: usize = 256;
+/// Templates aligned (stage 2), most lines first; the rest stay as they are.
+const MAX_MERGE: usize = 10_000;
 /// Templates of more atoms aren't aligned (stage 2).
 const MAX_ATOMS: usize = 256;
 /// Patterns a template is aligned with, at most (stage 2).
@@ -79,6 +101,57 @@ impl Default for PatternOptions {
     }
 }
 
+/// Lines of one set: how many, the first and the last.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Tally {
+    pub count: u64,
+    pub first: LineNo,
+    pub last: LineNo,
+}
+
+impl Tally {
+    fn add(&mut self, o: Tally) {
+        if o.count == 0 {
+        } else if self.count == 0 {
+            *self = o;
+        } else {
+            self.count += o.count;
+            self.first = self.first.min(o.first);
+            self.last = self.last.max(o.last);
+        }
+    }
+}
+
+/// Lines per set: set A's, and set B's in a comparison (else none).
+pub type Sides = [Tally; 2];
+
+/// One line of set `side`.
+fn one(side: usize, line: LineNo) -> Sides {
+    let mut s = Sides::default();
+    s[side] = Tally { count: 1, first: line, last: line };
+    s
+}
+
+fn add_sides(a: &mut Sides, b: &Sides) {
+    for (x, y) in a.iter_mut().zip(b) {
+        x.add(*y);
+    }
+}
+
+fn total(s: &Sides) -> u64 {
+    s[0].count + s[1].count
+}
+
+/// The first line: set A's, if it has lines there.
+fn first_of(s: &Sides) -> LineNo {
+    if s[0].count > 0 { s[0].first } else { s[1].first }
+}
+
+/// Most lines first, then by first line.
+fn by_count(a: &Sides, b: &Sides) -> std::cmp::Ordering {
+    total(b).cmp(&total(a)).then(first_of(a).cmp(&first_of(b)))
+}
+
 /// The values a slot took.
 #[derive(Debug, Clone, Default)]
 pub struct Slot {
@@ -94,29 +167,37 @@ pub struct Slot {
 pub struct SlotValue {
     /// With the markers.
     text: String,
-    pub count: u64,
-    pub first: LineNo,
-    pub last: LineNo,
+    /// Its lines per set.
+    pub sides: Sides,
 }
 
 impl SlotValue {
+    /// Its lines (both sets).
+    pub fn count(&self) -> u64 {
+        total(&self.sides)
+    }
+    pub fn first(&self) -> LineNo {
+        first_of(&self.sides)
+    }
+    pub fn last(&self) -> LineNo {
+        if self.sides[0].count > 0 { self.sides[0].last } else { self.sides[1].last }
+    }
+
     /// The value: masked parts as `<*>`, empty as `∅`.
     pub fn value(&self) -> String {
         if self.text.is_empty() {
             return "∅".into();
         }
-        self.text.replace([MASK, ANY], "<*>").replace(EITHER, " ")
+        self.text.replace([MASK, ANY], "<*>").replace(EITHER, " ").replace(REST, "…")
     }
 }
 
 impl Slot {
-    fn add(&mut self, text: &str, count: u64, first: LineNo, last: LineNo) {
+    fn add(&mut self, text: &str, sides: &Sides) {
         if let Some(v) = self.values.iter_mut().find(|v| v.text == text) {
-            v.count += count;
-            v.first = v.first.min(first);
-            v.last = v.last.max(last);
+            add_sides(&mut v.sides, sides);
         } else if self.values.len() < MAX_VALUES {
-            self.values.push(SlotValue { text: text.to_owned(), count, first, last });
+            self.values.push(SlotValue { text: text.to_owned(), sides: *sides });
         } else {
             self.overflow = true;
         }
@@ -124,7 +205,7 @@ impl Slot {
 
     fn join(&mut self, other: Slot) {
         for v in other.values {
-            self.add(&v.text, v.count, v.first, v.last);
+            self.add(&v.text, &v.sides);
         }
         self.overflow |= other.overflow;
         self.wide |= other.wide;
@@ -133,7 +214,7 @@ impl Slot {
     /// A state: all its values known, at least two, one of them on more than
     /// one line, and each with a letter (not only a masked number) or empty.
     pub fn is_state(&self) -> bool {
-        let lines: u64 = self.values.iter().map(|v| v.count).sum();
+        let lines: u64 = self.values.iter().map(SlotValue::count).sum();
         !self.overflow
             && self.values.len() >= 2
             && lines > self.values.len() as u64
@@ -184,16 +265,28 @@ struct Part {
 #[derive(Debug, Clone)]
 pub struct Pattern {
     parts: Vec<Part>,
-    /// Lines in the pattern.
-    pub count: u64,
-    pub first: LineNo,
-    pub last: LineNo,
+    /// Its lines per set.
+    pub sides: Sides,
+    /// Not a template: lines of its token count that fit none, past the
+    /// templates kept ([`MAX_PER_CHUNK`]).
+    pub unsorted: bool,
     /// Fields with one value on all its lines (and not on all patterns'):
     /// `(name, value)`.
     pub fields: Vec<(String, String)>,
 }
 
 impl Pattern {
+    /// Its lines (both sets).
+    pub fn count(&self) -> u64 {
+        total(&self.sides)
+    }
+    pub fn first(&self) -> LineNo {
+        first_of(&self.sides)
+    }
+    pub fn last(&self) -> LineNo {
+        if self.sides[0].count > 0 { self.sides[0].last } else { self.sides[1].last }
+    }
+
     /// The template: `<*>` where messages differ, a state's values as
     /// `{D|P|N}`.
     pub fn template(&self) -> String {
@@ -211,7 +304,7 @@ impl Pattern {
                 s.push(' ');
             }
             match &p.atom {
-                Atom::Lit(l) => s.push_str(&l.replace(MASK, "<*>")),
+                Atom::Lit(l) => s.push_str(&l.replace(MASK, "<*>").replace(REST, "…")),
                 Atom::Slot(slot) if slot.is_state() => {
                     s.push('{');
                     for (j, v) in slot.values.iter().enumerate() {
@@ -270,6 +363,7 @@ fn text_regex(text: &str, re: &mut String) {
             // `:`, `-` between them.
             MASK => re.push_str(r"[\w.:\-]+"),
             ANY => re.push_str(".*?"),
+            REST => re.push_str(".*"),
             EITHER => re.push_str(r"\s*"),
             c if c.is_whitespace() => re.push_str(r"\s+"),
             c => re.push_str(&regex::escape(c.encode_utf8(&mut buf))),
@@ -283,11 +377,16 @@ pub struct Patterns {
     /// The field grouped; `None`: the line.
     pub field: Option<String>,
     pub patterns: Vec<Pattern>,
-    /// Lines looked at.
-    pub lines: u64,
+    /// Lines looked at, per set.
+    pub lines: [u64; 2],
 }
 
 impl Patterns {
+    /// Lines looked at (both sets).
+    pub fn total(&self) -> u64 {
+        self.lines[0] + self.lines[1]
+    }
+
     /// NFD finding the lines of `p`, e.g. `apid == "NAV" AND payload ~ /^…$/`.
     pub fn query(&self, p: &Pattern) -> String {
         let mut q = String::new();
@@ -311,6 +410,13 @@ impl Patterns {
     }
 }
 
+/// Lines to group: a source's, or only `lines` (ascending) of it.
+#[derive(Clone, Copy)]
+pub struct Set<'a> {
+    pub source: &'a dyn LogSource,
+    pub lines: Option<&'a [LineNo]>,
+}
+
 /// Group the lines of `source` (or only `lines`, ascending) into patterns.
 pub fn detect(
     source: &dyn LogSource,
@@ -318,41 +424,84 @@ pub fn detect(
     options: &PatternOptions,
     progress: &Progress,
 ) -> Result<Patterns> {
-    let schema = source.schema();
-    let field = match &options.field {
-        Some(f) if f.eq_ignore_ascii_case("raw") => None,
-        Some(f) => Some(
-            schema
-                .iter()
-                .position(|d| d.name.eq_ignore_ascii_case(f))
-                .ok_or_else(|| Error::Format(format!("no field {f} in {}", source.name())))?,
-        ),
-        None => schema.iter().position(|d| d.name == "payload" && d.kind == FieldKind::Str),
+    group(&[Set { source, lines }], options, progress)
+}
+
+/// Group sets `a` and `b` together, so a pattern is the same on both sides,
+/// counting each side's lines ([`Pattern::sides`], [`SlotValue::sides`]);
+/// [`differences`] ranks what changed.
+pub fn compare(a: Set, b: Set, options: &PatternOptions, progress: &Progress) -> Result<Patterns> {
+    group(&[a, b], options, progress)
+}
+
+/// What a set's lines are read as: the field grouped, and the context
+/// fields' ids (by name, so two sources of different schemas line up).
+struct Reading {
+    field: Option<FieldId>,
+    context: Vec<Option<FieldId>>,
+}
+
+fn group(sets: &[Set], options: &PatternOptions, progress: &Progress) -> Result<Patterns> {
+    debug_assert!((1..=2).contains(&sets.len()));
+    let field_of = |source: &dyn LogSource| -> Result<Option<FieldId>> {
+        let schema = source.schema();
+        Ok(match &options.field {
+            Some(f) if f.eq_ignore_ascii_case("raw") => None,
+            Some(f) => Some(
+                schema
+                    .iter()
+                    .position(|d| d.name.eq_ignore_ascii_case(f))
+                    .ok_or_else(|| Error::Format(format!("no field {f} in {}", source.name())))?,
+            ),
+            None => schema.iter().position(|d| d.name == "payload" && d.kind == FieldKind::Str),
+        })
     };
-    // Context: the cheap text fields.
-    let context: Vec<FieldId> = (0..schema.len())
+    // Context: the cheap text fields of the first set.
+    let schema = sets[0].source.schema();
+    let field = field_of(sets[0].source)?;
+    let context: Vec<String> = (0..schema.len())
         .filter(|&i| {
             Some(i) != field && !schema[i].costly && matches!(schema[i].kind, FieldKind::Str | FieldKind::Name)
         })
+        .map(|i| schema[i].name.to_string())
         .collect();
-    let total = lines.map_or(source.line_count(), |l| l.len() as u64);
-    progress.set_total(total);
-    let chunks = total.div_ceil(CHUNK as u64) as usize;
+    let readings: Vec<Reading> = sets
+        .iter()
+        .map(|set| {
+            let schema = set.source.schema();
+            Ok(Reading {
+                field: field_of(set.source)?,
+                context: context.iter().map(|n| schema.iter().position(|d| d.name == n.as_str())).collect(),
+            })
+        })
+        .collect::<Result<_>>()?;
+    let mut lines = [0u64; 2];
+    for (side, set) in sets.iter().enumerate() {
+        lines[side] = set.lines.map_or(set.source.line_count(), |l| l.len() as u64);
+    }
+    progress.set_total(lines[0] + lines[1]);
+    // The tasks: chunks of each set's lines, set A's first.
+    let tasks: Vec<(usize, usize, usize)> = (0..sets.len())
+        .flat_map(|side| {
+            let n = lines[side] as usize;
+            (0..n.div_ceil(CHUNK)).map(move |c| (side, c * CHUNK, ((c + 1) * CHUNK).min(n)))
+        })
+        .collect();
     let sim = options.similarity.clamp(0.0, 1.0);
     // Stage 1.
-    let parts: Vec<Drain> = (0..chunks)
+    let parts: Vec<Drain> = tasks
         .into_par_iter()
-        .map(|c| {
+        .map(|(side, from, to)| {
             if progress.is_cancelled() {
                 return Err(Error::Cancelled);
             }
-            let from = c * CHUNK;
-            let to = ((c + 1) * CHUNK).min(total as usize);
-            let mut d = Drain::new(sim, context.len());
+            let Set { source, lines } = sets[side];
+            let reading = &readings[side];
+            let mut d = Drain::new(sim, context.len(), MAX_PER_CHUNK);
             let mut vals = Vec::with_capacity(context.len());
             for i in from..to {
                 let line = lines.map_or(i as LineNo, |l| l[i]);
-                let text = match field {
+                let text = match reading.field {
                     Some(id) => match source.field(line, id) {
                         Some(FieldValue::Str(b)) => match b {
                             Cow::Borrowed(b) => String::from_utf8_lossy(b),
@@ -363,22 +512,29 @@ pub fn detect(
                     None => source.line_text(line).unwrap_or_default(),
                 };
                 vals.clear();
-                vals.extend(context.iter().map(|&id| match source.field(line, id) {
+                vals.extend(reading.context.iter().map(|id| match id.and_then(|id| source.field(line, id)) {
                     Some(FieldValue::Str(b)) => Some(b),
                     _ => None,
                 }));
-                let toks: Vec<Cow<str>> = text.split_ascii_whitespace().map(mask).collect();
-                d.add_line(&toks, line, &vals);
+                let mut toks: Vec<Cow<str>> = text.split_ascii_whitespace().take(MAX_TOKENS + 1).map(mask).collect();
+                if toks.len() > MAX_TOKENS {
+                    toks.truncate(MAX_TOKENS - 1);
+                    toks.push(Cow::Borrowed(REST_STR));
+                }
+                d.add_line(&toks, side, line, &vals);
             }
             progress.add((to - from) as u64);
             Ok(d)
         })
         .collect::<Result<_>>()?;
-    let mut parts = parts.into_iter();
-    let mut all = parts.next().unwrap_or_else(|| Drain::new(sim, context.len()));
+    let parts = parts.into_iter();
+    let mut all = Drain::new(sim, context.len(), MAX_TEMPLATES);
     for d in parts {
         for c in d.clusters {
             all.add_cluster(c);
+        }
+        if progress.is_cancelled() {
+            return Err(Error::Cancelled);
         }
     }
     let mut families: Vec<Family> = all.clusters.into_iter().map(Family::from).collect();
@@ -407,21 +563,18 @@ pub fn detect(
                 .iter()
                 .zip(&f.vals)
                 .zip(&telling)
-                .filter_map(|((&id, v), &t)| match v {
-                    Val::One(Some(b)) if t => {
-                        Some((schema[id].name.to_string(), String::from_utf8_lossy(b).into_owned()))
-                    }
+                .filter_map(|((name, v), &t)| match v {
+                    Val::One(Some(b)) if t => Some((name.clone(), String::from_utf8_lossy(b).into_owned())),
                     _ => None,
                 })
                 .collect(),
             parts: factor(f.parts),
-            count: f.count,
-            first: f.first,
-            last: f.last,
+            sides: f.sides,
+            unsorted: f.unsorted,
         })
         .collect();
-    patterns.sort_by(|a, b| b.count.cmp(&a.count).then(a.first.cmp(&b.first)));
-    Ok(Patterns { field: field.map(|id| schema[id].name.to_string()), patterns, lines: total })
+    patterns.sort_by(|a, b| by_count(&a.sides, &b.sides));
+    Ok(Patterns { field: field.map(|id| schema[id].name.to_string()), patterns, lines })
 }
 
 /// `tok` with each run of word characters holding a digit (and the `.`,
@@ -553,19 +706,47 @@ struct Cluster {
     toks: Vec<Tok>,
     /// Per token; empty but for [`Tok::Any`].
     slots: Vec<Slot>,
-    count: u64,
-    first: LineNo,
-    last: LineNo,
+    sides: Sides,
     vals: Vec<Val>,
+    /// A catch-all ([`Pattern::unsorted`]): every token [`Tok::Any`].
+    catchall: bool,
+}
+
+/// `n` into `c`: its lines, values and fields; the tokens they differ in
+/// become slots.
+fn merge_into(c: &mut Cluster, mut n: Cluster) {
+    for i in 0..c.toks.len() {
+        if c.toks[i] == n.toks[i] && c.toks[i] != Tok::Any {
+            continue;
+        }
+        if let Tok::Lit(l) = &c.toks[i] {
+            let mut s = Slot::default();
+            s.add(l, &c.sides);
+            c.slots[i] = s;
+            c.toks[i] = Tok::Any;
+        }
+        match &n.toks[i] {
+            Tok::Lit(l) => c.slots[i].add(l, &n.sides),
+            Tok::Any => c.slots[i].join(std::mem::take(&mut n.slots[i])),
+        }
+    }
+    add_sides(&mut c.sides, &n.sides);
+    for (v, w) in c.vals.iter_mut().zip(&n.vals) {
+        v.join(w);
+    }
 }
 
 /// Templates of some lines: clusters, found by the fields' values, token
-/// count and first literal token (`key`).
+/// count and first literal token (`key`); at most `cap`, and
+/// [`MAX_GROUP`] per group, then catch-alls by token count.
 struct Drain {
     sim: f32,
     groups: HashMap<u64, Vec<usize>>,
     clusters: Vec<Cluster>,
     fields: usize,
+    cap: usize,
+    /// Token count → its catch-all in `clusters`.
+    catchall: HashMap<usize, usize>,
 }
 
 /// The group of a message of tokens `toks` on a line with field values
@@ -595,8 +776,34 @@ fn similarity<'a>(a: &[Tok], b: impl Iterator<Item = Option<&'a str>>) -> f32 {
 }
 
 impl Drain {
-    fn new(sim: f32, fields: usize) -> Self {
-        Self { sim, groups: HashMap::new(), clusters: Vec::new(), fields }
+    fn new(sim: f32, fields: usize, cap: usize) -> Self {
+        Self { sim, groups: HashMap::new(), clusters: Vec::new(), fields, cap, catchall: HashMap::new() }
+    }
+
+    /// No room for another template in group `key`.
+    fn full(&self, key: u64) -> bool {
+        self.clusters.len() - self.catchall.len() >= self.cap
+            || self.groups.get(&key).is_some_and(|g| g.len() >= MAX_GROUP)
+    }
+
+    /// `n` into the catch-all of its token count.
+    fn catch_all(&mut self, mut n: Cluster) {
+        match self.catchall.get(&n.toks.len()) {
+            Some(&ci) => merge_into(&mut self.clusters[ci], n),
+            None => {
+                for i in 0..n.toks.len() {
+                    if let Tok::Lit(l) = &n.toks[i] {
+                        let mut s = Slot::default();
+                        s.add(l, &n.sides);
+                        n.slots[i] = s;
+                        n.toks[i] = Tok::Any;
+                    }
+                }
+                n.catchall = true;
+                self.catchall.insert(n.toks.len(), self.clusters.len());
+                self.clusters.push(n);
+            }
+        }
     }
 
     /// The most alike template in group `key` with `len` tokens (`score`:
@@ -616,7 +823,8 @@ impl Drain {
         best.map(|(ci, _)| ci)
     }
 
-    fn add_line(&mut self, toks: &[Cow<str>], line: LineNo, vals: &[Option<Cow<[u8]>>]) {
+    fn add_line(&mut self, toks: &[Cow<str>], side: usize, line: LineNo, vals: &[Option<Cow<[u8]>>]) {
+        let here = one(side, line);
         debug_assert_eq!(vals.len(), self.fields);
         let k = key(toks.iter().map(|t| &**t), vals);
         match self.best(k, toks.len(), |c| similarity(c, toks.iter().map(|t| Some(&**t)))) {
@@ -628,16 +836,15 @@ impl Drain {
                         Tok::Lit(l) => {
                             // The lines so far all had `l` there.
                             let mut s = Slot::default();
-                            s.add(l, c.count, c.first, c.last);
-                            s.add(y, 1, line, line);
+                            s.add(l, &c.sides);
+                            s.add(y, &here);
                             c.slots[i] = s;
                             c.toks[i] = Tok::Any;
                         }
-                        Tok::Any => c.slots[i].add(y, 1, line, line),
+                        Tok::Any => c.slots[i].add(y, &here),
                     }
                 }
-                c.count += 1;
-                c.last = line;
+                add_sides(&mut c.sides, &here);
                 for (v, n) in c.vals.iter_mut().zip(vals) {
                     if !matches!(v, Val::One(o) if o.as_deref() == n.as_deref()) {
                         *v = Val::Mixed;
@@ -645,53 +852,38 @@ impl Drain {
                 }
             }
             None => {
-                self.groups.entry(k).or_default().push(self.clusters.len());
-                self.clusters.push(Cluster {
+                let n = Cluster {
                     key: k,
                     toks: toks.iter().map(|t| Tok::Lit(t.as_ref().into())).collect(),
                     slots: vec![Slot::default(); toks.len()],
-                    count: 1,
-                    first: line,
-                    last: line,
+                    sides: here,
                     vals: vals.iter().map(|v| Val::One(v.as_deref().map(Into::into))).collect(),
-                });
+                    catchall: false,
+                };
+                if self.full(k) {
+                    self.catch_all(n);
+                } else {
+                    self.groups.entry(k).or_default().push(self.clusters.len());
+                    self.clusters.push(n);
+                }
             }
         }
     }
 
     /// Merge a template found among other lines.
-    fn add_cluster(&mut self, mut n: Cluster) {
+    fn add_cluster(&mut self, n: Cluster) {
         fn lit(t: &Tok) -> Option<&str> {
             match t {
                 Tok::Lit(l) => Some(&**l),
                 Tok::Any => None,
             }
         }
+        if n.catchall {
+            return self.catch_all(n);
+        }
         match self.best(n.key, n.toks.len(), |c| similarity(c, n.toks.iter().map(lit))) {
-            Some(ci) => {
-                let c = &mut self.clusters[ci];
-                for i in 0..c.toks.len() {
-                    if c.toks[i] == n.toks[i] && c.toks[i] != Tok::Any {
-                        continue;
-                    }
-                    if let Tok::Lit(l) = &c.toks[i] {
-                        let mut s = Slot::default();
-                        s.add(l, c.count, c.first, c.last);
-                        c.slots[i] = s;
-                        c.toks[i] = Tok::Any;
-                    }
-                    match &n.toks[i] {
-                        Tok::Lit(l) => c.slots[i].add(l, n.count, n.first, n.last),
-                        Tok::Any => c.slots[i].join(std::mem::take(&mut n.slots[i])),
-                    }
-                }
-                c.count += n.count;
-                c.first = c.first.min(n.first);
-                c.last = c.last.max(n.last);
-                for (v, w) in c.vals.iter_mut().zip(&n.vals) {
-                    v.join(w);
-                }
-            }
+            Some(ci) => merge_into(&mut self.clusters[ci], n),
+            None if self.full(n.key) => self.catch_all(n),
             None => {
                 self.groups.entry(n.key).or_default().push(self.clusters.len());
                 self.clusters.push(n);
@@ -709,10 +901,9 @@ struct Family {
     /// common, but how alike another is counts against these (else each
     /// merge would make the next easier).
     size: usize,
-    count: u64,
-    first: LineNo,
-    last: LineNo,
+    sides: Sides,
     vals: Vec<Val>,
+    unsorted: bool,
 }
 
 impl From<Cluster> for Family {
@@ -730,7 +921,7 @@ impl From<Cluster> for Family {
             }
         }
         let size = parts.iter().filter(|p| matches!(&p.atom, Atom::Lit(l) if is_word(l))).count();
-        Family { parts, size, count: c.count, first: c.first, last: c.last, vals: c.vals }
+        Family { parts, size, sides: c.sides, vals: c.vals, unsorted: c.catchall }
     }
 }
 
@@ -847,7 +1038,7 @@ fn merge(a: Family, b: &Family, pairs: &[(usize, usize)]) -> Family {
         if text.is_empty() || text.contains([' ', EITHER, ANY]) {
             slot.wide = true;
         }
-        slot.add(&text, f.count, f.first, f.last);
+        slot.add(&text, &f.sides);
     }
     let mut parts = Vec::new();
     let (mut i, mut j) = (0, 0);
@@ -884,21 +1075,37 @@ fn merge(a: Family, b: &Family, pairs: &[(usize, usize)]) -> Family {
     for (v, w) in vals.iter_mut().zip(&b.vals) {
         v.join(w);
     }
-    Family {
-        parts,
-        size: a.size.max(b.size),
-        count: a.count + b.count,
-        first: a.first.min(b.first),
-        last: a.last.max(b.last),
-        vals,
+    let mut sides = a.sides;
+    add_sides(&mut sides, &b.sides);
+    Family { parts, size: a.size.max(b.size), sides, vals, unsorted: false }
+}
+
+/// How many words `f` and a template of words `sorted` hold both (with
+/// repeats): at least as many as an alignment of the two can match.
+fn shared_words(f: &Family, sorted: &[&str]) -> usize {
+    let mut theirs: Vec<&str> = f.words().collect();
+    theirs.sort_unstable();
+    let (mut i, mut j, mut n) = (0, 0, 0);
+    while i < theirs.len() && j < sorted.len() {
+        match theirs[i].cmp(sorted[j]) {
+            std::cmp::Ordering::Less => i += 1,
+            std::cmp::Ordering::Greater => j += 1,
+            std::cmp::Ordering::Equal => {
+                n += 1;
+                i += 1;
+                j += 1;
+            }
+        }
     }
+    n
 }
 
 /// Merge templates into patterns, most lines first: each is aligned with the
 /// patterns sharing its rarer words and joins the most alike one that
-/// [`accept`]s it.
+/// [`accept`]s it. Catch-alls, and templates past the first [`MAX_MERGE`],
+/// stay as they are.
 fn merge_all(mut templates: Vec<Family>, progress: &Progress) -> Result<Vec<Family>> {
-    templates.sort_by(|a, b| b.count.cmp(&a.count).then(a.first.cmp(&b.first)));
+    templates.sort_by(|a, b| by_count(&a.sides, &b.sides));
     let mut out: Vec<Family> = Vec::new();
     // Word → the patterns holding it.
     let mut index: HashMap<Box<str>, Vec<usize>> = HashMap::new();
@@ -906,8 +1113,13 @@ fn merge_all(mut templates: Vec<Family>, progress: &Progress) -> Result<Vec<Fami
         if n % 1024 == 0 && progress.is_cancelled() {
             return Err(Error::Cancelled);
         }
-        let mut words: Vec<&str> = t.words().collect();
-        words.sort_unstable();
+        if t.unsorted || n >= MAX_MERGE {
+            out.push(t);
+            continue;
+        }
+        let mut mine: Vec<&str> = t.words().collect();
+        mine.sort_unstable();
+        let mut words = mine.clone();
         words.dedup();
         words.sort_by_key(|w| index.get(*w).map_or(0, Vec::len));
         let mut candidates: Vec<usize> = Vec::new();
@@ -921,27 +1133,37 @@ fn merge_all(mut templates: Vec<Family>, progress: &Progress) -> Result<Vec<Fami
                 break;
             }
         }
-        let mut best: Option<(usize, f32, Pairs)> = None;
-        if t.parts.len() <= MAX_ATOMS {
-            for c in candidates {
-                let f = &out[c];
-                if f.parts.len() > MAX_ATOMS || !f.compatible(&t) {
-                    continue;
-                }
-                let pairs = align(&f.parts, &t.parts);
-                if let Some(s) = accept(f, &t, &pairs)
-                    && best.as_ref().is_none_or(|b| s > b.1)
-                {
-                    best = Some((c, s, pairs));
-                }
-            }
-        }
+        // The most alike, the first of equals (in parallel: alignments of
+        // long templates add up).
+        let best = (t.parts.len() <= MAX_ATOMS)
+            .then(|| {
+                candidates
+                    .par_iter()
+                    .enumerate()
+                    .filter_map(|(k, &c)| {
+                        let f = &out[c];
+                        if f.unsorted || f.parts.len() > MAX_ATOMS || !f.compatible(&t) {
+                            return None;
+                        }
+                        // The words aligned are some of those both hold: too
+                        // few of them, and `accept` can't pass.
+                        let shared = shared_words(f, &mine);
+                        if shared == 0 || shared * 3 < f.size.max(t.size) {
+                            return None;
+                        }
+                        let pairs = align(&f.parts, &t.parts);
+                        accept(f, &t, &pairs).map(|s| (k, c, s, pairs))
+                    })
+                    .reduce_with(|a, b| if b.2 > a.2 || (b.2 == a.2 && b.0 < a.0) { b } else { a })
+                    .map(|(_, c, s, pairs)| (c, s, pairs))
+            })
+            .flatten();
         let words: Vec<Box<str>> = words.into_iter().map(Into::into).collect();
         let at = match best {
             Some((c, _, pairs)) => {
                 let f = std::mem::replace(
                     &mut out[c],
-                    Family { parts: vec![], size: 0, count: 0, first: 0, last: 0, vals: vec![] },
+                    Family { parts: vec![], size: 0, sides: Sides::default(), vals: vec![], unsorted: false },
                 );
                 out[c] = merge(f, &t, &pairs);
                 c
@@ -970,7 +1192,7 @@ fn factor(parts: Vec<Part>) -> Vec<Part> {
             out.push(p);
             continue;
         };
-        slot.values.sort_by(|a, b| b.count.cmp(&a.count).then(a.first.cmp(&b.first)));
+        slot.values.sort_by(|a, b| by_count(&a.sides, &b.sides));
         if slot.overflow || slot.values.len() < 2 || slot.values.iter().any(|v| v.text.is_empty()) {
             out.push(Part { sep: p.sep, atom: Atom::Slot(slot) });
             continue;
@@ -1033,6 +1255,112 @@ fn factor(parts: Vec<Part>) -> Vec<Part> {
     out
 }
 
+// ---- Differences between two sets ----
+
+/// What changed between set A and set B: a pattern's lines, or a slot
+/// value's share of its pattern's lines.
+#[derive(Debug, Clone)]
+pub struct Difference {
+    /// Index into [`Patterns::patterns`].
+    pub pattern: usize,
+    /// A slot value: (slot, value) indexes into [`Pattern::slots`] and its
+    /// [`Slot::values`]; `None`: the pattern itself.
+    pub value: Option<(usize, usize)>,
+    /// Lines in A and B.
+    pub counts: [u64; 2],
+    /// Out of how many lines in A and B: all lines (a pattern), the
+    /// pattern's lines (a value).
+    pub of: [u64; 2],
+    /// How surely it changed: Dunning's log-likelihood ratio G² (one degree
+    /// of freedom: 3.84 is p = 0.05, 10.8 is p = 0.001). Unlike a ratio it
+    /// weighs the evidence: 0 → 1 line scores low, 0 → 500 high.
+    pub score: f64,
+}
+
+impl Difference {
+    pub fn change(&self) -> Change {
+        match self.counts {
+            [0, _] => Change::New,
+            [_, 0] => Change::Gone,
+            _ => Change::Changed,
+        }
+    }
+
+    /// How many times more often in B than in A, by rate (smoothed, so a
+    /// side with none stays finite).
+    pub fn ratio(&self) -> f64 {
+        let rate = |k: usize| (self.counts[k] as f64 + 0.5) / (self.of[k] as f64 + 1.0);
+        rate(1) / rate(0)
+    }
+}
+
+/// G² of a 2 × 2 table: `a` of `na` against `b` of `nb`.
+fn g2(a: u64, na: u64, b: u64, nb: u64) -> f64 {
+    fn xlx(x: f64) -> f64 {
+        if x > 0.0 { x * x.ln() } else { 0.0 }
+    }
+    let (a, b, na, nb) = (a as f64, b as f64, na as f64, nb as f64);
+    let (c, d) = (na - a, nb - b);
+    let g = xlx(a) + xlx(b) + xlx(c) + xlx(d) - xlx(a + b) - xlx(c + d) - xlx(na) - xlx(nb) + xlx(na + nb);
+    (2.0 * g).max(0.0)
+}
+
+/// What a [`Difference`] is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Change {
+    /// Lines in B only.
+    New,
+    /// Lines in A only.
+    Gone,
+    /// Lines in both, more or fewer.
+    Changed,
+}
+
+/// What changed between the sets of a [`compare`]: each pattern's lines
+/// against all lines, and, where a pattern has lines on both sides, each
+/// value of its slots (all values kept, `!overflow`) against the pattern's
+/// lines. New ones first, then gone ones (most lines first, whatever their
+/// score: one line in B only is weak evidence of a change in rate, but a
+/// message that never showed in A is what one looks for), then changed ones
+/// scoring `min_score` at least, surest first.
+pub fn differences(ps: &Patterns, min_score: f64) -> Vec<Difference> {
+    let mut out = Vec::new();
+    let mut add = |d: Difference| {
+        if d.change() != Change::Changed || d.score >= min_score {
+            out.push(d);
+        }
+    };
+    for (k, p) in ps.patterns.iter().enumerate() {
+        let counts = [p.sides[0].count, p.sides[1].count];
+        let score = g2(counts[0], ps.lines[0], counts[1], ps.lines[1]);
+        add(Difference { pattern: k, value: None, counts, of: ps.lines, score });
+        if counts[0] == 0 || counts[1] == 0 {
+            continue;
+        }
+        for (s, slot) in p.slots().enumerate() {
+            if slot.overflow || slot.values.len() < 2 {
+                continue;
+            }
+            for (v, value) in slot.values.iter().enumerate() {
+                let c = [value.sides[0].count, value.sides[1].count];
+                let score = g2(c[0], counts[0], c[1], counts[1]);
+                add(Difference { pattern: k, value: Some((s, v)), counts: c, of: counts, score });
+            }
+        }
+    }
+    out.sort_by(|a, b| {
+        let lines = |d: &Difference| d.counts[0] + d.counts[1];
+        a.change()
+            .cmp(&b.change())
+            .then_with(|| match a.change() {
+                Change::Changed => b.score.total_cmp(&a.score),
+                _ => lines(b).cmp(&lines(a)),
+            })
+            .then(a.pattern.cmp(&b.pattern))
+    });
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1060,11 +1388,11 @@ mod tests {
         for p in &ps.patterns {
             let q = Query::compile_in(&ps.query(p), source.schema(), &Default::default()).unwrap();
             let res = search(source, &Filter::Query(q), &Progress::new()).unwrap();
-            assert!(res.lines.len() as u64 >= p.count, "{}: {} < {}", ps.query(p), res.lines.len(), p.count);
-            assert!(res.contains(p.first) && res.contains(p.last), "{}", ps.query(p));
-            covered += p.count;
+            assert!(res.lines.len() as u64 >= p.count(), "{}: {} < {}", ps.query(p), res.lines.len(), p.count());
+            assert!(res.contains(p.first()) && res.contains(p.last()), "{}", ps.query(p));
+            covered += p.count();
         }
-        assert_eq!(covered, ps.lines);
+        assert_eq!(covered, ps.total());
     }
 
     #[test]
@@ -1115,7 +1443,7 @@ mod tests {
             "2026-10-17 10:00:00.007 [INFO] user carol logged in",
         ]);
         let ps = detect_all(&f);
-        let t: Vec<(u64, String)> = ps.patterns.iter().map(|p| (p.count, p.template())).collect();
+        let t: Vec<(u64, String)> = ps.patterns.iter().map(|p| (p.count(), p.template())).collect();
         assert_eq!(
             t,
             [
@@ -1124,14 +1452,14 @@ mod tests {
                 (2, "<*> <*> [WARN] disk almost full: <*>%".to_owned()),
             ]
         );
-        assert_eq!((ps.patterns[0].first, ps.patterns[0].last), (3, 6));
+        assert_eq!((ps.patterns[0].first(), ps.patterns[0].last()), (3, 6));
     }
 
     #[test]
     fn only_given_lines() {
         let f = text(&["a 1", "b x y", "a 2", "b x z"]);
         let ps = detect(&f, Some(&[1, 3]), &PatternOptions::default(), &Progress::new()).unwrap();
-        assert_eq!(ps.lines, 2);
+        assert_eq!(ps.lines, [2, 0]);
         assert_eq!(templates(&ps), ["b x <*>"]);
     }
 
@@ -1150,8 +1478,8 @@ mod tests {
         let f = text(&refs);
         let ps = detect_all(&f);
         assert_eq!(templates(&ps), ["send <*> bytes to <*>", "recv ok from {alpha|beta|gamma}", "tick <*>"]);
-        assert_eq!(ps.patterns[0].first, 0);
-        assert_eq!(ps.patterns.iter().map(|p| p.count).sum::<u64>(), lines.len() as u64);
+        assert_eq!(ps.patterns[0].first(), 0);
+        assert_eq!(ps.patterns.iter().map(Pattern::count).sum::<u64>(), lines.len() as u64);
     }
 
     #[test]
@@ -1205,7 +1533,7 @@ mod tests {
             .unwrap()
             .values
             .iter()
-            .map(|v| (v.value(), v.count, v.first, v.last))
+            .map(|v| (v.value(), v.count(), v.first(), v.last()))
             .collect();
         assert_eq!(gear, [("D".into(), 3, 2, 8), ("P".into(), 1, 0, 0), ("N".into(), 1, 6, 6)]);
         let users = ps.patterns[3].slots().next().unwrap();
@@ -1299,6 +1627,127 @@ mod tests {
         let f = text(&["call f(1) [ok] $5 a.b*", "call f(2) [ok] $9 a.b*", "x (a)* y", "x [b]$ y", "x (a)* y"]);
         let ps = detect_all(&f);
         assert_eq!(templates(&ps), ["x {(a)*|[b]$} y", "call f(<*>) [ok] $<*> a.b*"]);
+    }
+
+    /// Set A and set B: the same voltage readings and doors; B also has
+    /// undervoltage alarms and a panic.
+    fn two_sets() -> (TextFile, TextFile) {
+        let mut a = Vec::new();
+        for i in 0..100 {
+            a.push(format!("voltage={} mV", 12000 + i));
+        }
+        for _ in 0..10 {
+            a.push("door open".to_owned());
+            a.push("door closed".to_owned());
+        }
+        let mut b = a.clone();
+        for i in 0..9 {
+            b.insert(10 * i + 5, format!("undervoltage {} mV", 9000 + i));
+        }
+        for _ in 0..5 {
+            b.push("panic in task".to_owned());
+        }
+        let file = |name: &str, lines: Vec<String>| TextFile::from_bytes(name, lines.join("\n").into_bytes());
+        (file("a", a), file("b", b))
+    }
+
+    #[test]
+    fn compare_ranks_new_patterns_and_values() {
+        let (a, b) = two_sets();
+        let (sa, sb) = (Set { source: &a, lines: None }, Set { source: &b, lines: None });
+        let ps = compare(sa, sb, &PatternOptions::default(), &Progress::new()).unwrap();
+        assert_eq!(ps.lines, [120, 134]);
+        assert_eq!(templates(&ps), ["{voltage=|undervoltage} <*> mV", "door {open|closed}", "panic in task"]);
+        // The alarm, merged into the readings' pattern, still stands out as a
+        // value; the panic as a pattern; the doors don't.
+        let d = differences(&ps, 3.84);
+        let what: Vec<(String, [u64; 2])> = d
+            .iter()
+            .map(|d| {
+                let p = &ps.patterns[d.pattern];
+                let name = match d.value {
+                    None => p.template(),
+                    Some((s, v)) => p.slots().nth(s).unwrap().values[v].value(),
+                };
+                (name, d.counts)
+            })
+            .collect();
+        assert_eq!(
+            what,
+            [
+                ("undervoltage".to_owned(), [0, 9]),
+                ("panic in task".to_owned(), [0, 5]),
+                ("voltage=".to_owned(), [100, 100])
+            ]
+        );
+        assert_eq!(d.iter().map(Difference::change).collect::<Vec<_>>(), [Change::New, Change::New, Change::Changed]);
+        assert!(d[0].ratio() > 5.0 && d[1].ratio() > 5.0 && d[2].ratio() < 1.0);
+        // Where each side's lines are: B's first alarm, A's first reading.
+        let p = &ps.patterns[0];
+        assert_eq!(p.slots().next().unwrap().values[1].sides[1].first, 5);
+        assert_eq!((p.sides[0].first, p.sides[1].count), (0, 109));
+    }
+
+    #[test]
+    fn compare_two_filters_of_one_file() {
+        let f = text(&["x 1", "y on", "x 2", "y off", "x 3", "y on", "y on", "x 4"]);
+        let (a, b): (Vec<LineNo>, Vec<LineNo>) = (0..8).partition(|&l| l < 4);
+        let ps = compare(
+            Set { source: &f, lines: Some(&a) },
+            Set { source: &f, lines: Some(&b) },
+            &PatternOptions::default(),
+            &Progress::new(),
+        )
+        .unwrap();
+        assert_eq!(templates(&ps), ["x <*>", "y {on|off}"]);
+        let y = ps.patterns[1].slots().next().unwrap();
+        // `on`: line 1 in A, 5 and 6 in B; `off` only in A.
+        assert_eq!(y.values[0].sides, [Tally { count: 1, first: 1, last: 1 }, Tally { count: 2, first: 5, last: 6 }]);
+        assert_eq!(y.values[1].sides[1].count, 0);
+        // Too few lines to be sure of a change; `off` is gone, though.
+        let d = differences(&ps, 3.84);
+        assert_eq!((d.len(), d[0].change(), d[0].counts), (1, Change::Gone, [1, 0]));
+    }
+
+    #[test]
+    fn g2_weighs_the_evidence() {
+        assert!(g2(0, 10_000, 1, 10_000) < 3.84);
+        assert!(g2(0, 10_000, 500, 10_000) > 100.0);
+        assert!(g2(50, 1000, 50, 1000) < 1e-9);
+    }
+
+    #[test]
+    fn long_messages_end_in_the_rest() {
+        let long = |w: &str| {
+            (0..100).map(|i| format!("{w}{}", "abc"[i % 3..i % 3 + 1].repeat(i % 5 + 1))).collect::<Vec<_>>().join(" ")
+        };
+        let (a, b) = (long("x"), long("y"));
+        let f = text(&[&a, &a, &b]);
+        let ps = detect_all(&f);
+        assert!(ps.patterns.iter().all(|p| p.template().ends_with(" …")), "{:?}", templates(&ps));
+    }
+
+    #[test]
+    fn lines_that_hardly_repeat_go_to_a_catch_all() {
+        // Words without digits, all different: each line a template of its
+        // own, in one group (`k`, four tokens), until the group is full.
+        let word = |mut n: usize| {
+            let mut w = String::new();
+            for _ in 0..4 {
+                w.push((b'a' + (n % 26) as u8) as char);
+                n /= 26;
+            }
+            w
+        };
+        let lines: Vec<String> =
+            (0..300).map(|i| format!("k {} {} {}", word(i), word(i * 7 + 1), word(i * 13 + 2))).collect();
+        let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
+        let f = text(&refs);
+        let ps = detect_all(&f);
+        let unsorted: Vec<&Pattern> = ps.patterns.iter().filter(|p| p.unsorted).collect();
+        assert_eq!(unsorted.len(), 1);
+        assert_eq!((unsorted[0].count(), unsorted[0].template().as_str()), (300 - MAX_GROUP as u64, "<*> <*> <*> <*>"));
+        assert_eq!(ps.patterns.len(), MAX_GROUP + 1);
     }
 
     #[test]

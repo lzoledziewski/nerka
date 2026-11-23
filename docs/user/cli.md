@@ -1,6 +1,6 @@
 ---
 title: "The command line"
-description: "The nerka command line: filter, search, open, lines, check, lifecycles, patterns, export and import, with every option for DLT, pcap, MF4, JSON and text logs."
+description: "The nerka command line: filter, search, open, lines, check, lifecycles, patterns, compare, export and import, with every option for DLT, pcap, MF4, JSON and text logs."
 ---
 
 # The command line
@@ -26,6 +26,7 @@ Options for opening files (below) go before or after the command.
 | `check FILE…` | run the [checks](checks.md) (`--check`): issues and facts |
 | `lifecycles FILE…` | print the [lifecycles](lifecycles.md) (`--lifecycle`) and their findings |
 | `patterns FILE…` | group lines into message patterns (experimental), each with its count and a query |
+| `compare A B` | what differs between two files, or two filters' lines (experimental): patterns and values new, gone, more or less often |
 | `export` | write your setup as a [settings bundle](bundles.md) |
 | `import FILE` | read a settings bundle into your setup |
 
@@ -129,7 +130,48 @@ nerka patterns --rare --in 'level >= WARN' --queries trace.dlt
 ```
 
 Non-verbose DLT messages without a [FIBEX](formats.md) have no text to
-group, only their bytes.
+group, only their bytes. Lines that hardly repeat (a binary file read as
+text) don't each become a pattern: past a few thousand, the rest of a
+length go into one, marked *not sorted*. Messages longer than 64 words are
+grouped by their first 63, the rest shown as `…`.
+
+## `compare` (experimental)
+
+`compare` groups two sets of lines into patterns together, so a pattern is
+the same on both sides, then lists what differs, in three parts:
+
+- **New in B**: patterns, and values of a pattern's slots, that only B has;
+- **Gone from B**: those only A has;
+- **Changed**: those in both, more or less often (a pattern against all of
+  its side's lines, a value against its pattern's), surest first.
+
+So a value stands out even inside a pattern it was merged into:
+`undervoltage` new in B, while `{voltage=|undervoltage} <*> mV` holds
+steady. The score is a log-likelihood ratio (G²): it weighs the evidence,
+so 1 line against none scores low and 500 against none high; `--min-score`
+applies to changes only, new and gone ones are always listed. Each line
+prints the score, the lines in A and B, the change (`new`, `gone`, `×2.08`:
+how many times as often, by share), and the first line on the side it's on
+or grew on (`B:6412`).
+
+The sets are two files, or one file's lines of two filters, e.g. two
+[lifecycles](lifecycles.md):
+
+```
+nerka compare good.dlt bad.dlt
+nerka compare --in 'apid == NAV' good.dlt bad.dlt
+nerka --lifecycle 'ecu1: lines ecu == ECU1; reset uptime; planned payload ~ /shutdown/' compare --a '@ecu1 == 1' --b '@ecu1 == 2' trace.dlt
+```
+
+| Option | |
+|---|---|
+| `--a FILTER`, `--b FILTER` | set A's, set B's lines: only those an NFD filter keeps (one file: both needed) |
+| `--in FILTER` | both sets: only the lines an NFD filter keeps |
+| `--min-score S` | only changes at least this sure (default 10.8, p = 0.001; 3.84 is p = 0.05) |
+| `-n, --top N` | print at most N differences (default 30; `0`: all) |
+| `--queries` | also each pattern's NFD query |
+| `--field NAME`, `--similarity S`, `--no-merge` | as for `patterns` |
+| `--stats` | timing on stderr |
 
 ## `export` and `import`
 

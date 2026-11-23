@@ -22,7 +22,7 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use nerka_core::bundle::{Bundle, Choice, Item, Kind, Status, Store};
 use nerka_core::pack::{self, Expansion, Library, ParamValue, Pick, Role, Selection};
-use nerka_core::pattern::PatternOptions;
+use nerka_core::pattern::{self, PatternOptions};
 use nerka_core::{
     Bookmarks, Filter, LineNo, LogSource, Matcher, MatcherOptions, Progress, Query, SearchSet, SignalDef, Signals,
     search, search_within,
@@ -208,6 +208,47 @@ enum Cmd {
         /// Don't merge templates by alignment (Drain's templates only).
         #[arg(long)]
         no_merge: bool,
+        /// Also print each pattern's NFD query.
+        #[arg(long)]
+        queries: bool,
+        /// Print timing to stderr.
+        #[arg(long)]
+        stats: bool,
+    },
+    /// Compare two sets of lines (experimental): two files, or one file's
+    /// lines of two filters (--a, --b). Lines are grouped into patterns across
+    /// both, then what differs is listed: patterns and slot values new in B,
+    /// gone from B, then those more or less often, surest first.
+    Compare {
+        /// A_FILE B_FILE, or one FILE with --a and --b.
+        #[arg(required = true, num_args = 1..=2, value_name = "FILE")]
+        files: Vec<PathBuf>,
+        /// Set A: only the lines matching this NFD filter.
+        #[arg(long = "a", value_name = "FILTER")]
+        a: Option<String>,
+        /// Set B: only the lines matching this NFD filter.
+        #[arg(long = "b", value_name = "FILTER")]
+        b: Option<String>,
+        /// Both sets: only the lines matching this NFD filter.
+        #[arg(long = "in", value_name = "FILTER")]
+        within: Option<String>,
+        /// Group this field's text (default: `payload` if the file has it,
+        /// else the line).
+        #[arg(long)]
+        field: Option<String>,
+        /// How alike a message must be to join a template (0–1).
+        #[arg(long, default_value_t = 0.5)]
+        similarity: f32,
+        /// Don't merge templates by alignment.
+        #[arg(long)]
+        no_merge: bool,
+        /// Only changes at least this sure (new and gone ones are always
+        /// shown): G², 3.84 is p = 0.05, 10.8 is p = 0.001.
+        #[arg(long, default_value_t = 10.8)]
+        min_score: f64,
+        /// Print at most this many differences (0: all).
+        #[arg(short = 'n', long, default_value_t = 30)]
+        top: usize,
         /// Also print each pattern's NFD query.
         #[arg(long)]
         queries: bool,
@@ -996,6 +1037,110 @@ fn open(paths: &[PathBuf]) -> Result<Opened> {
     Ok(view)
 }
 
+/// `nerka compare`: two files, or one with a filter per set.
+#[allow(clippy::too_many_arguments)]
+fn compare(
+    files: &[PathBuf],
+    filters: [Option<String>; 2],
+    within: Option<String>,
+    options: PatternOptions,
+    min_score: f64,
+    top: usize,
+    queries: bool,
+    stats: bool,
+    out: &mut impl Write,
+) -> Result<()> {
+    if files.len() == 1 && filters.iter().any(Option::is_none) {
+        anyhow::bail!("one file: give a filter per set (--a FILTER --b FILTER), or two files");
+    }
+    let views: Vec<Opened> = files.iter().map(|f| open(std::slice::from_ref(f))).collect::<Result<_>>()?;
+    let view = |side: usize| &views[side.min(views.len() - 1)];
+    // A side's lines: its filter and --in, both.
+    let mut lines: [Option<Vec<LineNo>>; 2] = [None, None];
+    for (side, filter) in filters.iter().enumerate() {
+        let q = match (filter, &within) {
+            (Some(f), Some(w)) => Some(format!("({w}) AND ({f})")),
+            (Some(f), None) => Some(f.clone()),
+            (None, w) => w.clone(),
+        };
+        if let Some(q) = q {
+            let v = view(side);
+            let f = &*v.source;
+            lines[side] = Some(search(f, &with_marks(Filter::Query(compile(&q, f)?), v)?, &Progress::new())?.lines);
+        }
+    }
+    let set = |side: usize| pattern::Set { source: &*view(side).source, lines: lines[side].as_deref() };
+    let t = Instant::now();
+    let ps = pattern::compare(set(0), set(1), &options, &Progress::new())?;
+    let diffs = pattern::differences(&ps, min_score);
+    let took = t.elapsed();
+    let name = |side: usize| {
+        let v = view(side);
+        let file = v.paths.first().map(|p| p.display().to_string()).unwrap_or_default();
+        match &filters[side] {
+            Some(f) => format!("{file} where {f}"),
+            None => file,
+        }
+    };
+    writeln!(out, "A: {} ({} lines)", name(0), ps.lines[0])?;
+    writeln!(out, "B: {} ({} lines)", name(1), ps.lines[1])?;
+    let shown = if top == 0 { diffs.len() } else { top.min(diffs.len()) };
+    let mut section = None;
+    for d in &diffs[..shown] {
+        if section != Some(d.change()) {
+            section = Some(d.change());
+            let title = match d.change() {
+                pattern::Change::New => "New in B".to_owned(),
+                pattern::Change::Gone => "Gone from B".to_owned(),
+                pattern::Change::Changed => format!("Changed (score {min_score} or more)"),
+            };
+            writeln!(
+                out,
+                "
+{title}
+{:>9} {:>8} {:>8} {:>7}  {:<9} pattern",
+                "score", "A", "B", "change", "first"
+            )?;
+        }
+        let p = &ps.patterns[d.pattern];
+        let change = match d.counts {
+            [0, _] => "new".to_owned(),
+            [_, 0] => "gone".to_owned(),
+            _ => format!("×{:.2}", d.ratio()),
+        };
+        // Where to look: the side it's on, or grew on.
+        let side = match d.change() {
+            pattern::Change::New => 1,
+            pattern::Change::Gone => 0,
+            pattern::Change::Changed => usize::from(d.ratio() >= 1.0),
+        };
+        let (sides, what) = match d.value {
+            None => (&p.sides, p.template()),
+            Some((s, v)) => {
+                let value = &p.slots().nth(s).expect("a slot").values[v];
+                (&value.sides, format!("{}  → slot {}: {}", p.template(), s + 1, value.value()))
+            }
+        };
+        let first = format!("{}:{}", ["A", "B"][side], sides[side].first + 1);
+        let fields: String = p.fields.iter().map(|(n, v)| format!("{n}={v} ")).collect();
+        writeln!(out, "{:>9.1} {:>8} {:>8} {change:>7}  {first:<9} {fields}{what}", d.score, d.counts[0], d.counts[1])?;
+        if queries {
+            writeln!(out, "{:47}{}", "", ps.query(p))?;
+        }
+    }
+    if shown < diffs.len() {
+        writeln!(out, "… {} more (-n 0: all)", diffs.len() - shown)?;
+    }
+    if diffs.is_empty() {
+        writeln!(out, "nothing new or gone, and no change scoring {min_score} or more")?;
+    }
+    if stats {
+        out.flush()?;
+        eprintln!("{} patterns, {} differences | grouped and compared in {took:.2?}", ps.patterns.len(), diffs.len());
+    }
+    Ok(())
+}
+
 /// One file, or several as one view (review 2026-11-09, R6: the console
 /// opened one file): one after another in the order given, or merged by
 /// time with `--merge`; files of kinds that don't go together are refused.
@@ -1259,7 +1404,7 @@ fn run() -> Result<()> {
             let mut ps = nerka_core::pattern::detect(f, lines.as_deref(), &options, &Progress::new())?;
             let took = t.elapsed();
             if rare {
-                ps.patterns.sort_by(|a, b| a.count.cmp(&b.count).then(a.first.cmp(&b.first)));
+                ps.patterns.sort_by(|a, b| a.count().cmp(&b.count()).then(a.first().cmp(&b.first())));
             }
             let at = locator(f);
             let shown = if top == 0 { ps.patterns.len() } else { top.min(ps.patterns.len()) };
@@ -1272,25 +1417,26 @@ fn run() -> Result<()> {
                 }
             };
             for p in &ps.patterns[..shown] {
-                let first = place(p.first);
-                let share = 100.0 * p.count as f64 / ps.lines.max(1) as f64;
-                write!(out, "{:>9} {share:>5.1}%  {first:>7}  ", p.count)?;
+                let first = place(p.first());
+                let share = 100.0 * p.count() as f64 / ps.total().max(1) as f64;
+                write!(out, "{:>9} {share:>5.1}%  {first:>7}  ", p.count())?;
                 for (name, value) in &p.fields {
                     write!(out, "{name}={value} ")?;
                 }
-                writeln!(out, "{}", p.template())?;
+                let unsorted = if p.unsorted { "  (not sorted: too many kinds of lines)" } else { "" };
+                writeln!(out, "{}{unsorted}", p.template())?;
                 if values {
                     for (k, s) in p.slots().enumerate() {
                         let kind = if s.is_state() { "state" } else { "values" };
                         let more = if s.overflow { ", more not kept" } else { "" };
                         writeln!(out, "{:28}slot {} ({kind}{more}):", "", k + 1)?;
                         for v in &s.values {
-                            let lines = if v.first == v.last {
-                                place(v.first)
+                            let lines = if v.first() == v.last() {
+                                place(v.first())
                             } else {
-                                format!("{}–{}", place(v.first), place(v.last))
+                                format!("{}–{}", place(v.first()), place(v.last()))
                             };
-                            writeln!(out, "{:30}{:>9}  {:<24} {lines}", "", v.count, v.value())?;
+                            writeln!(out, "{:30}{:>9}  {:<24} {lines}", "", v.count(), v.value())?;
                         }
                     }
                 }
@@ -1306,10 +1452,23 @@ fn run() -> Result<()> {
                 eprintln!(
                     "{} patterns in {} lines | index {:.2?} | patterns {took:.2?}",
                     ps.patterns.len(),
-                    ps.lines,
+                    ps.total(),
                     view.took
                 );
             }
+        }
+        Cmd::Compare { files, a, b, within, field, similarity, no_merge, min_score, top, queries, stats } => {
+            compare(
+                &files,
+                [a, b],
+                within,
+                PatternOptions { field, similarity, merge: !no_merge },
+                min_score,
+                top,
+                queries,
+                stats,
+                &mut out,
+            )?;
         }
         Cmd::Expand { picks, parts } => {
             if picks.is_empty() {
