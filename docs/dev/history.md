@@ -4,6 +4,8 @@ The dated log of the project, newest first; append-only: add an entry at the top
 
 ## 2026-11-23
 
+Patterns (experimental, branch `claude/patterns`, CLI only): `nerka patterns` (message templates with their states) and `nerka compare` (patterns and state values new, gone or changed between two sets, e.g. two lifecycles), scored on LogHub-2.0's labelled samples (`core/examples/loghub_bench.rs`). The GUI for them is designed, not built: `patterns.md` (owner: not computed until asked; compare chooses its content and ignores the unwanted; a tuning pane and scoped rules for the alpha rounds), with six questions open.
+
 Filtering before background work (owner: filtering takes precedence, above all when I/O is slow; branch `claude/nfs-first-open-1722ad`): signals, checks and plot lanes run on an idle-priority pool that waits while an open, filter or search runs. Measured over loopback NFS in the Linux VM (`features.md`). The owner's "first open over NFS slow until Reload" is not reproduced yet: questions in `status.md`.
 
 ## 2026-11-22
