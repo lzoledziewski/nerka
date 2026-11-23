@@ -33,6 +33,7 @@
 
 mod bundles;
 mod checks;
+mod compare;
 mod console;
 mod icon;
 mod icon_art;
@@ -1418,6 +1419,30 @@ impl Tab {
 
     fn is_busy(&self) -> bool {
         self.loading.is_some() || !self.stage_jobs.is_empty() || self.signals_job.is_some() || self.patterns.is_busy()
+    }
+
+    /// The tab as the Patterns window sees it, once its file is read.
+    fn tab_ref(&self) -> Option<patterns::TabRef> {
+        let file = self.file.clone()?;
+        let lifecycles = self
+            .signals
+            .lifecycles()
+            .filter_map(|d| {
+                Some(patterns::LifeRef {
+                    name: d.name().to_owned(),
+                    lines: d.lines().and_then(|r| r.query()).map(|q| q.source().to_owned()),
+                    found: d.cached(&*file)?,
+                })
+            })
+            .collect();
+        Some(patterns::TabRef {
+            id: self.patterns.id(),
+            title: self.title(),
+            kept: self.session.result().cloned(),
+            cx: self.session.context().clone(),
+            lifecycles,
+            file,
+        })
     }
 
     fn cancel_jobs(&mut self) {
@@ -4389,34 +4414,28 @@ impl App {
         }
     }
 
-    /// Record a filter in the filter history.
     /// Each tab's Patterns window that is open, and what it asks of its
-    /// tab: go to a line (the tab comes to the front), a query to filter or
-    /// search by.
+    /// tab: go to a line (of its tab, or another's in a compare: that tab
+    /// comes to the front), a query to filter or search by.
     fn patterns_windows(&mut self, ctx: &egui::Context) {
+        if !self.tabs.iter().any(|t| t.patterns.open) {
+            return;
+        }
         let name = self.window_name.clone();
+        let refs: Vec<patterns::TabRef> = self.tabs.iter().filter_map(Tab::tab_ref).collect();
         let mut asked = Vec::new();
         for (i, t) in self.tabs.iter_mut().enumerate() {
             if !t.patterns.open {
                 continue;
             }
-            let Some(file) = t.file.clone() else { continue };
+            let Some(me) = refs.iter().find(|r| r.id == t.patterns.id()) else { continue };
             let title = match name.as_deref().map(str::trim).filter(|n| !n.is_empty()) {
-                Some(n) => format!("{n} · Patterns · {} — nerka", t.title()),
-                None => format!("Patterns · {} — nerka", t.title()),
+                Some(n) => format!("{n} · Patterns · {} — nerka", me.title),
+                None => format!("Patterns · {} — nerka", me.title),
             };
-            let lifecycles: Vec<(String, usize)> = t
-                .signals
-                .lifecycles()
-                .filter_map(|d| Some((d.name().to_owned(), d.cached(&*file)?.lives.len())))
-                .collect();
-            let session = &t.session;
-            let compile = |q: &str| session.compile(q).map(Filter::Query).map_err(|e| e.to_string());
             let input = patterns::Input {
-                file: &file,
-                kept: t.session.result(),
-                lifecycles,
-                compile: &compile,
+                tab: me,
+                tabs: &refs,
                 signals_gen: t.signals_gen,
                 title,
                 config: nerka_core::pattern::PatternConfig::load_saved,
@@ -4445,11 +4464,17 @@ impl App {
         i: usize,
         out: patterns::Output,
     ) -> (Option<String>, Option<String>) {
+        if let Some((id, line)) = out.goto
+            && let Some(j) = self.tabs.iter().position(|t| t.patterns.id() == id)
+        {
+            self.active = j;
+            self.tabs[j].goto_line(line);
+        }
+        if out.filter.is_none() && out.search.is_none() {
+            return (None, None);
+        }
         let Some(t) = self.tabs.get_mut(i) else { return (None, None) };
         self.active = i;
-        if let Some(line) = out.goto {
-            t.goto_line(line);
-        }
         let mut filtered = None;
         if let Some(q) = out.filter {
             t.mode = Mode::Query;
@@ -4470,6 +4495,7 @@ impl App {
         (filtered, searched)
     }
 
+    /// Record a filter in the filter history.
     fn record_search(&mut self, tag: &str, pattern: &str) {
         if self.history.push(tag, pattern)
             && let Some(path) = history_path()
@@ -5860,6 +5886,11 @@ impl App {
                 self.show_checks = true;
                 tab.checks_ui.selected = Some((name, 0));
             }
+            // A lifecycle compared with the one before (patterns, α2).
+            if let Some((life, n)) = &out.compare {
+                tab.patterns.open = true;
+                tab.patterns.compare.lifecycles(life, n - 1, *n);
+            }
             // A lifecycle's checks: the pane, on its first issue (else result).
             if let Some((life, n)) = out.checks {
                 self.show_checks = true;
@@ -6928,7 +6959,8 @@ gear=D
         let gear = ps.patterns.iter().find(|p| p.template() == "gear {D|P}").expect("gear");
         let q = ps.query(gear);
         app.active = 1;
-        let out = patterns::Output { goto: Some(8), filter: Some(q.clone()), search: None };
+        let out =
+            patterns::Output { goto: Some((app.tabs[0].patterns.id(), 8)), filter: Some(q.clone()), search: None };
         let (filtered, searched) = app.apply_patterns(&ctx, 0, out);
         assert_eq!((filtered.as_deref(), searched), (Some(q.as_str()), None));
         assert_eq!(app.active, 0);

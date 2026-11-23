@@ -454,6 +454,26 @@ impl Patterns {
         self.lines[0] + self.lines[1]
     }
 
+    /// A configuration rule leaving `p`'s lines out ([`PatternConfig`]):
+    /// scoped by the fields that tell it apart, its messages by its regex
+    /// (`apid == "NAV": ignore /^\s*heartbeat\s*$/`).
+    pub fn ignore_rule(&self, p: &Pattern) -> String {
+        let quote = |v: &str| {
+            let mut q = String::from('"');
+            for c in v.chars() {
+                if c == '"' || c == '\\' {
+                    q.push('\\');
+                }
+                q.push(c);
+            }
+            q.push('"');
+            q
+        };
+        let scope: Vec<String> = p.fields.iter().map(|(n, v)| format!("{n} == {}", quote(v))).collect();
+        let scope = if scope.is_empty() { "*".to_owned() } else { scope.join(" AND ") };
+        format!("{scope}: ignore /{}/", p.regex().replace('/', "\\/"))
+    }
+
     /// NFD finding the lines of `p`, e.g. `apid == "NAV" AND payload ~ /^…$/`.
     pub fn query(&self, p: &Pattern) -> String {
         let mut q = String::new();
@@ -2895,6 +2915,26 @@ mod tests {
         assert_eq!(m("id=ECU12,v=17", r"*: literal /ECU\d+/"), "id=ECU12,v=<*>");
         assert_eq!(m("to=db.example.com:5432", r"*: value /[a-z]+(\.[a-z]+)+/"), "to=<*>:<*>");
         assert_eq!(m("peer=10.0.0.1", r"*: value /zzz/"), "peer=<*>");
+    }
+
+    #[test]
+    fn a_patterns_ignore_rule_leaves_it_out() {
+        let row = |text, apid| Row { text, apid: Some(apid), mcnt: None, level: None };
+        let s = MemSource::new(vec![
+            row("speed 10 km/h", "NAV"),
+            row("speed 12 km/h", "NAV"),
+            row("door \"a/b\" open", "BODY"),
+            row("door \"a/b\" closed", "BODY"),
+            row("speed 11 km/h", "SEAT"),
+        ]);
+        let ps = detect_all(&s);
+        assert_eq!(templates(&ps), ["speed <*> km/h", "door \"a/b\" <*>", "speed <*> km/h"]);
+        let rule = ps.ignore_rule(&ps.patterns[0]);
+        assert_eq!(rule, r#"apid == "NAV": ignore /^\s*speed\s+[\w.:\-]+\s+km\/h\s*$/"#);
+        let t = templates(&detect_with(&s, &rule));
+        assert_eq!(t, ["door \"a/b\" <*>", "speed <*> km/h"]);
+        let t = templates(&detect_with(&s, &ps.ignore_rule(&ps.patterns[1])));
+        assert_eq!(t, ["speed <*> km/h", "speed <*> km/h"]);
     }
 
     #[test]

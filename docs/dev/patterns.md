@@ -172,6 +172,22 @@ A: [Lifecycle ecu1 #2 (planned) ▾]   B: [Lifecycle ecu1 #3 (crash) ▾]   [▶
   side's lifecycles a pattern or value appears (`3/3` against `0/5`),
   which tells a constant symptom from a one-off.
 
+As built (2026-11-24, α2; `ui/src/compare.rs`): **⚖ Compare** is a mode of
+the Patterns window (beside 🧩 Patterns), not a window of its own. A side
+is all lines, the filter result, a typed filter, lifecycles of `@name` by
+number (`2`, `2, 5-7`) or every one of an outcome, or another tab (all its
+lines or its filter result); a lifecycle side takes its lifecycles' own
+lines (its lines rule), as the Signals panel's ▾ filter does. Only and
+Ignore are typed NFD (library picks not yet). **Ignore this pattern /
+value** hides the row, remembered by its template for this window's
+session (so it stays hidden when compared again), with **Show ignored**;
+it doesn't change the Ignore filter. **Save as ignore rule** (patterns
+only) appends `SCOPE: ignore /REGEX/` to the configuration file
+(`Patterns::ignore_rule`, `PatternConfig::append_saved`). The presence
+(`A 3/3 · B 0/5`) shows on pattern rows (values: not yet). The Signals
+panel's lifecycle rows have **⚖** (from #2): compare with the one before,
+run at once. Changing the minimum score filters the rows without a new run.
+
 ## The tuning pane (🛠)
 
 For the alpha rounds; visible in alpha builds, behind ⚙ Settings →
@@ -236,3 +252,26 @@ always saved; groups of lifecycles come with the first compare; `keep
 WORD` is strict; after the alphas the tuning pane is behind a Settings
 switch, off by default; the configuration is one global file, moved and
 shared with settings bundles (not per pack).
+
+## Assumptions to review (2026-11-24)
+
+Taken while building the rounds unattended (owner, 2026-11-24: "you can
+take assumptions, let me review them in the morning"); each is a small
+change if it should be otherwise.
+
+1. Rules: of those setting one thing (`max-slots`, `no-merge`, `set`) the
+   first that applies counts; list rules (`keep`, `value`, `literal`,
+   `apart`, `header`, `ignore`) add up.
+2. `state-values` is 2–16: a slot keeps 16 values while grouping (more
+   would cost time on every line).
+3. Lines… of a pattern are shown in the Patterns window (▸), not in the
+   bottom pane, which keeps the search hits.
+4. Compare is a mode of the Patterns window, not a window of its own.
+5. Ignoring a row in Compare hides it (by template, for the window's
+   session); it doesn't rewrite the Ignore filter. Save as ignore rule
+   writes a regex rule scoped by the pattern's telling fields.
+6. A lifecycle side takes the lifecycles' own lines (their lines rule).
+7. Presence (`3/3`) is shown for patterns, not for values.
+8. Signals panel: ⚖ on a lifecycle row compares it with the one before and
+   runs at once (the plan said a right-click menu; rows have buttons, not
+   menus, so a button).

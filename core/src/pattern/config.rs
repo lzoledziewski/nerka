@@ -310,6 +310,34 @@ impl PatternConfig {
         }
     }
 
+    /// Add `line` (a setting or rule, checked first) at the end of the
+    /// saved configuration; returns its file.
+    pub fn append_saved(line: &str) -> Result<std::path::PathBuf, String> {
+        PatternConfig::default().add_line(line)?;
+        let path = Self::saved_path().ok_or("no configuration folder (APPDATA, XDG_CONFIG_HOME or HOME)")?;
+        Self::append_to(&path, line)?;
+        Ok(path)
+    }
+
+    fn append_to(path: &std::path::Path, line: &str) -> Result<(), String> {
+        let mut text = match std::fs::read_to_string(path) {
+            Ok(t) => t,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                "# nerka pattern configuration: settings and rules (docs: cli.md)\n".to_owned()
+            }
+            Err(e) => return Err(format!("{}: {e}", path.display())),
+        };
+        if !text.is_empty() && !text.ends_with('\n') {
+            text.push('\n');
+        }
+        text.push_str(line.trim());
+        text.push('\n');
+        // The whole file still reads: a line can't break it.
+        Self::parse(&text).map_err(|e| format!("{}: {e}", path.display()))?;
+        path.parent().map_or(Ok(()), std::fs::create_dir_all).map_err(|e| format!("{}: {e}", path.display()))?;
+        crate::write_atomic(path, text).map_err(|e| format!("{}: {e}", path.display()))
+    }
+
     /// Where it is saved.
     pub fn saved_path() -> Option<std::path::PathBuf> {
         crate::config_dir().map(|d| d.join("patterns"))
@@ -746,6 +774,22 @@ ctid == TCP: set similarity 0.7
         assert_eq!((a.s.similarity, a.s.merge), (0.6, false));
         let b = c.local(&names, &[Some(b"B")]);
         assert_eq!((b.s.similarity, b.s.merge), (0.8, false));
+    }
+
+    #[test]
+    fn a_line_is_appended_to_the_file() {
+        let dir = std::env::temp_dir().join(format!("nerka-patterns-append-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("nerka").join("patterns");
+        PatternConfig::append_to(&path, "*: ignore /heartbeat/").unwrap();
+        std::fs::write(&path, std::fs::read_to_string(&path).unwrap() + "similarity 0.6").unwrap();
+        PatternConfig::append_to(&path, "apid == NAV: keep Elapsed").unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.starts_with("# nerka pattern configuration"), "{text}");
+        assert!(text.ends_with("*: ignore /heartbeat/\nsimilarity 0.6\napid == NAV: keep Elapsed\n"), "{text}");
+        let c = PatternConfig::parse(&text).unwrap();
+        assert_eq!((c.rules.len(), c.settings.similarity), (2, 0.6));
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

@@ -9,10 +9,12 @@
 //! again, other lines, another field, the configuration or the signals
 //! changed.
 
+use crate::compare::CompareUi;
 use crate::job::{Job, Poll};
 use eframe::egui::{self, Color32, RichText};
+use nerka_core::lifecycle::Lifecycles;
 use nerka_core::pattern::{self, Pattern, PatternConfig, PatternOptions, Patterns, Piece};
-use nerka_core::{Filter, LineNo, LogSource, SearchResult};
+use nerka_core::{Filter, LineNo, LogSource, QueryContext, SearchResult};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -92,6 +94,14 @@ impl Key {
     }
 }
 
+/// What the window shows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Mode {
+    #[default]
+    Patterns,
+    Compare,
+}
+
 /// A finished run.
 struct Run {
     patterns: Patterns,
@@ -104,6 +114,8 @@ struct Run {
 /// A tab's Patterns window and its last result.
 pub struct PatternsUi {
     pub open: bool,
+    pub mode: Mode,
+    pub compare: CompareUi,
     /// Its window's id: the tab's, for as long as the tab lives.
     id: u64,
     from: From,
@@ -128,6 +140,8 @@ impl Default for PatternsUi {
         static NEXT: AtomicU64 = AtomicU64::new(1);
         PatternsUi {
             open: false,
+            mode: Mode::Patterns,
+            compare: CompareUi::default(),
             id: NEXT.fetch_add(1, Ordering::Relaxed),
             from: From::All,
             query: String::new(),
@@ -143,15 +157,51 @@ impl Default for PatternsUi {
     }
 }
 
-/// What the window needs of its tab.
-pub struct Input<'a> {
-    pub file: &'a Arc<dyn LogSource>,
+/// A tab as the window sees it.
+pub struct TabRef {
+    /// Its Patterns window's id, which names the tab.
+    pub id: u64,
+    pub title: String,
+    pub file: Arc<dyn LogSource>,
     /// The filter result (none: no filter).
-    pub kept: Option<&'a Arc<SearchResult>>,
-    /// Lifecycle signals found: name, how many.
-    pub lifecycles: Vec<(String, usize)>,
-    /// An NFD filter compiled with the tab's signals and bookmarks.
-    pub compile: &'a dyn Fn(&str) -> Result<Filter, String>,
+    pub kept: Option<Arc<SearchResult>>,
+    /// Its signals and bookmarks, to compile filters with.
+    pub cx: QueryContext,
+    /// Its lifecycles found.
+    pub lifecycles: Vec<LifeRef>,
+}
+
+/// The lifecycles of a `@name` found in a tab.
+pub struct LifeRef {
+    pub name: String,
+    /// Its lines rule as NFD, if it has one.
+    pub lines: Option<String>,
+    pub found: Arc<Lifecycles>,
+}
+
+impl TabRef {
+    /// An NFD filter, compiled with the tab's signals and bookmarks.
+    pub fn compile(&self, nfd: &str) -> Result<Filter, String> {
+        self.cx.compile(nfd, &*self.file).map(Filter::Query).map_err(|e| e.to_string())
+    }
+
+    /// NFD of the lines of lifecycles `numbers` of `l` (its own lines, by
+    /// its lines rule, as the Signals panel filters to one).
+    pub fn lifecycle_nfd(&self, l: &LifeRef, numbers: &[u32]) -> String {
+        let one: Vec<String> = numbers.iter().map(|n| format!("@{} == {n}", l.name)).collect();
+        let mut nfd = if one.len() == 1 { one[0].clone() } else { format!("({})", one.join(" OR ")) };
+        if let Some(lines) = &l.lines {
+            nfd += &format!(" AND ({lines})");
+        }
+        nfd
+    }
+}
+
+/// What the window needs: its tab, every tab (Compare reads others), and
+/// how to read the configuration.
+pub struct Input<'a> {
+    pub tab: &'a TabRef,
+    pub tabs: &'a [TabRef],
     pub signals_gen: u64,
     /// The window's title.
     pub title: String,
@@ -162,7 +212,8 @@ pub struct Input<'a> {
 /// What the window asks of its tab.
 #[derive(Debug, Default, PartialEq)]
 pub struct Output {
-    pub goto: Option<LineNo>,
+    /// A line of a tab (by its id) to go to.
+    pub goto: Option<(u64, LineNo)>,
     /// An NFD query for the Filter box, to run.
     pub filter: Option<String>,
     /// An NFD query for the Search box, to run.
@@ -175,10 +226,16 @@ impl PatternsUi {
         if let Some((j, _, _)) = self.job.take() {
             j.cancel();
         }
+        self.compare.cancel();
     }
 
     pub fn is_busy(&self) -> bool {
-        self.job.is_some()
+        self.job.is_some() || self.compare.is_busy()
+    }
+
+    /// Its id: the tab's in [`TabRef::id`].
+    pub fn id(&self) -> u64 {
+        self.id
     }
 
     /// The configuration file's stamp, looked at once a second.
@@ -195,10 +252,10 @@ impl PatternsUi {
 
     fn key(&mut self, input: &Input) -> Key {
         Key {
-            file: Arc::as_ptr(input.file) as *const u8 as usize,
+            file: Arc::as_ptr(&input.tab.file) as *const u8 as usize,
             from: self.from.clone(),
             query: self.query.trim().to_owned(),
-            kept: input.kept.map_or(0, |r| Arc::as_ptr(r) as usize),
+            kept: input.tab.kept.as_ref().map_or(0, |r| Arc::as_ptr(r) as usize),
             field: self.field.clone(),
             config: self.config_stamp(),
             signals: input.signals_gen,
@@ -223,11 +280,18 @@ impl PatternsUi {
         }
         let (lines, what) = match &self.from {
             From::All => (Lines::All, "all lines".to_owned()),
-            From::Filter => match input.kept {
+            From::Filter => match &input.tab.kept {
                 Some(r) => (Lines::Kept(r.clone()), "the filter result".to_owned()),
                 None => (Lines::All, "all lines (no filter)".to_owned()),
             },
-            From::Lifecycle(name, n) => match (input.compile)(&format!("@{name} == {n}")) {
+            From::Lifecycle(name, n) => match input
+                .tab
+                .lifecycles
+                .iter()
+                .find(|l| l.name == *name)
+                .ok_or_else(|| "not found (yet)".to_owned())
+                .and_then(|l| input.tab.compile(&input.tab.lifecycle_nfd(l, &[*n as u32])))
+            {
                 Ok(f) => (Lines::Search(f), format!("lifecycle @{name} #{n}")),
                 Err(e) => {
                     self.error = Some(format!("Lifecycle @{name}: {e}"));
@@ -240,7 +304,7 @@ impl PatternsUi {
                     self.error = Some("Type a filter for the lines to group, e.g. @ecu1 == 2".into());
                     return;
                 }
-                match (input.compile)(q) {
+                match input.tab.compile(q) {
                     Ok(f) => (Lines::Search(f), q.to_owned()),
                     Err(e) => {
                         self.error = Some(e);
@@ -251,7 +315,7 @@ impl PatternsUi {
         };
         let field = (!self.field.is_empty()).then(|| self.field.clone());
         let options = PatternOptions { field, lines: true, config };
-        let file = input.file.clone();
+        let file = input.tab.file.clone();
         let key = self.key(input);
         let job = Job::spawn(ctx, move |progress| {
             let found;
@@ -290,7 +354,8 @@ impl PatternsUi {
             return out;
         }
         self.poll();
-        if self.job.is_some() {
+        self.compare.poll();
+        if self.is_busy() {
             ctx.request_repaint_after(Duration::from_millis(100));
         }
         let id = egui::ViewportId::from_hash_of(("nerka-patterns", self.id));
@@ -307,6 +372,19 @@ impl PatternsUi {
     }
 
     fn contents(&mut self, ui: &mut egui::Ui, input: &Input, out: &mut Output) {
+        ui.horizontal(|ui| {
+            ui.selectable_value(&mut self.mode, Mode::Patterns, RichText::new("🧩 Patterns").strong())
+                .on_hover_text("This tab's lines grouped into patterns");
+            ui.selectable_value(&mut self.mode, Mode::Compare, RichText::new("⚖ Compare").strong())
+                .on_hover_text("What differs between two sets of lines: lifecycles, filters, tabs");
+        });
+        ui.separator();
+        if self.mode == Mode::Compare || self.compare.pending {
+            self.mode = Mode::Compare;
+            let config = self.config_stamp();
+            self.compare.ui(ui, input, config, out);
+            return;
+        }
         self.choices(ui, input);
         ui.horizontal(|ui| {
             if let Some((job, _, what)) = &self.job {
@@ -351,7 +429,7 @@ impl PatternsUi {
                 );
             }
             None => {}
-            Some(_) => self.list(ui, &**input.file, out),
+            Some(_) => self.list(ui, input.tab, out),
         }
     }
 
@@ -361,7 +439,7 @@ impl PatternsUi {
             ui.label("Lines:");
             let shown = match &self.from {
                 From::All => "All lines".to_owned(),
-                From::Filter => match input.kept {
+                From::Filter => match &input.tab.kept {
                     Some(r) => format!("Filter result ({} lines)", r.lines.len()),
                     None => "Filter result (no filter: all lines)".to_owned(),
                 },
@@ -371,17 +449,18 @@ impl PatternsUi {
             egui::ComboBox::from_id_salt("patterns-from").selected_text(shown).show_ui(ui, |ui| {
                 ui.selectable_value(&mut self.from, From::All, "All lines");
                 ui.selectable_value(&mut self.from, From::Filter, "Filter result");
-                for (name, _) in &input.lifecycles {
-                    let here = matches!(&self.from, From::Lifecycle(n, _) if n == name);
-                    if ui.selectable_label(here, format!("Lifecycle @{name}")).clicked() && !here {
-                        self.from = From::Lifecycle(name.clone(), 1);
+                for l in &input.tab.lifecycles {
+                    let here = matches!(&self.from, From::Lifecycle(n, _) if *n == l.name);
+                    if ui.selectable_label(here, format!("Lifecycle @{}", l.name)).clicked() && !here {
+                        self.from = From::Lifecycle(l.name.clone(), 1);
                     }
                 }
                 ui.selectable_value(&mut self.from, From::Query, "Lines of a filter…");
             });
             match &mut self.from {
                 From::Lifecycle(name, n) => {
-                    let count = input.lifecycles.iter().find(|(l, _)| l == name).map_or(0, |(_, c)| *c);
+                    let count =
+                        input.tab.lifecycles.iter().find(|l| l.name == *name).map_or(0, |l| l.found.lives.len());
                     ui.label("#");
                     ui.add(egui::DragValue::new(n).range(1..=count.max(1)));
                     ui.weak(format!("of {count}"));
@@ -397,7 +476,7 @@ impl PatternsUi {
             }
             ui.separator();
             ui.label("Field:");
-            let schema = input.file.schema();
+            let schema = input.tab.file.schema();
             let shown = if self.field.is_empty() { "Default".to_owned() } else { self.field.clone() };
             egui::ComboBox::from_id_salt("patterns-field").selected_text(shown).show_ui(ui, |ui| {
                 ui.selectable_value(&mut self.field, String::new(), "Default")
@@ -411,7 +490,7 @@ impl PatternsUi {
     }
 
     /// The patterns, sorted, the unfolded ones with their slots and lines.
-    fn list(&mut self, ui: &mut egui::Ui, file: &dyn LogSource, out: &mut Output) {
+    fn list(&mut self, ui: &mut egui::Ui, tab: &TabRef, out: &mut Output) {
         let Some(run) = &self.run else { return };
         let ps = &run.patterns;
         let mut order: Vec<usize> = (0..ps.patterns.len()).collect();
@@ -438,20 +517,8 @@ impl PatternsUi {
                     {
                         toggle = Some(k);
                     }
-                    let share = 100.0 * p.count() as f64 / total as f64;
-                    ui.monospace(format!("{share:>5.1}% {:>9}", p.count()));
-                    for (name, value) in &p.fields {
-                        ui.label(RichText::new(format!("{name}={value}")).color(weak));
-                    }
-                    let mut tip =
-                        format!("First line {}, last {}. Click: go to the first.", p.first() + 1, p.last() + 1);
-                    if p.unsorted {
-                        tip += "\nNot sorted: lines that fit no pattern (too many kinds of lines).";
-                    }
-                    let job = template_job(p, ui.visuals().text_color(), weak, state);
-                    if ui.add(egui::Label::new(job).sense(egui::Sense::click())).on_hover_text(tip).clicked() {
-                        out.goto = Some(p.first());
-                    }
+                    // The buttons first, at the right: a long template is
+                    // cut, not drawn under them.
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         let q = ps.query(p);
                         if ui.small_button("📋").on_hover_text(format!("Copy its query:\n{q}")).clicked() {
@@ -467,11 +534,32 @@ impl PatternsUi {
                         if ui.small_button("▾ Filter").on_hover_text(format!("Filter to its lines:\n{q}")).clicked() {
                             out.filter = Some(q);
                         }
+                        ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                            let share = 100.0 * p.count() as f64 / total as f64;
+                            ui.monospace(format!("{share:>5.1}% {:>9}", p.count()));
+                            for (name, value) in &p.fields {
+                                ui.label(RichText::new(format!("{name}={value}")).color(weak));
+                            }
+                            let mut tip = format!(
+                                "{}\nFirst line {}, last {}. Click: go to the first.",
+                                p.template(),
+                                p.first() + 1,
+                                p.last() + 1
+                            );
+                            if p.unsorted {
+                                tip += "\nNot sorted: lines that fit no pattern (too many kinds of lines).";
+                            }
+                            let job = template_job(p, ui.visuals().text_color(), weak, state);
+                            let label = egui::Label::new(job).sense(egui::Sense::click()).truncate();
+                            if ui.add(label).on_hover_text(tip).clicked() {
+                                out.goto = Some((tab.id, p.first()));
+                            }
+                        });
                     });
                 });
                 if let Some(n) = open {
                     ui.indent(("pattern", k), |ui| {
-                        if let Some(more) = unfolded(ui, p, n, file, out) {
+                        if let Some(more) = unfolded(ui, p, n, tab, out) {
                             more_lines = Some((k, more));
                         }
                     });
@@ -500,7 +588,8 @@ impl PatternsUi {
 
 /// An unfolded pattern: its slots' values and its first `lines` lines.
 /// Returns how many lines to show next, if "more" was clicked.
-fn unfolded(ui: &mut egui::Ui, p: &Pattern, lines: usize, file: &dyn LogSource, out: &mut Output) -> Option<usize> {
+fn unfolded(ui: &mut egui::Ui, p: &Pattern, lines: usize, tab: &TabRef, out: &mut Output) -> Option<usize> {
+    let file = &*tab.file;
     for (i, s) in p.slots().enumerate() {
         let kind = if s.is_state() { "state" } else { "values" };
         let more = if s.overflow { ", more not kept" } else { "" };
@@ -510,10 +599,10 @@ fn unfolded(ui: &mut egui::Ui, p: &Pattern, lines: usize, file: &dyn LogSource, 
                 ui.monospace(format!("{:>9}", v.count()));
                 ui.label(v.value());
                 if ui.link(format!("first {}", v.first() + 1)).clicked() {
-                    out.goto = Some(v.first());
+                    out.goto = Some((tab.id, v.first()));
                 }
                 if v.last() != v.first() && ui.link(format!("last {}", v.last() + 1)).clicked() {
-                    out.goto = Some(v.last());
+                    out.goto = Some((tab.id, v.last()));
                 }
                 ui.end_row();
             }
@@ -524,7 +613,7 @@ fn unfolded(ui: &mut egui::Ui, p: &Pattern, lines: usize, file: &dyn LogSource, 
     for &l in all.iter().take(lines) {
         ui.horizontal(|ui| {
             if ui.link(format!("{:>8}", l + 1)).clicked() {
-                out.goto = Some(l);
+                out.goto = Some((tab.id, l));
             }
             let text = file.line_text(l).unwrap_or_default();
             let text: String = text.chars().take(300).collect();
@@ -546,7 +635,7 @@ fn unfolded(ui: &mut egui::Ui, p: &Pattern, lines: usize, file: &dyn LogSource, 
 
 /// A pattern's template: text as text (masked values weak), `<*>` weak, a
 /// state's values in `state`'s colour.
-fn template_job(p: &Pattern, text: Color32, weak: Color32, state: Color32) -> egui::text::LayoutJob {
+pub fn template_job(p: &Pattern, text: Color32, weak: Color32, state: Color32) -> egui::text::LayoutJob {
     let mut job = egui::text::LayoutJob::default();
     let font = egui::FontId::monospace(13.0);
     let add = |job: &mut egui::text::LayoutJob, s: &str, c: Color32| {
@@ -604,9 +693,13 @@ mod tests {
         Arc::new(TextFile::from_bytes("t", lines.join("\n").into_bytes()))
     }
 
-    fn input<'a>(f: &'a Arc<dyn LogSource>, compile: &'a dyn Fn(&str) -> Result<Filter, String>) -> Input<'a> {
+    fn tab_of(id: u64, f: Arc<dyn LogSource>) -> TabRef {
+        TabRef { id, title: format!("t{id}"), file: f, kept: None, cx: QueryContext::default(), lifecycles: vec![] }
+    }
+
+    fn input<'a>(tab: &'a TabRef, tabs: &'a [TabRef]) -> Input<'a> {
         let config = || Ok(PatternConfig::default());
-        Input { file: f, kept: None, lifecycles: vec![], compile, signals_gen: 0, title: "Patterns".into(), config }
+        Input { tab, tabs, signals_gen: 0, title: "Patterns".into(), config }
     }
 
     /// Frames of the window until its run is done.
@@ -628,17 +721,16 @@ mod tests {
 
     #[test]
     fn nothing_runs_until_asked_then_the_result_stays() {
-        let f = file();
-        let compile = |q: &str| Err(format!("no queries here: {q}"));
+        let t = [tab_of(1, file())];
         let ctx = egui::Context::default();
         let mut p = PatternsUi { open: true, ..Default::default() };
-        let i = input(&f, &compile);
+        let i = input(&t[0], &t);
         run_until_done(&mut p, &ctx, &i);
         assert!(p.run.is_none() && p.job.is_none());
         p.start(&ctx, &i);
         run_until_done(&mut p, &ctx, &i);
-        let g = file();
-        let now = p.key(&input(&g, &compile));
+        let g = [tab_of(1, file())];
+        let now = p.key(&input(&g[0], &g));
         let run = p.run.as_ref().expect("a result");
         let ts: Vec<String> = run.patterns.patterns.iter().map(Pattern::template).collect();
         assert_eq!(ts, ["gear {D|P|N}", "door {open|closed}"]);
@@ -650,16 +742,55 @@ mod tests {
 
     #[test]
     fn a_typed_filter_that_doesnt_compile_says_why() {
-        let f = file();
-        let compile = |q: &str| Err(format!("bad: {q}"));
+        let t = [tab_of(1, file())];
         let ctx = egui::Context::default();
         let mut p = PatternsUi { open: true, from: From::Query, ..Default::default() };
-        p.start(&ctx, &input(&f, &compile));
+        p.start(&ctx, &input(&t[0], &t));
         assert!(p.error.as_deref().is_some_and(|e| e.contains("e.g. @ecu1")), "{:?}", p.error);
         p.query = "@x == 1".into();
-        p.start(&ctx, &input(&f, &compile));
-        assert_eq!(p.error.as_deref(), Some("bad: @x == 1"));
+        p.start(&ctx, &input(&t[0], &t));
+        assert!(p.error.as_deref().is_some_and(|e| e.contains('x')), "{:?}", p.error);
         assert!(p.job.is_none());
+    }
+
+    /// Compare (α2): another tab against this one's lines of a filter, the
+    /// new message and the new value listed; an ignored row leaves the
+    /// list, and a click on a row's line names its side's tab.
+    #[test]
+    fn compare_two_tabs() {
+        let a = file();
+        let b: Arc<dyn LogSource> = Arc::new(nerka_core::TextFile::from_bytes(
+            "b",
+            [
+                "gear D",
+                "gear P",
+                "gear D",
+                "door open",
+                "door closed",
+                "door open",
+                "gear N",
+                "gear R",
+                "gear R",
+                "panic in task",
+            ]
+            .join("\n")
+            .into_bytes(),
+        ));
+        let tabs = [tab_of(1, b), tab_of(2, a)];
+        let ctx = egui::Context::default();
+        let mut p = PatternsUi { open: true, mode: Mode::Compare, ..Default::default() };
+        p.compare.sides[0] = crate::compare::Side { from: crate::compare::SideFrom::Tab, tab: 2, ..Default::default() };
+        p.compare.sides[1] =
+            crate::compare::Side { from: crate::compare::SideFrom::Query, query: "/./".into(), ..Default::default() };
+        p.compare.pending = true;
+        let i = input(&tabs[0], &tabs);
+        run_until_done(&mut p, &ctx, &i);
+        let rows = p.compare.rows_for_test();
+        assert!(rows.contains(&"new panic in task".to_owned()), "{rows:?}");
+        assert!(rows.iter().any(|r| r.starts_with("new gear {") && r.ends_with("slot 1: R")), "{rows:?}");
+        // Ignored, it leaves the list.
+        p.compare.ignore_for_test("panic in task");
+        assert!(!p.compare.rows_for_test().contains(&"new panic in task".to_owned()));
     }
 
     #[test]

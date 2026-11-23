@@ -242,6 +242,9 @@ pub struct Output {
     pub filter: Option<String>,
     /// Open the Checks pane on this lifecycle's results (name, number).
     pub checks: Option<(String, u32)>,
+    /// Compare this lifecycle (name, number) with the one before, in the
+    /// Patterns window.
+    pub compare: Option<(String, u32)>,
     pub fibex: Option<FibexAction>,
     /// The picked FIBEX arguments changed.
     pub args_changed: bool,
@@ -1077,6 +1080,19 @@ fn lifecycles_list(
                                             nfd += &format!(" AND ({})", lines.source());
                                         }
                                         out.filter = Some(nfd);
+                                    }
+                                    if x.number > 1
+                                        && ui
+                                            .small_button("⚖")
+                                            .on_hover_text(format!(
+                                                "Compare with the one before: what is new, gone or changed \
+                                                 in #{} against #{} (Patterns window)",
+                                                x.number,
+                                                x.number - 1
+                                            ))
+                                            .clicked()
+                                    {
+                                        out.compare = Some((def.name().to_owned(), x.number));
                                     }
                                     // What the checks found in it (owner, 2026-11-07).
                                     let (issues, facts, lines) =

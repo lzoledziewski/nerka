@@ -115,6 +115,29 @@ or the signals changed.
   searches for its lines among the filtered ones, **📋** copies the
   query. Sort by most lines, rarest first, or first line.
 
+**⚖ Compare** (in the same window) groups two sets of lines into patterns
+together and lists what differs: patterns and slot values **new in B**,
+**gone from B**, then those **changed** (more or less often, surest first;
+the score is G², 10.8 or more by default), as
+[`nerka compare`](cli.md#compare-experimental) does.
+
+- **A and B:** all lines, the filter result, the lines of a filter,
+  lifecycles of `@name` by number (`2`, or a group: `2, 5-7`) or every one
+  of an outcome (every `crash` against every `planned`), or another tab.
+  With lifecycles, a row also says in how many of a side's lifecycles the
+  pattern has lines (`A 3/3 · B 0/5`): a constant symptom, not a one-off.
+- **Only** and **Ignore** (NFD) choose the lines of both sides first:
+  `ecu == ECU1`, or leave out heartbeats that differ every boot.
+- **Each row:** the lines in A and B, the change, the score, the pattern
+  (for a value: its slot and value), and its first line on its side (a
+  click goes there, in its tab). **⋮**: *Ignore this pattern / value*
+  (hidden from the results; *Show ignored* brings it back), *Save as
+  ignore rule* (added to the [pattern
+  configuration](cli.md#the-pattern-configuration), so patterns and
+  compares leave its lines out), *Filter to its lines*, *Copy its query*.
+- In the Signals panel, **⚖** on a lifecycle compares it with the one
+  before.
+
 ## Windows
 
 `nerka-gui FILE…` started while nerka is open hands the files to the window
