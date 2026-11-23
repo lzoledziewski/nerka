@@ -32,6 +32,7 @@
 //!   analysis setup (packs, presets, plots, checks, signals).
 
 pub mod atomic;
+pub mod background;
 pub mod bookmarks;
 pub mod bundle;
 pub mod check;
@@ -204,7 +205,11 @@ impl Progress {
     pub fn cancel(&self) {
         self.inner.cancelled.store(true, std::sync::atomic::Ordering::Relaxed);
     }
+    /// Whether the operation was cancelled. Checked per chunk, it is also
+    /// where background work waits while foreground work runs
+    /// ([`background`]; never on other threads).
     pub fn is_cancelled(&self) -> bool {
+        background::give_way(&self.inner.cancelled);
         self.inner.cancelled.load(std::sync::atomic::Ordering::Relaxed)
     }
 }

@@ -24,6 +24,9 @@ thiserror = "2"
 quick-xml = { version = "0.42", default-features = false }
 # Compressed MF4 data (DZ blocks: zlib deflate); pure Rust, already built for the GUI's images.
 miniz_oxide = "0.9"
+# Background threads at idle priority on Linux (sched_setscheduler); already
+# in the tree through memmap2.
+libc = "0.2"
 clap = { version = "4.6", features = ["derive"] }
 anyhow = "1"
 eframe = "0.37"

@@ -298,6 +298,8 @@ fn main() -> eframe::Result {
     if options_given == 0 && !initial.is_empty() && instance::hand_off(&initial) {
         return Ok(());
     }
+    // Its threads now, not while the first filter runs.
+    nerka_core::background::start();
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1280.0, 800.0])
@@ -1860,7 +1862,7 @@ impl Tab {
         }
         let checks = checks.switched(|c| on.contains(&c.name().to_lowercase()));
         let (signals, lib) = (self.own_signals.clone(), lib.clone());
-        let job = Job::spawn(ctx, move |p| checks.run_all(&*file, &signals, &lib, p));
+        let job = Job::background(ctx, move |p| checks.run_all(&*file, &signals, &lib, p));
         self.checks_job = Some((job, self.own_gen));
     }
 
@@ -1877,7 +1879,7 @@ impl Tab {
         let signals = self.signals.clone();
         // Signals keyed by a field together, the rest one by one; a
         // definition that doesn't fit the file says so in the panel.
-        self.signals_job = Some(Job::spawn(ctx, move |prog| signals.collect(&*file, prog)));
+        self.signals_job = Some(Job::background(ctx, move |prog| signals.collect(&*file, prog)));
     }
 
     fn build_filter(&self) -> Result<Filter, String> {
@@ -6998,6 +7000,170 @@ gear=D
         }
         for _ in 0..3 {
             run(&mut app, "scroll the Signals panel", vec![over_panel.clone(), wheel(-3.0)]);
+        }
+    }
+
+    /// A file opened with a filter, as at startup: when the file is read,
+    /// when the filter's result is in, when the background work (signals,
+    /// checks) is done, and the frames meanwhile (the slowest and the
+    /// mean per phase). `NERKA_PERF_FILE=big.log NERKA_PERF_QUERY='level >=
+    /// ERROR' [NERKA_PERF_SIGNALS / _LIFECYCLES / _CHECKS='spec;;spec']
+    /// cargo test --release -p nerka-gui perf_open_filter -- --ignored --nocapture`
+    #[test]
+    #[ignore = "needs a big file"]
+    fn perf_open_filter() {
+        let Ok(path) = std::env::var("NERKA_PERF_FILE") else { return };
+        let query = std::env::var("NERKA_PERF_QUERY").unwrap_or_else(|_| "level >= ERROR".into());
+        let specs = |var: &str| -> Vec<String> {
+            std::env::var(var).map(|s| s.split(";;").map(str::to_owned).collect()).unwrap_or_default()
+        };
+        let ctx = egui::Context::default();
+        let mut app = App::default();
+        for s in specs("NERKA_PERF_SIGNALS") {
+            app.add_session_signal(nerka_core::SignalDef::parse_spec(&s).unwrap());
+            app.saved_gen += 1;
+        }
+        for s in specs("NERKA_PERF_LIFECYCLES") {
+            let def = nerka_core::lifecycle::LifecycleDef::parse_spec(&s).unwrap();
+            app.add_session_signal(nerka_core::SignalDef::lifecycle(def));
+            app.saved_gen += 1;
+        }
+        for c in specs("NERKA_PERF_CHECKS") {
+            app.add_session_check(nerka_core::check::CheckDef::parse_spec(&c).unwrap());
+        }
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1600.0, 1000.0));
+        // As `main` does (NERKA_PERF_POOL_LATE: on first use, as before).
+        if std::env::var_os("NERKA_PERF_POOL_LATE").is_none() {
+            nerka_core::background::start();
+        }
+        // `NERKA_PERF_QUERY2`: a filter typed once the first is in (while
+        // the background works), and again once that is done.
+        let query2 = std::env::var("NERKA_PERF_QUERY2").ok();
+        // `NERKA_PERF_RELOAD=1`: all of it again after Reload.
+        let rounds = if std::env::var_os("NERKA_PERF_RELOAD").is_some() { 2 } else { 1 };
+        let mut time = 0.0;
+        let wheel = |y: f32| egui::Event::MouseWheel {
+            unit: egui::MouseWheelUnit::Line,
+            delta: egui::vec2(0.0, y),
+            phase: egui::TouchPhase::Move,
+            source: egui::MouseWheelSource::Wheel,
+            modifiers: egui::Modifiers::NONE,
+        };
+        for round in 0..rounds {
+            let t0 = std::time::Instant::now();
+            if round == 0 {
+                app.open(&ctx, PathBuf::from(&path));
+                // `NERKA_PERF_PLOT=a,b`: those signals plotted.
+                if let Ok(names) = std::env::var("NERKA_PERF_PLOT") {
+                    app.show_signals = true;
+                    for n in names.split(',') {
+                        plot::lock(&app.tabs[0].plot).toggle(n);
+                    }
+                }
+            } else {
+                eprintln!("-- Reload");
+                let (prefs, fibex) = (app.prefs.clone(), app.fibex.clone());
+                app.tabs[0].reopen(&ctx, &prefs, fibex);
+            }
+            app.tabs[0].set_filter("query", &query);
+            let (mut phase, mut frames) = (0usize, vec![Vec::new(); 3]);
+            let mut marks = [None; 3];
+            // 0: the first filter runs; 1: the second, typed while the
+            // background works; 2: the background works; 3: the third,
+            // typed after.
+            let (mut state, mut typed) = (0, std::time::Instant::now());
+            loop {
+                time += 1.0 / 60.0;
+                let input = egui::RawInput { screen_rect: Some(screen), time: Some(time), ..Default::default() };
+                let t = std::time::Instant::now();
+                let mut out = ctx.run_ui(input, |ui| app.frame(ui));
+                out.textures_delta.clear();
+                frames[phase].push(t.elapsed().as_secs_f64() * 1e3);
+                let tab = &mut app.tabs[0];
+                let read = tab.file.is_some();
+                let filtered = read && tab.result().is_some() && tab.stage_job(Stage::Filter).is_none();
+                let quiet = filtered && !tab.is_busy() && tab.checks_job.is_none();
+                for (i, done) in [read, filtered, quiet].into_iter().enumerate() {
+                    if done && marks[i].is_none() {
+                        marks[i] = Some(t0.elapsed());
+                        phase = (i + 1).min(2);
+                    }
+                }
+                let busy = tab.is_busy() || tab.checks_job.is_some();
+                let type_filter = |tab: &mut Tab, q: &str| {
+                    tab.set_filter("query", q);
+                    tab.start_search(&ctx);
+                    tab.kick(&ctx);
+                    std::time::Instant::now()
+                };
+                match (state, &query2) {
+                    (_, None) if quiet => break,
+                    (0, Some(q2)) if filtered && busy => {
+                        typed = type_filter(tab, q2);
+                        state = 1;
+                        continue;
+                    }
+                    (0, Some(_)) if filtered => state = 2,
+                    (1, _) if filtered => {
+                        let ms = typed.elapsed().as_secs_f64() * 1e3;
+                        eprintln!("filter typed while the background works: {ms:.0} ms");
+                        state = 2;
+                    }
+                    (2, Some(q2)) if quiet => {
+                        // Another text: not a result kept.
+                        typed = type_filter(tab, &format!("{q2} AND level >= ERROR"));
+                        state = 3;
+                        continue;
+                    }
+                    (3, _) if filtered => {
+                        let ms = typed.elapsed().as_secs_f64() * 1e3;
+                        eprintln!("filter typed after the background: {ms:.0} ms");
+                        break;
+                    }
+                    _ => {}
+                }
+                if std::env::var_os("NERKA_PERF_TRACE").is_some() {
+                    let jobs: Vec<String> = tab.stage_jobs.iter().map(|(s, _, _)| format!("{s:?}")).collect();
+                    eprintln!(
+                        "{:>6.0} ms frame {:.1} ms, foreground {}, stage jobs {jobs:?}, signals {}, checks {}",
+                        t0.elapsed().as_secs_f64() * 1e3,
+                        t.elapsed().as_secs_f64() * 1e3,
+                        nerka_core::background::foreground_running(),
+                        tab.signals_job.is_some(),
+                        tab.checks_job.is_some()
+                    );
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            let names = ["read", "filter result", "background done"];
+            for (i, name) in names.iter().enumerate() {
+                let f = &frames[i];
+                let max = f.iter().cloned().fold(0.0, f64::max);
+                let mean = f.iter().sum::<f64>() / f.len().max(1) as f64;
+                eprintln!(
+                    "{name}: {:.0} ms | frames before: {} (slowest {max:.1} ms, mean {mean:.1} ms)",
+                    marks[i].unwrap().as_secs_f64() * 1e3,
+                    f.len()
+                );
+            }
+            // The log scrolled, a page at a time, from its first line.
+            app.tabs[0].goto_line(0);
+            let over_log = egui::Event::PointerMoved(egui::pos2(600.0, 300.0));
+            let mut scroll = Vec::new();
+            for _ in 0..40 {
+                time += 1.0 / 60.0;
+                let events = vec![over_log.clone(), wheel(-40.0)];
+                let input =
+                    egui::RawInput { screen_rect: Some(screen), time: Some(time), events, ..Default::default() };
+                let t = std::time::Instant::now();
+                let mut out = ctx.run_ui(input, |ui| app.frame(ui));
+                out.textures_delta.clear();
+                scroll.push(t.elapsed().as_secs_f64() * 1e3);
+            }
+            let max = scroll.iter().cloned().fold(0.0, f64::max);
+            let mean = scroll.iter().sum::<f64>() / scroll.len() as f64;
+            eprintln!("scroll: 40 frames, slowest {max:.1} ms, mean {mean:.1} ms");
+            eprintln!("filter keeps {} lines", app.tabs[0].result().map_or(0, |r| r.lines.len()));
         }
     }
 

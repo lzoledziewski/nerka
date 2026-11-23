@@ -823,7 +823,7 @@ pub fn plot_panel(ui: &mut egui::Ui, state: &mut PlotState, src: Source<'_>) -> 
                 }
             }
             let clock = clock.clone();
-            let work = crate::job::Job::spawn(&ctx, move |_| {
+            let work = crate::job::Job::background(&ctx, move |_| {
                 let refs: Vec<(&str, &SignalDef, &SignalSeries)> =
                     todo.iter().map(|(n, d, s)| (n.as_str(), &**d, &**s)).collect();
                 Ok(nerka_core::plot::lane::lanes_of_all(&refs, &*owned, &clock, clock_series.as_ref()))
