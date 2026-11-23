@@ -627,8 +627,8 @@ fn group(sets: &[Set], options: &PatternOptions, progress: &Progress) -> Result<
     let mut families: Vec<Family> = all.clusters.into_iter().map(Family::from).collect();
     // Stage 2.
     if options.merge {
-        let boiler = boilerplate(&mut families, &shared);
-        families = merge_all(families, 1, &boiler, progress)?;
+        let weights = weigh(&mut families, &shared);
+        families = merge_all(families, 1, &weights, progress)?;
         // A merge adds one slot at most (`accept`), so a pattern kept apart
         // from one may join it once another has given it the slot: again
         // for those, while that joins any.
@@ -637,7 +637,7 @@ fn group(sets: &[Set], options: &PatternOptions, progress: &Progress) -> Result<
             if !families.iter().any(|f| f.apart) {
                 break;
             }
-            families = merge_all(families, pass, &boiler, progress)?;
+            families = merge_all(families, pass, &weights, progress)?;
             if families.len() == n {
                 break;
             }
@@ -1284,10 +1284,10 @@ impl Drain {
 /// A template in atoms, and its lines.
 struct Family {
     parts: Vec<Part>,
-    /// The words of its wordiest template: merging keeps only the words in
-    /// common, but how alike another is counts against these (else each
-    /// merge would make the next easier).
-    size: usize,
+    /// The words of its wordiest template, by weight ([`weigh`]): merging
+    /// keeps only the words in common, but how alike another is counts
+    /// against these (else each merge would make the next easier).
+    size: f32,
     sides: Sides,
     vals: Vec<Val>,
     unsorted: bool,
@@ -1297,21 +1297,26 @@ struct Family {
     grew: usize,
     /// The stage-1 templates it holds.
     ids: Vec<u32>,
-    /// Its context (the fields' values): an index into [`boilerplate`]'s.
+    /// Its context (the fields' values): an index into [`weigh`]'s.
     ctx: usize,
 }
 
 /// Words most lines of a context carry.
 type Boiler = std::collections::HashSet<Box<str>>;
 
+/// A context's word weights ([`weigh`]): words not in it weigh 1.
+type Weights = HashMap<Box<str>, f32>;
+
 /// Per context (the fields' values, `apid`, `ctid`: all one in a text
-/// file), the words more than half its lines carry that stage 1 saw
-/// different messages share in one place (`shared`: [`Group::shared`]): a
-/// header or footer (`LOG`, `Elapsed`, `us`), no sign of one message, so
-/// [`accept`] doesn't count them. A word every line has but no two
-/// messages were seen to share is the message itself (`gear=D`, `gear=P`).
-/// Sets [`Family::ctx`], and [`Family::size`] without them.
-fn boilerplate(families: &mut [Family], shared: &HashMap<Vec<Val>, Boiler>) -> Vec<Boiler> {
+/// file), how much each word tells its messages apart: 1 − the share of the
+/// context's lines that carry it, for the words stage 1 saw different
+/// messages share in one place (`shared`: [`Group::shared`]); others weigh
+/// one. A header or footer on every line (`LOG`, `Elapsed`, `us`) weighs
+/// about 0, so [`accept`] doesn't take it for a sign of one message. A word
+/// every line has but no two messages were seen to share is the message
+/// itself (`gear=D`, `gear=P`) and keeps its weight; so do all words of a
+/// context with one template. Sets [`Family::ctx`] and [`Family::size`].
+fn weigh(families: &mut [Family], shared: &HashMap<Vec<Val>, Boiler>) -> Vec<Weights> {
     let none = Boiler::default();
     let mut ctxs: HashMap<Vec<Val>, usize> = HashMap::new();
     // Per context: lines, templates, lines per word.
@@ -1333,25 +1338,30 @@ fn boilerplate(families: &mut [Family], shared: &HashMap<Vec<Val>, Boiler>) -> V
             *words.entry(w.into()).or_default() += count;
         }
     }
-    let mut by_ctx: Vec<&Vec<Val>> = vec![&families[0].vals; ctxs.len()];
+    let mut by_ctx: Vec<Option<&Vec<Val>>> = vec![None; ctxs.len()];
     for (vals, &k) in &ctxs {
-        by_ctx[k] = vals;
+        by_ctx[k] = Some(vals);
     }
-    let bp: Vec<Boiler> = stats
+    let weights: Vec<Weights> = stats
         .into_iter()
         .zip(by_ctx)
         .map(|((lines, n, words), vals)| {
-            let seen = shared.get(vals).unwrap_or(&none);
-            if n < 2 || seen.is_empty() {
-                return Boiler::default();
+            let seen = vals.and_then(|v| shared.get(v)).unwrap_or(&none);
+            if n < 2 || seen.is_empty() || lines == 0 {
+                return Weights::default();
             }
-            words.into_iter().filter(|(w, c)| c * 2 > lines && seen.contains(w)).map(|(w, _)| w).collect()
+            words
+                .into_iter()
+                .filter(|(w, _)| seen.contains(w))
+                .map(|(w, c)| (w, 1.0 - c as f32 / lines as f32))
+                .collect()
         })
         .collect();
     for f in families.iter_mut() {
-        f.size = f.words().filter(|w| !bp[f.ctx].contains(*w)).count();
+        let w = &weights[f.ctx];
+        f.size = f.words().map(|x| w.get(x).copied().unwrap_or(1.0)).sum();
     }
-    bp
+    weights
 }
 
 impl From<Cluster> for Family {
@@ -1368,7 +1378,7 @@ impl From<Cluster> for Family {
                 }
             }
         }
-        let size = parts.iter().filter(|p| matches!(&p.atom, Atom::Lit(l) if is_word(l))).count();
+        let size = parts.iter().filter(|p| matches!(&p.atom, Atom::Lit(l) if is_word(l))).count() as f32;
         Family {
             parts,
             size,
@@ -1453,8 +1463,8 @@ fn align(a: &[Part], b: &[Part]) -> Pairs {
 
 /// Whether templates `a` and `b`, aligned as `pairs`, are one pattern, and
 /// how alike they are (the share of words in common, of the wordier one;
-/// words counted as [`Family::size`], none of the context's `boiler`plate:
-/// [`boilerplate`]). They share a word at least, at each
+/// words counted by their `weights` in the context, as [`Family::size`]:
+/// [`weigh`]). They share half a word at least, at each
 /// place they differ one side has one token at most (a state's value is a
 /// word: `{D|P}`, `{engaged at <*> C|released}`, not two phrases) and the
 /// other [`MAX_SIDE`] (tokens: words, values and slots, so neither
@@ -1468,11 +1478,14 @@ fn align(a: &[Part], b: &[Part]) -> Pairs {
 /// data {was|is} read` holding only `warning … was` and `status … is`,
 /// which are two messages. A third with one of them (`warning … is`) shows
 /// the slots apart, and then both join.
-fn accept(a: &Family, b: &Family, pairs: &[(usize, usize)], boiler: &Boiler) -> Verdict {
-    let common = pairs
+fn accept(a: &Family, b: &Family, pairs: &[(usize, usize)], weights: &Weights) -> Verdict {
+    let common: f32 = pairs
         .iter()
-        .filter(|&&(i, _)| matches!(&a.parts[i].atom, Atom::Lit(l) if is_word(l) && !boiler.contains(l)))
-        .count();
+        .filter_map(|&(i, _)| match &a.parts[i].atom {
+            Atom::Lit(l) if is_word(l) => Some(weights.get(l).copied().unwrap_or(1.0)),
+            _ => None,
+        })
+        .sum();
     let (few, many) = (a.size.min(b.size), a.size.max(b.size));
     let tokens = |seg: &[Part]| {
         seg.iter()
@@ -1503,13 +1516,13 @@ fn accept(a: &Family, b: &Family, pairs: &[(usize, usize)], boiler: &Boiler) -> 
     // (`gear=D`, `gear=P`), however common the words around it.
     let flip = gaps == 1 && widest <= 1;
     let ok = flip
-        || common > 0
+        || common >= 0.5
             && match gaps {
                 0 => true,
-                1 => common * 2 >= few && common * 3 >= many,
-                _ => common * 5 >= many * 3,
+                1 => common * 2.0 >= few && common * 3.0 >= many,
+                _ => common * 5.0 >= many * 3.0,
             };
-    let alike = if flip && common == 0 { 0.5 / many.max(1) as f32 } else { common as f32 / many.max(1) as f32 };
+    let alike = if many > 0.0 { common / many } else { 0.0 };
     match (ok, new) {
         (false, _) => Verdict::No,
         (true, 0 | 1) => Verdict::Join(alike),
@@ -1624,7 +1637,7 @@ fn shared_words(f: &Family, sorted: &[&str]) -> usize {
 /// time, after all the others, and only with those that have grown a slot
 /// since (merged in the pass before or in this one): the others they were
 /// kept apart from as they are.
-fn merge_all(mut templates: Vec<Family>, pass: usize, boiler: &[Boiler], progress: &Progress) -> Result<Vec<Family>> {
+fn merge_all(mut templates: Vec<Family>, pass: usize, weights: &[Weights], progress: &Progress) -> Result<Vec<Family>> {
     let later = pass > 1;
     templates.sort_by(|a, b| by_count(&a.sides, &b.sides));
     if later {
@@ -1685,11 +1698,11 @@ fn merge_all(mut templates: Vec<Family>, pass: usize, boiler: &[Boiler], progres
                         // The words aligned are some of those both hold: too
                         // few of them, and `accept` can't pass.
                         let shared = shared_words(f, &mine);
-                        if shared == 0 || shared * 3 < f.size.max(t.size) {
+                        if shared == 0 || shared as f32 * 3.0 < f.size.max(t.size) {
                             return None;
                         }
                         let pairs = align(&f.parts, &t.parts);
-                        match accept(f, &t, &pairs, &boiler[f.ctx]) {
+                        match accept(f, &t, &pairs, &weights[f.ctx]) {
                             Verdict::Join(s) => Some((k, c, s, pairs)),
                             Verdict::Apart => {
                                 apart.store(true, Ordering::Relaxed);
@@ -1709,7 +1722,7 @@ fn merge_all(mut templates: Vec<Family>, pass: usize, boiler: &[Boiler], progres
                     &mut out[c],
                     Family {
                         parts: vec![],
-                        size: 0,
+                        size: 0.0,
                         sides: Sides::default(),
                         vals: vec![],
                         unsorted: false,
@@ -2304,6 +2317,15 @@ mod tests {
                 "LOG: {radar|lidar|imu|gnss|hmi}: {OK|OFFLINE} Elapsed[us]: <*>; #<*>",
             ]
         );
+    }
+
+    #[test]
+    fn no_lines_no_patterns() {
+        let f = text(&[]);
+        let ps = detect(&f, None, &PatternOptions { lines: true, ..Default::default() }, &Progress::new()).unwrap();
+        assert!(ps.patterns.is_empty());
+        let ps = detect(&text(&["a 1", "b 2"]), Some(&[]), &PatternOptions::default(), &Progress::new()).unwrap();
+        assert!(ps.patterns.is_empty() && ps.total() == 0);
     }
 
     #[test]
