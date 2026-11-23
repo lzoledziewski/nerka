@@ -1,11 +1,13 @@
-# Patterns in the GUI (design; the core configuration built)
+# Patterns in the GUI (design; core configuration and α1 built)
 
 Status: **settled** with the owner (2026-11-23). Built: the engine and the
-CLI (`core/src/pattern.rs`, `nerka patterns`, `nerka compare`), and round 1
+CLI (`core/src/pattern.rs`, `nerka patterns`, `nerka compare`); round 1
 below, the core configuration (2026-11-24: `core/src/pattern/config.rs`,
 the `patterns` file and bundle kind, `--pattern-config` / `--set` /
-`--rule`; user guide `docs/user/cli.md#the-pattern-configuration`). Not
-built: the GUI (rounds α1–α3).
+`--rule`; user guide `docs/user/cli.md#the-pattern-configuration`); and
+α1, the Patterns window (2026-11-24: `ui/src/patterns.rs`; user guide
+`docs/user/gui.md#patterns`). Not built: α2 (Compare, tuning pane) and
+α3.
 
 ## What the owner asked for (2026-11-23)
 
@@ -210,9 +212,15 @@ default; the configuration file works either way).
    with scopes, the `patterns` file and bundle kind, the CLI flags, and the
    verdict counts. Tests per rule. The LogHub benchmark takes a config too,
    so a setting's effect on GA / FGA / WGA is measured.
-2. **α1:** the Patterns pane, off until ▶ Run: list, unfold, go to line,
-   Filter / Search / Lines, on all lines, the filter result or one
-   lifecycle.
+2. **α1 (built 2026-11-24):** the Patterns pane, off until ▶ Run: list,
+   unfold, go to line, Filter / Search / Lines, on all lines, the filter
+   result or one lifecycle. As built: an immediate viewport per tab (its
+   own window; the plot's is deferred, this one is light enough to share
+   the tab's state directly); lines can also be a typed filter; **Lines…**
+   is in the window (▸ unfolds the pattern's own lines, kept by the run,
+   a click goes there), not the bottom pane, which shows search hits, and
+   🔍 searches by the pattern's query; 📋 copies the query. ⋮ Rule… comes
+   with the tuning pane (α2), ➕ To library in α3.
 3. **α2:** Compare (lifecycles and groups of them, filters, tabs) with
    Only / Ignore and ignoring from the results, and the tuning pane
    (settings, rules, re-run, change since the last run, why apart).

@@ -39,6 +39,8 @@ Owner feedback is driving this; these are deliberate choices, keep them:
 
 - **The plot's own window (owner, 2026-11-12):** its title starts with the window's name (`OTA crash · Plot · trace.dlt — nerka`), as the main window's does. One close only: the window's ✖ closes the plot (it docked before; the header's ✖ shows only when docked), and 📈 Plot opens it in its own window again; **⧉ Dock** puts it back under the views.
 
+- **Patterns (owner, 2026-11-23; experimental, design `patterns.md`):** **🧩 Patterns** opens a tab's patterns in a **window of its own** (for now; docking may come later). Patterns are **not computed by themselves**: only ▶ Run groups the lines, and a result stays, marked out of date, until the next run. Compare chooses its content (Only / Ignore filters, ignoring rows from the results) and takes groups of lifecycles in its first round; the tuning pane is behind a Settings switch after the alphas; settings and rules are one global file.
+
 ## Checking the GUI visually
 
 `tools/screenshot.ps1` launches the debug build, captures its window to a PNG and closes it again. Read the PNG to check layout and rendering. This is how the off-screen scrollbar was found. `-Keys` sends keystrokes before the capture (SendKeys syntax), e.g. `-Keys '{F1}'` for the About dialog. Don't close or kill nerka-gui windows the owner has open; if the exe is locked by one of them, build with `--target-dir target/<name>` and pass `-Exe`.

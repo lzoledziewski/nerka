@@ -39,6 +39,7 @@ mod icon_art;
 mod instance;
 mod job;
 mod library;
+mod patterns;
 mod plot;
 mod plots;
 mod prefs;
@@ -700,6 +701,8 @@ struct Tab {
     /// The Checks pane's state, the checks' results on this tab's file, the
     /// job running them and what they ran with.
     checks_ui: checks::ChecksUi,
+    /// The Patterns window (experimental) and its last result.
+    patterns: patterns::PatternsUi,
     check_results: Vec<(String, checks::Outcome)>,
     /// The job, and the generation of `own_signals` it ran with.
     checks_job: Option<(Job<nerka_core::check::CheckRun>, u64)>,
@@ -1365,6 +1368,7 @@ impl Tab {
             signals_ui: signals::SignalsUi::default(),
             signals_job: None,
             checks_ui: Default::default(),
+            patterns: Default::default(),
             check_results: Vec::new(),
             checks_job: None,
             checks_key: None,
@@ -1413,7 +1417,7 @@ impl Tab {
     }
 
     fn is_busy(&self) -> bool {
-        self.loading.is_some() || !self.stage_jobs.is_empty() || self.signals_job.is_some()
+        self.loading.is_some() || !self.stage_jobs.is_empty() || self.signals_job.is_some() || self.patterns.is_busy()
     }
 
     fn cancel_jobs(&mut self) {
@@ -1428,6 +1432,7 @@ impl Tab {
         if let Some(j) = self.signals_job.take() {
             j.cancel();
         }
+        self.patterns.cancel();
     }
 
     /// The lines the filter keeps, once in (`None`: no filter yet).
@@ -4385,6 +4390,86 @@ impl App {
     }
 
     /// Record a filter in the filter history.
+    /// Each tab's Patterns window that is open, and what it asks of its
+    /// tab: go to a line (the tab comes to the front), a query to filter or
+    /// search by.
+    fn patterns_windows(&mut self, ctx: &egui::Context) {
+        let name = self.window_name.clone();
+        let mut asked = Vec::new();
+        for (i, t) in self.tabs.iter_mut().enumerate() {
+            if !t.patterns.open {
+                continue;
+            }
+            let Some(file) = t.file.clone() else { continue };
+            let title = match name.as_deref().map(str::trim).filter(|n| !n.is_empty()) {
+                Some(n) => format!("{n} · Patterns · {} — nerka", t.title()),
+                None => format!("Patterns · {} — nerka", t.title()),
+            };
+            let lifecycles: Vec<(String, usize)> = t
+                .signals
+                .lifecycles()
+                .filter_map(|d| Some((d.name().to_owned(), d.cached(&*file)?.lives.len())))
+                .collect();
+            let session = &t.session;
+            let compile = |q: &str| session.compile(q).map(Filter::Query).map_err(|e| e.to_string());
+            let input = patterns::Input {
+                file: &file,
+                kept: t.session.result(),
+                lifecycles,
+                compile: &compile,
+                signals_gen: t.signals_gen,
+                title,
+                config: nerka_core::pattern::PatternConfig::load_saved,
+            };
+            let out = t.patterns.window(ctx, &input);
+            if out != patterns::Output::default() {
+                asked.push((i, out));
+            }
+        }
+        for (i, out) in asked {
+            let (filtered, searched) = self.apply_patterns(ctx, i, out);
+            if let Some(q) = filtered {
+                self.record_search("query", &q);
+            }
+            if let Some(q) = searched {
+                self.record_search_box("query", &q);
+            }
+        }
+    }
+
+    /// What tab `i`'s Patterns window asked for, done: the filter and the
+    /// search run, to record in their histories.
+    fn apply_patterns(
+        &mut self,
+        ctx: &egui::Context,
+        i: usize,
+        out: patterns::Output,
+    ) -> (Option<String>, Option<String>) {
+        let Some(t) = self.tabs.get_mut(i) else { return (None, None) };
+        self.active = i;
+        if let Some(line) = out.goto {
+            t.goto_line(line);
+        }
+        let mut filtered = None;
+        if let Some(q) = out.filter {
+            t.mode = Mode::Query;
+            t.pattern = q;
+            t.filter_exp = None;
+            if t.start_search(ctx) {
+                filtered = Some(t.pattern.clone());
+            }
+        }
+        let mut searched = None;
+        if let Some(q) = out.search {
+            t.search.mode = Mode::Query;
+            t.search.pattern = q.clone();
+            t.search.terms.clear();
+            t.run_search_box(ctx);
+            searched = Some(q);
+        }
+        (filtered, searched)
+    }
+
     fn record_search(&mut self, tag: &str, pattern: &str) {
         if self.history.push(tag, pattern)
             && let Some(path) = history_path()
@@ -5403,6 +5488,7 @@ impl App {
         self.settings_window(&ctx);
         self.profiles_window(&ctx);
         self.bundle_windows(&ctx);
+        self.patterns_windows(&ctx);
         if let Some(t) = self.tabs.get_mut(self.active)
             && let Some(d) = &mut t.detail
         {
@@ -5457,6 +5543,11 @@ impl App {
                 };
                 ui.toggle_value(&mut self.show_checks, format!("✔ Checks ({checks})"))
                     .on_hover_text("Issues and facts found in the file, overall and per lifecycle");
+                if let Some(t) = self.tabs.get_mut(self.active) {
+                    ui.toggle_value(&mut t.patterns.open, "🧩 Patterns").on_hover_text(
+                        "This tab's lines grouped by the message they print (experimental), in a window of its                          own: nothing is grouped until ▶ Run",
+                    );
+                }
                 ui.toggle_value(&mut self.show_library, format!("📚 Library ({queries})")).on_hover_text(
                     "Saved queries from packs (*.nerka-pack): pick them for the filter or the search \
                      (Ctrl+Shift+L)",
@@ -6798,6 +6889,56 @@ gear=D
         // A new tab starts with them.
         let tab = Tab::open(&ctx, dir.join("app.log"), &app.prefs);
         assert!(tab.search.regex && tab.search.ignore_case);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The Patterns window's requests (plan α1): a pattern's ▾ Filter
+    /// filters the tab to its lines, 🔍 searches for them, a click goes to
+    /// a line; the tab comes to the front.
+    #[test]
+    fn a_patterns_query_filters_and_searches_its_tab() {
+        let dir = std::env::temp_dir().join(format!("nerka-gui-patterns-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (a, b) = (dir.join("a.log"), dir.join("b.log"));
+        let text: String = (0..40)
+            .map(|i| {
+                if i % 4 == 0 {
+                    format!(
+                        "gear {}
+",
+                        ["D", "P"][i % 8 / 4]
+                    )
+                } else {
+                    format!(
+                        "speed {i} km/h
+"
+                    )
+                }
+            })
+            .collect();
+        std::fs::write(&a, &text).unwrap();
+        std::fs::write(&b, &text).unwrap();
+        let ctx = egui::Context::default();
+        let mut app = App::default();
+        app.open(&ctx, a);
+        app.open(&ctx, b);
+        settle_app(&mut app, &ctx);
+        let file = app.tabs[0].file.clone().unwrap();
+        let ps = nerka_core::pattern::detect(&*file, None, &Default::default(), &nerka_core::Progress::new()).unwrap();
+        let gear = ps.patterns.iter().find(|p| p.template() == "gear {D|P}").expect("gear");
+        let q = ps.query(gear);
+        app.active = 1;
+        let out = patterns::Output { goto: Some(8), filter: Some(q.clone()), search: None };
+        let (filtered, searched) = app.apply_patterns(&ctx, 0, out);
+        assert_eq!((filtered.as_deref(), searched), (Some(q.as_str()), None));
+        assert_eq!(app.active, 0);
+        settle_app(&mut app, &ctx);
+        assert_eq!(app.tabs[0].result().unwrap().lines, (0..10).map(|i| i * 4).collect::<Vec<LineNo>>());
+        let out = patterns::Output { search: Some(q.clone()), ..Default::default() };
+        app.apply_patterns(&ctx, 1, out);
+        settle_app(&mut app, &ctx);
+        assert_eq!(app.active, 1);
+        assert_eq!(app.tabs[1].session.hits().unwrap().lines.len(), 10);
         std::fs::remove_dir_all(&dir).ok();
     }
 

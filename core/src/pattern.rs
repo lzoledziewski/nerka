@@ -271,6 +271,17 @@ struct Part {
     atom: Atom,
 }
 
+/// A piece of a pattern's template ([`Pattern::pieces`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Piece {
+    /// Text, with its spaces (a masked value in it: `<*>`).
+    Text(String),
+    /// A slot of any value: `<*>`.
+    Any,
+    /// A state's values, most lines first (`∅`: none).
+    State(Vec<String>),
+}
+
 /// One pattern: a message template and where it occurs.
 #[derive(Debug, Clone)]
 pub struct Pattern {
@@ -309,6 +320,30 @@ impl Pattern {
     /// `{D|P|N}`.
     pub fn template(&self) -> String {
         let mut s = String::new();
+        for p in self.pieces() {
+            match p {
+                Piece::Text(t) => s.push_str(&t),
+                Piece::Any => s.push_str("<*>"),
+                Piece::State(vs) => {
+                    s.push('{');
+                    s.push_str(&vs.join("|"));
+                    s.push('}');
+                }
+            }
+        }
+        s
+    }
+
+    /// The template in pieces, to show each as it is: text (masked values
+    /// in it as `<*>`), slots of any value, and states with their values.
+    pub fn pieces(&self) -> Vec<Piece> {
+        fn text(out: &mut Vec<Piece>, s: &str) {
+            match out.last_mut() {
+                Some(Piece::Text(t)) => t.push_str(s),
+                _ => out.push(Piece::Text(s.to_owned())),
+            }
+        }
+        let mut out = Vec::new();
         let punct = |p: &Part| matches!(&p.atom, Atom::Lit(l) if !is_word(l) && &**l != MASK_STR);
         for (i, p) in self.parts.iter().enumerate() {
             // Either: a space, but next to punctuation (`[{INFO|WARN}]`).
@@ -319,24 +354,17 @@ impl Pattern {
                     Sep::Either => !punct(p) && !punct(&self.parts[i - 1]),
                 };
             if space {
-                s.push(' ');
+                text(&mut out, " ");
             }
             match &p.atom {
-                Atom::Lit(l) => s.push_str(&l.replace(MASK, "<*>").replace(REST, "…")),
+                Atom::Lit(l) => text(&mut out, &l.replace(MASK, "<*>").replace(REST, "…")),
                 Atom::Slot(slot) if slot.is_state() => {
-                    s.push('{');
-                    for (j, v) in slot.values.iter().enumerate() {
-                        if j > 0 {
-                            s.push('|');
-                        }
-                        s.push_str(&v.value());
-                    }
-                    s.push('}');
+                    out.push(Piece::State(slot.values.iter().map(SlotValue::value).collect()))
                 }
-                Atom::Slot(_) => s.push_str("<*>"),
+                Atom::Slot(_) => out.push(Piece::Any),
             }
         }
-        s
+        out
     }
 
     /// Its slots, in order, with the values they took.
