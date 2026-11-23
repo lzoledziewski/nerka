@@ -138,6 +138,29 @@ the score is G², 10.8 or more by default), as
 - In the Signals panel, **⚖** on a lifecycle compares it with the one
   before.
 
+**🛠 Tuning** (in the same window; alpha builds, else ⚙ Settings →
+Developer → Pattern tuning) edits the [pattern
+configuration](cli.md#the-pattern-configuration) on the lines at hand:
+
+- **Settings** of both stages, each with **●** while it isn't the default
+  (a click puts the default back). A change runs the patterns again on the
+  same lines, and **Change** says what it did: patterns new and gone,
+  joined and split (**Show** lists them).
+- **Rules**, one per line, read top to bottom (▲ ▼ to move, − to remove);
+  a rule that doesn't read says why. **➕** makes one from the scope fields
+  (`apid`, `ctid`, …; empty: any), an action and its argument. In 🧩
+  Patterns, **⋮** on a row fills it from that pattern: leave it out, at
+  most so many slots here, keep a slot's values apart, keep a value out of
+  slots.
+- **Last run:** templates and patterns, and the templates kept apart by
+  two new slots, a long side, or a rule.
+- **Why:** tick **?** on two rows in 🧩 Patterns: where they differ, the
+  words they share and what was needed, and the setting or rule that
+  decides (stage 2 alone, on the patterns as they are).
+- Nothing is written until **💾 Save** (the configuration file);
+  **↺ Revert** goes back to it, **Load…** reads another file, **Export…**
+  writes this one (e.g. for a bug report).
+
 ## Windows
 
 `nerka-gui FILE…` started while nerka is open hands the files to the window

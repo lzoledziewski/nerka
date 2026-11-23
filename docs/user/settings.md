@@ -20,6 +20,8 @@ description: "nerka's settings and where it keeps them: time zones, capture prot
   applies to files opened from then on (a tab's **Reload** reads its files
   again).
 - **Compressed MF4:** the unpack cache's size limit, its use, **Clear**.
+- **Developer → Pattern tuning:** the [Patterns](gui.md#patterns) window's
+  🛠 Tuning pane (always shown in alpha builds).
 - **Reload configuration:** read packs, presets, plots, checks, signals,
   profiles and preferences again (after editing a file by hand, or after
   another window changed them).
@@ -43,6 +45,7 @@ Nothing is stored in the cloud. Your configuration folder is
 | `plots\` | kept [plots](signals.md#plots) |
 | `signals` | saved signals and lifecycles, one spec per line |
 | `checks` | saved [checks](checks.md), one spec per line |
+| `patterns` | the [pattern configuration](cli.md#the-pattern-configuration): settings and rules |
 | `profiles` | [profiles](formats.md#profiles) for text files, one per line |
 | `protocols\` | protocol definitions loaded in Settings |
 | `records` | per file: how it was last split into records, a profile forced on it, its offset |

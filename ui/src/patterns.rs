@@ -11,6 +11,7 @@
 
 use crate::compare::CompareUi;
 use crate::job::{Job, Poll};
+use crate::tuning::{self, TuningUi};
 use eframe::egui::{self, Color32, RichText};
 use nerka_core::lifecycle::Lifecycles;
 use nerka_core::pattern::{self, Pattern, PatternConfig, PatternOptions, Patterns, Piece};
@@ -71,6 +72,8 @@ struct Key {
     config: Option<(SystemTime, u64)>,
     /// The tab's signals' generation (lifecycles and typed filters use them).
     signals: u64,
+    /// The tuning pane's configuration's generation (0: the saved one).
+    tuned: u64,
 }
 
 impl Key {
@@ -84,7 +87,7 @@ impl Key {
             Some("the filter changed")
         } else if self.field != now.field {
             Some("another field is chosen")
-        } else if self.config != now.config {
+        } else if self.config != now.config || self.tuned != now.tuned {
             Some("the pattern configuration changed")
         } else if matches!(self.from, From::Lifecycle(..) | From::Query) && self.signals != now.signals {
             Some("the signals changed")
@@ -100,7 +103,12 @@ pub enum Mode {
     #[default]
     Patterns,
     Compare,
+    Tuning,
 }
+
+/// A rule a pattern's menu asks for: its fields (the scope), the action,
+/// its argument.
+type RuleAsked = (Vec<(String, String)>, &'static str, String);
 
 /// A finished run.
 struct Run {
@@ -116,6 +124,11 @@ pub struct PatternsUi {
     pub open: bool,
     pub mode: Mode,
     pub compare: CompareUi,
+    pub tuning: TuningUi,
+    /// Patterns (their index in the result) picked for "why apart", and
+    /// the explanation of the two.
+    why: Vec<usize>,
+    why_text: Option<(Vec<usize>, u64, Vec<String>)>,
     /// Its window's id: the tab's, for as long as the tab lives.
     id: u64,
     from: From,
@@ -142,6 +155,9 @@ impl Default for PatternsUi {
             open: false,
             mode: Mode::Patterns,
             compare: CompareUi::default(),
+            tuning: TuningUi::default(),
+            why: Vec::new(),
+            why_text: None,
             id: NEXT.fetch_add(1, Ordering::Relaxed),
             from: From::All,
             query: String::new(),
@@ -207,6 +223,8 @@ pub struct Input<'a> {
     pub title: String,
     /// The pattern configuration to run with (the saved one).
     pub config: fn() -> Result<PatternConfig, String>,
+    /// The tuning pane is shown (alpha builds, or ⚙ Settings).
+    pub tuning: bool,
 }
 
 /// What the window asks of its tab.
@@ -259,6 +277,7 @@ impl PatternsUi {
             field: self.field.clone(),
             config: self.config_stamp(),
             signals: input.signals_gen,
+            tuned: if input.tuning && self.tuning.active().is_some() { self.tuning.generation } else { 0 },
         }
     }
 
@@ -266,7 +285,11 @@ impl PatternsUi {
     fn start(&mut self, ctx: &egui::Context, input: &Input) {
         self.cancel();
         self.error = None;
-        let config = match (input.config)() {
+        let config = match self.tuning.active().filter(|_| input.tuning) {
+            Some(c) => Ok(c.clone()),
+            None => (input.config)(),
+        };
+        let config = match config {
             Ok(c) => c,
             Err(e) => {
                 self.error = Some(format!("Pattern configuration: {e}"));
@@ -338,8 +361,22 @@ impl PatternsUi {
         let (_, key, what) = self.job.take().expect("polled");
         match r {
             Ok(patterns) => {
-                self.unfolded.clear();
-                self.shown = PAGE;
+                // The same lines again, other settings: what they did.
+                let same = |k: &Key| {
+                    (k.file, &k.from, &k.query, k.kept, &k.field)
+                        == (key.file, &key.from, &key.query, key.kept, &key.field)
+                };
+                self.tuning.change = match &self.run {
+                    Some(old) if same(&old.key) && (old.key.config != key.config || old.key.tuned != key.tuned) => {
+                        Some(tuning::change(&old.patterns, &patterns))
+                    }
+                    _ => None,
+                };
+                if self.run.as_ref().is_none_or(|old| !same(&old.key)) {
+                    self.unfolded.clear();
+                    self.shown = PAGE;
+                }
+                self.why.clear();
                 self.run = Some(Run { patterns, key, took, what });
             }
             Err(nerka_core::Error::Cancelled) => {}
@@ -355,7 +392,11 @@ impl PatternsUi {
         }
         self.poll();
         self.compare.poll();
-        if self.is_busy() {
+        // A setting changed in the tuning pane: the same lines again.
+        if input.tuning && self.tuning.due() && self.job.is_none() {
+            self.start(ctx, input);
+        }
+        if self.is_busy() || self.tuning.waiting() {
             ctx.request_repaint_after(Duration::from_millis(100));
         }
         let id = egui::ViewportId::from_hash_of(("nerka-patterns", self.id));
@@ -377,7 +418,28 @@ impl PatternsUi {
                 .on_hover_text("This tab's lines grouped into patterns");
             ui.selectable_value(&mut self.mode, Mode::Compare, RichText::new("⚖ Compare").strong())
                 .on_hover_text("What differs between two sets of lines: lifecycles, filters, tabs");
+            if input.tuning {
+                ui.selectable_value(&mut self.mode, Mode::Tuning, RichText::new("🛠 Tuning").strong()).on_hover_text(
+                    "The pattern configuration's settings and rules, tried on these lines (experimental)",
+                );
+            }
         });
+        if self.mode == Mode::Tuning && !input.tuning {
+            self.mode = Mode::Patterns;
+        }
+        if self.mode == Mode::Tuning {
+            let fields: Vec<String> = input
+                .tab
+                .file
+                .schema()
+                .iter()
+                .filter(|d| !d.costly && matches!(d.kind, nerka_core::FieldKind::Str | nerka_core::FieldKind::Name))
+                .map(|d| d.name.to_string())
+                .collect();
+            let last = self.run.as_ref().map(|r| &r.patterns);
+            self.tuning.ui(ui, &fields, last, input.config);
+            return;
+        }
         ui.separator();
         if self.mode == Mode::Compare || self.compare.pending {
             self.mode = Mode::Compare;
@@ -429,7 +491,57 @@ impl PatternsUi {
                 );
             }
             None => {}
-            Some(_) => self.list(ui, input.tab, out),
+            Some(_) => {
+                if input.tuning {
+                    self.why_box(ui, input);
+                }
+                self.list(ui, input.tab, input.tuning, out)
+            }
+        }
+    }
+
+    /// Why the two patterns picked (?) are apart, or one.
+    fn why_box(&mut self, ui: &mut egui::Ui, input: &Input) {
+        let Some(run) = &self.run else { return };
+        if self.why.len() != 2 {
+            if !self.why.is_empty() {
+                ui.weak("Pick one more pattern (?) to see why the two are apart.");
+            }
+            return;
+        }
+        let generation = self.tuning.generation;
+        if self.why_text.as_ref().is_none_or(|(w, g, _)| *w != self.why || *g != generation) {
+            let config = match self.tuning.active() {
+                Some(c) => Ok(c.clone()),
+                None => (input.config)(),
+            };
+            let text = match config {
+                Ok(c) => {
+                    let (a, b) = (&run.patterns.patterns[self.why[0]], &run.patterns.patterns[self.why[1]]);
+                    pattern::explain(a, b, &c)
+                }
+                Err(e) => vec![format!("The configuration doesn't read: {e}")],
+            };
+            self.why_text = Some((self.why.clone(), generation, text));
+        }
+        let Some((_, _, text)) = &self.why_text else { return };
+        let mut clear = false;
+        egui::Frame::group(ui.style()).show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("Why").strong());
+                for &k in &self.why {
+                    ui.monospace(run.patterns.patterns[k].template());
+                    ui.weak("·");
+                }
+                clear = ui.small_button("✖").on_hover_text("Unpick them").clicked();
+            });
+            for line in text {
+                ui.label(line);
+            }
+            ui.weak("Stage 2 alone, on the patterns as they are, every word weighing 1.");
+        });
+        if clear {
+            self.why.clear();
         }
     }
 
@@ -490,8 +602,10 @@ impl PatternsUi {
     }
 
     /// The patterns, sorted, the unfolded ones with their slots and lines.
-    fn list(&mut self, ui: &mut egui::Ui, tab: &TabRef, out: &mut Output) {
+    fn list(&mut self, ui: &mut egui::Ui, tab: &TabRef, tuning: bool, out: &mut Output) {
         let Some(run) = &self.run else { return };
+        let mut rule: Option<RuleAsked> = None;
+        let mut why_pick = None;
         let ps = &run.patterns;
         let mut order: Vec<usize> = (0..ps.patterns.len()).collect();
         match self.sort {
@@ -533,6 +647,59 @@ impl PatternsUi {
                         }
                         if ui.small_button("▾ Filter").on_hover_text(format!("Filter to its lines:\n{q}")).clicked() {
                             out.filter = Some(q);
+                        }
+                        if tuning {
+                            ui.menu_button("⋮", |ui| {
+                                ui.label(RichText::new("Rule… (in 🛠 Tuning)").strong());
+                                let fields = p.fields.clone();
+                                if ui.button("Leave it out (ignore)").clicked() {
+                                    let re = format!("/{}/", p.regex().replace('/', "\\/"));
+                                    rule = Some((fields.clone(), "ignore", re));
+                                    ui.close();
+                                }
+                                let slots = p.slots().count();
+                                if slots > 0
+                                    && ui
+                                        .button(format!("At most {} slots here", slots - 1))
+                                        .on_hover_text("Its last merge made one slot too many")
+                                        .clicked()
+                                {
+                                    rule = Some((fields.clone(), "max-slots", (slots - 1).to_string()));
+                                    ui.close();
+                                }
+                                for (i, s) in p.slots().enumerate() {
+                                    let words: Vec<String> = s
+                                        .values
+                                        .iter()
+                                        .map(|v| v.value())
+                                        .filter(|v| !v.is_empty() && !v.contains([' ', '<', '∅']))
+                                        .take(8)
+                                        .collect();
+                                    if words.len() >= 2
+                                        && ui
+                                            .button(format!("Slot {}: keep its values apart", i + 1))
+                                            .on_hover_text(words.join(" "))
+                                            .clicked()
+                                    {
+                                        rule = Some((fields.clone(), "apart", words.join(" ")));
+                                        ui.close();
+                                    }
+                                    for w in &words {
+                                        if ui.button(format!("Slot {}: keep {w} out of slots", i + 1)).clicked() {
+                                            rule = Some((fields.clone(), "keep", w.clone()));
+                                            ui.close();
+                                        }
+                                    }
+                                }
+                            });
+                            let picked = self.why.contains(&k);
+                            if ui
+                                .selectable_label(picked, "?")
+                                .on_hover_text("Pick two: why they are apart (or one), in words")
+                                .clicked()
+                            {
+                                why_pick = Some(k);
+                            }
                         }
                         ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
                             let share = 100.0 * p.count() as f64 / total as f64;
@@ -582,6 +749,20 @@ impl PatternsUi {
         }
         if show_more {
             self.shown += PAGE;
+        }
+        if let Some((fields, action, arg)) = rule {
+            self.tuning.form.fill(&fields, action, arg);
+            self.mode = Mode::Tuning;
+        }
+        if let Some(k) = why_pick {
+            if let Some(i) = self.why.iter().position(|&x| x == k) {
+                self.why.remove(i);
+            } else {
+                self.why.push(k);
+                if self.why.len() > 2 {
+                    self.why.remove(0);
+                }
+            }
         }
     }
 }
@@ -699,7 +880,7 @@ mod tests {
 
     fn input<'a>(tab: &'a TabRef, tabs: &'a [TabRef]) -> Input<'a> {
         let config = || Ok(PatternConfig::default());
-        Input { tab, tabs, signals_gen: 0, title: "Patterns".into(), config }
+        Input { tab, tabs, signals_gen: 0, title: "Patterns".into(), config, tuning: true }
     }
 
     /// Frames of the window until its run is done.
@@ -793,6 +974,33 @@ mod tests {
         assert!(!p.compare.rows_for_test().contains(&"new panic in task".to_owned()));
     }
 
+    /// Tuning (α2): a setting changed in the pane runs the same lines
+    /// again with it, and says what the change did.
+    #[test]
+    fn a_tuned_setting_runs_again_and_says_what_changed() {
+        let lines = [
+            "state changed from IDLE to RUN",
+            "state changed from RUN to IDLE",
+            "state changed from IDLE to RUN",
+            "gear D",
+            "gear P",
+            "gear D",
+        ];
+        let f: Arc<dyn LogSource> = Arc::new(TextFile::from_bytes("t", lines.join("\n").into_bytes()));
+        let t = [tab_of(1, f)];
+        let ctx = egui::Context::default();
+        let mut p = PatternsUi { open: true, ..Default::default() };
+        let i = input(&t[0], &t);
+        p.start(&ctx, &i);
+        run_until_done(&mut p, &ctx, &i);
+        assert_eq!(p.run.as_ref().unwrap().patterns.patterns.len(), 3);
+        p.tuning.tune_for_test(PatternConfig::parse("new-slots 2").unwrap());
+        run_until_done(&mut p, &ctx, &i);
+        assert_eq!(p.run.as_ref().unwrap().patterns.patterns.len(), 2);
+        let c = p.tuning.change.as_ref().expect("a change");
+        assert_eq!((c.joined.len(), c.gone.len()), (1, 2), "{c:?}");
+    }
+
     #[test]
     fn stale_reasons() {
         let k = Key {
@@ -803,8 +1011,10 @@ mod tests {
             field: String::new(),
             config: None,
             signals: 0,
+            tuned: 0,
         };
         assert_eq!(k.why_stale(&k.clone()), None);
+        assert_eq!(k.why_stale(&Key { tuned: 3, ..k.clone() }), Some("the pattern configuration changed"));
         assert_eq!(k.why_stale(&Key { kept: 6, ..k.clone() }), Some("the filter changed"));
         assert_eq!(k.why_stale(&Key { field: "raw".into(), ..k.clone() }), Some("another field is chosen"));
         let stamp = Some((SystemTime::UNIX_EPOCH, 3));

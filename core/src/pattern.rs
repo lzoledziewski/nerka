@@ -1748,6 +1748,24 @@ fn align(a: &[Part], b: &[Part]) -> Pairs {
 /// `local`'s rules refuse a merge putting a `keep` word in a slot, two
 /// words of an `apart` in one slot, or making more than `max-slots` slots.
 fn accept(a: &Family, b: &Family, pairs: &[(usize, usize)], weights: &Weights, local: &Local) -> Verdict {
+    assess(a, b, pairs, weights, local, None)
+}
+
+/// [`accept`], saying in `notes` what it weighed and why (for
+/// [`explain`]; none in the merge itself).
+fn assess(
+    a: &Family,
+    b: &Family,
+    pairs: &[(usize, usize)],
+    weights: &Weights,
+    local: &Local,
+    mut notes: Option<&mut Vec<String>>,
+) -> Verdict {
+    let mut say = |s: &dyn Fn() -> String| {
+        if let Some(n) = notes.as_deref_mut() {
+            n.push(s());
+        }
+    };
     let common: f32 = pairs
         .iter()
         .filter_map(|&(i, _)| match &a.parts[i].atom {
@@ -1764,7 +1782,12 @@ fn accept(a: &Family, b: &Family, pairs: &[(usize, usize)], weights: &Weights, l
             .count()
     };
     let slot = |seg: &[Part]| matches!(seg, [Part { atom: Atom::Slot(_), .. }]);
-    let kept = |seg: &[Part]| seg.iter().any(|p| matches!(&p.atom, Atom::Lit(l) if local.keep.contains(l)));
+    let kept = |seg: &[Part]| {
+        seg.iter().find_map(|p| match &p.atom {
+            Atom::Lit(l) if local.keep.contains(l) => Some(l.to_string()),
+            _ => None,
+        })
+    };
     let (mut gaps, mut new, mut widest) = (0, 0, 0);
     let (mut long, mut rule) = (false, false);
     // Slots it would have: those aligned with slots, and a slot per gap.
@@ -1777,16 +1800,55 @@ fn accept(a: &Family, b: &Family, pairs: &[(usize, usize)], weights: &Weights, l
             slots += 1;
             widest = widest.max(sa.len()).max(sb.len());
             let (ta, tb) = (tokens(sa), tokens(sb));
-            long |= ta.min(tb) > 1 || ta.max(tb) > local.s.side;
-            if !slot(sa) && !slot(sb) {
+            let fresh = !slot(sa) && !slot(sb);
+            say(&|| {
+                format!(
+                    "they differ: “{}” / “{}” ({ta} and {tb} tokens{})",
+                    shown(sa),
+                    shown(sb),
+                    if fresh { ", a new slot" } else { ", into a slot" }
+                )
+            });
+            if ta.min(tb) > 1 {
+                long = true;
+                say(&|| "both sides hold a phrase there: a state's value is one token".into());
+            } else if ta.max(tb) > local.s.side {
+                long = true;
+                say(&|| format!("a side of {} tokens there, more than side {}", ta.max(tb), local.s.side));
+            }
+            if fresh {
                 new += 1;
             }
-            rule |= !local.keep.is_empty() && (kept(sa) || kept(sb));
-            rule |= local.apart.iter().any(|g| clash(items_in(sa, g), items_in(sb, g)));
+            if !local.keep.is_empty()
+                && let Some(w) = kept(sa).or_else(|| kept(sb))
+            {
+                rule = true;
+                say(&|| format!("rule keep {w}: the word would be in a slot"));
+            }
+            for g in &local.apart {
+                let (x, y) = (items_in(sa, g), items_in(sb, g));
+                if clash(x, y) {
+                    rule = true;
+                    let name = |bits: u64| {
+                        let k = bits.trailing_zeros() as usize;
+                        g.get(k).map(|item| item.concat()).unwrap_or_default()
+                    };
+                    say(&|| {
+                        format!(
+                            "rule apart: {} and {} would be in one slot",
+                            name(x),
+                            name(if y & !x != 0 { y & !x } else { y })
+                        )
+                    });
+                }
+            }
         }
         (i, j) = (pi + 1, pj + 1);
     }
-    rule |= local.max_slots.is_some_and(|m| slots > m);
+    if let Some(m) = local.max_slots.filter(|&m| slots > m) {
+        rule = true;
+        say(&|| format!("rule max-slots {m}: it would have {slots} slots"));
+    }
     // One atom for another (or for nothing), all else the same: a state
     // (`gear=D`, `gear=P`), however common the words around it.
     let flip = gaps == 1 && widest <= 1;
@@ -1798,17 +1860,79 @@ fn accept(a: &Family, b: &Family, pairs: &[(usize, usize)], weights: &Weights, l
                 _ => common * 5.0 >= many * 3.0,
             };
     let alike = if many > 0.0 { common / many } else { 0.0 };
+    say(&|| {
+        let need = match gaps {
+            _ if flip => "none: one atom for another, the rest the same".to_owned(),
+            0 => "half a word".to_owned(),
+            1 => format!("half of {few:.1} and a third of {many:.1}"),
+            _ => format!("60 % of {many:.1}"),
+        };
+        format!("words in common: {common:.1} (of {few:.1} and {many:.1}); needed: {need}; {gaps} place(s) differ")
+    });
     if !ok {
+        say(&|| "apart: too few words in common".into());
         Verdict::No
     } else if long {
+        say(&|| "apart: a side too long (setting side)".into());
         Verdict::Side
     } else if rule {
+        say(&|| "apart: a rule refuses".into());
         Verdict::Rule
     } else if new > local.s.new_slots {
+        say(&|| format!("apart: {new} new slots at once, more than new-slots {}", local.s.new_slots));
         Verdict::Apart
     } else {
+        say(&|| format!("one pattern: alike {:.0} %", alike * 100.0));
         Verdict::Join(alike)
     }
+}
+
+/// A place's atoms as text: `<*>` for values and slots, `∅` for nothing.
+fn shown(seg: &[Part]) -> String {
+    let t = render(seg).replace([MASK, ANY], "<*>").replace(EITHER, " ").replace(REST, "…");
+    if t.is_empty() { "∅".into() } else { t }
+}
+
+/// Why stage 2 keeps two patterns apart, or would join them, in words: the
+/// places they differ in, the words in common, and the setting or rule
+/// that decides (with `config`'s settings and rules for `a`'s fields).
+/// For tuning: stage 2 alone, on the patterns as they came out, every word
+/// weighing 1 (the run also weighs header words less, and stage 1 may
+/// have kept their lines apart before).
+pub fn explain(a: &Pattern, b: &Pattern, config: &PatternConfig) -> Vec<String> {
+    for (n, v) in &a.fields {
+        if let Some((_, w)) = b.fields.iter().find(|(m, _)| m == n)
+            && v != w
+        {
+            return vec![format!("apart: their {n} differs ({v} / {w}); patterns never join across fields")];
+        }
+    }
+    let family = |p: &Pattern| Family {
+        parts: p.parts.clone(),
+        size: p.parts.iter().filter(|x| matches!(&x.atom, Atom::Lit(l) if is_word(l))).count() as f32,
+        sides: p.sides,
+        vals: Vec::new(),
+        unsorted: p.unsorted,
+        apart: false,
+        grew: 0,
+        ids: Vec::new(),
+        ctx: 0,
+    };
+    if a.unsorted || b.unsorted {
+        return vec!["apart: lines that fit no pattern (not sorted) aren't aligned".into()];
+    }
+    let (fa, fb) = (family(a), family(b));
+    let names: Vec<String> = a.fields.iter().map(|(n, _)| n.clone()).collect();
+    let vals: Vec<Option<&[u8]>> = a.fields.iter().map(|(_, v)| Some(v.as_bytes())).collect();
+    let local = config.local(&names, &vals);
+    let mut notes = Vec::new();
+    if !local.s.merge {
+        notes.push("apart: merge is off here (merge off, or no-merge)".into());
+        return notes;
+    }
+    let pairs = align(&fa.parts, &fb.parts);
+    assess(&fa, &fb, &pairs, &Weights::default(), &local, Some(&mut notes));
+    notes
 }
 
 /// The items of an `apart` group (each its atoms) a place two templates
@@ -2935,6 +3059,32 @@ mod tests {
         assert_eq!(t, ["door \"a/b\" <*>", "speed <*> km/h"]);
         let t = templates(&detect_with(&s, &ps.ignore_rule(&ps.patterns[1])));
         assert_eq!(t, ["speed <*> km/h", "speed <*> km/h"]);
+    }
+
+    #[test]
+    fn explain_says_why_apart() {
+        let f = states();
+        let ps = detect_with(&f, "");
+        let find = |ps: &Patterns, t: &str| ps.patterns.iter().find(|p| p.template() == t).cloned().unwrap();
+        let (a, b) = (find(&ps, "<*> state changed from IDLE to RUN"), find(&ps, "<*> state changed from RUN to IDLE"));
+        let why = explain(&a, &b, &PatternConfig::default());
+        assert!(why.last().unwrap().contains("2 new slots at once, more than new-slots 1"), "{why:?}");
+        assert_eq!(why[0], "they differ: “IDLE to” / “∅” (2 and 0 tokens, a new slot)");
+        let config = PatternConfig::parse("new-slots 2\n").unwrap();
+        assert!(explain(&a, &b, &config).last().unwrap().starts_with("one pattern"));
+        // A rule.
+        let kept = detect_with(&f, "*: keep D\n");
+        let (d, pn) = (find(&kept, "<*> NAV gear D"), find(&kept, "<*> NAV gear <*>"));
+        let config = PatternConfig::parse("*: keep D\n").unwrap();
+        let why = explain(&d, &pn, &config);
+        assert!(why.iter().any(|w| w == "rule keep D: the word would be in a slot"), "{why:?}");
+        assert_eq!(why.last().unwrap(), "apart: a rule refuses");
+        // Fields.
+        let row = |text, apid| Row { text, apid: Some(apid), mcnt: None, level: None };
+        let s = MemSource::new(vec![row("door open", "BODY"), row("door open", "SEAT")]);
+        let ps = detect_with(&s, "");
+        let why = explain(&ps.patterns[0], &ps.patterns[1], &PatternConfig::default());
+        assert_eq!(why, ["apart: their apid differs (BODY / SEAT); patterns never join across fields"]);
     }
 
     #[test]

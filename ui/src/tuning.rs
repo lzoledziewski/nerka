@@ -1,0 +1,637 @@
+//! The pattern tuning pane (🛠; experimental, `docs/dev/patterns.md`, round
+//! α2), a mode of the Patterns window: the pattern configuration's settings
+//! and rules edited on the trace at hand, each change re-running the
+//! patterns (debounced, on the same lines), what the change did, and why
+//! two patterns were kept apart or joined. Visible in pre-release (alpha)
+//! builds, else behind ⚙ Settings → *Developer: pattern tuning* (owner,
+//! 2026-11-23). Nothing is written until Save; Export and Load move a
+//! configuration between testers.
+
+use eframe::egui::{self, RichText};
+use nerka_core::pattern::{PatternConfig, Patterns, Setting, Settings};
+use std::time::{Duration, Instant};
+
+/// A setting's change waits this long for the next before the run.
+const DEBOUNCE: Duration = Duration::from_millis(600);
+
+/// The rule form's actions.
+const ACTIONS: [(&str, &str); 9] = [
+    ("keep", "WORD… never in a slot"),
+    ("apart", "WORD WORD… never in one slot"),
+    ("max-slots", "N: slots a pattern has at most"),
+    ("value", "/REGEX/: text that is a value"),
+    ("literal", "/REGEX/: text that is never a value"),
+    ("header", "WORD…: header or footer tokens"),
+    ("ignore", "[/REGEX/]: lines left out"),
+    ("no-merge", "stage 1 only"),
+    ("set", "SETTING VALUE for these lines"),
+];
+
+/// What a change of settings did to the patterns.
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct Change {
+    /// Patterns (fields and template) only the new run has, only the old.
+    pub new: Vec<String>,
+    pub gone: Vec<String>,
+    /// New patterns holding lines of several old ones (how many), and old
+    /// ones whose lines went into several new ones.
+    pub joined: Vec<(String, usize)>,
+    pub split: Vec<(String, usize)>,
+    /// Too many lines to follow (only new and gone are known).
+    pub partial: bool,
+}
+
+impl Change {
+    fn summary(&self) -> String {
+        if *self == Change::default() {
+            return "no change".into();
+        }
+        format!(
+            "+{} patterns, −{}, {} joined, {} split{}",
+            self.new.len(),
+            self.gone.len(),
+            self.joined.len(),
+            self.split.len(),
+            if self.partial { " (joins and splits not followed: too many lines)" } else { "" }
+        )
+    }
+}
+
+/// A pattern's name in a change: its fields and template.
+pub fn name_of(p: &nerka_core::pattern::Pattern) -> String {
+    let mut s: String = p.fields.iter().map(|(n, v)| format!("{n}={v} ")).collect();
+    s += &p.template();
+    s
+}
+
+/// What changed from run `old` to run `new` (of the same lines).
+pub fn change(old: &Patterns, new: &Patterns) -> Change {
+    use std::collections::HashSet;
+    let names = |ps: &Patterns| ps.patterns.iter().map(name_of).collect::<Vec<_>>();
+    let (on, nn) = (names(old), names(new));
+    let (os, ns): (HashSet<&String>, HashSet<&String>) = (on.iter().collect(), nn.iter().collect());
+    let mut c = Change {
+        new: nn.iter().filter(|n| !os.contains(n)).cloned().collect(),
+        gone: on.iter().filter(|n| !ns.contains(n)).cloned().collect(),
+        ..Change::default()
+    };
+    // Each line's pattern in both runs, by line: who went where.
+    let lines: u64 = old.patterns.iter().map(|p| p.lines.iter().map(Vec::len).sum::<usize>() as u64).sum();
+    if lines > 4_000_000 || old.total() != new.total() {
+        c.partial = true;
+        return c;
+    }
+    let of = |ps: &Patterns| {
+        let mut v: Vec<(usize, u64, u32)> = Vec::new();
+        for (k, p) in ps.patterns.iter().enumerate() {
+            for (side, ls) in p.lines.iter().enumerate() {
+                v.extend(ls.iter().map(|&l| (side, l, k as u32)));
+            }
+        }
+        v.sort_unstable();
+        v
+    };
+    let (a, b) = (of(old), of(new));
+    if a.len() != b.len() || a.iter().zip(&b).any(|(x, y)| (x.0, x.1) != (y.0, y.1)) {
+        c.partial = true;
+        return c;
+    }
+    let mut pairs: Vec<(u32, u32)> = a.iter().zip(&b).map(|(x, y)| (x.2, y.2)).collect();
+    pairs.sort_unstable();
+    pairs.dedup();
+    let count = |key: &dyn Fn(&(u32, u32)) -> u32, n: usize| {
+        let mut per = vec![0usize; n];
+        for p in &pairs {
+            per[key(p) as usize] += 1;
+        }
+        per
+    };
+    let into = count(&|p| p.0, old.patterns.len());
+    let from = count(&|p| p.1, new.patterns.len());
+    c.split = into.iter().enumerate().filter(|(_, n)| **n > 1).map(|(k, n)| (on[k].clone(), *n)).collect();
+    c.joined = from.iter().enumerate().filter(|(_, n)| **n > 1).map(|(k, n)| (nn[k].clone(), *n)).collect();
+    c
+}
+
+/// The new rule form.
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct Form {
+    /// Per scope field: (name, value; empty: any).
+    pub scope: Vec<(String, String)>,
+    pub action: usize,
+    pub arg: String,
+}
+
+impl Form {
+    /// The rule it makes: `apid == NAV: keep Elapsed`.
+    pub fn rule(&self) -> String {
+        let conds: Vec<String> = self
+            .scope
+            .iter()
+            .filter(|(_, v)| !v.trim().is_empty())
+            .map(|(n, v)| {
+                let v = v.trim();
+                if v.chars().all(|c| c.is_alphanumeric() || "_*.-".contains(c)) {
+                    format!("{n} == {v}")
+                } else {
+                    format!("{n} == \"{}\"", v.replace('\\', "\\\\").replace('"', "\\\""))
+                }
+            })
+            .collect();
+        let scope = if conds.is_empty() { "*".to_owned() } else { conds.join(" AND ") };
+        format!("{scope}: {} {}", ACTIONS[self.action].0, self.arg.trim()).trim_end().to_owned()
+    }
+
+    /// Filled for `action` with `arg`, scoped by `fields` (of a pattern).
+    pub fn fill(&mut self, fields: &[(String, String)], action: &str, arg: String) {
+        for (n, v) in &mut self.scope {
+            *v = fields.iter().find(|(m, _)| m == n).map(|(_, w)| w.clone()).unwrap_or_default();
+        }
+        self.action = ACTIONS.iter().position(|(a, _)| *a == action).unwrap_or(0);
+        self.arg = arg;
+    }
+}
+
+/// The tuning pane's state.
+#[derive(Default)]
+pub struct TuningUi {
+    /// The configuration tuned: loaded from the saved one when first shown.
+    config: Option<PatternConfig>,
+    /// The rules as typed, each with why it doesn't read.
+    rules: Vec<(String, Option<String>)>,
+    /// Edited since saved or loaded.
+    changed: bool,
+    /// Bumps with each edit: a run with another is out of date.
+    pub generation: u64,
+    edited: Option<Instant>,
+    note: Option<String>,
+    pub form: Form,
+    /// What the last change did, and whether its list is shown.
+    pub change: Option<Change>,
+    show_change: bool,
+}
+
+impl TuningUi {
+    /// The configuration to run with, once the pane is in use.
+    pub fn active(&self) -> Option<&PatternConfig> {
+        self.config.as_ref()
+    }
+
+    /// Load the saved configuration (the pane's first showing, Revert).
+    fn load(&mut self, config: Result<PatternConfig, String>) {
+        match config {
+            Ok(c) => self.set(c, false),
+            Err(e) => {
+                self.note = Some(format!("The saved configuration doesn't read: {e}"));
+                self.set(PatternConfig::default(), false);
+            }
+        }
+    }
+
+    fn set(&mut self, c: PatternConfig, changed: bool) {
+        self.rules = c.rules.iter().map(|r| (r.text.clone(), None)).collect();
+        self.config = Some(c);
+        self.changed = changed;
+        self.touch();
+    }
+
+    fn touch(&mut self) {
+        self.generation += 1;
+        self.edited = Some(Instant::now());
+    }
+
+    /// An edit waited long enough: run again (once).
+    pub fn due(&mut self) -> bool {
+        if self.edited.is_some_and(|t| t.elapsed() >= DEBOUNCE) {
+            self.edited = None;
+            return true;
+        }
+        false
+    }
+
+    /// Waiting to run again.
+    pub fn waiting(&self) -> bool {
+        self.edited.is_some()
+    }
+
+    /// The rules typed, read again into the configuration.
+    fn rules_changed(&mut self) {
+        let Some(c) = &mut self.config else { return };
+        c.rules.clear();
+        for (text, error) in &mut self.rules {
+            *error = None;
+            if text.trim().is_empty() {
+                continue;
+            }
+            if let Err(e) = c.add_rule(text) {
+                *error = Some(e);
+            }
+        }
+        self.changed = true;
+        self.touch();
+    }
+
+    /// Add a rule from the form (or a pattern's ⋮ Rule…).
+    pub fn add_rule(&mut self, rule: String) {
+        self.rules.push((rule, None));
+        self.rules_changed();
+    }
+
+    /// The pane. `fields`: the context fields rules are scoped by;
+    /// `last`: the last run.
+    pub fn ui(
+        &mut self,
+        ui: &mut egui::Ui,
+        fields: &[String],
+        last: Option<&Patterns>,
+        load: fn() -> Result<PatternConfig, String>,
+    ) {
+        if self.config.is_none() {
+            self.load(load());
+            self.edited = None;
+        }
+        if self.form.scope.iter().map(|(n, _)| n).ne(fields.iter()) {
+            self.form.scope = fields.iter().map(|f| (f.clone(), String::new())).collect();
+        }
+        ui.horizontal(|ui| {
+            let path = PatternConfig::saved_path().map(|p| p.display().to_string()).unwrap_or_default();
+            let state = if self.changed { "changed, not saved" } else { "as saved" };
+            ui.label(RichText::new(format!("Configuration: {state}")).strong()).on_hover_text(path);
+            if ui.add_enabled(self.changed, egui::Button::new("💾 Save")).clicked() {
+                self.save();
+            }
+            if ui
+                .add_enabled(self.changed, egui::Button::new("↺ Revert"))
+                .on_hover_text("Back to the saved configuration")
+                .clicked()
+            {
+                self.load(load());
+            }
+            if ui.button("Load…").on_hover_text("Read a configuration file (not saved until Save)").clicked() {
+                self.load_file();
+            }
+            if ui.button("Export…").on_hover_text("Write this configuration to a file, e.g. for a bug report").clicked()
+            {
+                self.export();
+            }
+            if self.waiting() {
+                ui.weak("running again…");
+            }
+        });
+        if let Some(n) = &self.note {
+            ui.label(n);
+        }
+        ui.separator();
+        egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+            self.settings_ui(ui);
+            ui.separator();
+            self.rules_ui(ui);
+            ui.separator();
+            if let Some(p) = last {
+                let s = &p.stats;
+                ui.label(RichText::new("Last run").strong());
+                ui.label(format!(
+                    "stage 1: {} templates, {:.1?} · stage 2: {} patterns, {:.1?}",
+                    s.templates,
+                    s.stage1,
+                    p.patterns.len(),
+                    s.stage2
+                ));
+                ui.label(format!(
+                    "kept apart: {} by two new slots · {} by a long side · {} by rules{}",
+                    s.apart,
+                    s.side,
+                    s.rules,
+                    if s.ignored != [0, 0] {
+                        format!(" · {} lines ignored", s.ignored[0] + s.ignored[1])
+                    } else {
+                        String::new()
+                    }
+                ));
+            }
+            if let Some(c) = &self.change {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("Change").strong());
+                    ui.label(format!("{} (since the run before)", c.summary()));
+                    if *c != Change::default() {
+                        ui.toggle_value(&mut self.show_change, "Show");
+                    }
+                });
+                if self.show_change {
+                    let list = |ui: &mut egui::Ui, title: &str, items: &[String]| {
+                        if !items.is_empty() {
+                            ui.label(RichText::new(title).strong());
+                            for i in items {
+                                ui.monospace(i);
+                            }
+                        }
+                    };
+                    list(ui, "New", &c.new);
+                    list(ui, "Gone", &c.gone);
+                    let counted = |v: &[(String, usize)], what: &str| -> Vec<String> {
+                        v.iter().map(|(n, k)| format!("{n}   ({what} {k})")).collect()
+                    };
+                    list(ui, "Joined", &counted(&c.joined, "from"));
+                    list(ui, "Split", &counted(&c.split, "into"));
+                }
+            }
+            ui.add_space(4.0);
+            ui.weak(
+                "Why two patterns are apart or one: tick ? on two rows in 🧩 Patterns. ⋮ on a row makes a \
+                 rule from it here.",
+            );
+        });
+    }
+
+    fn settings_ui(&mut self, ui: &mut egui::Ui) {
+        let Some(c) = &mut self.config else { return };
+        let d = Settings::default();
+        let s = c.settings.clone();
+        let mut set: Vec<Setting> = Vec::new();
+        /// A setting's reset dot: ● while it isn't the default.
+        fn dot(ui: &mut egui::Ui, changed: bool, default: String) -> bool {
+            if changed {
+                ui.small_button("●").on_hover_text(format!("Changed: back to the default, {default}")).clicked()
+            } else {
+                ui.weak("·").on_hover_text(format!("The default, {default}"));
+                false
+            }
+        }
+        egui::Grid::new("tuning-settings").num_columns(4).spacing([10.0, 4.0]).show(ui, |ui| {
+            ui.label(RichText::new("Stage 1").strong());
+            let mut v = s.similarity;
+            ui.label("similarity").on_hover_text("Share of a template's words a message must have to join it");
+            if ui.add(egui::DragValue::new(&mut v).range(0.0..=1.0).speed(0.01).max_decimals(2)).changed() {
+                set.push(Setting::Similarity(v));
+            }
+            if dot(ui, s.similarity != d.similarity, d.similarity.to_string()) {
+                set.push(Setting::Similarity(d.similarity));
+            }
+            ui.end_row();
+            ui.label("");
+            let mut v = s.new_wildcards;
+            ui.label("new wildcards").on_hover_text("Words a message may turn into wildcards at once");
+            if ui.add(egui::DragValue::new(&mut v).range(0..=8)).changed() {
+                set.push(Setting::NewWildcards(v));
+            }
+            if dot(ui, s.new_wildcards != d.new_wildcards, d.new_wildcards.to_string()) {
+                set.push(Setting::NewWildcards(d.new_wildcards));
+            }
+            ui.end_row();
+            ui.label("");
+            ui.label("header").on_hover_text(
+                "Header and footer detection: lines held back per context and chunk, the fewest to detect \
+                 on, the share of lines a word is on (more than), tokens from the start and end",
+            );
+            ui.horizontal(|ui| {
+                let (mut a, mut b, mut sh, mut p) = (s.header_sample, s.header_min, s.header_share, s.header_places);
+                ui.label("sample");
+                if ui.add(egui::DragValue::new(&mut a).range(1..=1024)).changed() {
+                    set.push(Setting::HeaderSample(a));
+                }
+                ui.label("min");
+                if ui.add(egui::DragValue::new(&mut b).range(0..=1024)).changed() {
+                    set.push(Setting::HeaderMin(b));
+                }
+                ui.label("share");
+                if ui.add(egui::DragValue::new(&mut sh).range(0.0..=1.0).speed(0.01).max_decimals(2)).changed() {
+                    set.push(Setting::HeaderShare(sh));
+                }
+                ui.label("places");
+                if ui.add(egui::DragValue::new(&mut p).range(1..=8)).changed() {
+                    set.push(Setting::HeaderPlaces(p));
+                }
+            });
+            let header_changed = (s.header_sample, s.header_min, s.header_share, s.header_places)
+                != (d.header_sample, d.header_min, d.header_share, d.header_places);
+            if dot(ui, header_changed, "sample 32 min 8 share 0.5 places 3".into()) {
+                set.extend([
+                    Setting::HeaderSample(d.header_sample),
+                    Setting::HeaderMin(d.header_min),
+                    Setting::HeaderShare(d.header_share),
+                    Setting::HeaderPlaces(d.header_places),
+                ]);
+            }
+            ui.end_row();
+            ui.label(RichText::new("Stage 2").strong());
+            let mut m = s.merge;
+            ui.label("merge").on_hover_text("Align templates into patterns at all");
+            if ui.checkbox(&mut m, "on").changed() {
+                set.push(Setting::Merge(m));
+            }
+            if dot(ui, s.merge != d.merge, "on".into()) {
+                set.push(Setting::Merge(d.merge));
+            }
+            ui.end_row();
+            ui.label("");
+            let mut v = s.new_slots;
+            ui.label("new slots").on_hover_text("Slots one merge may make: two at once vary together");
+            if ui.add(egui::DragValue::new(&mut v).range(0..=8)).changed() {
+                set.push(Setting::NewSlots(v));
+            }
+            if dot(ui, s.new_slots != d.new_slots, d.new_slots.to_string()) {
+                set.push(Setting::NewSlots(d.new_slots));
+            }
+            ui.end_row();
+            ui.label("");
+            let mut v = s.side;
+            ui.label("side").on_hover_text("Tokens on the longer side of a place two templates differ in");
+            if ui.add(egui::DragValue::new(&mut v).range(1..=16)).changed() {
+                set.push(Setting::Side(v));
+            }
+            if dot(ui, s.side != d.side, d.side.to_string()) {
+                set.push(Setting::Side(d.side));
+            }
+            ui.end_row();
+            ui.label("");
+            let mut v = s.state_values;
+            ui.label("state values").on_hover_text("A slot with more values is <*>, not a state");
+            if ui.add(egui::DragValue::new(&mut v).range(2..=nerka_core::pattern::MAX_VALUES)).changed() {
+                set.push(Setting::StateValues(v));
+            }
+            if dot(ui, s.state_values != d.state_values, d.state_values.to_string()) {
+                set.push(Setting::StateValues(d.state_values));
+            }
+            ui.end_row();
+        });
+        if !set.is_empty() {
+            for x in set {
+                c.settings.apply(x);
+            }
+            self.changed = true;
+            self.touch();
+        }
+    }
+
+    fn rules_ui(&mut self, ui: &mut egui::Ui) {
+        ui.label(RichText::new("Rules").strong()).on_hover_text(
+            "SCOPE: ACTION, read top to bottom; of rules setting one thing the first that applies counts, \
+             the others add up",
+        );
+        let mut edited = false;
+        let (mut up, mut remove) = (None, None);
+        let n = self.rules.len();
+        for (i, (text, error)) in self.rules.iter_mut().enumerate() {
+            ui.horizontal(|ui| {
+                if ui.add_enabled(i > 0, egui::Button::new("▲").small()).clicked() {
+                    up = Some(i);
+                }
+                if ui.add_enabled(i + 1 < n, egui::Button::new("▼").small()).clicked() {
+                    up = Some(i + 1);
+                }
+                let r = ui.add(egui::TextEdit::singleline(text).desired_width(520.0).font(egui::TextStyle::Monospace));
+                edited |= r.lost_focus() || (r.changed() && !r.has_focus());
+                if ui.small_button("−").on_hover_text("Remove the rule").clicked() {
+                    remove = Some(i);
+                }
+            });
+            if let Some(e) = error {
+                ui.colored_label(ui.visuals().error_fg_color, e.as_str());
+            }
+        }
+        if let Some(i) = up {
+            self.rules.swap(i - 1, i);
+            edited = true;
+        }
+        if let Some(i) = remove {
+            self.rules.remove(i);
+            edited = true;
+        }
+        if edited {
+            self.rules_changed();
+        }
+        ui.horizontal_wrapped(|ui| {
+            ui.label("➕");
+            for (name, value) in &mut self.form.scope {
+                ui.label(format!("{name} =="));
+                ui.add(egui::TextEdit::singleline(value).hint_text("any").desired_width(70.0));
+            }
+            egui::ComboBox::from_id_salt("tuning-action").selected_text(ACTIONS[self.form.action].0).show_ui(
+                ui,
+                |ui| {
+                    for (k, (a, what)) in ACTIONS.iter().enumerate() {
+                        ui.selectable_value(&mut self.form.action, k, *a).on_hover_text(*what);
+                    }
+                },
+            );
+            ui.add(
+                egui::TextEdit::singleline(&mut self.form.arg)
+                    .hint_text(ACTIONS[self.form.action].1)
+                    .desired_width(220.0),
+            );
+            let rule = self.form.rule();
+            let check = PatternConfig::default().add_rule(&rule);
+            let r = ui.add_enabled(check.is_ok(), egui::Button::new("Add rule"));
+            let r = match &check {
+                Ok(()) => r.on_hover_text(rule.clone()),
+                Err(e) => r.on_disabled_hover_text(format!("{rule}\n{e}")),
+            };
+            if r.clicked() {
+                self.add_rule(rule);
+                self.form.arg.clear();
+            }
+        });
+    }
+
+    fn save(&mut self) {
+        let Some(c) = &self.config else { return };
+        let Some(path) = PatternConfig::saved_path() else {
+            self.note = Some("No configuration folder to save to".into());
+            return;
+        };
+        let write = path
+            .parent()
+            .map_or(Ok(()), std::fs::create_dir_all)
+            .and_then(|_| nerka_core::write_atomic(&path, c.to_text()));
+        match write {
+            Ok(()) => {
+                self.changed = false;
+                self.note = Some(format!("Saved to {}", path.display()));
+            }
+            Err(e) => self.note = Some(format!("Not saved: {}: {e}", path.display())),
+        }
+    }
+
+    fn load_file(&mut self) {
+        let Some(path) = rfd::FileDialog::new().set_title("Load a pattern configuration").pick_file() else { return };
+        match std::fs::read_to_string(&path).map_err(|e| e.to_string()).and_then(|t| PatternConfig::parse(&t)) {
+            Ok(c) => {
+                self.set(c, true);
+                self.note = Some(format!("Loaded {} (not saved)", path.display()));
+            }
+            Err(e) => self.note = Some(format!("{}: {e}", path.display())),
+        }
+    }
+
+    fn export(&mut self) {
+        let Some(c) = &self.config else { return };
+        let Some(path) =
+            rfd::FileDialog::new().set_title("Export the pattern configuration").set_file_name("patterns").save_file()
+        else {
+            return;
+        };
+        self.note = Some(match nerka_core::write_atomic(&path, c.to_text()) {
+            Ok(()) => format!("Exported to {}", path.display()),
+            Err(e) => format!("Not exported: {}: {e}", path.display()),
+        });
+    }
+}
+
+#[cfg(test)]
+impl TuningUi {
+    /// As if `c` had been set in the pane a while ago.
+    pub fn tune_for_test(&mut self, c: PatternConfig) {
+        self.set(c, true);
+        self.edited = Instant::now().checked_sub(DEBOUNCE);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use nerka_core::pattern::{PatternOptions, detect};
+    use nerka_core::{Progress, TextFile};
+
+    fn run(config: &str) -> Patterns {
+        let f = TextFile::from_bytes(
+            "t",
+            [
+                "state changed from IDLE to RUN",
+                "state changed from RUN to IDLE",
+                "state changed from IDLE to RUN",
+                "gear D",
+                "gear P",
+                "gear D",
+            ]
+            .join("\n")
+            .into_bytes(),
+        );
+        let options =
+            PatternOptions { lines: true, config: PatternConfig::parse(config).unwrap(), ..Default::default() };
+        detect(&f, None, &options, &Progress::new()).unwrap()
+    }
+
+    #[test]
+    fn a_change_says_what_joined() {
+        let (a, b) = (run(""), run("new-slots 2\n"));
+        let c = change(&a, &b);
+        assert_eq!(c.joined.len(), 1, "{c:?}");
+        assert!(c.joined[0].0.starts_with("state changed") && c.joined[0].1 == 2, "{c:?}");
+        assert_eq!((c.new.len(), c.gone.len(), c.split.len()), (1, 2, 0), "{c:?}");
+        let back = change(&b, &a);
+        assert_eq!((back.split.len(), back.joined.len()), (1, 0));
+        assert_eq!(change(&a, &a), Change::default());
+        assert_eq!(change(&a, &a).summary(), "no change");
+    }
+
+    #[test]
+    fn the_form_makes_rules() {
+        let mut f =
+            Form { scope: vec![("apid".into(), String::new()), ("ctid".into(), String::new())], ..Default::default() };
+        f.fill(&[("apid".into(), "NAV".into())], "keep", "Elapsed".into());
+        assert_eq!(f.rule(), "apid == NAV: keep Elapsed");
+        f.fill(&[("ctid".into(), "a b".into())], "no-merge", String::new());
+        assert_eq!(f.rule(), "ctid == \"a b\": no-merge");
+        assert!(PatternConfig::default().add_rule(&f.rule()).is_ok());
+    }
+}

@@ -338,6 +338,42 @@ impl PatternConfig {
         crate::write_atomic(path, text).map_err(|e| format!("{}: {e}", path.display()))
     }
 
+    /// As a `patterns` file: the settings that aren't the defaults, then
+    /// the rules as written. [`Self::parse`] reads it back the same.
+    pub fn to_text(&self) -> String {
+        let (s, d) = (&self.settings, Settings::default());
+        let mut out = String::from("# nerka pattern configuration: settings and rules (docs: cli.md)\n");
+        let mut line = |differs: bool, text: String| {
+            if differs {
+                out.push_str(&text);
+                out.push('\n');
+            }
+        };
+        line(s.similarity != d.similarity, format!("similarity {}", s.similarity));
+        line(s.new_wildcards != d.new_wildcards, format!("new-wildcards {}", s.new_wildcards));
+        line(s.new_slots != d.new_slots, format!("new-slots {}", s.new_slots));
+        line(s.side != d.side, format!("side {}", s.side));
+        line(s.state_values != d.state_values, format!("state-values {}", s.state_values));
+        let mut header = String::new();
+        for (differs, text) in [
+            (s.header_sample != d.header_sample, format!(" sample {}", s.header_sample)),
+            (s.header_min != d.header_min, format!(" min {}", s.header_min)),
+            (s.header_share != d.header_share, format!(" share {}", s.header_share)),
+            (s.header_places != d.header_places, format!(" places {}", s.header_places)),
+        ] {
+            if differs {
+                header += &text;
+            }
+        }
+        line(!header.is_empty(), format!("header{header}"));
+        line(s.merge != d.merge, format!("merge {}", if s.merge { "on" } else { "off" }));
+        for r in &self.rules {
+            out.push_str(&r.text);
+            out.push('\n');
+        }
+        out
+    }
+
     /// Where it is saved.
     pub fn saved_path() -> Option<std::path::PathBuf> {
         crate::config_dir().map(|d| d.join("patterns"))
@@ -774,6 +810,20 @@ ctid == TCP: set similarity 0.7
         assert_eq!((a.s.similarity, a.s.merge), (0.6, false));
         let b = c.local(&names, &[Some(b"B")]);
         assert_eq!((b.s.similarity, b.s.merge), (0.8, false));
+    }
+
+    #[test]
+    fn text_reads_back_the_same() {
+        let text = "similarity 0.7\nheader min 4 places 2\nmerge off\napid == NAV: keep Elapsed\n*: value /a\\/b/\n";
+        let c = PatternConfig::parse(text).unwrap();
+        let out = c.to_text();
+        assert!(out.ends_with(
+            "similarity 0.7\nheader min 4 places 2\nmerge off\napid == NAV: keep Elapsed\n*: value /a\\/b/\n"
+        ));
+        let again = PatternConfig::parse(&out).unwrap();
+        assert_eq!(again.settings, c.settings);
+        assert_eq!(again.to_text(), out);
+        assert_eq!(PatternConfig::default().to_text().lines().count(), 1);
     }
 
     #[test]

@@ -222,6 +222,21 @@ default; the configuration file works either way).
 - Save / Load / Export: the configuration file, so a tester sends theirs
   with a bug report and it is loaded as it was.
 
+As built (2026-11-24, α2; `ui/src/tuning.rs`): **🛠 Tuning** is the third
+mode of the Patterns window, shown when the version is a pre-release
+(`-alpha…`) or ⚙ Settings → Developer → Pattern tuning (`prefs`:
+`pattern_tuning`) is on. The pane loads the saved configuration once and
+from then on the window's runs use the pane's (saved or not); a change
+runs again after 0.6 s on the same lines. **Change** follows each line
+from the run before to this one (joins and splits; past 4 M lines only new
+and gone). **Why** is `pattern::explain`: stage 2's verdict on the two
+patterns as they came out, every word weighing 1 (an approximation:
+header words weigh less in the run, and stage 1 may have kept lines apart
+first). Rules are edited as text lines plus a form; ⋮ on a pattern row
+fills the form (ignore it, at most N−1 slots, a slot's values apart, a
+value kept). Save writes the settings that aren't the defaults and the
+rules (`PatternConfig::to_text`).
+
 ## Order of work (alpha rounds)
 
 1. **Core (built 2026-11-24):** `PatternConfig` (settings now constants become fields), rules
@@ -275,3 +290,12 @@ change if it should be otherwise.
 8. Signals panel: ⚖ on a lifecycle row compares it with the one before and
    runs at once (the plan said a right-click menu; rows have buttons, not
    menus, so a button).
+9. Tuning is a mode of the Patterns window; once opened, its configuration
+   (even unsaved) is what that window runs with, until Revert.
+10. Save writes only the settings that differ from the defaults, so a
+    later default reaches files that didn't change it.
+11. ⋮ "At most N slots here" proposes one less than the pattern has (its
+    last merge made one too many); the form can be edited before Add.
+12. "Why" explains stage 2 only, with every word weighing 1.
+13. The tuning pane shows in any version with a `-` (pre-releases) and is
+    a Settings switch otherwise.

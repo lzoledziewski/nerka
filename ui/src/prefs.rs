@@ -49,6 +49,9 @@ pub struct SearchPrefs {
     pub plot_window: bool,
     /// The plot's own window opens maximized (as it was last left).
     pub plot_window_maximized: bool,
+    /// The Patterns window's tuning pane in a release build (alpha builds
+    /// always show it; owner, 2026-11-23).
+    pub pattern_tuning: bool,
     /// Light, dark, or as the system says (egui falls back to dark where
     /// it can't tell, as on many Linux desktops).
     pub theme: egui::ThemePreference,
@@ -83,6 +86,7 @@ impl Default for SearchPrefs {
             checks_auto: true,
             plot_window: false,
             plot_window_maximized: false,
+            pattern_tuning: false,
             theme: egui::ThemePreference::System,
             routes: Vec::new(),
             disabled_protocols: Vec::new(),
@@ -161,6 +165,7 @@ impl SearchPrefs {
                 "checks_auto" => p.checks_auto = flag,
                 "plot_window" => p.plot_window = flag,
                 "plot_window_maximized" => p.plot_window_maximized = flag,
+                "pattern_tuning" => p.pattern_tuning = flag,
                 _ => {}
             }
         }
@@ -195,6 +200,7 @@ impl SearchPrefs {
         out.push_str(&format!("plot_window={}\n", self.plot_window));
         out.push_str(&format!("plot_window_maximized={}\n", self.plot_window_maximized));
         out.push_str(&format!("theme={}\n", theme_key(self.theme)));
+        out.push_str(&format!("pattern_tuning={}\n", self.pattern_tuning));
         for r in &self.routes {
             out.push_str(&format!("route={r}\n"));
         }
@@ -291,6 +297,7 @@ mod tests {
             checks_auto: false,
             plot_window: true,
             plot_window_maximized: true,
+            pattern_tuning: true,
             theme: egui::ThemePreference::Light,
             routes: vec!["DLT:port=3490,vlan=5".into()],
             disabled_protocols: vec!["syslog".into()],

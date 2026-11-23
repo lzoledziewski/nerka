@@ -53,6 +53,7 @@ mod shot;
 mod signals;
 mod skips;
 mod sync;
+mod tuning;
 mod view;
 
 use eframe::egui::{self, Color32, Key, KeyboardShortcut, Modifiers, RichText};
@@ -3491,11 +3492,12 @@ struct SettingsFields<'a> {
     limit: &'a mut String,
     local_time: &'a mut bool,
     mf4_local_time: &'a mut bool,
+    pattern_tuning: &'a mut bool,
 }
 
 /// The Settings window's fields ([`SettingsFields`]).
 fn settings_ui(ui: &mut egui::Ui, f: SettingsFields<'_>) -> SettingsChange {
-    let SettingsFields { name, theme, limit, local_time, mf4_local_time } = f;
+    let SettingsFields { name, theme, limit, local_time, mf4_local_time, pattern_tuning } = f;
     let mut save = SettingsChange::default();
     egui::Grid::new("settings-grid").num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| {
         ui.label(RichText::new("Look").strong());
@@ -3533,6 +3535,16 @@ fn settings_ui(ui: &mut egui::Ui, f: SettingsFields<'_>) -> SettingsChange {
              On: read it in this computer's zone. Off: read it as UTC.",
         );
         save.times |= r.changed();
+        ui.end_row();
+        ui.label(RichText::new("Developer").strong());
+        ui.end_row();
+        ui.label("Patterns");
+        let alpha = env!("CARGO_PKG_VERSION").contains('-');
+        let r = ui
+            .add_enabled(!alpha, egui::Checkbox::new(pattern_tuning, "Pattern tuning"))
+            .on_hover_text("🛠 Tuning in the Patterns window: the pattern configuration tried on the trace at hand")
+            .on_disabled_hover_text("Always shown in alpha builds");
+        save.theme |= r.changed();
         ui.end_row();
         ui.label(RichText::new("This window").strong());
         ui.end_row();
@@ -4283,6 +4295,7 @@ impl App {
                         limit,
                         local_time: &mut self.prefs.local_time,
                         mf4_local_time: &mut self.prefs.mf4_local_time,
+                        pattern_tuning: &mut self.prefs.pattern_tuning,
                     },
                 );
                 ui.separator();
@@ -4422,6 +4435,9 @@ impl App {
             return;
         }
         let name = self.window_name.clone();
+        // Alpha builds show the tuning pane; releases behind Settings
+        // (owner, 2026-11-23).
+        let tuning = env!("CARGO_PKG_VERSION").contains('-') || self.prefs.pattern_tuning;
         let refs: Vec<patterns::TabRef> = self.tabs.iter().filter_map(Tab::tab_ref).collect();
         let mut asked = Vec::new();
         for (i, t) in self.tabs.iter_mut().enumerate() {
@@ -4439,6 +4455,7 @@ impl App {
                 signals_gen: t.signals_gen,
                 title,
                 config: nerka_core::pattern::PatternConfig::load_saved,
+                tuning,
             };
             let out = t.patterns.window(ctx, &input);
             if out != patterns::Output::default() {
@@ -8072,6 +8089,7 @@ gear=D
                             limit: &mut "8".to_owned(),
                             local_time: &mut true,
                             mf4_local_time: &mut true,
+                            pattern_tuning: &mut false,
                         };
                         settings_ui(ui, fields);
                         let change = protocols::settings_section(ui, edit, &prefs, &[]);
