@@ -22,7 +22,7 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use nerka_core::bundle::{Bundle, Choice, Item, Kind, Status, Store};
 use nerka_core::pack::{self, Expansion, Library, ParamValue, Pick, Role, Selection};
-use nerka_core::pattern::{self, PatternOptions};
+use nerka_core::pattern::{self, PatternConfig, PatternOptions};
 use nerka_core::{
     Bookmarks, Filter, LineNo, LogSource, Matcher, MatcherOptions, Progress, Query, SearchSet, SignalDef, Signals,
     search, search_within,
@@ -189,13 +189,8 @@ enum Cmd {
         /// Only the lines matching this NFD filter.
         #[arg(long = "in", value_name = "FILTER")]
         within: Option<String>,
-        /// Group this field's text (default: `payload` if the file has it,
-        /// else the line).
-        #[arg(long)]
-        field: Option<String>,
-        /// How alike a message must be to join a pattern (0–1).
-        #[arg(long, default_value_t = 0.5)]
-        similarity: f32,
+        #[command(flatten)]
+        engine: PatternArgs,
         /// Print at most this many patterns (0: all).
         #[arg(short = 'n', long, default_value_t = 30)]
         top: usize,
@@ -205,9 +200,6 @@ enum Cmd {
         /// Also print each slot's values: lines, first and last line.
         #[arg(long)]
         values: bool,
-        /// Don't merge templates by alignment (Drain's templates only).
-        #[arg(long)]
-        no_merge: bool,
         /// Also print each pattern's NFD query.
         #[arg(long)]
         queries: bool,
@@ -236,16 +228,8 @@ enum Cmd {
         /// Both sets: only the lines matching this NFD filter.
         #[arg(long = "in", value_name = "FILTER")]
         within: Option<String>,
-        /// Group this field's text (default: `payload` if the file has it,
-        /// else the line).
-        #[arg(long)]
-        field: Option<String>,
-        /// How alike a message must be to join a template (0–1).
-        #[arg(long, default_value_t = 0.5)]
-        similarity: f32,
-        /// Don't merge templates by alignment.
-        #[arg(long)]
-        no_merge: bool,
+        #[command(flatten)]
+        engine: PatternArgs,
         /// Only changes at least this sure (new and gone ones are always
         /// shown): G², 3.84 is p = 0.05, 10.8 is p = 0.001.
         #[arg(long, default_value_t = 10.8)]
@@ -351,6 +335,75 @@ enum Conflicts {
     Both,
     Theirs,
     Mine,
+}
+
+/// What a pattern run's stages did (`--stats`).
+fn engine_stats(s: &pattern::PatternStats) -> String {
+    let mut out = format!(
+        "stage 1: {} templates {:.2?} | stage 2: {:.2?}, kept apart: {} new slots, {} side, {} rules",
+        s.templates, s.stage1, s.stage2, s.apart, s.side, s.rules
+    );
+    if s.ignored != [0, 0] {
+        out += &format!(" | ignored {} lines", s.ignored[0] + s.ignored[1]);
+    }
+    out
+}
+
+/// How `patterns` and `compare` group lines.
+#[derive(clap::Args)]
+struct PatternArgs {
+    /// Group this field's text (default: `payload` if the file has it,
+    /// else the line).
+    #[arg(long)]
+    field: Option<String>,
+    /// How alike a message must be to join a template (0–1; the setting
+    /// `similarity`).
+    #[arg(long)]
+    similarity: Option<f32>,
+    /// Don't merge templates by alignment (Drain's templates only; the
+    /// setting `merge off`).
+    #[arg(long)]
+    no_merge: bool,
+    /// Settings and rules (default: the saved ones, <config>/nerka/patterns;
+    /// `-`: none, the defaults).
+    #[arg(long, value_name = "FILE")]
+    pattern_config: Option<PathBuf>,
+    /// A setting for this run, after the configuration's (repeatable):
+    /// `similarity=0.7`, `header=sample 16 min 4`.
+    #[arg(long = "set", value_name = "KEY=VALUE")]
+    set: Vec<String>,
+    /// A rule for this run, after the configuration's (repeatable):
+    /// `'apid == NAV: keep Elapsed'`.
+    #[arg(long = "rule", value_name = "RULE")]
+    rules: Vec<String>,
+}
+
+impl PatternArgs {
+    /// The options: the configuration, then `--set`, `--rule`,
+    /// `--similarity`, `--no-merge`.
+    fn options(self, lines: bool) -> Result<PatternOptions> {
+        let mut config = match &self.pattern_config {
+            Some(p) if p == Path::new("-") => PatternConfig::default(),
+            Some(p) => {
+                let text = std::fs::read_to_string(p).with_context(|| format!("reading {}", p.display()))?;
+                PatternConfig::parse(&text).map_err(|e| anyhow::anyhow!("{}: {e}", p.display()))?
+            }
+            None => PatternConfig::load_saved().map_err(anyhow::Error::msg)?,
+        };
+        for s in &self.set {
+            config.set(s).map_err(|e| anyhow::anyhow!("--set {s}: {e}"))?;
+        }
+        for r in &self.rules {
+            config.add_rule(r).map_err(|e| anyhow::anyhow!("--rule {r}: {e}"))?;
+        }
+        if let Some(s) = self.similarity {
+            config.set(&format!("similarity {s}")).map_err(|e| anyhow::anyhow!("--similarity: {e}"))?;
+        }
+        if self.no_merge {
+            config.settings.merge = false;
+        }
+        Ok(PatternOptions { field: self.field, lines, config })
+    }
 }
 
 #[derive(clap::Args)]
@@ -1141,6 +1194,7 @@ fn compare(
     if stats {
         out.flush()?;
         eprintln!("{} patterns, {} differences | grouped and compared in {took:.2?}", ps.patterns.len(), diffs.len());
+        eprintln!("{}", engine_stats(&ps.stats));
     }
     Ok(())
 }
@@ -1396,19 +1450,8 @@ fn run() -> Result<()> {
         Cmd::Filter { query, files, out: o } => {
             run_filter(&files, |source| Ok(Filter::Query(compile(&query, source)?)), &o, &mut out)?;
         }
-        Cmd::Patterns {
-            files,
-            within,
-            field,
-            similarity,
-            top,
-            rare,
-            values,
-            no_merge,
-            queries,
-            lines: show,
-            stats,
-        } => {
+        Cmd::Patterns { files, within, engine, top, rare, values, queries, lines: show, stats } => {
+            let options = engine.options(show.is_some())?;
             let view = open(&files)?;
             let f = &*view.source;
             let lines = match &within {
@@ -1416,7 +1459,6 @@ fn run() -> Result<()> {
                 None => None,
             };
             let t = Instant::now();
-            let options = PatternOptions { field, similarity, merge: !no_merge, lines: show.is_some() };
             let mut ps = nerka_core::pattern::detect(f, lines.as_deref(), &options, &Progress::new())?;
             let took = t.elapsed();
             if rare {
@@ -1481,20 +1523,11 @@ fn run() -> Result<()> {
                     ps.total(),
                     view.took
                 );
+                eprintln!("{}", engine_stats(&ps.stats));
             }
         }
-        Cmd::Compare { files, a, b, within, field, similarity, no_merge, min_score, top, queries, stats } => {
-            compare(
-                &files,
-                [a, b],
-                within,
-                PatternOptions { field, similarity, merge: !no_merge, lines: false },
-                min_score,
-                top,
-                queries,
-                stats,
-                &mut out,
-            )?;
+        Cmd::Compare { files, a, b, within, engine, min_score, top, queries, stats } => {
+            compare(&files, [a, b], within, engine.options(false)?, min_score, top, queries, stats, &mut out)?;
         }
         Cmd::Expand { picks, parts } => {
             if picks.is_empty() {

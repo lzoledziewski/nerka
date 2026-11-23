@@ -571,3 +571,36 @@ fn several_values_of_a_parameter_on_the_command_line() {
          exclude cam.drops(cam=CAM 2, x): (/CAM 2, x drop/)\n"
     );
 }
+
+/// Patterns follow the saved configuration (`<config>/nerka/patterns`),
+/// `--pattern-config`, `--set` and `--rule`; a mistake names its line.
+#[test]
+fn patterns_take_a_configuration() {
+    let d = dir("patterns");
+    let f = d.join("gear.log");
+    std::fs::write(&f, "gear D\ngear P\ngear D\ngear N\ngear D\n").unwrap();
+    let home = d.join("home");
+    let run = |args: &[&str]| {
+        let mut all = vec!["patterns"];
+        all.extend_from_slice(args);
+        all.push(s(&f));
+        nerka_at(&home, &all)
+    };
+    let o = run(&[]);
+    assert!(o.status.success() && out(&o).contains("gear {D|P|N}"), "{}{}", out(&o), err(&o));
+    let o = run(&["--rule", "*: keep D"]);
+    assert!(out(&o).contains("gear D") && !out(&o).contains("{D|"), "{}", out(&o));
+    // Saved: used unless `--pattern-config -`.
+    std::fs::create_dir_all(home.join("nerka")).unwrap();
+    std::fs::write(home.join("nerka").join("patterns"), "# mine\nstate-values 2\n").unwrap();
+    assert!(out(&run(&[])).contains("gear <*>"), "{}", out(&run(&[])));
+    assert!(out(&run(&["--pattern-config", "-"])).contains("gear {D|P|N}"));
+    assert!(out(&run(&["--set", "state-values=3"])).contains("gear {D|P|N}"));
+    let o = run(&["--stats"]);
+    assert!(err(&o).contains("stage 1: ") && err(&o).contains("kept apart:"), "{}", err(&o));
+    std::fs::write(home.join("nerka").join("patterns"), "similarity 0.5\nsimlarity 0.4\n").unwrap();
+    let o = run(&[]);
+    assert!(!o.status.success() && err(&o).contains("line 2: unknown setting 'simlarity'"), "{}", err(&o));
+    let o = run(&["--pattern-config", "-", "--rule", "apid NAV: keep x"]);
+    assert!(!o.status.success() && err(&o).contains("isn't a rule"), "{}", err(&o));
+}

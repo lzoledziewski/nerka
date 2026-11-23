@@ -129,15 +129,19 @@ first.
 | `-l, --lines N` | also each pattern's first N lines with their numbers (`0`: all) |
 | `-n, --top N` | print at most N patterns (default 30; `0`: all) |
 | `--field NAME` | group this field's text (`raw`: the line) |
-| `--similarity S` | how alike (0–1, default 0.5) a message must be to join a template |
-| `--no-merge` | don't align templates (only messages of the same length join) |
-| `--stats` | timing on stderr |
+| `--pattern-config FILE` | settings and rules (below; default: the saved ones, `-`: none) |
+| `--set KEY=VALUE` | a setting for this run, e.g. `similarity=0.7` (repeatable) |
+| `--rule RULE` | a rule for this run, e.g. `'apid == NAV: keep Elapsed'` (repeatable) |
+| `--similarity S` | the setting `similarity` (0–1, default 0.5): how alike a message must be to join a template |
+| `--no-merge` | the setting `merge off`: don't align templates (only messages of the same length join) |
+| `--stats` | timing on stderr, and what each stage did: templates, and those kept apart and why |
 
 ```
 nerka patterns app.log
 nerka patterns --values --in 'apid == NAV' trace.dlt
 nerka patterns --rare --in 'level >= WARN' --queries trace.dlt
 nerka patterns -n 5 --lines 3 app.log
+nerka patterns --rule 'apid == PWR: apart voltage= undervoltage' --set new-slots=2 trace.dlt
 ```
 
 Non-verbose DLT messages without a [FIBEX](formats.md) have no text to
@@ -145,6 +149,64 @@ group, only their bytes. Lines that hardly repeat (a binary file read as
 text) don't each become a pattern: past a few thousand, the rest of a
 length go into one, marked *not sorted*. Messages longer than 64 words are
 grouped by their first 63, the rest shown as `…`.
+
+### The pattern configuration
+
+How lines group can be tuned without a new nerka: one file,
+`%APPDATA%\nerka\patterns` (Linux `~/.config/nerka/patterns`), read by
+`patterns` and `compare`, holds settings and rules, a line each, `#` to the
+end of a line a comment. A mistake (an unknown setting, a bad regex) stops
+with its line number. It is part of [settings bundles](bundles.md), so a
+tester's configuration can be sent with a bug report. `--set` and `--rule`
+come after the file's lines, `--similarity` and `--no-merge` last.
+
+```
+# Settings (these are the defaults)
+similarity 0.5            # stage 1: share of words alike to join a template
+new-wildcards 1           # stage 1: words a message may turn into wildcards at once
+new-slots 1               # stage 2: slots one merge may make
+side 4                    # stage 2: tokens on the longer side of a slot
+state-values 16           # a slot with more values (2–16) is <*>, not a state
+header sample 32 min 8 share 0.5 places 3   # header/footer detection
+merge on                  # stage 2 at all
+
+# Rules: SCOPE: ACTION
+apid == NAV: keep Elapsed
+ecu == ECU1 AND apid == GPS*: max-slots 2
+*: value /[a-z][\w-]*(\.[a-z][\w-]*)+/
+apid == PWR: apart voltage= undervoltage
+ctid == TCP: no-merge
+*: header INFO: WARN: ERROR:
+*: ignore /heartbeat/
+ctid == TCP: set similarity 0.7
+```
+
+The header settings: lines of a context held back per chunk (`sample`),
+the fewest to detect a header or footer on (`min`), the share of them a
+word must be on, more than (`share`), and how many tokens from the start
+and the end it may be at (`places`).
+
+A rule's **scope** is the fields lines are grouped by: for DLT `ecu`,
+`apid`, `ctid`, `type`, `mode` (the short text fields), for a text file
+its profile's text fields; `FIELD == VALUE`, `*` in a value for any text,
+`"…"` for a value with spaces, joined by `AND`; `*` alone is every line. A
+field a file doesn't have is empty there.
+
+| Action | Effect |
+|---|---|
+| `keep WORD…` | the word is never in a slot: a message differing there is a pattern of its own (`keep undervoltage`: `undervoltage <*> mV` apart from `voltage=<*> mV`) |
+| `value /REGEX/` | text a token holds that the regex finds is a value (`<*>`), as a digit makes one: host names |
+| `literal /REGEX/` | text the regex finds is never a value, though it holds a digit (`ECU1`, `v2`) |
+| `max-slots N` | a pattern has N slots at most; a merge making more is refused |
+| `apart WORD WORD…` | words (or parts like `voltage=`) never in one slot together |
+| `header WORD…` | header or footer tokens, passed over whatever the detection says |
+| `no-merge` | templates aren't aligned (stage 1 only) |
+| `ignore`, `ignore /REGEX/` | the lines (whose message the regex finds) are left out, of `compare` too |
+| `set SETTING` | a setting for these lines only: `set similarity 0.7` |
+
+Rules are read top to bottom. Of those setting one thing (`max-slots`,
+`no-merge`, each setting of `set`) the first that applies counts; the
+others add up (two `keep` rules keep both words).
 
 ## `compare` (experimental)
 
@@ -181,7 +243,7 @@ nerka --lifecycle 'ecu1: lines ecu == ECU1; reset uptime; planned payload ~ /shu
 | `--min-score S` | only changes at least this sure (default 10.8, p = 0.001; 3.84 is p = 0.05) |
 | `-n, --top N` | print at most N differences (default 30; `0`: all) |
 | `--queries` | also each pattern's NFD query |
-| `--field NAME`, `--similarity S`, `--no-merge` | as for `patterns` |
+| `--field NAME`, `--pattern-config FILE`, `--set`, `--rule`, `--similarity S`, `--no-merge` | as for `patterns` |
 | `--stats` | timing on stderr |
 
 ## `export` and `import`

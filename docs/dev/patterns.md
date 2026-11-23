@@ -1,8 +1,11 @@
-# Patterns in the GUI (design, not built)
+# Patterns in the GUI (design; the core configuration built)
 
-Status: **settled** with the owner (2026-11-23), not built. The engine and
-the CLI are built (`core/src/pattern.rs`, `nerka patterns`, `nerka compare`,
-`docs/user/cli.md`); this is the GUI and the tuning around them.
+Status: **settled** with the owner (2026-11-23). Built: the engine and the
+CLI (`core/src/pattern.rs`, `nerka patterns`, `nerka compare`), and round 1
+below, the core configuration (2026-11-24: `core/src/pattern/config.rs`,
+the `patterns` file and bundle kind, `--pattern-config` / `--set` /
+`--rule`; user guide `docs/user/cli.md#the-pattern-configuration`). Not
+built: the GUI (rounds α1–α3).
 
 ## What the owner asked for (2026-11-23)
 
@@ -79,8 +82,19 @@ configuration (a rule made in the pane too), never only for the session.
 | `ignore` | lines there are left out of patterns and compares (`apid == GPS: ignore`; `*: ignore /heartbeat/` for messages matching) |
 | `set KEY VALUE` | a setting for that scope only (`ctid == TCP: set similarity 0.7`) |
 
-The first matching rule of each kind applies; the list is read top to
-bottom.
+Rules are read top to bottom. Of those setting one thing (`max-slots`,
+`no-merge`, each setting of `set`) the first that applies counts; the
+others add up (two `keep` rules keep both words).
+
+As built (2026-11-24): `keep` and `apart` words never become or join a
+wildcard in stage 1 (a token holding one), and stage 2 refuses a merge
+putting a `keep` word in a slot or two items of an `apart` in one;
+`max-slots` holds in both stages. `value` and `literal` act where a token
+is masked (text a regex finds, not only whole tokens); a pattern with
+`value` rules gets `\S+?` for its masked values in its query.
+`state-values` is 2–16 (a slot keeps 16 values). `--stats` prints the
+verdict counts the tuning pane will show: per stage-2 pass, templates kept
+apart by two new slots, a long side, or a rule.
 
 ## The Patterns pane
 
@@ -192,7 +206,7 @@ default; the configuration file works either way).
 
 ## Order of work (alpha rounds)
 
-1. **Core:** `PatternConfig` (settings now constants become fields), rules
+1. **Core (built 2026-11-24):** `PatternConfig` (settings now constants become fields), rules
    with scopes, the `patterns` file and bundle kind, the CLI flags, and the
    verdict counts. Tests per rule. The LogHub benchmark takes a config too,
    so a setting's effect on GA / FGA / WGA is measured.

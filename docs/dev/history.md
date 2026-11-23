@@ -2,6 +2,10 @@
 
 The dated log of the project, newest first; append-only: add an entry at the top when `status.md` changes. Moved from `status.md` on 2026-11-10, word for word: its "Last update" line (each update with the ones before it) and its "Next steps" as they stood then, which tell what was built when and why. Where the moved text says "above", "below" or "this file", it means the old `status.md`: its sections are now `status.md` (state, pending decisions, limitations, licensing), `gui-decisions.md`, `features.md` and `history.md`.
 
+## 2026-11-24
+
+Patterns, round 1 of `patterns.md` (branch `claude/patterns`): the pattern configuration in core, one global file (`<config>/nerka/patterns`) of settings (the engine's constants until now) and rules scoped by the fields lines are grouped by (`keep`, `value`, `literal`, `max-slots`, `apart`, `header`, `no-merge`, `ignore`, `set`), a bundle kind of one item, and `--pattern-config` / `--set` / `--rule` for `patterns`, `compare` and the LogHub benchmark. The plan's six questions were answered by the owner on 2026-11-23. Defaults score as before on LogHub (GA 0.751, FGA 0.748, WGA 0.914); the plan's host-name rule, given with `--rule`, 0.776 / 0.777 / 0.922. The GUI is next (α1).
+
 ## 2026-11-23
 
 Patterns (experimental, branch `claude/patterns`, CLI only): `nerka patterns` (message templates with their states) and `nerka compare` (patterns and state values new, gone or changed between two sets, e.g. two lifecycles), scored on LogHub-2.0's labelled samples (`core/examples/loghub_bench.rs`). The GUI for them is designed, not built: `patterns.md` (owner: not computed until asked; compare chooses its content and ignores the unwanted; a tuning pane and scoped rules for the alpha rounds), with six questions open.

@@ -1,13 +1,13 @@
 ---
 title: "Settings bundles"
-description: "Settings bundles: export and import nerka's query packs, presets, plots, checks, signals and profiles as one readable file, upgraded across versions."
+description: "Settings bundles: export and import nerka's query packs, presets, plots, checks, signals, profiles and pattern configuration as one readable file, upgraded across versions."
 ---
 
 # Settings bundles
 
 A **settings bundle** is one readable text file (`.nerka-bundle`) holding
-your analysis setup: query packs, presets, kept plots, checks, signals and
-text profiles.
+your analysis setup: query packs, presets, kept plots, checks, signals,
+text profiles and the pattern configuration.
 Export one to move your setup to another machine or share it; import one to
 take someone else's. Later versions of nerka read bundles that earlier ones
 wrote, and upgrade them on import.
@@ -25,6 +25,7 @@ The **analysis setup**, the user's own items in the per-user config folder
 | `check`  | `checks` (a spec line each)       | one check line   | the text before `:`    |
 | `signal` | `signals` (a spec line each)      | one signal or lifecycle line | its name   |
 | `profile` | `profiles` (a spec line each)    | one [profile](formats.md#profiles) line | the text before `:` |
+| `patterns` | `patterns`                      | the whole [pattern configuration](cli.md#the-pattern-configuration) | `patterns` |
 
 Not in it: `prefs`, the filter and search histories,
 `query-usage`, the `records` memo (absolute paths), window registrations
@@ -96,6 +97,10 @@ without case). **Keep both** imports theirs as `NAME_imported` (or
 `NAME_imported_2`, …, whichever is free among mine and the bundle's), its
 name changed in its text. A renamed pack keeps the ids inside it, so a
 preset in the bundle that names `vision.cam` still names my `vision`.
+
+There is one pattern configuration, so a different one can't be kept
+beside mine: it is **keep mine** (Auto) or **take theirs**, and
+`--conflicts both` keeps mine.
 
 **Auto** loses nothing and overwrites nothing. Before an import replaces
 anything (take theirs), the items it replaces are written into a backup

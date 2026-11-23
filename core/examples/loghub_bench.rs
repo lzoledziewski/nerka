@@ -10,13 +10,16 @@
 //!   lines, over the patterns found and the templates.
 //!
 //! ```text
-//! cargo run --release -p nerka-core --example loghub_bench -- DIR [--no-merge] [--similarity S] [--show SYSTEM]
+//! cargo run --release -p nerka-core --example loghub_bench -- DIR [--config FILE] [--set KEY=VALUE]... [--rule RULE]... [--no-merge] [--similarity S] [--show SYSTEM]
 //! ```
+//!
+//! `--config FILE` (first) is a pattern configuration (`docs/user/cli.md`),
+//! `--set` and `--rule` add to it, so a setting's effect is measured.
 //!
 //! `--show SYSTEM` prints that system's patterns which aren't a template
 //! exactly, with the templates their lines have.
 
-use nerka_core::pattern::{self, PatternOptions};
+use nerka_core::pattern::{self, PatternConfig, PatternOptions};
 use nerka_core::{Progress, TextFile};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -29,13 +32,26 @@ fn main() {
     let mut show = None;
     while let Some(a) = args.next() {
         match a.as_str() {
-            "--no-merge" => options.merge = false,
-            "--similarity" => options.similarity = args.next().and_then(|s| s.parse().ok()).expect("--similarity S"),
+            "--no-merge" => options.config.settings.merge = false,
+            "--similarity" => options
+                .config
+                .set(&format!("similarity {}", args.next().expect("--similarity S")))
+                .expect("--similarity S"),
+            "--config" => {
+                let path = args.next().expect("--config FILE");
+                let text = std::fs::read_to_string(&path).expect("--config FILE");
+                // First: it replaces what came before.
+                options.config = PatternConfig::parse(&text).unwrap_or_else(|e| panic!("{path}: {e}"));
+            }
+            "--set" => options.config.set(&args.next().expect("--set KEY=VALUE")).expect("--set KEY=VALUE"),
+            "--rule" => options.config.add_rule(&args.next().expect("--rule RULE")).expect("--rule RULE"),
             "--show" => show = args.next(),
             _ => dir = Some(PathBuf::from(a)),
         }
     }
-    let dir = dir.expect("usage: loghub_bench DIR [--no-merge] [--similarity S] [--show SYSTEM]");
+    let dir = dir.expect(
+        "usage: loghub_bench DIR [--config FILE] [--set KEY=VALUE]... [--rule RULE]... [--no-merge] [--similarity S] [--show SYSTEM]",
+    );
     let mut files: Vec<PathBuf> = std::fs::read_dir(&dir)
         .expect("DIR")
         .filter_map(|e| e.ok().map(|e| e.path()))
