@@ -99,12 +99,21 @@ first), while a part with many (users, addresses, numbers) shows as `<*>`.
 How: values holding a digit (numbers, hex, times, addresses) are masked
 first; messages of the same length, first word and fields (DLT `apid`,
 `ctid`, …) that are alike enough join a template, the words where they
-differ becoming slots. Then templates are aligned atom by atom (words and
+differ becoming slots; a message differing from a template in two words or
+more starts a template of its own. Words most messages share at the same
+place from their start or end whatever their length, a header or footer
+such as `LOG:` … `Elapsed[us]: 412; #3`, don't count as alike: two short
+messages between them are two patterns. Then templates are aligned atom by atom (words and
 single characters), so a varying part can also sit inside a word
 (`gear=D`), come first (`{RUNNING|IDLE} state entered`) or have different
 lengths (`thermal throttling {engaged at <*> C|released}`, `job done
 {∅|fast}`, `∅`: nothing there). Two templates join when they share enough
-words and differ, at each place, by one word at most on one side.
+words and differ, at each place, by one word at most on one side, and in
+one new place at most. Two slots made at once would always change together:
+`warning the data was read` and `status the data is read` stay two
+patterns. Once `warning the data is read` turns up, the two places are seen
+to vary on their own, and all three join as `{warning|status} the data
+{was|is} read`.
 
 A DLT message's `payload` is grouped (other files: the line), and fields
 such as `apid` that tell the patterns apart print with them. Each pattern
@@ -117,6 +126,7 @@ first.
 | `--rare` | the rarest patterns first: the odd message out |
 | `--values` | also each slot's values: lines, first and last line |
 | `--queries` | also each pattern's NFD query, to `filter` its lines |
+| `-l, --lines N` | also each pattern's first N lines with their numbers (`0`: all) |
 | `-n, --top N` | print at most N patterns (default 30; `0`: all) |
 | `--field NAME` | group this field's text (`raw`: the line) |
 | `--similarity S` | how alike (0–1, default 0.5) a message must be to join a template |
@@ -127,6 +137,7 @@ first.
 nerka patterns app.log
 nerka patterns --values --in 'apid == NAV' trace.dlt
 nerka patterns --rare --in 'level >= WARN' --queries trace.dlt
+nerka patterns -n 5 --lines 3 app.log
 ```
 
 Non-verbose DLT messages without a [FIBEX](formats.md) have no text to

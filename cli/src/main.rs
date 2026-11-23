@@ -211,6 +211,10 @@ enum Cmd {
         /// Also print each pattern's NFD query.
         #[arg(long)]
         queries: bool,
+        /// Also print each pattern's first N lines (0: all), with their
+        /// line numbers.
+        #[arg(short = 'l', long, value_name = "N")]
+        lines: Option<usize>,
         /// Print timing to stderr.
         #[arg(long)]
         stats: bool,
@@ -1392,7 +1396,19 @@ fn run() -> Result<()> {
         Cmd::Filter { query, files, out: o } => {
             run_filter(&files, |source| Ok(Filter::Query(compile(&query, source)?)), &o, &mut out)?;
         }
-        Cmd::Patterns { files, within, field, similarity, top, rare, values, no_merge, queries, stats } => {
+        Cmd::Patterns {
+            files,
+            within,
+            field,
+            similarity,
+            top,
+            rare,
+            values,
+            no_merge,
+            queries,
+            lines: show,
+            stats,
+        } => {
             let view = open(&files)?;
             let f = &*view.source;
             let lines = match &within {
@@ -1400,7 +1416,7 @@ fn run() -> Result<()> {
                 None => None,
             };
             let t = Instant::now();
-            let options = PatternOptions { field, similarity, merge: !no_merge };
+            let options = PatternOptions { field, similarity, merge: !no_merge, lines: show.is_some() };
             let mut ps = nerka_core::pattern::detect(f, lines.as_deref(), &options, &Progress::new())?;
             let took = t.elapsed();
             if rare {
@@ -1443,6 +1459,16 @@ fn run() -> Result<()> {
                 if queries {
                     writeln!(out, "{:28}{}", "", ps.query(p))?;
                 }
+                if let Some(n) = show {
+                    let n = if n == 0 { usize::MAX } else { n };
+                    for &l in p.lines[0].iter().take(n) {
+                        let text = f.line_text(l).unwrap_or_default();
+                        writeln!(out, "{:28}{:>9}: {text}", "", place(l))?;
+                    }
+                    if p.lines[0].len() > n {
+                        writeln!(out, "{:28}… {} more lines", "", p.lines[0].len() - n)?;
+                    }
+                }
             }
             if shown < ps.patterns.len() {
                 writeln!(out, "… {} more (-n 0: all)", ps.patterns.len() - shown)?;
@@ -1462,7 +1488,7 @@ fn run() -> Result<()> {
                 &files,
                 [a, b],
                 within,
-                PatternOptions { field, similarity, merge: !no_merge },
+                PatternOptions { field, similarity, merge: !no_merge, lines: false },
                 min_score,
                 top,
                 queries,

@@ -16,10 +16,11 @@
 //!    holding a digit (numbers, hex, times, addresses) are masked. Messages
 //!    of the same field values (DLT `apid`, …), token count and first
 //!    literal token are compared token by
-//!    token (a token that is only a masked value doesn't count); one at
-//!    least [`PatternOptions::similarity`] like a template joins it, its
-//!    differing tokens becoming slots, else it starts one. The chunks'
-//!    templates are merged the same way.
+//!    token (a token that is only a masked value doesn't count, nor a header
+//!    or footer of the context: [`Sample`], [`Group`]); one at least
+//!    [`PatternOptions::similarity`] like a template, and new in one token
+//!    at most, joins it, its differing tokens becoming slots, else it starts
+//!    one. The chunks' templates are merged the same way.
 //! 2. **Templates → patterns** (on templates, not lines, so the cost doesn't
 //!    grow with the file): templates are split finer, into atoms by
 //!    character class (a run of letters, digits and `_`; any other
@@ -29,7 +30,10 @@
 //!    entered`), or span different lengths (`throttling engaged at <*> C`,
 //!    `throttling released`). Two templates join when they share enough
 //!    words ([`accept`]) and no field (`apid`) tells them apart; the parts
-//!    where they differ become a slot holding both sides' values.
+//!    where they differ become a slot holding both sides' values. A merge
+//!    makes one new slot at most: two at once would change together (two
+//!    messages), and join only once a third shows them apart, in a later
+//!    pass if need be.
 //!
 //! Finally, what all of a slot's values begin or end with moves out of the
 //! slot (`{gear=D|gear=P}` → `gear={D|P}`).
@@ -51,6 +55,7 @@ use rayon::prelude::*;
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 // Markers inside texts (private-use characters, so text can't hold them by
 // accident): a masked value, a whole slot, white space or none.
@@ -65,6 +70,9 @@ const REST_STR: &str = "\u{E003}";
 const CHUNK: usize = 64 * 1024;
 /// Values a slot keeps.
 pub const MAX_VALUES: usize = 16;
+/// Words, values and slots in the longer side of a place two templates
+/// differ in, at most (`{engaged at <*> C|released}`: 4).
+const MAX_SIDE: usize = 4;
 /// Tokens of a message looked at; the rest is one token, [`REST`].
 const MAX_TOKENS: usize = 64;
 /// Templates per chunk of lines (stage 1), and in all; past that, a line
@@ -78,6 +86,11 @@ const MAX_TEMPLATES: usize = 65536;
 const MAX_GROUP: usize = 256;
 /// Templates aligned (stage 2), most lines first; the rest stay as they are.
 const MAX_MERGE: usize = 10_000;
+/// Lines of each context (per chunk) held back to find its header and
+/// footer ([`Sample`]).
+const SAMPLE: u32 = 32;
+/// Passes of stage 2 at most (the later ones over the patterns kept apart).
+const MAX_PASSES: usize = 4;
 /// Templates of more atoms aren't aligned (stage 2).
 const MAX_ATOMS: usize = 256;
 /// Patterns a template is aligned with, at most (stage 2).
@@ -93,11 +106,13 @@ pub struct PatternOptions {
     pub similarity: f32,
     /// Merge templates by alignment (stage 2).
     pub merge: bool,
+    /// Keep each pattern's lines ([`Pattern::lines`]): 8 bytes a line.
+    pub lines: bool,
 }
 
 impl Default for PatternOptions {
     fn default() -> Self {
-        Self { field: None, similarity: 0.5, merge: true }
+        Self { field: None, similarity: 0.5, merge: true, lines: false }
     }
 }
 
@@ -273,6 +288,11 @@ pub struct Pattern {
     /// Fields with one value on all its lines (and not on all patterns'):
     /// `(name, value)`.
     pub fields: Vec<(String, String)>,
+    /// Its lines per set, ascending, with [`PatternOptions::lines`] (else
+    /// none).
+    pub lines: [Vec<LineNo>; 2],
+    /// The stage-1 templates it holds (ids given in [`group`]).
+    ids: Vec<u32>,
 }
 
 impl Pattern {
@@ -488,8 +508,10 @@ fn group(sets: &[Set], options: &PatternOptions, progress: &Progress) -> Result<
         })
         .collect();
     let sim = options.similarity.clamp(0.0, 1.0);
-    // Stage 1.
-    let parts: Vec<Drain> = tasks
+    // Stage 1: per chunk its templates, and with `options.lines` each line's
+    // template (an index into them).
+    let parts: Vec<(Drain, Vec<u32>)> = tasks
+        .clone()
         .into_par_iter()
         .map(|(side, from, to)| {
             if progress.is_cancelled() {
@@ -498,49 +520,128 @@ fn group(sets: &[Set], options: &PatternOptions, progress: &Progress) -> Result<
             let Set { source, lines } = sets[side];
             let reading = &readings[side];
             let mut d = Drain::new(sim, context.len(), MAX_PER_CHUNK);
+            let mut of_line = Vec::with_capacity(if options.lines { to - from } else { 0 });
             let mut vals = Vec::with_capacity(context.len());
+            if options.lines {
+                of_line.resize(to - from, 0);
+            }
+            // Each context's first lines wait until its header and footer are
+            // known (`Sample`).
+            let mut samples: HashMap<u64, Sample> = HashMap::new();
+            let flush = |d: &mut Drain, ctx: u64, s: Sample, of_line: &mut Vec<u32>| {
+                d.boiler.insert(ctx, s.boilerplate().into_iter().collect());
+                for (i, line, toks, vals) in &s.held {
+                    let toks: Vec<Cow<str>> = toks.iter().map(|t| Cow::Borrowed(t.as_str())).collect();
+                    let vals: Vec<Option<Cow<[u8]>>> = vals.iter().map(|v| v.as_deref().map(Cow::Borrowed)).collect();
+                    let t = d.add_line(&toks, side, *line, &vals, ctx);
+                    if options.lines {
+                        of_line[i - from] = t as u32;
+                    }
+                }
+            };
             for i in from..to {
                 let line = lines.map_or(i as LineNo, |l| l[i]);
-                let text = match reading.field {
-                    Some(id) => match source.field(line, id) {
-                        Some(FieldValue::Str(b)) => match b {
-                            Cow::Borrowed(b) => String::from_utf8_lossy(b),
-                            Cow::Owned(b) => Cow::Owned(String::from_utf8_lossy(&b).into_owned()),
-                        },
-                        _ => Cow::Borrowed(""),
-                    },
-                    None => source.line_text(line).unwrap_or_default(),
-                };
-                vals.clear();
-                vals.extend(reading.context.iter().map(|id| match id.and_then(|id| source.field(line, id)) {
-                    Some(FieldValue::Str(b)) => Some(b),
-                    _ => None,
-                }));
+                let text = text_of(source, reading, line);
+                read_context(source, reading, line, &mut vals);
                 let mut toks: Vec<Cow<str>> = text.split_ascii_whitespace().take(MAX_TOKENS + 1).map(mask).collect();
                 if toks.len() > MAX_TOKENS {
                     toks.truncate(MAX_TOKENS - 1);
                     toks.push(Cow::Borrowed(REST_STR));
                 }
-                d.add_line(&toks, side, line, &vals);
+                let ctx = context_id(&vals);
+                if !d.boiler.contains_key(&ctx) {
+                    let s = samples.entry(ctx).or_default();
+                    s.count(&toks);
+                    s.held.push((
+                        i,
+                        line,
+                        toks.iter().map(|t| t.to_string()).collect(),
+                        vals.iter().map(|v| v.as_deref().map(<[u8]>::to_vec)).collect(),
+                    ));
+                    if s.n >= SAMPLE {
+                        let s = samples.remove(&ctx).expect("sampled");
+                        flush(&mut d, ctx, s, &mut of_line);
+                    }
+                    continue;
+                }
+                let t = d.add_line(&toks, side, line, &vals, ctx);
+                if options.lines {
+                    of_line[i - from] = t as u32;
+                }
+            }
+            // Contexts with fewer lines, in the order they began.
+            let mut rest: Vec<(u64, Sample)> = samples.into_iter().collect();
+            rest.sort_by_key(|(_, s)| s.held[0].0);
+            for (ctx, s) in rest {
+                flush(&mut d, ctx, s, &mut of_line);
             }
             progress.add((to - from) as u64);
-            Ok(d)
+            Ok((d, of_line))
         })
         .collect::<Result<_>>()?;
-    let parts = parts.into_iter();
+    // A template's id: its index in its chunk plus the templates of the
+    // chunks before.
+    let mut offsets = Vec::with_capacity(parts.len());
+    let mut of_lines = Vec::with_capacity(parts.len());
     let mut all = Drain::new(sim, context.len(), MAX_TEMPLATES);
-    for d in parts {
-        for c in d.clusters {
+    let mut next = 0u32;
+    for (d, _) in &parts {
+        for (ctx, words) in &d.boiler {
+            let all = all.boiler.entry(*ctx).or_default();
+            for w in words {
+                if !all.contains(w) {
+                    all.push(w.clone());
+                }
+            }
+        }
+        for c in &d.clusters {
+            all.prenote(c, d.groups.get(&c.key).map_or(1, |g| g.clusters.len()));
+        }
+    }
+    for (d, of_line) in parts {
+        offsets.push(next);
+        of_lines.push(of_line);
+        let n = d.clusters.len() as u32;
+        for (k, mut c) in d.clusters.into_iter().enumerate() {
+            c.ids = vec![next + k as u32];
             all.add_cluster(c);
         }
+        next += n;
         if progress.is_cancelled() {
             return Err(Error::Cancelled);
+        }
+    }
+    // The words stage 1 saw different messages share, per context.
+    let mut shared: HashMap<Vec<Val>, Boiler> = HashMap::new();
+    for g in all.groups.values() {
+        let (Some(toks), Some(&first)) = (g.boilerplate(), g.clusters.first()) else { continue };
+        let words = shared.entry(all.clusters[first].vals.clone()).or_default();
+        for t in toks.iter().flatten() {
+            for (_, a) in atomize(t) {
+                if is_word(&a) {
+                    words.insert(a.into());
+                }
+            }
         }
     }
     let mut families: Vec<Family> = all.clusters.into_iter().map(Family::from).collect();
     // Stage 2.
     if options.merge {
-        families = merge_all(families, progress)?;
+        let boiler = boilerplate(&mut families, &shared);
+        families = merge_all(families, 1, &boiler, progress)?;
+        // A merge adds one slot at most (`accept`), so a pattern kept apart
+        // from one may join it once another has given it the slot: again
+        // for those, while that joins any.
+        for pass in 2..=MAX_PASSES {
+            let n = families.len();
+            if !families.iter().any(|f| f.apart) {
+                break;
+            }
+            families = merge_all(families, pass, &boiler, progress)?;
+            if families.len() == n {
+                break;
+            }
+        }
     }
     // A field goes into the queries where patterns differ in it.
     let telling: Vec<bool> = (0..context.len())
@@ -571,10 +672,132 @@ fn group(sets: &[Set], options: &PatternOptions, progress: &Progress) -> Result<
             parts: factor(f.parts),
             sides: f.sides,
             unsorted: f.unsorted,
+            lines: Default::default(),
+            ids: f.ids,
         })
         .collect();
     patterns.sort_by(|a, b| by_count(&a.sides, &b.sides));
+    if options.lines {
+        // Template id → its pattern; each line to its template's.
+        let mut pattern_of = vec![0u32; next as usize];
+        for (k, p) in patterns.iter().enumerate() {
+            for &id in &p.ids {
+                pattern_of[id as usize] = k as u32;
+            }
+        }
+        for (((side, from, _), offset), of_line) in tasks.iter().zip(&offsets).zip(&of_lines) {
+            let set_lines = sets[*side].lines;
+            for (i, &t) in of_line.iter().enumerate() {
+                let line = set_lines.map_or((from + i) as LineNo, |l| l[from + i]);
+                patterns[pattern_of[(offset + t) as usize] as usize].lines[*side].push(line);
+            }
+        }
+    }
     Ok(Patterns { field: field.map(|id| schema[id].name.to_string()), patterns, lines })
+}
+
+/// The text grouped of `line`.
+fn text_of<'s>(source: &'s dyn LogSource, reading: &Reading, line: LineNo) -> Cow<'s, str> {
+    match reading.field {
+        Some(id) => match source.field(line, id) {
+            Some(FieldValue::Str(b)) => match b {
+                Cow::Borrowed(b) => String::from_utf8_lossy(b),
+                Cow::Owned(b) => Cow::Owned(String::from_utf8_lossy(&b).into_owned()),
+            },
+            _ => Cow::Borrowed(""),
+        },
+        None => source.line_text(line).unwrap_or_default(),
+    }
+}
+
+/// The context fields' values of `line` into `vals`.
+fn read_context<'s>(source: &'s dyn LogSource, reading: &Reading, line: LineNo, vals: &mut Vec<Option<Cow<'s, [u8]>>>) {
+    vals.clear();
+    vals.extend(reading.context.iter().map(|id| match id.and_then(|id| source.field(line, id)) {
+        Some(FieldValue::Str(b)) => Some(b),
+        _ => None,
+    }));
+}
+
+/// A context's id: its fields' values hashed.
+fn context_id(vals: &[Option<Cow<[u8]>>]) -> u64 {
+    let mut h = std::hash::DefaultHasher::new();
+    vals.hash(&mut h);
+    h.finish()
+}
+
+/// A context's first lines in a chunk, held back from stage 1 until its
+/// header and footer are known ([`Sample::boilerplate`]).
+#[derive(Default)]
+struct Sample {
+    /// Lines counted.
+    n: u32,
+    /// Per token (values aside), the lines with it.
+    words: HashMap<Box<str>, u32>,
+    /// Per token and place (from the start: 0, 1, 2; from the end: -1, -2,
+    /// -3), the message length it was first seen in there, and whether in
+    /// another.
+    places: HashMap<(Box<str>, i8), (usize, bool)>,
+    /// The lines held.
+    held: Vec<Held>,
+}
+
+/// A line held back ([`Sample`]): its index in the chunk, line, tokens and
+/// fields' values.
+type Held = (usize, LineNo, Vec<String>, Vec<Option<Vec<u8>>>);
+
+impl Sample {
+    fn count(&mut self, toks: &[Cow<str>]) {
+        self.n += 1;
+        let len = toks.len();
+        for (k, t) in toks.iter().enumerate() {
+            let at = if k < 3 {
+                k as i8
+            } else if len - k <= 3 {
+                -((len - k) as i8)
+            } else {
+                continue;
+            };
+            if is_value(t) {
+                continue;
+            }
+            match self.places.get_mut(&(t.as_ref().into(), at)) {
+                Some((first, other)) => *other |= *first != len,
+                None => {
+                    self.places.insert((t.as_ref().into(), at), (len, false));
+                }
+            }
+        }
+        let mut seen: Vec<&str> = toks.iter().map(|t| &**t).filter(|t| !is_value(t)).collect();
+        seen.sort_unstable();
+        seen.dedup();
+        for t in seen {
+            match self.words.get_mut(t) {
+                Some(c) => *c += 1,
+                None => {
+                    self.words.insert(t.into(), 1);
+                }
+            }
+        }
+    }
+
+    /// The tokens more than half its lines carry (values aside) at one
+    /// place from the start or the end (the first or last three) in
+    /// messages of different lengths: a header or footer the messages share
+    /// (`LOG:` first, `Elapsed[us]:` third from last), which stage 1 then
+    /// doesn't take for a sign of one message ([`similarity`]). Known before
+    /// the context's first comparison, so its first lines can't join a
+    /// template on it alone. The words of one message, its lines all as
+    /// long, are none (`in state {Idle|Active}`); nor are any with fewer
+    /// than 8 lines to go by.
+    fn boilerplate(&self) -> Boiler {
+        if self.n < 8 {
+            return Boiler::default();
+        }
+        let placed: std::collections::HashSet<&str> =
+            self.places.iter().filter(|(_, (_, other))| *other).map(|((t, _), _)| &**t).collect();
+        self.words.iter().filter(|&(w, &c)| c * 2 > self.n && placed.contains(&**w)).map(|(w, _)| w.clone()).collect()
+    }
 }
 
 /// `tok` with each run of word characters holding a digit (and the `.`,
@@ -677,7 +900,7 @@ fn render(parts: &[Part]) -> String {
 }
 
 /// A field's value on every line of a pattern so far.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 enum Val {
     One(Option<Box<[u8]>>),
     Mixed,
@@ -710,6 +933,10 @@ struct Cluster {
     vals: Vec<Val>,
     /// A catch-all ([`Pattern::unsorted`]): every token [`Tok::Any`].
     catchall: bool,
+    /// The templates of the chunks merged into it (their ids: [`group`]).
+    ids: Vec<u32>,
+    /// Its context ([`context_id`]).
+    ctx: u64,
 }
 
 /// `n` into `c`: its lines, values and fields; the tokens they differ in
@@ -734,6 +961,7 @@ fn merge_into(c: &mut Cluster, mut n: Cluster) {
     for (v, w) in c.vals.iter_mut().zip(&n.vals) {
         v.join(w);
     }
+    c.ids.append(&mut n.ids);
 }
 
 /// Templates of some lines: clusters, found by the fields' values, token
@@ -741,49 +969,159 @@ fn merge_into(c: &mut Cluster, mut n: Cluster) {
 /// [`MAX_GROUP`] per group, then catch-alls by token count.
 struct Drain {
     sim: f32,
-    groups: HashMap<u64, Vec<usize>>,
+    groups: HashMap<u64, Group>,
     clusters: Vec<Cluster>,
     fields: usize,
     cap: usize,
     /// Token count → its catch-all in `clusters`.
     catchall: HashMap<usize, usize>,
+    /// Per context: its header and footer tokens ([`Sample`]; a few: a
+    /// list is quicker than a set); a context not in it yet is still being
+    /// sampled.
+    boiler: HashMap<u64, Vec<Box<str>>>,
 }
 
-/// The group of a message of tokens `toks` on a line with field values
-/// `vals`.
-fn key<'a>(toks: impl ExactSizeIterator<Item = &'a str>, vals: &[Option<Cow<[u8]>>]) -> u64 {
+/// The templates of one group (`key`).
+#[derive(Default)]
+struct Group {
+    clusters: Vec<usize>,
+    /// Per token: the one every line of the group has there (`None`: they
+    /// differ, or there is none yet). Once the group holds two templates,
+    /// such a token is a header or footer the messages share (`LOG:`,
+    /// `Elapsed[us]:`), no sign of the same message: [`similarity`] passes
+    /// it over.
+    shared: Vec<Option<Box<str>>>,
+    /// Messages or templates noted.
+    seen: usize,
+    /// The most templates the group held apart in one chunk (noted before
+    /// the chunks' are merged: [`Drain::prenote`]). The same template from
+    /// two chunks is one message, not two.
+    templates: usize,
+}
+
+impl Group {
+    /// Note a message (or template: `None` where it has a wildcard).
+    fn note<'a>(&mut self, toks: impl ExactSizeIterator<Item = Option<&'a str>>) {
+        if self.seen == 0 {
+            self.shared = toks.map(|t| t.map(Into::into)).collect();
+        } else {
+            for (s, t) in self.shared.iter_mut().zip(toks) {
+                if s.as_deref() != t {
+                    *s = None;
+                }
+            }
+        }
+        self.seen += 1;
+    }
+
+    /// The tokens to pass over: once it holds two templates.
+    fn boilerplate(&self) -> Option<&[Option<Box<str>>]> {
+        (self.clusters.len().max(self.templates) >= 2).then_some(&self.shared[..])
+    }
+}
+
+/// The group of a message of tokens `toks` in context `ctx`
+/// ([`context_id`]).
+fn key<'a>(toks: impl ExactSizeIterator<Item = &'a str>, ctx: u64) -> u64 {
     let mut h = std::hash::DefaultHasher::new();
-    vals.hash(&mut h);
+    ctx.hash(&mut h);
     toks.len().hash(&mut h);
     toks.into_iter().find(|&t| t != MASK_STR).hash(&mut h);
     h.finish()
 }
 
 /// How alike template `a` and the message or template `b` (`None`: any)
-/// are: the share of equal tokens where neither is a wildcard nor only a
-/// masked value (1 if there are none).
-fn similarity<'a>(a: &[Tok], b: impl Iterator<Item = Option<&'a str>>) -> f32 {
-    let (mut same, mut n) = (0u32, 0u32);
-    for (x, y) in a.iter().zip(b) {
-        if let (Tok::Lit(x), Some(y)) = (x, y)
-            && &**x != MASK_STR
+/// are: the share of equal tokens where neither is a value (1 if there are
+/// none). A wildcard is a difference, as in Drain, also on both sides (two
+/// templates join no more readily than their lines would): else a template
+/// with a few would take any message of its length that shares the rest,
+/// which may be only a header and footer (`LOG: <*> <*> <*> Elapsed[us]:
+/// <*>; #<*>`). Stage 2 joins what this keeps apart where it should.
+///
+/// Two words differing at once make it 0, as [`accept`] keeps two new
+/// slots apart: `Received disconnect: Bye Bye [preauth]` and `…:
+/// disconnected by user` are two messages, not `{Bye|disconnected}
+/// {Bye|by} {[preauth]|user}` (LogHub 2k: grouping accuracy 0.715 →
+/// 0.738, `examples/loghub_bench.rs`).
+///
+/// `shared`: the group's header and footer ([`Group::shared`]), and
+/// `boiler`: whether each token of `b` is the context's ([`Sample`]),
+/// passed over where both have them.
+fn similarity<'a>(
+    a: &[Tok],
+    b: impl Iterator<Item = Option<&'a str>>,
+    shared: Option<&[Option<Box<str>>]>,
+    boiler: &[bool],
+) -> f32 {
+    // `new`: words that would become wildcards (neither side is one yet).
+    let (mut same, mut n, mut new) = (0u32, 0u32, 0u32);
+    for (i, (x, y)) in a.iter().zip(b).enumerate() {
+        if let (Some(s), Some(y)) = (shared.and_then(|s| s.get(i)).and_then(Option::as_deref), y)
+            && s == y
         {
-            n += 1;
-            same += u32::from(&**x == y);
+            continue;
         }
+        if let (Tok::Lit(x), Some(y)) = (x, y)
+            && boiler.get(i) == Some(&true)
+            && **x == *y
+        {
+            continue;
+        }
+        match (x, y) {
+            (Tok::Lit(x), _) if is_value(x) => {}
+            (_, Some(y)) if is_value(y) => {}
+            (Tok::Lit(x), Some(y)) => {
+                n += 1;
+                if **x == *y {
+                    same += 1;
+                } else {
+                    new += 1;
+                }
+            }
+            _ => n += 1,
+        }
+    }
+    if new > 1 {
+        return 0.0;
     }
     if n == 0 { 1.0 } else { same as f32 / n as f32 }
 }
 
+/// A token of masked values and ASCII punctuation only (`<*>`, `<*>;`,
+/// `#<*>`). On bytes: it runs for each token of each comparison.
+fn is_value(t: &str) -> bool {
+    let (b, m) = (t.as_bytes(), MASK_STR.as_bytes());
+    let (mut i, mut masked) = (0, false);
+    while i < b.len() {
+        if b[i..].starts_with(m) {
+            masked = true;
+            i += m.len();
+        } else if b[i].is_ascii_punctuation() {
+            i += 1;
+        } else {
+            return false;
+        }
+    }
+    masked
+}
+
 impl Drain {
     fn new(sim: f32, fields: usize, cap: usize) -> Self {
-        Self { sim, groups: HashMap::new(), clusters: Vec::new(), fields, cap, catchall: HashMap::new() }
+        Self {
+            sim,
+            groups: HashMap::new(),
+            clusters: Vec::new(),
+            fields,
+            cap,
+            catchall: HashMap::new(),
+            boiler: HashMap::new(),
+        }
     }
 
     /// No room for another template in group `key`.
     fn full(&self, key: u64) -> bool {
         self.clusters.len() - self.catchall.len() >= self.cap
-            || self.groups.get(&key).is_some_and(|g| g.len() >= MAX_GROUP)
+            || self.groups.get(&key).is_some_and(|g| g.clusters.len() >= MAX_GROUP)
     }
 
     /// `n` into the catch-all of its token count.
@@ -808,14 +1146,16 @@ impl Drain {
 
     /// The most alike template in group `key` with `len` tokens (`score`:
     /// how alike), if alike enough.
-    fn best(&self, key: u64, len: usize, score: impl Fn(&[Tok]) -> f32) -> Option<usize> {
+    fn best(&self, key: u64, len: usize, score: impl Fn(&[Tok], Option<&[Option<Box<str>>]>) -> f32) -> Option<usize> {
         let mut best = None;
-        for &ci in self.groups.get(&key).into_iter().flatten() {
+        let g = self.groups.get(&key)?;
+        let shared = g.boilerplate().filter(|s| s.len() == len);
+        for &ci in &g.clusters {
             let c = &self.clusters[ci];
             if c.toks.len() != len {
                 continue;
             }
-            let s = score(&c.toks);
+            let s = score(&c.toks, shared);
             if s >= self.sim && best.is_none_or(|(_, bs)| s > bs) {
                 best = Some((ci, s));
             }
@@ -823,11 +1163,28 @@ impl Drain {
         best.map(|(ci, _)| ci)
     }
 
-    fn add_line(&mut self, toks: &[Cow<str>], side: usize, line: LineNo, vals: &[Option<Cow<[u8]>>]) {
+    /// Add a message of context `ctx` ([`context_id`] of `vals`); returns
+    /// the template (its index) it went to.
+    fn add_line(
+        &mut self,
+        toks: &[Cow<str>],
+        side: usize,
+        line: LineNo,
+        vals: &[Option<Cow<[u8]>>],
+        ctx: u64,
+    ) -> usize {
         let here = one(side, line);
         debug_assert_eq!(vals.len(), self.fields);
-        let k = key(toks.iter().map(|t| &**t), vals);
-        match self.best(k, toks.len(), |c| similarity(c, toks.iter().map(|t| Some(&**t)))) {
+        let k = key(toks.iter().map(|t| &**t), ctx);
+        let bp: Vec<bool> = match self.boiler.get(&ctx) {
+            Some(b) if !b.is_empty() => toks.iter().map(|t| b.iter().any(|w| **w == **t)).collect(),
+            _ => Vec::new(),
+        };
+        let found = self.best(k, toks.len(), |c, s| similarity(c, toks.iter().map(|t| Some(&**t)), s, &bp));
+        if let Some(g) = self.groups.get_mut(&k) {
+            g.note(toks.iter().map(|t| Some(&**t)));
+        }
+        match found {
             Some(ci) => {
                 let c = &mut self.clusters[ci];
                 for (i, y) in toks.iter().enumerate() {
@@ -850,6 +1207,7 @@ impl Drain {
                         *v = Val::Mixed;
                     }
                 }
+                ci
             }
             None => {
                 let n = Cluster {
@@ -859,12 +1217,20 @@ impl Drain {
                     sides: here,
                     vals: vals.iter().map(|v| Val::One(v.as_deref().map(Into::into))).collect(),
                     catchall: false,
+                    ids: Vec::new(),
+                    ctx,
                 };
                 if self.full(k) {
                     self.catch_all(n);
+                    self.catchall[&toks.len()]
                 } else {
-                    self.groups.entry(k).or_default().push(self.clusters.len());
+                    let g = self.groups.entry(k).or_default();
+                    if g.seen == 0 {
+                        g.note(toks.iter().map(|t| Some(&**t)));
+                    }
+                    g.clusters.push(self.clusters.len());
                     self.clusters.push(n);
+                    self.clusters.len() - 1
                 }
             }
         }
@@ -881,14 +1247,35 @@ impl Drain {
         if n.catchall {
             return self.catch_all(n);
         }
-        match self.best(n.key, n.toks.len(), |c| similarity(c, n.toks.iter().map(lit))) {
+        let bp: Vec<bool> = match self.boiler.get(&n.ctx) {
+            Some(b) if !b.is_empty() => {
+                n.toks.iter().map(|t| lit(t).is_some_and(|t| b.iter().any(|w| **w == *t))).collect()
+            }
+            _ => Vec::new(),
+        };
+        match self.best(n.key, n.toks.len(), |c, s| similarity(c, n.toks.iter().map(lit), s, &bp)) {
             Some(ci) => merge_into(&mut self.clusters[ci], n),
             None if self.full(n.key) => self.catch_all(n),
             None => {
-                self.groups.entry(n.key).or_default().push(self.clusters.len());
+                self.groups.entry(n.key).or_default().clusters.push(self.clusters.len());
                 self.clusters.push(n);
             }
         }
+    }
+
+    /// Note a template before [`Drain::add_cluster`] merges them all, so
+    /// each group knows its header and footer from the start; `apart`: the
+    /// templates its chunk's group held.
+    fn prenote(&mut self, n: &Cluster, apart: usize) {
+        if n.catchall {
+            return;
+        }
+        let g = self.groups.entry(n.key).or_default();
+        g.note(n.toks.iter().map(|t| match t {
+            Tok::Lit(l) => Some(&**l),
+            Tok::Any => None,
+        }));
+        g.templates = g.templates.max(apart);
     }
 }
 
@@ -904,6 +1291,67 @@ struct Family {
     sides: Sides,
     vals: Vec<Val>,
     unsorted: bool,
+    /// Kept apart from a pattern by [`Verdict::Apart`] in the last pass.
+    apart: bool,
+    /// The pass of stage 2 that last merged another into it (0: none).
+    grew: usize,
+    /// The stage-1 templates it holds.
+    ids: Vec<u32>,
+    /// Its context (the fields' values): an index into [`boilerplate`]'s.
+    ctx: usize,
+}
+
+/// Words most lines of a context carry.
+type Boiler = std::collections::HashSet<Box<str>>;
+
+/// Per context (the fields' values, `apid`, `ctid`: all one in a text
+/// file), the words more than half its lines carry that stage 1 saw
+/// different messages share in one place (`shared`: [`Group::shared`]): a
+/// header or footer (`LOG`, `Elapsed`, `us`), no sign of one message, so
+/// [`accept`] doesn't count them. A word every line has but no two
+/// messages were seen to share is the message itself (`gear=D`, `gear=P`).
+/// Sets [`Family::ctx`], and [`Family::size`] without them.
+fn boilerplate(families: &mut [Family], shared: &HashMap<Vec<Val>, Boiler>) -> Vec<Boiler> {
+    let none = Boiler::default();
+    let mut ctxs: HashMap<Vec<Val>, usize> = HashMap::new();
+    // Per context: lines, templates, lines per word.
+    let mut stats: Vec<(u64, usize, HashMap<Box<str>, u64>)> = Vec::new();
+    for f in families.iter_mut() {
+        let next = ctxs.len();
+        f.ctx = *ctxs.entry(f.vals.clone()).or_insert(next);
+        if f.ctx == stats.len() {
+            stats.push(Default::default());
+        }
+        let (lines, n, words) = &mut stats[f.ctx];
+        let count = total(&f.sides);
+        *lines += count;
+        *n += 1;
+        let mut mine: Vec<&str> = f.words().collect();
+        mine.sort_unstable();
+        mine.dedup();
+        for w in mine {
+            *words.entry(w.into()).or_default() += count;
+        }
+    }
+    let mut by_ctx: Vec<&Vec<Val>> = vec![&families[0].vals; ctxs.len()];
+    for (vals, &k) in &ctxs {
+        by_ctx[k] = vals;
+    }
+    let bp: Vec<Boiler> = stats
+        .into_iter()
+        .zip(by_ctx)
+        .map(|((lines, n, words), vals)| {
+            let seen = shared.get(vals).unwrap_or(&none);
+            if n < 2 || seen.is_empty() {
+                return Boiler::default();
+            }
+            words.into_iter().filter(|(w, c)| c * 2 > lines && seen.contains(w)).map(|(w, _)| w).collect()
+        })
+        .collect();
+    for f in families.iter_mut() {
+        f.size = f.words().filter(|w| !bp[f.ctx].contains(*w)).count();
+    }
+    bp
 }
 
 impl From<Cluster> for Family {
@@ -921,7 +1369,17 @@ impl From<Cluster> for Family {
             }
         }
         let size = parts.iter().filter(|p| matches!(&p.atom, Atom::Lit(l) if is_word(l))).count();
-        Family { parts, size, sides: c.sides, vals: c.vals, unsorted: c.catchall }
+        Family {
+            parts,
+            size,
+            sides: c.sides,
+            vals: c.vals,
+            unsorted: c.catchall,
+            apart: false,
+            grew: 0,
+            ids: c.ids,
+            ctx: 0,
+        }
     }
 }
 
@@ -995,34 +1453,79 @@ fn align(a: &[Part], b: &[Part]) -> Pairs {
 
 /// Whether templates `a` and `b`, aligned as `pairs`, are one pattern, and
 /// how alike they are (the share of words in common, of the wordier one;
-/// words counted as [`Family::size`]). They share a word at least, at each
-/// place they differ one side has one word at most (a state's value is a
-/// word: `{D|P}`, `{engaged at <*> C|released}`, not two phrases), and:
+/// words counted as [`Family::size`], none of the context's `boiler`plate:
+/// [`boilerplate`]). They share a word at least, at each
+/// place they differ one side has one token at most (a state's value is a
+/// word: `{D|P}`, `{engaged at <*> C|released}`, not two phrases) and the
+/// other [`MAX_SIDE`] (tokens: words, values and slots, so neither
+/// nothing nor `<*> <*> <*>` makes room for a whole phrase), and:
 /// - they differ in one place (one slot): the words in common are half the
 ///   words of the one with fewer at least, and a third of the other's;
 /// - in several: the words in common are 60 % of either's at least.
-fn accept(a: &Family, b: &Family, pairs: &[(usize, usize)]) -> Option<f32> {
-    let common = pairs.iter().filter(|&&(i, _)| matches!(&a.parts[i].atom, Atom::Lit(l) if is_word(l))).count();
+///
+/// A slot at most is new (a place where neither side is a slot yet): two
+/// at once vary together as far as anyone can tell, `{warning|status} the
+/// data {was|is} read` holding only `warning … was` and `status … is`,
+/// which are two messages. A third with one of them (`warning … is`) shows
+/// the slots apart, and then both join.
+fn accept(a: &Family, b: &Family, pairs: &[(usize, usize)], boiler: &Boiler) -> Verdict {
+    let common = pairs
+        .iter()
+        .filter(|&&(i, _)| matches!(&a.parts[i].atom, Atom::Lit(l) if is_word(l) && !boiler.contains(l)))
+        .count();
     let (few, many) = (a.size.min(b.size), a.size.max(b.size));
-    let words = |seg: &[Part]| seg.iter().filter(|p| matches!(&p.atom, Atom::Lit(l) if is_word(l))).count();
-    let mut gaps = 0;
+    let tokens = |seg: &[Part]| {
+        seg.iter()
+            .filter(|p| {
+                matches!(&p.atom, Atom::Slot(_)) || matches!(&p.atom, Atom::Lit(l) if is_word(l) || &**l == MASK_STR)
+            })
+            .count()
+    };
+    let slot = |seg: &[Part]| matches!(seg, [Part { atom: Atom::Slot(_), .. }]);
+    let (mut gaps, mut new, mut widest) = (0, 0, 0);
     let (mut i, mut j) = (0, 0);
     for &(pi, pj) in pairs.iter().chain(std::iter::once(&(a.parts.len(), b.parts.len()))) {
         if i < pi || j < pj {
+            let (sa, sb) = (&a.parts[i..pi], &b.parts[j..pj]);
             gaps += 1;
-            if words(&a.parts[i..pi]).min(words(&b.parts[j..pj])) > 1 {
-                return None;
+            widest = widest.max(sa.len()).max(sb.len());
+            let (ta, tb) = (tokens(sa), tokens(sb));
+            if ta.min(tb) > 1 || ta.max(tb) > MAX_SIDE {
+                return Verdict::No;
+            }
+            if !slot(sa) && !slot(sb) {
+                new += 1;
             }
         }
         (i, j) = (pi + 1, pj + 1);
     }
-    let ok = common > 0
-        && match gaps {
-            0 => true,
-            1 => common * 2 >= few && common * 3 >= many,
-            _ => common * 5 >= many * 3,
-        };
-    ok.then(|| common as f32 / many.max(1) as f32)
+    // One atom for another (or for nothing), all else the same: a state
+    // (`gear=D`, `gear=P`), however common the words around it.
+    let flip = gaps == 1 && widest <= 1;
+    let ok = flip
+        || common > 0
+            && match gaps {
+                0 => true,
+                1 => common * 2 >= few && common * 3 >= many,
+                _ => common * 5 >= many * 3,
+            };
+    let alike = if flip && common == 0 { 0.5 / many.max(1) as f32 } else { common as f32 / many.max(1) as f32 };
+    match (ok, new) {
+        (false, _) => Verdict::No,
+        (true, 0 | 1) => Verdict::Join(alike),
+        (true, _) => Verdict::Apart,
+    }
+}
+
+/// What [`accept`] says of two templates.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Verdict {
+    /// One pattern; how alike they are.
+    Join(f32),
+    /// Alike enough, but two slots or more would be new: apart until
+    /// another pattern holds one of them as a slot.
+    Apart,
+    No,
 }
 
 /// `a` and `b` as one: the aligned atoms kept, each place they differ a slot
@@ -1077,7 +1580,19 @@ fn merge(a: Family, b: &Family, pairs: &[(usize, usize)]) -> Family {
     }
     let mut sides = a.sides;
     add_sides(&mut sides, &b.sides);
-    Family { parts, size: a.size.max(b.size), sides, vals, unsorted: false }
+    let mut ids = a.ids;
+    ids.extend_from_slice(&b.ids);
+    Family {
+        parts,
+        size: a.size.max(b.size),
+        sides,
+        vals,
+        unsorted: false,
+        apart: a.apart,
+        grew: a.grew,
+        ids,
+        ctx: a.ctx,
+    }
 }
 
 /// How many words `f` and a template of words `sorted` hold both (with
@@ -1104,19 +1619,41 @@ fn shared_words(f: &Family, sorted: &[&str]) -> usize {
 /// patterns sharing its rarer words and joins the most alike one that
 /// [`accept`]s it. Catch-alls, and templates past the first [`MAX_MERGE`],
 /// stay as they are.
-fn merge_all(mut templates: Vec<Family>, progress: &Progress) -> Result<Vec<Family>> {
+///
+/// Pass `pass` > 1 aligns only the patterns kept [`Verdict::Apart`] last
+/// time, after all the others, and only with those that have grown a slot
+/// since (merged in the pass before or in this one): the others they were
+/// kept apart from as they are.
+fn merge_all(mut templates: Vec<Family>, pass: usize, boiler: &[Boiler], progress: &Progress) -> Result<Vec<Family>> {
+    let later = pass > 1;
     templates.sort_by(|a, b| by_count(&a.sides, &b.sides));
+    if later {
+        templates.sort_by_key(|t| t.apart);
+    }
     let mut out: Vec<Family> = Vec::new();
-    // Word → the patterns holding it.
+    // Word → the patterns holding it (in a later pass, those grown).
     let mut index: HashMap<Box<str>, Vec<usize>> = HashMap::new();
-    for (n, t) in templates.into_iter().enumerate() {
+    let indexed = |f: &Family| !later || f.grew + 1 >= pass;
+    for (n, mut t) in templates.into_iter().enumerate() {
         if n % 1024 == 0 && progress.is_cancelled() {
             return Err(Error::Cancelled);
         }
-        if t.unsorted || n >= MAX_MERGE {
+        let align_it = if later { t.apart } else { n < MAX_MERGE };
+        t.apart = false;
+        if t.unsorted || !align_it {
+            if later && indexed(&t) {
+                let at = out.len();
+                for w in t.words() {
+                    let list = index.entry(w.into()).or_default();
+                    if list.last() != Some(&at) {
+                        list.push(at);
+                    }
+                }
+            }
             out.push(t);
             continue;
         }
+        let apart = AtomicBool::new(false);
         let mut mine: Vec<&str> = t.words().collect();
         mine.sort_unstable();
         let mut words = mine.clone();
@@ -1152,7 +1689,14 @@ fn merge_all(mut templates: Vec<Family>, progress: &Progress) -> Result<Vec<Fami
                             return None;
                         }
                         let pairs = align(&f.parts, &t.parts);
-                        accept(f, &t, &pairs).map(|s| (k, c, s, pairs))
+                        match accept(f, &t, &pairs, &boiler[f.ctx]) {
+                            Verdict::Join(s) => Some((k, c, s, pairs)),
+                            Verdict::Apart => {
+                                apart.store(true, Ordering::Relaxed);
+                                None
+                            }
+                            Verdict::No => None,
+                        }
                     })
                     .reduce_with(|a, b| if b.2 > a.2 || (b.2 == a.2 && b.0 < a.0) { b } else { a })
                     .map(|(_, c, s, pairs)| (c, s, pairs))
@@ -1163,16 +1707,31 @@ fn merge_all(mut templates: Vec<Family>, progress: &Progress) -> Result<Vec<Fami
             Some((c, _, pairs)) => {
                 let f = std::mem::replace(
                     &mut out[c],
-                    Family { parts: vec![], size: 0, sides: Sides::default(), vals: vec![], unsorted: false },
+                    Family {
+                        parts: vec![],
+                        size: 0,
+                        sides: Sides::default(),
+                        vals: vec![],
+                        unsorted: false,
+                        apart: false,
+                        grew: 0,
+                        ids: vec![],
+                        ctx: 0,
+                    },
                 );
                 out[c] = merge(f, &t, &pairs);
+                out[c].grew = pass;
                 c
             }
             None => {
+                t.apart = apart.into_inner();
                 out.push(t);
                 out.len() - 1
             }
         };
+        if !indexed(&out[at]) {
+            continue;
+        }
         for w in words {
             let list = index.entry(w).or_default();
             if !list.contains(&at) {
@@ -1377,22 +1936,44 @@ mod tests {
     }
 
     fn detect_all(source: &dyn LogSource) -> Patterns {
-        let ps = detect(source, None, &PatternOptions::default(), &Progress::new()).unwrap();
+        let options = PatternOptions { lines: true, ..Default::default() };
+        let ps = detect(source, None, &options, &Progress::new()).unwrap();
         check_queries(source, &ps);
         ps
     }
 
-    /// Every pattern's query finds at least its own lines.
+    /// Every pattern's query finds at least its own lines; kept lines
+    /// ([`PatternOptions::lines`]) are each in one pattern, as many as it
+    /// counts, and its query finds them.
     fn check_queries(source: &dyn LogSource, ps: &Patterns) {
         let mut covered = 0;
+        let mut seen = std::collections::HashSet::new();
+        let kept = ps.patterns.iter().any(|p| !p.lines[0].is_empty() || !p.lines[1].is_empty());
         for p in &ps.patterns {
             let q = Query::compile_in(&ps.query(p), source.schema(), &Default::default()).unwrap();
             let res = search(source, &Filter::Query(q), &Progress::new()).unwrap();
             assert!(res.lines.len() as u64 >= p.count(), "{}: {} < {}", ps.query(p), res.lines.len(), p.count());
             assert!(res.contains(p.first()) && res.contains(p.last()), "{}", ps.query(p));
             covered += p.count();
+            if kept {
+                for side in 0..2 {
+                    let l = &p.lines[side];
+                    assert_eq!(l.len() as u64, p.sides[side].count, "{}", p.template());
+                    assert!(l.windows(2).all(|w| w[0] < w[1]), "{}", p.template());
+                    if let (Some(a), Some(b)) = (l.first(), l.last()) {
+                        assert_eq!((*a, *b), (p.sides[side].first, p.sides[side].last), "{}", p.template());
+                    }
+                    for &line in l {
+                        assert!(res.contains(line), "{} misses line {line}", ps.query(p));
+                        assert!(seen.insert((side, line)), "line {line} in two patterns");
+                    }
+                }
+            }
         }
         assert_eq!(covered, ps.total());
+        if kept {
+            assert_eq!(seen.len() as u64, ps.total());
+        }
     }
 
     #[test]
@@ -1522,8 +2103,10 @@ mod tests {
             [
                 "<*> NAV gear {D|P|N}",
                 "<*> OTA {downloading|installing|done}",
-                "<*> state changed from {IDLE|RUN} to {RUN|IDLE}",
                 "<*> user <*> logged in",
+                // Two places that only ever change together: two messages.
+                "<*> state changed from IDLE to RUN",
+                "<*> state changed from RUN to IDLE",
             ]
         );
         // Each value: its lines, where it first and last shows.
@@ -1536,7 +2119,7 @@ mod tests {
             .map(|v| (v.value(), v.count(), v.first(), v.last()))
             .collect();
         assert_eq!(gear, [("D".into(), 3, 2, 8), ("P".into(), 1, 0, 0), ("N".into(), 1, 6, 6)]);
-        let users = ps.patterns[3].slots().next().unwrap();
+        let users = ps.patterns[2].slots().next().unwrap();
         assert!(!users.is_state() && users.values.len() == 2);
     }
 
@@ -1579,6 +2162,52 @@ mod tests {
     }
 
     #[test]
+    fn slots_that_vary_together_are_two_messages() {
+        let states = ["Idle", "Active", "Done", "Idle"];
+        let lines = |combos: &[(&str, &str)]| -> Vec<String> {
+            let mut v = Vec::new();
+            for (k, s) in states.iter().enumerate() {
+                for (who, verb) in combos {
+                    v.push(format!("{who} the data {verb} read {k}s ago in state {s}"));
+                }
+            }
+            v
+        };
+        let run = |lines: &[String]| {
+            let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
+            let f = text(&refs);
+            let ps = detect_all(&f);
+            check_queries(&f, &ps);
+            templates(&ps)
+        };
+        // Only `Warning … was` and `status … is`: two messages.
+        let mut t = run(&lines(&[("Warning", "was"), ("status", "is")]));
+        t.sort();
+        assert_eq!(
+            t,
+            [
+                "Warning the data was read <*> ago in state {Idle|Active|Done}",
+                "status the data is read <*> ago in state {Idle|Active|Done}",
+            ]
+        );
+        // Every combination: the slots vary apart, one message.
+        let all = [("Warning", "was"), ("status", "is"), ("Warning", "is"), ("status", "was")];
+        assert_eq!(run(&lines(&all)), ["{Warning|status} the data {was|is} read <*> ago in state {Idle|Active|Done}"]);
+        // A merge kept apart joins in a later pass: `status … has been`
+        // (two new slots against `Warning … was`) comes before the lines
+        // that show the slots apart.
+        let mut v = Vec::new();
+        for (who, verb, n) in
+            [("Warning", "was", 4), ("status", "has been", 3), ("Warning", "has been", 2), ("status", "was", 1)]
+        {
+            for k in 0..n {
+                v.push(format!("{who} the data {verb} read {k}s ago from the cache"));
+            }
+        }
+        assert_eq!(run(&v), ["{Warning|status} the data {was|has been} read <*> ago from the cache"]);
+    }
+
+    #[test]
     fn phrases_are_no_values_and_merges_dont_drift() {
         let f = text(&[
             "frame received id 5 n=1",
@@ -1599,6 +2228,80 @@ mod tests {
                 "frame received id <*> n=<*>",
                 "frame drawn in us <*> n=<*>",
                 "voltage mV <*> n=<*>"
+            ]
+        );
+    }
+
+    #[test]
+    fn values_are_no_room_for_a_phrase() {
+        // Three values against a phrase are no state: `LOG: {<*> <*>
+        // <*>|Probe stats LOW - MID - TOP - ns: <*> <*> <*>} Elapsed[us]` was.
+        let mut v = Vec::new();
+        for k in 0..6 {
+            v.push(format!("LOG: {k}1 {k}2 {k}3 Elapsed[us]: {k}; #{k}"));
+        }
+        for k in 0..2 {
+            v.push(format!("LOG: Probe stats LOW - MID - TOP - ns: {k}1 {k}2 {k}3 Elapsed[us]: {k}; #{k}"));
+        }
+        // Nor is a slot that exists (`red`, `green`, `blue`) room for a
+        // phrase longer than a state's value ([`MAX_SIDE`]).
+        for w in ["red", "green", "blue"] {
+            v.push(format!("job {w} finished in 5 ms"));
+        }
+        v.push("job of the big nightly batch finished in 5 ms".into());
+        let refs: Vec<&str> = v.iter().map(String::as_str).collect();
+        let f = text(&refs);
+        let ps = detect_all(&f);
+        check_queries(&f, &ps);
+        let mut t = templates(&ps);
+        t.sort();
+        assert_eq!(
+            t,
+            [
+                "LOG: <*> <*> <*> Elapsed[us]: <*>; #<*>",
+                "LOG: Probe stats LOW - MID - TOP - ns: <*> <*> <*> Elapsed[us]: <*>; #<*>",
+                "job <*> finished in <*> ms",
+                "job of the big nightly batch finished in <*> ms",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_shared_header_and_footer_join_nothing() {
+        // Short messages between a severity tag and a counter footer: the
+        // tag and footer are no sign of one message, in either stage.
+        let mut v = Vec::new();
+        let msgs = [
+            "radar: OK",
+            "Clock sync started",
+            "lidar: OK",
+            "Bridge state: SLEEP",
+            "imu: OFFLINE",
+            "Vendor ID42",
+            "Clock sync done",
+            "gnss: OK",
+            "BatchCount: 17",
+            "Bridge state: NORMAL",
+            "hmi: OFFLINE",
+            "Config reload requested",
+        ];
+        for (i, m) in msgs.iter().cycle().take(48).enumerate() {
+            v.push(format!("LOG: {m} Elapsed[us]: {}; #{}", 100 + i * 37, i % 10));
+        }
+        let refs: Vec<&str> = v.iter().map(String::as_str).collect();
+        let f = text(&refs);
+        let ps = detect_all(&f);
+        let mut t = templates(&ps);
+        t.sort();
+        assert_eq!(
+            t,
+            [
+                "LOG: BatchCount: <*> Elapsed[us]: <*>; #<*>",
+                "LOG: Bridge state: {SLEEP|NORMAL} Elapsed[us]: <*>; #<*>",
+                "LOG: Clock sync {started|done} Elapsed[us]: <*>; #<*>",
+                "LOG: Config reload requested Elapsed[us]: <*>; #<*>",
+                "LOG: Vendor <*> Elapsed[us]: <*>; #<*>",
+                "LOG: {radar|lidar|imu|gnss|hmi}: {OK|OFFLINE} Elapsed[us]: <*>; #<*>",
             ]
         );
     }
@@ -1695,11 +2398,14 @@ mod tests {
         let ps = compare(
             Set { source: &f, lines: Some(&a) },
             Set { source: &f, lines: Some(&b) },
-            &PatternOptions::default(),
+            &PatternOptions { lines: true, ..Default::default() },
             &Progress::new(),
         )
         .unwrap();
         assert_eq!(templates(&ps), ["x <*>", "y {on|off}"]);
+        // Each pattern's lines, per set.
+        assert_eq!(ps.patterns[0].lines, [vec![0, 2], vec![4, 7]]);
+        assert_eq!(ps.patterns[1].lines, [vec![1, 3], vec![5, 6]]);
         let y = ps.patterns[1].slots().next().unwrap();
         // `on`: line 1 in A, 5 and 6 in B; `off` only in A.
         assert_eq!(y.values[0].sides, [Tally { count: 1, first: 1, last: 1 }, Tally { count: 2, first: 5, last: 6 }]);
