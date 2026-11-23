@@ -1,6 +1,6 @@
 # Patterns in the GUI (design, not built)
 
-Status: **proposed** (2026-11-23), for the owner to settle. The engine and
+Status: **settled** with the owner (2026-11-23), not built. The engine and
 the CLI are built (`core/src/pattern.rs`, `nerka patterns`, `nerka compare`,
 `docs/user/cli.md`); this is the GUI and the tuning around them.
 
@@ -29,7 +29,8 @@ put in a bug report.
 
 ## The configuration
 
-A saved kind like checks and signals: spec lines in
+One global file (owner, 2026-11-23; not per pack), a saved kind like
+checks and signals: spec lines in
 `%APPDATA%\nerka\patterns` (Linux `~/.config/nerka/patterns`), one setting
 or rule a line, `#` comments, unknown keys an error with their line. A new
 bundle kind (`patterns 1`, `docs/dev/bundles.md`), so a tester's settings
@@ -55,17 +56,20 @@ ctid == TCP: no-merge                  # stage 1 only here
 *: header INFO: WARN: ERROR:               # known header words, not detected
 ```
 
-**Scope:** the fields of the context (`ecu`, `apid`, `ctid`, any field the
-file has), `==` with `*` as a wildcard, joined by `AND`; `*` alone is every
-line. The GUI form offers the three DLT fields as boxes (empty = any); the
-file may hold any NFD condition for the rare case that needs more (open
-question 2).
+**Scope (owner, 2026-11-23: what the engine groups by, and persistent):**
+the fields the engine keeps lines apart by, its context: for DLT `ecu`,
+`apid`, `ctid`, `type` and `mode` (the short text fields; not the payload
+or the numbers), for a text file with a profile its text fields; `==` with
+`*` as a wildcard, joined by `AND`; `*` alone is every line. No other NFD:
+a rule applies to whole contexts, as the engine works on them. The GUI
+form offers those fields as boxes (empty = any). Rules are saved with the
+configuration (a rule made in the pane too), never only for the session.
 
 **Actions:**
 
 | Action | Effect |
 |---|---|
-| `keep WORD…` | the word never becomes a slot: a line differing there starts its own template; a merge putting it in a slot is refused |
+| `keep WORD…` | strict (owner, 2026-11-23): the word is never in a slot, neither `<*>` nor a state's value: a line differing there starts its own template, and a merge putting it in a slot is refused (`keep undervoltage`: `undervoltage <*> mV` a pattern of its own, not a value of `{voltage=\|undervoltage} <*> mV`) |
 | `value /REGEX/` | tokens matching it are values (`<*>`), like those holding a digit |
 | `literal /REGEX/` | tokens matching it are never values, though they hold a digit (`ECU1`, `v2`) |
 | `max-slots N` | a pattern there has N slots at most; a merge making more is refused |
@@ -80,8 +84,9 @@ bottom.
 
 ## The Patterns pane
 
-**🧩 Patterns** in the top bar (as ✔ Checks): a pane per tab, docked like
-the Checks pane or in a window of its own like the plot (open question 1).
+**🧩 Patterns** in the top bar (as ✔ Checks) opens, per tab, a **window of
+its own** (owner, 2026-11-23: for now), titled like the plot window
+(`<window name> · Patterns · <file> — nerka`). Docking may come later.
 
 ```
 ┌ 🧩 Patterns ──────────────────────────────────────────────────────────────┐
@@ -143,13 +148,19 @@ A: [Lifecycle ecu1 #2 (planned) ▾]   B: [Lifecycle ecu1 #3 (crash) ▾]   [▶
   so the next compare leaves it out too.
 - Rows as in `nerka compare`: counts, ratio, score, the first line on the
   side that has it (click: go there; in another tab, switch to it).
-- Later (open question 5): **groups**, e.g. every `crash` lifecycle against
-  every `planned` one.
+- **Groups of lifecycles (owner, 2026-11-23: in the first round, it is
+  cheap):** A and B can each be several lifecycles: by outcome (every
+  `crash` against every `planned`), or picked (#2, #5 against #7). Each
+  side is the union of its lifecycles' lines, so counts are compared as
+  rates per side's lines, as now; the rows also say in how many of a
+  side's lifecycles a pattern or value appears (`3/3` against `0/5`),
+  which tells a constant symptom from a one-off.
 
 ## The tuning pane (🛠)
 
 For the alpha rounds; visible in alpha builds, behind ⚙ Settings →
-*Developer: pattern tuning* after (open question 3).
+*Developer: pattern tuning* after (owner, 2026-11-23: a switch, off by
+default; the configuration file works either way).
 
 ```
 ┌ 🛠 Pattern tuning ─────────────── config: patterns (saved) [Save][Load][Export] ┐
@@ -188,26 +199,18 @@ For the alpha rounds; visible in alpha builds, behind ⚙ Settings →
 2. **α1:** the Patterns pane, off until ▶ Run: list, unfold, go to line,
    Filter / Search / Lines, on all lines, the filter result or one
    lifecycle.
-3. **α2:** Compare (lifecycles, filters, tabs) with Only / Ignore and
-   ignoring from the results, and the tuning pane (settings, rules, re-run,
-   change since the last run, why apart).
-4. **α3, from the owner's use:** ➕ To library with state signals, groups
-   of lifecycles compared, pooling the header sample per context (rare
-   contexts), `nerka anonymize` if real traces are needed for tuning.
+3. **α2:** Compare (lifecycles and groups of them, filters, tabs) with
+   Only / Ignore and ignoring from the results, and the tuning pane
+   (settings, rules, re-run, change since the last run, why apart).
+4. **α3, from the owner's use:** ➕ To library with state signals, pooling
+   the header sample per context (rare contexts), `nerka anonymize` if real
+   traces are needed for tuning.
 
-## Open questions for the owner
+## Settled with the owner (2026-11-23)
 
-1. **Where the pane lives:** docked like Checks, a window of its own like
-   the plot, or a tab of the bottom pane next to the search hits?
-2. **Rule scopes:** the three DLT fields with `*` (the form), plus any NFD
-   condition in the file for the rare case (proposed), or fields only?
-3. **The tuning pane after the alphas:** keep it behind a Settings switch
-   (proposed), or remove it and keep only the file?
-4. **Where the configuration lives:** one global file (proposed, exported
-   with bundles), or also per pack, so a project's rules travel with its
-   queries?
-5. **Comparing groups** of lifecycles (every crash against every planned
-   boot) in the first round, or later?
-6. **`keep WORD`:** when two messages differ only in a kept word, they stay
-   two patterns (proposed). Should a kept word also refuse to be a state
-   value (`{D|P}`), or only a `<*>` slot?
+All the plan's questions are answered: the Patterns pane is a window of its
+own (for now); rule scopes are the engine's context fields, and rules are
+always saved; groups of lifecycles come with the first compare; `keep
+WORD` is strict; after the alphas the tuning pane is behind a Settings
+switch, off by default; the configuration is one global file, moved and
+shared with settings bundles (not per pack).
