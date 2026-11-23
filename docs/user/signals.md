@@ -120,10 +120,13 @@ colour and under a small ▼ notch on the lane's top edge (shorter than
 drawn), and several within one pixel become such a column split into
 their colours. A band without a notch is as long as it looks. Hovering
 there names them: *near here: error ×2, idle ×2 (4
-changes in 60 ms): zoom in to see them*.
+changes in 60 ms): zoom in to see them*; values that came at the same time,
+which no zoom shows apart, are *4 changes at the same time*.
 
 - **Navigate:** the wheel zooms, drag pans, double-click shows all; hover
-  shows a value; click goes to the line.
+  shows a value; click goes to the line. The zoom stops where the times
+  can't be told apart any closer: a few tenths of a millisecond across
+  the plot for dated times (a DLT trace, a dated log), 1 ns for times from 0.
 - **Time cursors:** right-click → place cursor A, B, …; Δt between them is
   shown (like a logic analyser). Drag a cursor to move it. Clicked near a
   change of a signal (the lane under the pointer first, else any lane),
