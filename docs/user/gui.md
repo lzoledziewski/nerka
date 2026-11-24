@@ -86,11 +86,84 @@ the filter, search, selection and the line you are on.
 | 📚 Library (`Ctrl+Shift+L`) | the Library of queries and this tab's selection ([The Library](library.md)) |
 | 📈 Signals | signals and lifecycles of this tab ([Signals](signals.md), [Lifecycles](lifecycles.md)) |
 | ✔ Checks | checks and their results ([Checks](checks.md)) |
+| 🧩 Patterns | this tab's lines grouped by message, in a window of its own ([Patterns](#patterns)) |
 | 📈 Plot | the plot of this tab's signals |
 | 📷 (`Ctrl+Shift+S`) | copies a screenshot of the window to the clipboard |
 | ⚠ after the file's size in the top bar | what wasn't read, one by one, with an export for a bug report ([What wasn't read](formats.md#what-wasnt-read)) |
 | ⚙ (`Ctrl+,`) | settings ([Settings](settings.md)) |
 | ℹ About (`F1`) | version, licence, the repository |
+
+## Patterns
+
+*Experimental.* **🧩 Patterns** opens a window of the tab's lines grouped
+by the message they print: values masked, the parts where messages differ
+as slots, and states with their values (`gear={D|P|N}`), as
+[`nerka patterns`](cli.md#patterns-experimental) does. Nothing is grouped
+until **▶ Run**, and a result stays until the next run; it says **Out of
+date** when the file was read again, other lines or another field are
+chosen, or the [pattern configuration](cli.md#the-pattern-configuration)
+or the signals changed.
+
+- **Lines:** all lines, the filter result, one lifecycle (`@ecu1` and its
+  number), or the lines of a filter you type (NFD). **Field:** the text
+  grouped (default: a DLT message's `payload`, else the line).
+- **Each row:** its share and count of lines, the fields that tell it
+  apart (`apid=NAV`) and the template, state values in colour. A click
+  goes to its first line. **▸** unfolds its slots (each value with its
+  count and first and last line, a click goes there) and its lines.
+- **▾ Filter** puts its query in the Filter box and runs it, **🔍**
+  searches for its lines among the filtered ones, **📋** copies the
+  query. Sort by most lines, rarest first, or first line.
+- **➕** (to the library) opens the Library's editor on a new query of its
+  lines in the pack `patterns` (made if there is none), each state
+  captured as an enum signal: `gear={D|P|N}` gives `@gear`. Nothing is
+  written until the editor's **Save**.
+
+**⚖ Compare** (in the same window) groups two sets of lines into patterns
+together and lists what differs: patterns and slot values **new in B**,
+**gone from B**, then those **changed** (more or less often, surest first;
+the score is G², 10.8 or more by default), as
+[`nerka compare`](cli.md#compare-experimental) does.
+
+- **A and B:** all lines, the filter result, the lines of a filter,
+  lifecycles of `@name` by number (`2`, or a group: `2, 5-7`) or every one
+  of an outcome (every `crash` against every `planned`), or another tab.
+  With lifecycles, a row also says in how many of a side's lifecycles the
+  pattern has lines (`A 3/3 · B 0/5`): a constant symptom, not a one-off.
+- **Only** and **Ignore** (NFD) choose the lines of both sides first:
+  `ecu == ECU1`, or leave out heartbeats that differ every boot.
+- **Each row:** the lines in A and B, the change, the score, the pattern
+  (for a value: its slot and value), and its first line on its side (a
+  click goes there, in its tab). **⋮**: *Ignore this pattern / value*
+  (hidden from the results; *Show ignored* brings it back), *Save as
+  ignore rule* (added to the [pattern
+  configuration](cli.md#the-pattern-configuration), so patterns and
+  compares leave its lines out), *Filter to its lines*, *Copy its query*.
+- In the Signals panel, **⚖** on a lifecycle compares it with the one
+  before.
+
+**🛠 Tuning** (in the same window; alpha builds, else ⚙ Settings →
+Developer → Pattern tuning) edits the [pattern
+configuration](cli.md#the-pattern-configuration) on the lines at hand:
+
+- **Settings** of both stages, each with **●** while it isn't the default
+  (a click puts the default back). A change runs the patterns again on the
+  same lines, and **Change** says what it did: patterns new and gone,
+  joined and split (**Show** lists them).
+- **Rules**, one per line, read top to bottom (▲ ▼ to move, − to remove);
+  a rule that doesn't read says why. **➕** makes one from the scope fields
+  (`apid`, `ctid`, …; empty: any), an action and its argument. In 🧩
+  Patterns, **⋮** on a row fills it from that pattern: leave it out, at
+  most so many slots here, keep a slot's values apart, keep a value out of
+  slots.
+- **Last run:** templates and patterns, and the templates kept apart by
+  two new slots, a long side, or a rule.
+- **Why:** tick **?** on two rows in 🧩 Patterns: where they differ, the
+  words they share and what was needed, and the setting or rule that
+  decides (stage 2 alone, on the patterns as they are).
+- Nothing is written until **💾 Save** (the configuration file);
+  **↺ Revert** goes back to it, **Load…** reads another file, **Export…**
+  writes this one (e.g. for a bug report).
 
 ## Windows
 

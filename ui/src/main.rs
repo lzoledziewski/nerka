@@ -33,12 +33,14 @@
 
 mod bundles;
 mod checks;
+mod compare;
 mod console;
 mod icon;
 mod icon_art;
 mod instance;
 mod job;
 mod library;
+mod patterns;
 mod plot;
 mod plots;
 mod prefs;
@@ -51,6 +53,7 @@ mod shot;
 mod signals;
 mod skips;
 mod sync;
+mod tuning;
 mod view;
 
 use eframe::egui::{self, Color32, Key, KeyboardShortcut, Modifiers, RichText};
@@ -700,6 +703,8 @@ struct Tab {
     /// The Checks pane's state, the checks' results on this tab's file, the
     /// job running them and what they ran with.
     checks_ui: checks::ChecksUi,
+    /// The Patterns window (experimental) and its last result.
+    patterns: patterns::PatternsUi,
     check_results: Vec<(String, checks::Outcome)>,
     /// The job, and the generation of `own_signals` it ran with.
     checks_job: Option<(Job<nerka_core::check::CheckRun>, u64)>,
@@ -1365,6 +1370,7 @@ impl Tab {
             signals_ui: signals::SignalsUi::default(),
             signals_job: None,
             checks_ui: Default::default(),
+            patterns: Default::default(),
             check_results: Vec::new(),
             checks_job: None,
             checks_key: None,
@@ -1413,7 +1419,31 @@ impl Tab {
     }
 
     fn is_busy(&self) -> bool {
-        self.loading.is_some() || !self.stage_jobs.is_empty() || self.signals_job.is_some()
+        self.loading.is_some() || !self.stage_jobs.is_empty() || self.signals_job.is_some() || self.patterns.is_busy()
+    }
+
+    /// The tab as the Patterns window sees it, once its file is read.
+    fn tab_ref(&self) -> Option<patterns::TabRef> {
+        let file = self.file.clone()?;
+        let lifecycles = self
+            .signals
+            .lifecycles()
+            .filter_map(|d| {
+                Some(patterns::LifeRef {
+                    name: d.name().to_owned(),
+                    lines: d.lines().and_then(|r| r.query()).map(|q| q.source().to_owned()),
+                    found: d.cached(&*file)?,
+                })
+            })
+            .collect();
+        Some(patterns::TabRef {
+            id: self.patterns.id(),
+            title: self.title(),
+            kept: self.session.result().cloned(),
+            cx: self.session.context().clone(),
+            lifecycles,
+            file,
+        })
     }
 
     fn cancel_jobs(&mut self) {
@@ -1428,6 +1458,7 @@ impl Tab {
         if let Some(j) = self.signals_job.take() {
             j.cancel();
         }
+        self.patterns.cancel();
     }
 
     /// The lines the filter keeps, once in (`None`: no filter yet).
@@ -3461,11 +3492,12 @@ struct SettingsFields<'a> {
     limit: &'a mut String,
     local_time: &'a mut bool,
     mf4_local_time: &'a mut bool,
+    pattern_tuning: &'a mut bool,
 }
 
 /// The Settings window's fields ([`SettingsFields`]).
 fn settings_ui(ui: &mut egui::Ui, f: SettingsFields<'_>) -> SettingsChange {
-    let SettingsFields { name, theme, limit, local_time, mf4_local_time } = f;
+    let SettingsFields { name, theme, limit, local_time, mf4_local_time, pattern_tuning } = f;
     let mut save = SettingsChange::default();
     egui::Grid::new("settings-grid").num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| {
         ui.label(RichText::new("Look").strong());
@@ -3503,6 +3535,16 @@ fn settings_ui(ui: &mut egui::Ui, f: SettingsFields<'_>) -> SettingsChange {
              On: read it in this computer's zone. Off: read it as UTC.",
         );
         save.times |= r.changed();
+        ui.end_row();
+        ui.label(RichText::new("Developer").strong());
+        ui.end_row();
+        ui.label("Patterns");
+        let alpha = env!("CARGO_PKG_VERSION").contains('-');
+        let r = ui
+            .add_enabled(!alpha, egui::Checkbox::new(pattern_tuning, "Pattern tuning"))
+            .on_hover_text("🛠 Tuning in the Patterns window: the pattern configuration tried on the trace at hand")
+            .on_disabled_hover_text("Always shown in alpha builds");
+        save.theme |= r.changed();
         ui.end_row();
         ui.label(RichText::new("This window").strong());
         ui.end_row();
@@ -4253,6 +4295,7 @@ impl App {
                         limit,
                         local_time: &mut self.prefs.local_time,
                         mf4_local_time: &mut self.prefs.mf4_local_time,
+                        pattern_tuning: &mut self.prefs.pattern_tuning,
                     },
                 );
                 ui.separator();
@@ -4382,6 +4425,116 @@ impl App {
         {
             t.status = format!("Could not save preferences: {e}");
         }
+    }
+
+    /// Each tab's Patterns window that is open, and what it asks of its
+    /// tab: go to a line (of its tab, or another's in a compare: that tab
+    /// comes to the front), a query to filter or search by.
+    fn patterns_windows(&mut self, ctx: &egui::Context) {
+        if !self.tabs.iter().any(|t| t.patterns.open) {
+            return;
+        }
+        let name = self.window_name.clone();
+        // Alpha builds show the tuning pane; releases behind Settings
+        // (owner, 2026-11-23).
+        let tuning = env!("CARGO_PKG_VERSION").contains('-') || self.prefs.pattern_tuning;
+        let refs: Vec<patterns::TabRef> = self.tabs.iter().filter_map(Tab::tab_ref).collect();
+        let mut asked = Vec::new();
+        for (i, t) in self.tabs.iter_mut().enumerate() {
+            if !t.patterns.open {
+                continue;
+            }
+            let Some(me) = refs.iter().find(|r| r.id == t.patterns.id()) else { continue };
+            let title = match name.as_deref().map(str::trim).filter(|n| !n.is_empty()) {
+                Some(n) => format!("{n} · Patterns · {} — nerka", me.title),
+                None => format!("Patterns · {} — nerka", me.title),
+            };
+            let input = patterns::Input {
+                tab: me,
+                tabs: &refs,
+                signals_gen: t.signals_gen,
+                title,
+                config: nerka_core::pattern::PatternConfig::load_saved,
+                tuning,
+            };
+            let out = t.patterns.window(ctx, &input);
+            if out != patterns::Output::default() {
+                asked.push((i, out));
+            }
+        }
+        for (i, out) in asked {
+            let (filtered, searched) = self.apply_patterns(ctx, i, out);
+            if let Some(q) = filtered {
+                self.record_search("query", &q);
+            }
+            if let Some(q) = searched {
+                self.record_search_box("query", &q);
+            }
+        }
+    }
+
+    /// A pattern into the library: the editor opens on a new query in pack
+    /// `patterns` (made in the pack folder if there is none), its states as
+    /// enum signals; nothing is written until its Save.
+    fn pattern_to_library(&mut self, q: &nerka_core::pattern::LibraryQuery) {
+        const PACK: &str = "patterns";
+        if !self.library.packs().iter().any(|p| p.name == PACK) {
+            let made = pack::default_dir()
+                .ok_or_else(|| "no pack folder".to_owned())
+                .and_then(|dir| pack::create_pack_file(&dir, PACK).map_err(|e| e.to_string()))
+                .and_then(|path| self.library.load(&path).map_err(|e| e.to_string()));
+            if let Err(e) = made {
+                self.status = format!("To the library: pack {PACK}: {e}");
+                return;
+            }
+        }
+        let enum_kind = nerka_core::SignalOptions { kind: Some(nerka_core::SignalKind::Enum), ..Default::default() };
+        let signals = q.states.iter().map(|s| (s.clone(), enum_kind.clone())).collect();
+        let note = "From a pattern: its lines, its states as signals.";
+        library::edit_new(&mut self.library_view, PACK, &q.name, &q.nfd, signals, note);
+        self.show_library = true;
+    }
+
+    /// What tab `i`'s Patterns window asked for, done: the filter and the
+    /// search run, to record in their histories.
+    fn apply_patterns(
+        &mut self,
+        ctx: &egui::Context,
+        i: usize,
+        out: patterns::Output,
+    ) -> (Option<String>, Option<String>) {
+        if let Some((id, line)) = out.goto
+            && let Some(j) = self.tabs.iter().position(|t| t.patterns.id() == id)
+        {
+            self.active = j;
+            self.tabs[j].goto_line(line);
+        }
+        if let Some(q) = out.to_library {
+            self.pattern_to_library(&q);
+        }
+        if out.filter.is_none() && out.search.is_none() {
+            return (None, None);
+        }
+        let Some(t) = self.tabs.get_mut(i) else { return (None, None) };
+        self.active = i;
+        let mut filtered = None;
+        if let Some(q) = out.filter {
+            t.mode = Mode::Query;
+            t.pattern = q;
+            t.filter_exp = None;
+            if t.start_search(ctx) {
+                filtered = Some(t.pattern.clone());
+            }
+        }
+        let mut searched = None;
+        if let Some(q) = out.search {
+            t.search.mode = Mode::Query;
+            t.search.pattern = q.clone();
+            t.search.terms.clear();
+            t.run_search_box(ctx);
+            searched = Some(q);
+        }
+        (filtered, searched)
     }
 
     /// Record a filter in the filter history.
@@ -5403,6 +5556,7 @@ impl App {
         self.settings_window(&ctx);
         self.profiles_window(&ctx);
         self.bundle_windows(&ctx);
+        self.patterns_windows(&ctx);
         if let Some(t) = self.tabs.get_mut(self.active)
             && let Some(d) = &mut t.detail
         {
@@ -5457,6 +5611,11 @@ impl App {
                 };
                 ui.toggle_value(&mut self.show_checks, format!("✔ Checks ({checks})"))
                     .on_hover_text("Issues and facts found in the file, overall and per lifecycle");
+                if let Some(t) = self.tabs.get_mut(self.active) {
+                    ui.toggle_value(&mut t.patterns.open, "🧩 Patterns").on_hover_text(
+                        "This tab's lines grouped by the message they print (experimental), in a window of its                          own: nothing is grouped until ▶ Run",
+                    );
+                }
                 ui.toggle_value(&mut self.show_library, format!("📚 Library ({queries})")).on_hover_text(
                     "Saved queries from packs (*.nerka-pack): pick them for the filter or the search \
                      (Ctrl+Shift+L)",
@@ -5768,6 +5927,11 @@ impl App {
             if let Some(name) = out.open_check {
                 self.show_checks = true;
                 tab.checks_ui.selected = Some((name, 0));
+            }
+            // A lifecycle compared with the one before (patterns, α2).
+            if let Some((life, n)) = &out.compare {
+                tab.patterns.open = true;
+                tab.patterns.compare.lifecycles(life, n - 1, *n);
             }
             // A lifecycle's checks: the pane, on its first issue (else result).
             if let Some((life, n)) = out.checks {
@@ -6798,6 +6962,60 @@ gear=D
         // A new tab starts with them.
         let tab = Tab::open(&ctx, dir.join("app.log"), &app.prefs);
         assert!(tab.search.regex && tab.search.ignore_case);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The Patterns window's requests (plan α1): a pattern's ▾ Filter
+    /// filters the tab to its lines, 🔍 searches for them, a click goes to
+    /// a line; the tab comes to the front.
+    #[test]
+    fn a_patterns_query_filters_and_searches_its_tab() {
+        let dir = std::env::temp_dir().join(format!("nerka-gui-patterns-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (a, b) = (dir.join("a.log"), dir.join("b.log"));
+        let text: String = (0..40)
+            .map(|i| {
+                if i % 4 == 0 {
+                    format!(
+                        "gear {}
+",
+                        ["D", "P"][i % 8 / 4]
+                    )
+                } else {
+                    format!(
+                        "speed {i} km/h
+"
+                    )
+                }
+            })
+            .collect();
+        std::fs::write(&a, &text).unwrap();
+        std::fs::write(&b, &text).unwrap();
+        let ctx = egui::Context::default();
+        let mut app = App::default();
+        app.open(&ctx, a);
+        app.open(&ctx, b);
+        settle_app(&mut app, &ctx);
+        let file = app.tabs[0].file.clone().unwrap();
+        let ps = nerka_core::pattern::detect(&*file, None, &Default::default(), &nerka_core::Progress::new()).unwrap();
+        let gear = ps.patterns.iter().find(|p| p.template() == "gear {D|P}").expect("gear");
+        let q = ps.query(gear);
+        app.active = 1;
+        let out = patterns::Output {
+            goto: Some((app.tabs[0].patterns.id(), 8)),
+            filter: Some(q.clone()),
+            ..Default::default()
+        };
+        let (filtered, searched) = app.apply_patterns(&ctx, 0, out);
+        assert_eq!((filtered.as_deref(), searched), (Some(q.as_str()), None));
+        assert_eq!(app.active, 0);
+        settle_app(&mut app, &ctx);
+        assert_eq!(app.tabs[0].result().unwrap().lines, (0..10).map(|i| i * 4).collect::<Vec<LineNo>>());
+        let out = patterns::Output { search: Some(q.clone()), ..Default::default() };
+        app.apply_patterns(&ctx, 1, out);
+        settle_app(&mut app, &ctx);
+        assert_eq!(app.active, 1);
+        assert_eq!(app.tabs[1].session.hits().unwrap().lines.len(), 10);
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -7899,6 +8117,7 @@ gear=D
                             limit: &mut "8".to_owned(),
                             local_time: &mut true,
                             mf4_local_time: &mut true,
+                            pattern_tuning: &mut false,
                         };
                         settings_ui(ui, fields);
                         let change = protocols::settings_section(ui, edit, &prefs, &[]);

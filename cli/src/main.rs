@@ -22,6 +22,7 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use nerka_core::bundle::{Bundle, Choice, Item, Kind, Status, Store};
 use nerka_core::pack::{self, Expansion, Library, ParamValue, Pick, Role, Selection};
+use nerka_core::pattern::{self, PatternConfig, PatternOptions};
 use nerka_core::{
     Bookmarks, Filter, LineNo, LogSource, Matcher, MatcherOptions, Progress, Query, SearchSet, SignalDef, Signals,
     search, search_within,
@@ -178,6 +179,96 @@ enum Cmd {
         #[command(flatten)]
         out: OutputArgs,
     },
+    /// Group lines into patterns (experimental): message templates with
+    /// `<*>` where the values differ, most lines first, each with its count,
+    /// first line and (with --queries) an NFD query finding its lines.
+    Patterns {
+        /// The files (several: one view).
+        #[arg(required = true, value_name = "FILE")]
+        files: Vec<PathBuf>,
+        /// Only the lines matching this NFD filter.
+        #[arg(long = "in", value_name = "FILTER")]
+        within: Option<String>,
+        #[command(flatten)]
+        engine: PatternArgs,
+        /// Print at most this many patterns (0: all).
+        #[arg(short = 'n', long, default_value_t = 30)]
+        top: usize,
+        /// The rarest patterns first.
+        #[arg(long)]
+        rare: bool,
+        /// Also print each slot's values: lines, first and last line.
+        #[arg(long)]
+        values: bool,
+        /// Also print each pattern's NFD query.
+        #[arg(long)]
+        queries: bool,
+        /// Also print each pattern's first N lines (0: all), with their
+        /// line numbers.
+        #[arg(short = 'l', long, value_name = "N")]
+        lines: Option<usize>,
+        /// Print timing to stderr.
+        #[arg(long)]
+        stats: bool,
+    },
+    /// Write the files' lines with every word made up, so a trace can be
+    /// shared (for tuning patterns, a bug report): the messages keep their
+    /// structure, and so their patterns. DLT stays DLT (times, levels and
+    /// IDs kept); other files become text.
+    Anonymize {
+        /// The files (several: one view).
+        #[arg(required = true, value_name = "FILE")]
+        files: Vec<PathBuf>,
+        /// The file to write.
+        #[arg(short = 'o', long, value_name = "OUT")]
+        output: PathBuf,
+        /// Only the lines matching this NFD filter.
+        #[arg(long = "in", value_name = "FILTER")]
+        within: Option<String>,
+        /// A word to keep as it is (repeatable; any case).
+        #[arg(long, value_name = "WORD")]
+        keep: Vec<String>,
+        /// The same seed makes the same words (default: a random one, so
+        /// nobody can map them back).
+        #[arg(long)]
+        seed: Option<String>,
+        /// Make up DLT ECU, application and context IDs too.
+        #[arg(long)]
+        ids: bool,
+    },
+    /// Compare two sets of lines (experimental): two files, or one file's
+    /// lines of two filters (--a, --b). Lines are grouped into patterns across
+    /// both, then what differs is listed: patterns and slot values new in B,
+    /// gone from B, then those more or less often, surest first.
+    Compare {
+        /// A_FILE B_FILE, or one FILE with --a and --b.
+        #[arg(required = true, num_args = 1..=2, value_name = "FILE")]
+        files: Vec<PathBuf>,
+        /// Set A: only the lines matching this NFD filter.
+        #[arg(long = "a", value_name = "FILTER")]
+        a: Option<String>,
+        /// Set B: only the lines matching this NFD filter.
+        #[arg(long = "b", value_name = "FILTER")]
+        b: Option<String>,
+        /// Both sets: only the lines matching this NFD filter.
+        #[arg(long = "in", value_name = "FILTER")]
+        within: Option<String>,
+        #[command(flatten)]
+        engine: PatternArgs,
+        /// Only changes at least this sure (new and gone ones are always
+        /// shown): G², 3.84 is p = 0.05, 10.8 is p = 0.001.
+        #[arg(long, default_value_t = 10.8)]
+        min_score: f64,
+        /// Print at most this many differences (0: all).
+        #[arg(short = 'n', long, default_value_t = 30)]
+        top: usize,
+        /// Also print each pattern's NFD query.
+        #[arg(long)]
+        queries: bool,
+        /// Print timing to stderr.
+        #[arg(long)]
+        stats: bool,
+    },
     /// Expand pack picks into plain NFD and print it.
     Expand {
         #[command(flatten)]
@@ -269,6 +360,75 @@ enum Conflicts {
     Both,
     Theirs,
     Mine,
+}
+
+/// What a pattern run's stages did (`--stats`).
+fn engine_stats(s: &pattern::PatternStats) -> String {
+    let mut out = format!(
+        "stage 1: {} templates {:.2?} | stage 2: {:.2?}, kept apart: {} new slots, {} side, {} rules",
+        s.templates, s.stage1, s.stage2, s.apart, s.side, s.rules
+    );
+    if s.ignored != [0, 0] {
+        out += &format!(" | ignored {} lines", s.ignored[0] + s.ignored[1]);
+    }
+    out
+}
+
+/// How `patterns` and `compare` group lines.
+#[derive(clap::Args)]
+struct PatternArgs {
+    /// Group this field's text (default: `payload` if the file has it,
+    /// else the line).
+    #[arg(long)]
+    field: Option<String>,
+    /// How alike a message must be to join a template (0–1; the setting
+    /// `similarity`).
+    #[arg(long)]
+    similarity: Option<f32>,
+    /// Don't merge templates by alignment (Drain's templates only; the
+    /// setting `merge off`).
+    #[arg(long)]
+    no_merge: bool,
+    /// Settings and rules (default: the saved ones, `<config>/nerka/patterns`;
+    /// `-`: none, the defaults).
+    #[arg(long, value_name = "FILE")]
+    pattern_config: Option<PathBuf>,
+    /// A setting for this run, after the configuration's (repeatable):
+    /// `similarity=0.7`, `header=sample 16 min 4`.
+    #[arg(long = "set", value_name = "KEY=VALUE")]
+    set: Vec<String>,
+    /// A rule for this run, after the configuration's (repeatable):
+    /// `'apid == NAV: keep Elapsed'`.
+    #[arg(long = "rule", value_name = "RULE")]
+    rules: Vec<String>,
+}
+
+impl PatternArgs {
+    /// The options: the configuration, then `--set`, `--rule`,
+    /// `--similarity`, `--no-merge`.
+    fn options(self, lines: bool) -> Result<PatternOptions> {
+        let mut config = match &self.pattern_config {
+            Some(p) if p == Path::new("-") => PatternConfig::default(),
+            Some(p) => {
+                let text = std::fs::read_to_string(p).with_context(|| format!("reading {}", p.display()))?;
+                PatternConfig::parse(&text).map_err(|e| anyhow::anyhow!("{}: {e}", p.display()))?
+            }
+            None => PatternConfig::load_saved().map_err(anyhow::Error::msg)?,
+        };
+        for s in &self.set {
+            config.set(s).map_err(|e| anyhow::anyhow!("--set {s}: {e}"))?;
+        }
+        for r in &self.rules {
+            config.add_rule(r).map_err(|e| anyhow::anyhow!("--rule {r}: {e}"))?;
+        }
+        if let Some(s) = self.similarity {
+            config.set(&format!("similarity {s}")).map_err(|e| anyhow::anyhow!("--similarity: {e}"))?;
+        }
+        if self.no_merge {
+            config.settings.merge = false;
+        }
+        Ok(PatternOptions { field: self.field, lines, config })
+    }
 }
 
 #[derive(clap::Args)]
@@ -959,6 +1119,111 @@ fn open(paths: &[PathBuf]) -> Result<Opened> {
     Ok(view)
 }
 
+/// `nerka compare`: two files, or one with a filter per set.
+#[allow(clippy::too_many_arguments)]
+fn compare(
+    files: &[PathBuf],
+    filters: [Option<String>; 2],
+    within: Option<String>,
+    options: PatternOptions,
+    min_score: f64,
+    top: usize,
+    queries: bool,
+    stats: bool,
+    out: &mut impl Write,
+) -> Result<()> {
+    if files.len() == 1 && filters.iter().any(Option::is_none) {
+        anyhow::bail!("one file: give a filter per set (--a FILTER --b FILTER), or two files");
+    }
+    let views: Vec<Opened> = files.iter().map(|f| open(std::slice::from_ref(f))).collect::<Result<_>>()?;
+    let view = |side: usize| &views[side.min(views.len() - 1)];
+    // A side's lines: its filter and --in, both.
+    let mut lines: [Option<Vec<LineNo>>; 2] = [None, None];
+    for (side, filter) in filters.iter().enumerate() {
+        let q = match (filter, &within) {
+            (Some(f), Some(w)) => Some(format!("({w}) AND ({f})")),
+            (Some(f), None) => Some(f.clone()),
+            (None, w) => w.clone(),
+        };
+        if let Some(q) = q {
+            let v = view(side);
+            let f = &*v.source;
+            lines[side] = Some(search(f, &with_marks(Filter::Query(compile(&q, f)?), v)?, &Progress::new())?.lines);
+        }
+    }
+    let set = |side: usize| pattern::Set { source: &*view(side).source, lines: lines[side].as_deref() };
+    let t = Instant::now();
+    let ps = pattern::compare(set(0), set(1), &options, &Progress::new())?;
+    let diffs = pattern::differences(&ps, min_score);
+    let took = t.elapsed();
+    let name = |side: usize| {
+        let v = view(side);
+        let file = v.paths.first().map(|p| p.display().to_string()).unwrap_or_default();
+        match &filters[side] {
+            Some(f) => format!("{file} where {f}"),
+            None => file,
+        }
+    };
+    writeln!(out, "A: {} ({} lines)", name(0), ps.lines[0])?;
+    writeln!(out, "B: {} ({} lines)", name(1), ps.lines[1])?;
+    let shown = if top == 0 { diffs.len() } else { top.min(diffs.len()) };
+    let mut section = None;
+    for d in &diffs[..shown] {
+        if section != Some(d.change()) {
+            section = Some(d.change());
+            let title = match d.change() {
+                pattern::Change::New => "New in B".to_owned(),
+                pattern::Change::Gone => "Gone from B".to_owned(),
+                pattern::Change::Changed => format!("Changed (score {min_score} or more)"),
+            };
+            writeln!(
+                out,
+                "
+{title}
+{:>9} {:>8} {:>8} {:>7}  {:<9} pattern",
+                "score", "A", "B", "change", "first"
+            )?;
+        }
+        let p = &ps.patterns[d.pattern];
+        let change = match d.counts {
+            [0, _] => "new".to_owned(),
+            [_, 0] => "gone".to_owned(),
+            _ => format!("×{:.2}", d.ratio()),
+        };
+        // Where to look: the side it's on, or grew on.
+        let side = match d.change() {
+            pattern::Change::New => 1,
+            pattern::Change::Gone => 0,
+            pattern::Change::Changed => usize::from(d.ratio() >= 1.0),
+        };
+        let (sides, what) = match d.value {
+            None => (&p.sides, p.template()),
+            Some((s, v)) => {
+                let value = &p.slots().nth(s).expect("a slot").values[v];
+                (&value.sides, format!("{}  → slot {}: {}", p.template(), s + 1, value.value()))
+            }
+        };
+        let first = format!("{}:{}", ["A", "B"][side], sides[side].first + 1);
+        let fields: String = p.fields.iter().map(|(n, v)| format!("{n}={v} ")).collect();
+        writeln!(out, "{:>9.1} {:>8} {:>8} {change:>7}  {first:<9} {fields}{what}", d.score, d.counts[0], d.counts[1])?;
+        if queries {
+            writeln!(out, "{:47}{}", "", ps.query(p))?;
+        }
+    }
+    if shown < diffs.len() {
+        writeln!(out, "… {} more (-n 0: all)", diffs.len() - shown)?;
+    }
+    if diffs.is_empty() {
+        writeln!(out, "nothing new or gone, and no change scoring {min_score} or more")?;
+    }
+    if stats {
+        out.flush()?;
+        eprintln!("{} patterns, {} differences | grouped and compared in {took:.2?}", ps.patterns.len(), diffs.len());
+        eprintln!("{}", engine_stats(&ps.stats));
+    }
+    Ok(())
+}
+
 /// One file, or several as one view (review 2026-11-09, R6: the console
 /// opened one file): one after another in the order given, or merged by
 /// time with `--merge`; files of kinds that don't go together are refused.
@@ -1209,6 +1474,112 @@ fn run() -> Result<()> {
         }
         Cmd::Filter { query, files, out: o } => {
             run_filter(&files, |source| Ok(Filter::Query(compile(&query, source)?)), &o, &mut out)?;
+        }
+        Cmd::Patterns { files, within, engine, top, rare, values, queries, lines: show, stats } => {
+            let options = engine.options(show.is_some())?;
+            let view = open(&files)?;
+            let f = &*view.source;
+            let lines = match &within {
+                Some(w) => Some(search(f, &with_marks(Filter::Query(compile(w, f)?), &view)?, &Progress::new())?.lines),
+                None => None,
+            };
+            let t = Instant::now();
+            let mut ps = nerka_core::pattern::detect(f, lines.as_deref(), &options, &Progress::new())?;
+            let took = t.elapsed();
+            if rare {
+                ps.patterns.sort_by(|a, b| a.count().cmp(&b.count()).then(a.first().cmp(&b.first())));
+            }
+            let at = locator(f);
+            let shown = if top == 0 { ps.patterns.len() } else { top.min(ps.patterns.len()) };
+            let place = |l: LineNo| {
+                if view.paths.len() > 1 {
+                    let (k, l) = at(l);
+                    format!("{}:{}", view.paths[k].display(), l + 1)
+                } else {
+                    (l + 1).to_string()
+                }
+            };
+            for p in &ps.patterns[..shown] {
+                let first = place(p.first());
+                let share = 100.0 * p.count() as f64 / ps.total().max(1) as f64;
+                write!(out, "{:>9} {share:>5.1}%  {first:>7}  ", p.count())?;
+                for (name, value) in &p.fields {
+                    write!(out, "{name}={value} ")?;
+                }
+                let unsorted = if p.unsorted { "  (not sorted: too many kinds of lines)" } else { "" };
+                writeln!(out, "{}{unsorted}", p.template())?;
+                if values {
+                    for (k, s) in p.slots().enumerate() {
+                        let kind = if s.is_state() { "state" } else { "values" };
+                        let more = if s.overflow { ", more not kept" } else { "" };
+                        writeln!(out, "{:28}slot {} ({kind}{more}):", "", k + 1)?;
+                        for v in &s.values {
+                            let lines = if v.first() == v.last() {
+                                place(v.first())
+                            } else {
+                                format!("{}–{}", place(v.first()), place(v.last()))
+                            };
+                            writeln!(out, "{:30}{:>9}  {:<24} {lines}", "", v.count(), v.value())?;
+                        }
+                    }
+                }
+                if queries {
+                    writeln!(out, "{:28}{}", "", ps.query(p))?;
+                }
+                if let Some(n) = show {
+                    let n = if n == 0 { usize::MAX } else { n };
+                    for &l in p.lines[0].iter().take(n) {
+                        let text = f.line_text(l).unwrap_or_default();
+                        writeln!(out, "{:28}{:>9}: {text}", "", place(l))?;
+                    }
+                    if p.lines[0].len() > n {
+                        writeln!(out, "{:28}… {} more lines", "", p.lines[0].len() - n)?;
+                    }
+                }
+            }
+            if shown < ps.patterns.len() {
+                writeln!(out, "… {} more (-n 0: all)", ps.patterns.len() - shown)?;
+            }
+            if stats {
+                out.flush()?;
+                eprintln!(
+                    "{} patterns in {} lines | index {:.2?} | patterns {took:.2?}",
+                    ps.patterns.len(),
+                    ps.total(),
+                    view.took
+                );
+                eprintln!("{}", engine_stats(&ps.stats));
+            }
+        }
+        Cmd::Anonymize { files, output, within, keep, seed, ids } => {
+            let same = |p: &Path| {
+                let c = |x: &Path| std::fs::canonicalize(x).unwrap_or_else(|_| x.to_owned());
+                c(p) == c(&output)
+            };
+            if files.iter().any(|f| same(f)) {
+                anyhow::bail!("{}: the output can't be one of the files read", output.display());
+            }
+            let view = open(&files)?;
+            let f = &*view.source;
+            let lines = match &within {
+                Some(w) => Some(search(f, &with_marks(Filter::Query(compile(w, f)?), &view)?, &Progress::new())?.lines),
+                None => None,
+            };
+            let n = lines.as_ref().map_or(f.line_count(), |l| l.len() as u64);
+            let file = std::fs::File::create(&output).with_context(|| format!("creating {}", output.display()))?;
+            let mut w = BufWriter::new(file);
+            let mut a = nerka_core::anonymize::Anonymizer::new(seed.as_deref(), keep);
+            let what = nerka_core::anonymize::anonymize(f, lines.as_deref(), &mut a, ids, &mut w, &Progress::new())?;
+            w.flush().with_context(|| format!("writing {}", output.display()))?;
+            let what = match what {
+                nerka_core::anonymize::Written::Dlt => "DLT",
+                nerka_core::anonymize::Written::Text => "text",
+            };
+            let key = if seed.is_none() { "; keyed at random: the words can't be mapped back" } else { "" };
+            eprintln!("nerka: {n} lines anonymized into {} ({what}){key}", output.display());
+        }
+        Cmd::Compare { files, a, b, within, engine, min_score, top, queries, stats } => {
+            compare(&files, [a, b], within, engine.options(false)?, min_score, top, queries, stats, &mut out)?;
         }
         Cmd::Expand { picks, parts } => {
             if picks.is_empty() {

@@ -726,6 +726,27 @@ pub enum Action {
     },
 }
 
+/// Open the editor on a new query of `pack`: its name, NFD, its named
+/// groups' signal options and its note (a pattern's ➕ To library).
+pub fn edit_new(
+    view: &mut LibraryView,
+    pack: &str,
+    name: &str,
+    text: &str,
+    signals: Vec<(String, SignalOptions)>,
+    note: &str,
+) {
+    let node = Node {
+        name: name.to_owned(),
+        text: text.to_owned(),
+        signals,
+        note: note.to_owned(),
+        open: true,
+        ..Node::blank(0, Use::Include)
+    };
+    view.editing = Some(LibEdit { pack: pack.to_owned(), old: None, node, confirm_delete: false });
+}
+
 /// A library query being edited (or a new one).
 #[derive(Debug, Clone)]
 pub struct LibEdit {
@@ -2233,6 +2254,20 @@ mod tests {
         q.renamed("a.xyz all", "a.renamed");
         assert_eq!((q.nodes[0].source.as_deref(), q.nodes[0].name.as_str()), (Some("a.renamed"), "renamed"));
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A pattern's ➕ To library: the editor opens on a new query with its
+    /// text and its states as enum signals, written only by its Save.
+    #[test]
+    fn a_new_query_from_a_pattern() {
+        let mut view = LibraryView::default();
+        let enum_kind = SignalOptions { kind: Some(nerka_core::SignalKind::Enum), ..Default::default() };
+        edit_new(&mut view, "patterns", "nav_gear", "raw ~ /gear (?<gear>D|P)/", vec![("gear".into(), enum_kind)], "n");
+        let e = view.editing.as_ref().expect("editing");
+        assert_eq!((e.pack.as_str(), e.old.as_deref()), ("patterns", None));
+        let q = e.node.as_query("nav_gear");
+        assert_eq!((q.text.as_str(), q.signals.len()), ("raw ~ /gear (?<gear>D|P)/", 1));
+        assert!(pack::format_query(&q).contains("signals: gear:enum"), "{}", pack::format_query(&q));
     }
 
     #[test]

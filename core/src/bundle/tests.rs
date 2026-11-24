@@ -197,7 +197,7 @@ fn export_then_import_into_an_empty_folder() {
     assert!(errors.is_empty() && signals.get("v").is_some() && signals.get("ecu1").is_some());
     assert_eq!(
         std::fs::read_to_string(root.join(FORMAT_FILE)).unwrap().lines().filter(|l| l.ends_with(" 1")).count(),
-        6
+        Kind::ALL.len()
     );
     // Again: all the same, nothing to do.
     let again = to.plan(&b);
@@ -228,6 +228,56 @@ fn profiles_export_and_import_as_lines() {
     let (ps, errors) = crate::input::profile::Profiles::parse_text(&text);
     assert!(errors.is_empty() && ps.get("app").is_some(), "{text}");
     assert!(text.starts_with("# nerka profiles"), "{text}");
+}
+
+/// The pattern configuration (`patterns.md`, owner 2026-11-23: one global
+/// file, moved with bundles) is one item: never renamed, theirs taken only
+/// when asked for.
+#[test]
+fn the_pattern_configuration_is_one_item() {
+    const MINE: &str = "similarity 0.6
+apid == NAV: keep Elapsed
+";
+    const THEIRS: &str = "# a tester's
+new-slots 2
+*: max-slots 3
+";
+    assert_eq!(item(Kind::Patterns, MINE).name, "patterns");
+    assert!(Item::new(Kind::Patterns, "similarty 0.6").unwrap_err().contains("line 1: unknown setting"));
+    assert!(renamed(Kind::Patterns, MINE, "patterns_imported").is_err());
+    let from = Store::new(dir("patterns-from"));
+    std::fs::write(from.root().join("patterns"), THEIRS).unwrap();
+    let (b, errors) = from.export(&|_| true);
+    assert!(errors.is_empty(), "{errors:?}");
+    assert!(
+        b.to_text().contains(
+            "@@ patterns patterns format 1
+# a tester's
+"
+        ),
+        "{}",
+        b.to_text()
+    );
+    let b = Bundle::parse("t", &b.to_text()).unwrap();
+    // Into a folder without one: added.
+    let to = Store::new(dir("patterns-to"));
+    let plan = to.plan(&b);
+    assert_eq!(labels(&plan), ["new patterns patterns"]);
+    assert!(to.apply(&plan).errors.is_empty());
+    assert_eq!(std::fs::read_to_string(to.root().join("patterns")).unwrap(), THEIRS);
+    // Into one with another: mine kept, unless theirs is asked for.
+    std::fs::write(to.root().join("patterns"), MINE).unwrap();
+    let mut plan = to.plan(&b);
+    assert_eq!(labels(&plan), ["different patterns patterns"]);
+    assert_eq!((plan.items[0].choice, plan.items[0].choices()), (Choice::Skip, &[Choice::Skip, Choice::Take][..]));
+    plan.set_conflicts(Choice::Both);
+    assert_eq!(plan.changes(), 0);
+    plan.set_conflicts(Choice::Take);
+    let done = to.apply(&plan);
+    assert!(done.errors.is_empty() && done.backup.is_some(), "{done:?}");
+    assert_eq!(std::fs::read_to_string(to.root().join("patterns")).unwrap(), THEIRS);
+    let backup = std::fs::read_to_string(done.backup.unwrap()).unwrap();
+    assert!(backup.contains("apid == NAV: keep Elapsed"), "{backup}");
 }
 
 #[test]

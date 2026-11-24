@@ -22,14 +22,15 @@
 //! ```text
 //! file   := "nerka-bundle" VERSION NEWLINE ["nerka" TEXT NEWLINE] (comment | blank)* item*
 //! item   := "@@" KIND NAME "format" N NEWLINE line*   -- up to the next header or the end
-//! KIND   := "pack" | "preset" | "plot" | "check" | "signal"
+//! KIND   := "pack" | "preset" | "plot" | "check" | "signal" | "profile" | "patterns"
 //! NAME   := a word, or "…" with \" and \\           -- as in presets
 //! line   := any line; one starting with "@@" is written with one more "@"
 //! ```
 //!
-//! An item is a pack, preset or plot file, or one check, signal or profile line, as
-//! it is. Its format number says which format its text is in; [`STEPS`]
-//! turn a kind's text from one format into the next, so an older item is
+//! An item is a pack, preset or plot file, one check, signal or profile
+//! line, or the pattern configuration (`patterns`, one item), as it is.
+//! Its format number says which format its text is in; [`STEPS`] turn a
+//! kind's text from one format into the next, so an older item is
 //! upgraded ([`upgrade`]) before it is parsed. A [`Store`] is a config
 //! folder: its items, an export of them, the upgrade of the folder itself,
 //! and an import planned ([`Store::plan`]) and applied ([`Store::apply`]).
@@ -37,6 +38,7 @@
 use crate::check::CheckDef;
 use crate::input::profile::Profile;
 use crate::pack::{PackError, is_name, parse_pack};
+use crate::pattern::PatternConfig;
 use crate::plot::parse_plot;
 use crate::preset::{parse_preset, quote, words};
 use crate::signal::SignalDef;
@@ -61,10 +63,13 @@ pub enum Kind {
     Check,
     Signal,
     Profile,
+    /// The pattern configuration: one file, `patterns`.
+    Patterns,
 }
 
 impl Kind {
-    pub const ALL: [Kind; 6] = [Kind::Pack, Kind::Preset, Kind::Plot, Kind::Check, Kind::Signal, Kind::Profile];
+    pub const ALL: [Kind; 7] =
+        [Kind::Pack, Kind::Preset, Kind::Plot, Kind::Check, Kind::Signal, Kind::Profile, Kind::Patterns];
 
     pub fn as_str(self) -> &'static str {
         match self {
@@ -74,6 +79,7 @@ impl Kind {
             Kind::Check => "check",
             Kind::Signal => "signal",
             Kind::Profile => "profile",
+            Kind::Patterns => "patterns",
         }
     }
 
@@ -85,6 +91,7 @@ impl Kind {
             Kind::Check => "checks",
             Kind::Signal => "signals",
             Kind::Profile => "profiles",
+            Kind::Patterns => "patterns",
         }
     }
 
@@ -104,7 +111,12 @@ impl Kind {
         matches!(self, Kind::Check | Kind::Signal | Kind::Profile)
     }
 
-    /// The folder (pack, preset, plot) or file (check, signal) in a config folder.
+    /// Kinds of one item, a whole file (`patterns`), named as the kind.
+    pub fn is_single(self) -> bool {
+        self == Kind::Patterns
+    }
+
+    /// The folder (pack, preset, plot) or file (check, signal, patterns) in a config folder.
     fn place(self, root: &Path) -> PathBuf {
         root.join(self.plural())
     }
@@ -114,7 +126,7 @@ impl Kind {
             Kind::Pack => crate::pack::PACK_EXTENSION,
             Kind::Preset => crate::preset::PRESET_EXTENSION,
             Kind::Plot => crate::plot::PLOT_EXTENSION,
-            Kind::Check | Kind::Signal | Kind::Profile => "",
+            Kind::Check | Kind::Signal | Kind::Profile | Kind::Patterns => "",
         }
     }
 
@@ -246,6 +258,7 @@ pub fn name_of(kind: Kind, text: &str) -> Result<String, String> {
             let line = one_line(kind, text)?;
             Profile::parse_spec(&line).map(|p| p.name().to_owned()).map_err(|e| e.at(&line))
         }
+        Kind::Patterns => PatternConfig::parse(text).map(|_| file.to_owned()),
     }
 }
 
@@ -296,6 +309,7 @@ pub fn renamed(kind: Kind, text: &str, new: &str) -> Result<String, String> {
             let colon = line.find(':').ok_or("a profile without ':'")?;
             format!("{new}{}", &line[colon..])
         }
+        Kind::Patterns => return Err("there is one pattern configuration: keep mine or take theirs".into()),
     };
     let out = tidy(&lines.join("\n"));
     match name_of(kind, &out) {
@@ -536,6 +550,17 @@ impl Store {
                 Ok(Item { kind, name, format, text })
             };
             let place = kind.place(&self.root);
+            if kind.is_single() {
+                match std::fs::read_to_string(&place) {
+                    Ok(t) => match item(t, kind.as_str().to_owned()) {
+                        Ok(it) => out.push(Stored { item: it, path: place }),
+                        Err(e) => errors.push(format!("{}: {e}", place.display())),
+                    },
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => errors.push(format!("{}: {e}", place.display())),
+                }
+                continue;
+            }
             if kind.is_line() {
                 let text = match std::fs::read_to_string(&place) {
                     Ok(t) => t,
@@ -651,7 +676,12 @@ impl Store {
                     }
                 }
             } else {
-                for path in files(&place, kind.extension()) {
+                let paths = if kind.is_single() {
+                    if place.is_file() { vec![place.clone()] } else { Vec::new() }
+                } else {
+                    files(&place, kind.extension())
+                };
+                for path in paths {
                     let r = std::fs::read_to_string(&path)
                         .map_err(|e| e.to_string())
                         .and_then(|t| run(&tidy(&t)))
@@ -804,6 +834,7 @@ impl Store {
                 continue;
             }
             let path = match (&p.mine, replace) {
+                _ if it.kind.is_single() => it.kind.place(&self.root),
                 (Some(m), true) => m.clone(),
                 _ => free_file(&it.kind.place(&self.root), &name, it.kind.extension()),
             };
@@ -941,6 +972,8 @@ impl Planned {
     pub fn auto(&self) -> Choice {
         match self.status {
             Status::New => Choice::Take,
+            // One of the kind: theirs only if asked for.
+            Status::Different if self.kind.is_single() => Choice::Skip,
             Status::Different => Choice::Both,
             Status::Same | Status::Invalid(_) => Choice::Skip,
         }
@@ -950,6 +983,7 @@ impl Planned {
     pub fn choices(&self) -> &'static [Choice] {
         match self.status {
             Status::New => &[Choice::Take, Choice::Skip],
+            Status::Different if self.kind.is_single() => &[Choice::Skip, Choice::Take],
             Status::Different => &[Choice::Both, Choice::Take, Choice::Skip],
             Status::Same | Status::Invalid(_) => &[Choice::Skip],
         }
@@ -993,10 +1027,11 @@ impl Plan {
         }
     }
 
-    /// Every different item's choice to `c`; the others Auto.
+    /// Every different item's choice to `c` (where it is one of its
+    /// choices); the others Auto.
     pub fn set_conflicts(&mut self, c: Choice) {
         for p in &mut self.items {
-            p.choice = if p.status == Status::Different { c } else { p.auto() };
+            p.choice = if p.status == Status::Different && p.choices().contains(&c) { c } else { p.auto() };
         }
     }
 
