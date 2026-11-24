@@ -1440,6 +1440,7 @@ impl Tab {
             id: self.patterns.id(),
             title: self.title(),
             kept: self.session.result().cloned(),
+            filter: self.session.filter().map(|f| f.nfd()),
             cx: self.session.context().clone(),
             lifecycles,
             file,
@@ -1581,6 +1582,10 @@ impl Tab {
             r if r.len() == self.paths.len() => {
                 (self.paths.iter().zip(r)).filter(|(_, r)| !r.profile.is_empty()).map(|(p, _)| p.clone()).collect()
             }
+            // Read without reading info: one DLT file or capture (text files
+            // and views of several files have it for each file). Not opened
+            // to tell: over sshfs every open drops the file's cached pages.
+            _ if self.file.is_some() => Vec::new(),
             _ => (self.paths.iter())
                 .filter(|p| !protocols::is_capture(p) && !p.extension().is_some_and(|e| e.eq_ignore_ascii_case("dlt")))
                 .cloned()
@@ -5250,6 +5255,12 @@ impl App {
     fn records_window(&mut self, ctx: &egui::Context) {
         let (prefs, fibex) = (&self.prefs, self.fibex.clone());
         let Some(t) = self.tabs.get_mut(self.active) else { return };
+        // Only while the window is shown: `text_paths` may open the files
+        // (captures), and over sshfs every open drops the file's cached
+        // pages, so a filter and each frame read it over the link again.
+        if t.records_edit.is_none() {
+            return;
+        }
         let title = t.title();
         let files = t.text_paths();
         let Some(edit) = &mut t.records_edit else { return };
@@ -7381,6 +7392,54 @@ gear=D
             let max = scroll.iter().cloned().fold(0.0, f64::max);
             let mean = scroll.iter().sum::<f64>() / scroll.len() as f64;
             eprintln!("scroll: 40 frames, slowest {max:.1} ms, mean {mean:.1} ms");
+            // `NERKA_PERF_TYPE=TEXT`: TEXT typed into the filter box, a
+            // character a frame (as keys arrive), then Enter: how fast the
+            // window answers typing, and the filter's time after it.
+            if let Ok(text) = std::env::var("NERKA_PERF_TYPE") {
+                app.tabs[0].pattern.clear();
+                let (mut typing, t1) = (Vec::new(), std::time::Instant::now());
+                for c in text.chars() {
+                    app.tabs[0].pattern.push(c);
+                    time += 1.0 / 60.0;
+                    let input = egui::RawInput { screen_rect: Some(screen), time: Some(time), ..Default::default() };
+                    let t = std::time::Instant::now();
+                    let mut out = ctx.run_ui(input, |ui| app.frame(ui));
+                    out.textures_delta.clear();
+                    typing.push(t.elapsed().as_secs_f64() * 1e3);
+                }
+                let secs = t1.elapsed().as_secs_f64();
+                let max = typing.iter().cloned().fold(0.0, f64::max);
+                let mean = typing.iter().sum::<f64>() / typing.len().max(1) as f64;
+                eprintln!(
+                    "typing: {} chars, {:.1} chars/s | frames slowest {max:.1} ms, mean {mean:.1} ms",
+                    typing.len(),
+                    typing.len() as f64 / secs
+                );
+                let tab = &mut app.tabs[0];
+                tab.start_search(&ctx);
+                tab.kick(&ctx);
+                let (t2, mut during) = (std::time::Instant::now(), Vec::new());
+                loop {
+                    time += 1.0 / 60.0;
+                    let input = egui::RawInput { screen_rect: Some(screen), time: Some(time), ..Default::default() };
+                    let t = std::time::Instant::now();
+                    let mut out = ctx.run_ui(input, |ui| app.frame(ui));
+                    out.textures_delta.clear();
+                    during.push(t.elapsed().as_secs_f64() * 1e3);
+                    let tab = &app.tabs[0];
+                    if tab.result().is_some() && tab.stage_job(Stage::Filter).is_none() {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                let max = during.iter().cloned().fold(0.0, f64::max);
+                let mean = during.iter().sum::<f64>() / during.len() as f64;
+                eprintln!(
+                    "filter after typing: {:.0} ms | frames meanwhile {} (slowest {max:.1} ms, mean {mean:.1} ms)",
+                    t2.elapsed().as_secs_f64() * 1e3,
+                    during.len()
+                );
+            }
             eprintln!("filter keeps {} lines", app.tabs[0].result().map_or(0, |r| r.lines.len()));
         }
     }
@@ -8017,6 +8076,29 @@ gear=D
         assert!(!m.file.as_ref().unwrap().columns().is_empty(), "{}", m.status);
         assert_eq!(m.text_paths(), std::slice::from_ref(&c));
         drop((t, m));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A read DLT file or capture has no text files, whatever its name, and
+    /// isn't opened again to tell (owner's report, 2026-11-24: over sshfs,
+    /// where each open drops the file's cached pages, typing in the filter
+    /// box showed 2-3 characters a second; the tab's menu and the Records
+    /// window opened the file every frame).
+    #[test]
+    fn a_read_dlt_file_has_no_text_files_and_is_not_opened_again() {
+        let dir = std::env::temp_dir().join(format!("nerka-gui-notext-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // DLT under a name that isn't `.dlt`: before, taken for text.
+        let d = dir.join("trace.bin");
+        let mut buf = Vec::new();
+        nerka_core::input::dlt::writer::Msg::log(nerka_core::Level::Info, "E", "A", "C", vec![]).encode(&mut buf);
+        std::fs::write(&d, buf).unwrap();
+        let ctx = egui::Context::default();
+        let mut t = Tab::open_many(&ctx, vec![d.clone()], &SearchPrefs::default(), None);
+        settle(&mut t, &ctx);
+        assert!(!t.file.as_ref().unwrap().columns().is_empty(), "{}", t.status);
+        assert!(t.text_paths().is_empty());
+        drop(t);
         std::fs::remove_dir_all(&dir).ok();
     }
 

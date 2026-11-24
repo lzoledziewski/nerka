@@ -105,15 +105,22 @@ chosen, or the [pattern configuration](cli.md#the-pattern-configuration)
 or the signals changed.
 
 - **Lines:** all lines, the filter result, one lifecycle (`@ecu1` and its
-  number), or the lines of a filter you type (NFD). **Field:** the text
+  number: every line during it, or with *its lines only* its own lines),
+  or the lines of a filter you type (NFD). **Field:** the text
   grouped (default: a DLT message's `payload`, else the line).
+- **Only** and **Ignore** (NFD), as in Compare, narrow those lines:
+  `ecu == ECU1`, or leave out `apid == GPS OR payload ~ /heartbeat/`.
+  Enter in any of these boxes runs, as ▶ Run does (▶ Compare in Compare).
+- Files opened together in one tab are one set of lines: the same message
+  in each is one pattern, never told apart by its file.
 - **Each row:** its share and count of lines, the fields that tell it
   apart (`apid=NAV`) and the template, state values in colour. A click
   goes to its first line. **▸** unfolds its slots (each value with its
   count and first and last line, a click goes there) and its lines.
-- **▾ Filter** puts its query in the Filter box and runs it, **🔍**
-  searches for its lines among the filtered ones, **📋** copies the
-  query. Sort by most lines, rarest first, or first line.
+- **▾ Filter** puts its query, kept to the lines grouped (`(the lines
+  chosen) AND (its query)`), in the Filter box and runs it; **🔍** searches
+  for them among the filtered ones; **📋** copies the query alone. Sort by
+  most lines, rarest first, or first line.
 - **➕** (to the library) opens the Library's editor on a new query of its
   lines in the pack `patterns` (made if there is none), each state
   captured as an enum signal: `gear={D|P|N}` gives `@gear`. Nothing is
@@ -127,7 +134,8 @@ the score is G², 10.8 or more by default), as
 
 - **A and B:** all lines, the filter result, the lines of a filter,
   lifecycles of `@name` by number (`2`, or a group: `2, 5-7`) or every one
-  of an outcome (every `crash` against every `planned`), or another tab.
+  of an outcome (every `crash` against every `planned`): every line during
+  them, or with *its lines only* their own lines; or another tab.
   With lifecycles, a row also says in how many of a side's lifecycles the
   pattern has lines (`A 3/3 · B 0/5`): a constant symptom, not a one-off.
 - **Only** and **Ignore** (NFD) choose the lines of both sides first:
@@ -138,7 +146,10 @@ the score is G², 10.8 or more by default), as
   (hidden from the results; *Show ignored* brings it back), *Save as
   ignore rule* (added to the [pattern
   configuration](cli.md#the-pattern-configuration), so patterns and
-  compares leave its lines out), *Filter to its lines*, *Copy its query*.
+  compares leave its lines out), *Filter to its lines* and *Search for
+  its lines* (in this window's tab, all its lines: for another tab, copy
+  the query there), *Copy its query*. The row under the mouse is lit, so
+  its buttons at the right are easy to tell apart.
 - In the Signals panel, **⚖** on a lifecycle compares it with the one
   before.
 
@@ -147,7 +158,8 @@ Developer → Pattern tuning) edits the [pattern
 configuration](cli.md#the-pattern-configuration) on the lines at hand:
 
 - **Settings** of both stages, each with **●** while it isn't the default
-  (a click puts the default back). A change runs the patterns again on the
+  (a click puts the default back), and beside it what raising or lowering
+  it does; its name's hover says what it does, with an example. A change runs the patterns again on the
   same lines, and **Change** says what it did: patterns new and gone,
   joined and split (**Show** lists them).
 - **Rules**, one per line, read top to bottom (▲ ▼ to move, − to remove);

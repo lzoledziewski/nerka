@@ -106,3 +106,10 @@ Design agreed with the owner on 2026-10-18 after mockups: **`search-manager.md`*
 - **NFD is unchanged:** picking from the library expands (in core) into plain NFD, with provenance for search colours.
 - Parked: scenarios / skill export, pack collaboration (dirty / clean, push / pull), the details view with replace / extract.
 - Still not a copy of klogg's saved filters / highlighters lists.
+
+## Windows around a condition (built 2026-11-24: core, CLI)
+
+- **Owner (2026-11-24):** a common case, above all for AI workflows (the CLI now, an MCP server later), is the lines n seconds or minutes before (or after) a condition; `@time` with a require filter needs times typed by hand.
+- **In NFD, so everywhere a query goes** (GUI, CLI, packs, checks, lifecycles): `before(DUR, X)`, `after(DUR, X)`, `around(DUR, DUR, X)`, X any query. `X` runs once over the source in `Query::prepare` (as signals do), its lines' times widened into merged windows; a line is a lookup. A line without a time is in none; a source without times is an error. `Filter::uses_rows` is true for them (other lines decide).
+- **CLI:** `filter --before DUR --after DUR QUERY`, the matches marked `>`, `--` between windows apart (grep's context). A line-count form (`-B` / `-A N`) isn't built.
+

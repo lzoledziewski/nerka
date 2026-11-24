@@ -59,6 +59,7 @@ whose lines' times go backward.
 | `--stats` | timing on stderr |
 | `search -i`, `-F`, `-v` | ignore case, a literal pattern, the lines that don't match |
 | `search --in FILTER` | search only among the lines an NFD filter keeps |
+| `filter --before DUR`, `--after DUR` | also every line within that time before / after each match (`30s`, `500ms`, `2m`), the matches marked `>`, `--` between windows apart: what led to an error, for a person or an agent ([around a condition](queries.md#around-a-condition-by-time)) |
 
 Instead of a pattern, `search` and `expand` take **pack picks**, and
 `search` then prints which query matched each line:
@@ -76,6 +77,7 @@ Instead of a pattern, `search` and `expand` take **pack picks**, and
 ```
 nerka --pack examples/packs/ expand -l ota -p cam=CAM1 --parts
 nerka --pack examples/packs/ search --in 'level >= WARN' -l ota -p cam=CAM1 app.log
+nerka filter --before 30s --after 2s 'payload ~ /watchdog reset/' trace.dlt
 ```
 
 ## `check` and `lifecycles`
@@ -115,10 +117,14 @@ one new place at most. Two slots made at once would always change together:
 `warning the data was read` and `status the data is read` stay two
 patterns. Once `warning the data is read` turns up, the two places are seen
 to vary on their own, and all three join as `{warning|status} the data
-{was|is} read`.
+{was|is} read`. Last, a pattern whose lines another's query takes too (a
+message split by the shape of a value, `proxy.lab.example.edu:<*> open
+through proxy …` beside `<*> open through proxy …`) joins that one,
+however few words they share.
 
 A DLT message's `payload` is grouped (other files: the line), and fields
-such as `apid` that tell the patterns apart print with them. Each pattern
+such as `apid` that tell the patterns apart print with them. The file
+isn't one of them: files read together are one set of lines. Each pattern
 prints its count, its share, its first line and the template, most lines
 first.
 

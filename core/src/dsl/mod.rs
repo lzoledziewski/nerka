@@ -18,6 +18,9 @@
 //!          | FIELD OP VALUE
 //!          | SIGNAL OP VALUE
 //!          | "bookmark" [ OP VALUE ]    -- the line's bookmark
+//!          | WINDOW "(" DUR "," [ DUR "," ] expr ")"
+//! WINDOW  := before | after | around    -- around takes two DURs
+//! DUR     := NUMBER [ ms | s | m | h ]  -- default seconds
 //! FIELD   := raw | level | WORD         -- WORD: a field the source supplies
 //! SIGNAL  := "@" NAME [ "." VIEW ]      -- a signal the tab defines
 //! VIEW    := state | event | changed    -- default state; event and
@@ -74,6 +77,14 @@
 //! match its name or its note (`bookmark ~ /fan/`). A line without a
 //! bookmark only satisfies `!=` and `!~`; without bookmarks given, no line
 //! has one.
+//!
+//! `before(30s, X)` holds on a line whose time is at most 30 s before a
+//! line `X` keeps (or is that line), `after(5s, X)` up to 5 s after one,
+//! `around(30s, 5s, X)` both: the lines around a condition, for one (an
+//! agent's "what happened before the crash"). `X` is any query; it runs
+//! once over the source before the search ([`Query::prepare`]), its lines'
+//! times widened into windows. A line without a time is in none; a source
+//! without times is an error there.
 //!
 //! The search boxes' Auto mode (`auto.rs`, `docs/dev/search-modes.md`) reads plain
 //! words as text and rewrites them into this grammar; NFD itself has no
@@ -143,6 +154,70 @@ pub enum Cond {
     Signal(SignalCond),
     /// `bookmark [OP VALUE]`.
     Bookmark(BookmarkCond),
+    /// `before(…)`, `after(…)`, `around(…)`.
+    Window(WindowCond),
+}
+
+/// `before(DUR, X)`, `after(DUR, X)`, `around(DUR, DUR, X)`: a line whose
+/// time is within `back` before or `ahead` after a line `inner` keeps.
+#[derive(Debug, Clone)]
+pub struct WindowCond {
+    /// Seconds before and after a line of `inner`.
+    pub back: f64,
+    pub ahead: f64,
+    pub inner: Box<Expr>,
+    /// `inner` as written.
+    pub inner_src: String,
+    /// Byte offset of the word in the query.
+    pub pos: usize,
+    /// The windows (start, end) in seconds, merged and ascending, set by
+    /// [`Query::prepare`]; without them no line is in one.
+    pub spans: Option<Arc<Vec<(f64, f64)>>>,
+}
+
+impl WindowCond {
+    fn eval(&self, ev: &Event<'_>) -> bool {
+        let (Some(spans), Some(source)) = (&self.spans, ev.source()) else { return false };
+        let Some(t) = source.time(ev.line()) else { return false };
+        let k = spans.partition_point(|s| s.0 <= t);
+        k > 0 && t <= spans[k - 1].1
+    }
+
+    /// `inner` as a query of its own.
+    fn query(&self) -> Query {
+        Query { expr: (*self.inner).clone(), source: self.inner_src.clone() }
+    }
+
+    /// Its windows in `source`: `inner`'s lines (one pass), their times
+    /// widened and merged.
+    fn prepare(&mut self, source: &dyn LogSource, progress: &Progress) -> crate::Result<()> {
+        if !source.has_time() {
+            return Err(crate::Error::Format(format!(
+                "a window ({}) needs times, and {} has none",
+                self.inner_src,
+                source.name()
+            )));
+        }
+        let filter = crate::Filter::Query(self.query()).prepare(source, progress)?;
+        let lines = crate::engine::search::scan(source, &filter, progress)?;
+        let times: Vec<f64> = lines.iter().filter_map(|&l| source.time(l)).collect();
+        self.spans = Some(Arc::new(windows(times, self.back, self.ahead)));
+        Ok(())
+    }
+}
+
+/// `times` widened by `back` and `ahead`, overlaps merged, ascending.
+fn windows(mut times: Vec<f64>, back: f64, ahead: f64) -> Vec<(f64, f64)> {
+    times.sort_by(f64::total_cmp);
+    let mut out: Vec<(f64, f64)> = Vec::new();
+    for t in times {
+        let (a, b) = (t - back, t + ahead);
+        match out.last_mut() {
+            Some(last) if a <= last.1 => last.1 = last.1.max(b),
+            _ => out.push((a, b)),
+        }
+    }
+    out
 }
 
 /// `bookmark` alone (`test` is [`FieldTest::Any`]), `==` / `!=` on the
@@ -266,6 +341,7 @@ impl Expr {
             },
             Expr::Cond(Cond::Signal(s)) => s.eval(ev),
             Expr::Cond(Cond::Bookmark(b)) => b.eval(ev.line()),
+            Expr::Cond(Cond::Window(w)) => w.eval(ev),
         }
     }
 
@@ -275,6 +351,12 @@ impl Expr {
             Expr::And(xs) | Expr::Or(xs) => xs.iter_mut().try_for_each(|x| x.bind(schema)),
             Expr::Not(x) => x.bind(schema),
             Expr::Cond(Cond::Field(f)) => f.bind(schema),
+            Expr::Cond(Cond::Window(w)) => {
+                w.inner.bind(schema)?;
+                let inner = std::mem::replace(&mut *w.inner, Expr::And(Vec::new()));
+                *w.inner = inner.optimize();
+                Ok(())
+            }
             Expr::Cond(Cond::Signal(s)) => {
                 let Some(def) = &s.def else {
                     return Err(DslError { msg: format!("unknown signal '@{}'", s.name), pos: s.pos });
@@ -301,6 +383,7 @@ impl Expr {
             Expr::And(xs) | Expr::Or(xs) => xs.iter_mut().try_for_each(|x| x.attach(signals)),
             Expr::Not(x) => x.attach(signals),
             Expr::Cond(Cond::Signal(s)) => s.attach(signals),
+            Expr::Cond(Cond::Window(w)) => w.inner.attach(signals),
             Expr::Cond(_) => Ok(()),
         }
     }
@@ -313,6 +396,7 @@ impl Expr {
                 Expr::And(xs) | Expr::Or(xs) => xs.iter().for_each(|x| walk(x, out)),
                 Expr::Not(x) => walk(x, out),
                 Expr::Cond(Cond::Field(f)) if !out.contains(&f.name) => out.push(f.name.clone()),
+                Expr::Cond(Cond::Window(w)) => walk(&w.inner, out),
                 Expr::Cond(_) => {}
             }
         }
@@ -339,6 +423,8 @@ impl Expr {
             // Runs the signal's whole query, then its capture.
             // A lookup in the signal's events (collected beforehand).
             Expr::Cond(Cond::Signal(_)) => 3,
+            // A lookup in its windows (found beforehand).
+            Expr::Cond(Cond::Window(_)) => 3,
             Expr::Not(x) => x.cost(),
             Expr::And(xs) | Expr::Or(xs) => xs.iter().map(Expr::cost).sum(),
         }
@@ -678,6 +764,7 @@ impl Query {
                 Expr::And(xs) | Expr::Or(xs) => xs.iter_mut().for_each(|x| walk(x, marks)),
                 Expr::Not(x) => walk(x, marks),
                 Expr::Cond(Cond::Bookmark(b)) => b.marks = Some(marks.clone()),
+                Expr::Cond(Cond::Window(w)) => walk(&mut w.inner, marks),
                 Expr::Cond(_) => {}
             }
         }
@@ -692,6 +779,7 @@ impl Query {
             match e {
                 Expr::And(xs) | Expr::Or(xs) => xs.iter().any(walk),
                 Expr::Not(x) => walk(x),
+                Expr::Cond(Cond::Window(w)) => walk(&w.inner),
                 Expr::Cond(c) => matches!(c, Cond::Bookmark(_)),
             }
         }
@@ -712,6 +800,7 @@ impl Query {
                     }
                     Ok(())
                 }
+                Expr::Cond(Cond::Window(w)) => w.prepare(source, progress),
                 Expr::Cond(_) => Ok(()),
             }
         }
@@ -728,6 +817,9 @@ impl Query {
                 Expr::Cond(Cond::Signal(s)) if !seen.contains(&s.name) => {
                     seen.push(s.name.clone());
                     s.def.as_ref().map_or(0, |d| d.series_work(source))
+                }
+                Expr::Cond(Cond::Window(w)) => {
+                    walk(&w.inner, source, seen) + crate::engine::search::work(source, &crate::Filter::Query(w.query()))
                 }
                 Expr::Cond(_) => 0,
             }
@@ -769,12 +861,26 @@ impl Query {
                 Expr::And(xs) | Expr::Or(xs) => xs.iter().for_each(|x| walk(x, out)),
                 Expr::Not(x) => walk(x, out),
                 Expr::Cond(Cond::Signal(s)) if !out.contains(&s.name) => out.push(s.name.clone()),
+                Expr::Cond(Cond::Window(w)) => walk(&w.inner, out),
                 Expr::Cond(_) => {}
             }
         }
         let mut out = Vec::new();
         walk(&self.expr, &mut out);
         out
+    }
+
+    /// Whether the query uses `before`, `after` or `around`: lines held by
+    /// other lines' times.
+    pub fn uses_windows(&self) -> bool {
+        fn walk(e: &Expr) -> bool {
+            match e {
+                Expr::And(xs) | Expr::Or(xs) => xs.iter().any(walk),
+                Expr::Not(x) => walk(x),
+                Expr::Cond(c) => matches!(c, Cond::Window(_)),
+            }
+        }
+        walk(&self.expr)
     }
 
     /// Resolve source-supplied field names (`apid == "NAV"`) against the
@@ -912,6 +1018,33 @@ mod tests {
         let odd = DslError { msg: String::new(), pos: 1 };
         assert_eq!(odd.column("żx"), 1);
         assert_eq!(DslError { msg: String::new(), pos: 99 }.column("ab"), 3);
+    }
+
+    /// `before`, `after`, `around`: parsed with their durations and inner
+    /// query; a field of that name is still a field; errors say where.
+    #[test]
+    fn windows_parse_and_say_where_they_are_wrong() {
+        let w = |s: &str| match q(s).expr() {
+            Expr::Cond(Cond::Window(w)) => (w.back, w.ahead, w.inner_src.clone()),
+            e => panic!("{s}: {e:?}"),
+        };
+        assert_eq!(w("before(30s, /crash/)"), (30.0, 0.0, "/crash/".into()));
+        assert_eq!(w("after(500ms, level >= ERROR)"), (0.0, 0.5, "level >= ERROR".into()));
+        assert_eq!(w("AROUND(2m, 5, apid == NAV OR /x/)"), (120.0, 5.0, "apid == NAV OR /x/".into()));
+        assert!(q("before(1s, /a/) AND NOT after(1s, /b/)").uses_windows());
+        assert!(!q("level >= ERROR").uses_windows());
+        // A field named like one, compared: a field.
+        const SCHEMA: &[FieldDef] = &[FieldDef::new("before", FieldKind::Str, false)];
+        assert!(!Query::compile_for("before == x", SCHEMA).unwrap().uses_windows());
+        let bad = |s: &str, pos: usize, msg: &str| {
+            let e = Query::compile(s).unwrap_err();
+            assert_eq!((e.pos, e.msg.as_str()), (pos, msg), "{s}");
+        };
+        bad("before(soon, /x/)", 7, "before(…) needs a duration here (30s, 500ms, 2m)");
+        bad("before(5s /x/)", 10, "expected ',' but found regex { pat: \"x\", ci: false }");
+        bad("around(5s, /x/)", 11, "around(…) needs a duration here (30s, 500ms, 2m)");
+        bad("after(5s, /x/", 13, "expected ')' but found end of query");
+        bad("after(5s, )", 10, "expected a condition but found ')'");
     }
 
     #[test]

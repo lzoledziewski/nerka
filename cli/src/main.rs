@@ -176,6 +176,14 @@ enum Cmd {
         /// The files: text, DLT, captures (pcap, pcapng, MF4).
         #[arg(required = true, value_name = "FILE")]
         files: Vec<PathBuf>,
+        /// Also every line up to this long before each match, by time
+        /// (30s, 500ms, 2m): what led to it. Matches are marked `>`, `--`
+        /// stands between windows apart.
+        #[arg(long, value_name = "DUR")]
+        before: Option<String>,
+        /// Also every line up to this long after each match, by time.
+        #[arg(long, value_name = "DUR")]
+        after: Option<String>,
         #[command(flatten)]
         out: OutputArgs,
     },
@@ -708,6 +716,54 @@ fn run_filter(
             res.lines.len(),
             f.line_count(),
             mib_per_s(f.size_bytes(), t_search)
+        );
+    }
+    Ok(())
+}
+
+/// `filter --before / --after`: every line within `before` before or
+/// `after` after a match, by time (`around(…)`), the matches marked `>`
+/// and `--` between windows apart, as grep's context.
+fn run_window(
+    files: &[PathBuf],
+    query: &str,
+    before: &str,
+    after: &str,
+    o: &OutputArgs,
+    out: &mut impl Write,
+) -> Result<()> {
+    let view = open(files)?;
+    let (f, t_index) = (&*view.source, view.took);
+    // The query alone first: its errors point into it as typed.
+    let matches = with_marks(Filter::Query(compile(query, f)?), &view)?;
+    let around = with_marks(Filter::Query(compile(&format!("around({before}, {after}, {query})"), f)?), &view)?;
+    let at = locator(f);
+    let t = Instant::now();
+    let hits = search(f, &matches, &Progress::new())?;
+    let res = search(f, &around, &Progress::new())?;
+    let t_search = t.elapsed();
+    if o.count {
+        writeln!(out, "{}", res.lines.len())?;
+    } else {
+        let mut last: Option<LineNo> = None;
+        for &l in &res.lines {
+            if last.is_some_and(|p| l > p + 1) {
+                out.write_all(b"--\n")?;
+            }
+            last = Some(l);
+            out.write_all(if hits.lines.binary_search(&l).is_ok() { b">" } else { b" " })?;
+            write_prefix(out, o, &view, &at, l)?;
+            out.write_all(&f.line_bytes(l).unwrap_or_default())?;
+            out.write_all(b"\n")?;
+        }
+    }
+    if o.stats {
+        out.flush()?;
+        eprintln!(
+            "{} lines around {} matches in {} lines | index {t_index:.2?} | search {t_search:.2?}",
+            res.lines.len(),
+            hits.lines.len(),
+            f.line_count()
         );
     }
     Ok(())
@@ -1472,8 +1528,20 @@ fn run() -> Result<()> {
                 }
             }
         }
-        Cmd::Filter { query, files, out: o } => {
-            run_filter(&files, |source| Ok(Filter::Query(compile(&query, source)?)), &o, &mut out)?;
+        Cmd::Filter { query, files, before, after, out: o } => {
+            if before.is_none() && after.is_none() {
+                run_filter(&files, |source| Ok(Filter::Query(compile(&query, source)?)), &o, &mut out)?;
+            } else {
+                let dur = |d: &Option<String>, what: &str| -> Result<String> {
+                    match d {
+                        None => Ok("0s".into()),
+                        Some(t) if nerka_core::lifecycle::parse_duration(t).is_some() => Ok(t.trim().to_owned()),
+                        Some(t) => Err(anyhow::anyhow!("--{what}: '{t}' isn't a duration (30s, 500ms, 2m)")),
+                    }
+                };
+                let (b, a) = (dur(&before, "before")?, dur(&after, "after")?);
+                run_window(&files, &query, &b, &a, &o, &mut out)?;
+            }
         }
         Cmd::Patterns { files, within, engine, top, rare, values, queries, lines: show, stats } => {
             let options = engine.options(show.is_some())?;

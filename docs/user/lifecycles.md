@@ -24,6 +24,7 @@ app: lines apid == NAV; start payload ~ /NAV started/; crash payload ~ /panic/
 | Clause | Meaning |
 |---|---|
 | `lines QUERY` | the entity's lines (default: every line) |
+| `uptime QUERY` | optional: of its lines, those whose uptime counts (default: all). `uptime tmsp > 0` when some of its messages are logged with uptime 0: they no longer look like a reboot, yet stay its lines (a `planned` line among them still counts) |
 | `reset uptime [tolerance 5s]` | a new one starts when the uptime its lines carry (DLT's `tmsp`) goes back by more than the tolerance (default 5 s) |
 | `reset @signal [tolerance …]` | … when a number signal goes back (an uptime read from a text log, `[   12.3]`) |
 | `start QUERY` | … when one of its lines matches |
@@ -70,7 +71,8 @@ how often.
   from one boot into the next.
 - **Checks per lifecycle:** `…; per ecu1` ([Checks](checks.md)).
 - **The Signals panel** lists each lifecycle: number, first line (click: go
-  there), duration, outcome, what its checks found, `▾ filter` (its lines).
+  there), duration, outcome, what its checks found, `▾ filter` (its lines),
+  `▾ during` (every line during it, whoever wrote it).
 - **The plot** labels where each plotted lifecycle starts.
 
 ```

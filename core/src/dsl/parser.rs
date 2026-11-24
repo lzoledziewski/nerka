@@ -1,6 +1,6 @@
 //! Lexer + recursive-descent parser for NFD.
 
-use super::{BookmarkCond, CmpOp, Cond, DslError, Expr, FieldCond, FieldTest, SignalCond};
+use super::{BookmarkCond, CmpOp, Cond, DslError, Expr, FieldCond, FieldTest, SignalCond, WindowCond};
 use crate::event::Level;
 use crate::signal::SignalView;
 use regex::bytes::RegexBuilder;
@@ -9,6 +9,8 @@ use regex::bytes::RegexBuilder;
 pub(super) enum Tok {
     LParen,
     RParen,
+    /// `,` between the arguments of `before(…)`, `after(…)`, `around(…)`.
+    Comma,
     And,
     Or,
     Not,
@@ -71,6 +73,7 @@ impl<'a> Lexer<'a> {
         let one = match c {
             '(' => Some(Tok::LParen),
             ')' => Some(Tok::RParen),
+            ',' => Some(Tok::Comma),
             '>' => Some(Tok::Op(OpTok::Cmp(CmpOp::Gt))),
             '<' => Some(Tok::Op(OpTok::Cmp(CmpOp::Lt))),
             '=' => Some(Tok::Op(OpTok::Cmp(CmpOp::Eq))),
@@ -205,6 +208,7 @@ fn describe(t: &Tok) -> String {
         Tok::Word(w) => format!("'{w}'"),
         Tok::Signal(s, _) => format!("'@{s}'"),
         Tok::RParen => "')'".into(),
+        Tok::Comma => "','".into(),
         t => format!("{t:?}").to_lowercase(),
     }
 }
@@ -266,11 +270,56 @@ impl Parser<'_> {
                     }
                     None => &lower,
                 };
+                if matches!(field, "before" | "after" | "around") && self.tok == Tok::LParen {
+                    return self.window(field, pos);
+                }
                 if field == "bookmark" { self.bookmark_condition(pos) } else { self.condition(field, pos) }
             }
             Tok::Signal(name, view) => self.signal_condition(name, view, pos),
             t => err(format!("expected a condition but found {}", describe(&t)), pos),
         }
+    }
+
+    /// `before(DUR, expr)`, `after(DUR, expr)`, `around(DUR, DUR, expr)`;
+    /// the current token is the `(`.
+    fn window(&mut self, kind: &str, pos: usize) -> Result<Expr, DslError> {
+        self.bump()?;
+        let mut durs = Vec::new();
+        for _ in 0..if kind == "around" { 2 } else { 1 } {
+            let at = self.pos;
+            let d = match self.bump()? {
+                Tok::Word(w) => crate::lifecycle::parse_duration(&w),
+                _ => None,
+            };
+            let Some(d) = d else {
+                return err(format!("{kind}(…) needs a duration here (30s, 500ms, 2m)"), at);
+            };
+            durs.push(d);
+            if self.tok != Tok::Comma {
+                return err(format!("expected ',' but found {}", describe(&self.tok)), self.pos);
+            }
+            self.bump()?;
+        }
+        let start = self.pos;
+        let inner = self.or()?;
+        let end = self.pos;
+        if self.tok != Tok::RParen {
+            return err(format!("expected ')' but found {}", describe(&self.tok)), self.pos);
+        }
+        self.bump()?;
+        let (back, ahead) = match kind {
+            "before" => (durs[0], 0.0),
+            "after" => (0.0, durs[0]),
+            _ => (durs[0], durs[1]),
+        };
+        Ok(Expr::Cond(Cond::Window(WindowCond {
+            back,
+            ahead,
+            inner: Box::new(inner.optimize()),
+            inner_src: self.lex.s[start..end].trim().to_owned(),
+            pos,
+            spans: None,
+        })))
     }
 
     fn condition(&mut self, field: &str, field_pos: usize) -> Result<Expr, DslError> {

@@ -64,6 +64,8 @@ struct Draft {
 /// The lifecycle form's fields.
 struct LifeForm {
     lines: String,
+    /// Of its lines, those whose uptime counts (empty: all).
+    uptime: String,
     on_start: bool,
     start: String,
     on_reset: bool,
@@ -84,6 +86,7 @@ impl Default for LifeForm {
         let d = |v: f64| lifecycle::format_duration(v);
         LifeForm {
             lines: String::new(),
+            uptime: String::new(),
             on_start: false,
             start: String::new(),
             on_reset: true,
@@ -104,6 +107,7 @@ impl LifeForm {
         let text = |r: Option<&lifecycle::Rule>| r.map(|r| r.text()).unwrap_or_default();
         let mut f = LifeForm {
             lines: text(l.lines()),
+            uptime: text(l.uptime()),
             start: text(l.start()),
             planned: text(l.planned()),
             crash: text(l.crash()),
@@ -135,6 +139,8 @@ impl LifeForm {
         let mut d = LifecycleDef::new(name)?
             .with_lines(&self.lines)
             .map_err(|e| q("Its lines", &self.lines, e))?
+            .with_uptime(&self.uptime)
+            .map_err(|e| q("Uptime from", &self.uptime, e))?
             .with_start(if self.on_start { &self.start } else { "" })
             .map_err(|e| q("Starts on a line", if self.on_start { &self.start } else { "" }, e))?
             .with_planned(&self.planned)
@@ -884,6 +890,12 @@ fn lifecycle_form(ui: &mut egui::Ui, d: &mut Draft, lib: &Library, signals: &Sig
         ui.label("Its lines").on_hover_text("The lines of the entity (empty: every line), e.g. ecu == ECU1");
         rule_field(ui, "life_lines", &mut f.lines, "ecu == ECU1  (empty: every line)", lib);
         ui.end_row();
+        ui.label("Uptime from").on_hover_text(
+            "Optional: of its lines, those whose uptime counts (empty: all), e.g. tmsp > 0 when some of its \
+             messages are logged with uptime 0. The others stay its lines: they start and end lifecycles too.",
+        );
+        rule_field(ui, "life_uptime", &mut f.uptime, "tmsp > 0  (optional; empty: all its lines)", lib);
+        ui.end_row();
         ui.label("Starts when");
         ui.vertical(|ui| {
             ui.horizontal(|ui| {
@@ -1080,6 +1092,18 @@ fn lifecycles_list(
                                             nfd += &format!(" AND ({})", lines.source());
                                         }
                                         out.filter = Some(nfd);
+                                    }
+                                    // Every line during it, whoever wrote it
+                                    // (with no lines rule, ▾ filter is that).
+                                    if def.lines().is_some()
+                                        && ui
+                                            .small_button("▾ during")
+                                            .on_hover_text(
+                                                "Filter to every line during this lifecycle, whoever wrote it",
+                                            )
+                                            .clicked()
+                                    {
+                                        out.filter = Some(format!("@{} == {}", def.name(), x.number));
                                     }
                                     if x.number > 1
                                         && ui
@@ -1644,6 +1668,7 @@ mod tests {
     fn the_form_round_trips_lifecycles_and_bound_signals() {
         for spec in [
             "lifecycle ecu1: lines ecu == ECU1; reset uptime; planned {sys.shutdown}",
+            "lifecycle ecu1: lines ecu == ECU1; uptime NOT raw ~ /nv/; reset uptime",
             "lifecycle run: start raw ~ /boot/; gap 30s; crash raw ~ /panic/; late 20s",
             "lifecycle up: reset @up tolerance 500ms",
             r"ota(s):enum:per(ecu1):default(idle)=/OTA state=(?<s>\w+)/",
@@ -1656,6 +1681,8 @@ mod tests {
         let life = |f: LifeForm| Draft { life: true, name: "ecu1".into(), life_form: f, ..Draft::default() }.build();
         let e = life(LifeForm { lines: "ecu ==".into(), ..LifeForm::default() }).unwrap_err();
         assert!(e.starts_with("Its lines: "), "{e}");
+        let e = life(LifeForm { uptime: "tmsp >".into(), ..LifeForm::default() }).unwrap_err();
+        assert!(e.starts_with("Uptime from: "), "{e}");
         let e = life(LifeForm { on_gap: true, gap: "soon".into(), ..LifeForm::default() }).unwrap_err();
         assert_eq!(e, "Its lines stop: 'soon' isn't a duration (30s, 500ms, 2m)");
         let e = life(LifeForm { on_reset: false, ..LifeForm::default() }).unwrap_err();

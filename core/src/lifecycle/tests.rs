@@ -222,6 +222,7 @@ fn results_are_cached_per_source() {
 fn specs_round_trip() {
     for s in [
         "a: lines ecu == A; reset uptime; planned raw ~ /shutdown/",
+        "a: lines ecu == A; uptime NOT raw ~ /nv/; reset uptime tolerance 100ms",
         "run: start apid == SYS; gap 30s; crash raw ~ /crash/; late 1m",
         "b: reset @up tolerance 500ms",
         "b: lines {sys.of ecu=B}; start {sys.boot}; reset uptime tolerance 2s; planned raw ~ /bye/; late 20s",
@@ -240,6 +241,8 @@ fn spec_errors_say_where() {
     bad("boot reset uptime", 0, "expected NAME:");
     bad("1boot: gap 1s", 0, "isn't a name");
     bad("boot: gap 1s; restart x", 14, "unknown clause 'restart'");
+    bad("boot: gap 1s; uptime", 20, "'uptime' needs a query");
+    bad("boot: gap 1s; uptime raw ~", 26, "");
     bad("boot: gap soon", 10, "needs a duration");
     bad("boot: reset tmsp", 12, "needs uptime or a signal");
     bad("boot: reset uptime tolerance x", 29, "expected a duration");
@@ -1021,4 +1024,29 @@ fn references_and_clauses_keep_what_is_written() {
     );
     let d = LifecycleDef::parse_spec("l: lines raw ~ /timeout;x|timeout/; start {edge.semi;colon}").unwrap();
     assert_eq!(d.unresolved(), ["edge.semi;colon"]);
+}
+
+/// A writer logging some messages with uptime 0 (its NV messages, its
+/// shutdown among them): without `uptime` each such message resets it;
+/// with `uptime NOT raw ~ /nv/` only the real reboot does, and the
+/// shutdown, still one of its lines, makes the first one planned.
+#[test]
+fn uptime_from_some_of_its_lines() {
+    let src = Src(vec![
+        (Some("A"), Some(100.0), Some(1.0), "boot"),
+        (Some("A"), Some(101.0), Some(0.0), "nv write"),
+        (Some("A"), Some(102.0), Some(3.0), "running"),
+        (Some("A"), Some(103.0), Some(0.0), "nv shutdown"),
+        (Some("A"), Some(110.0), Some(0.5), "boot"),
+        (Some("A"), Some(111.0), Some(0.0), "nv write"),
+        (Some("A"), Some(112.0), Some(2.0), "running"),
+    ]);
+    let all = run("a: lines ecu == A; reset uptime tolerance 100ms; planned raw ~ /shutdown/", &src);
+    assert!(all.lives.len() > 2, "{:?}", lives(&all));
+    let some =
+        run("a: lines ecu == A; uptime NOT raw ~ /nv/; reset uptime tolerance 100ms; planned raw ~ /shutdown/", &src);
+    assert_eq!(lives(&some), [(1, 0, "planned"), (2, 4, "open")]);
+    assert!(findings(&some).is_empty(), "{:?}", findings(&some));
+    // Every line stays its: the second one has three.
+    assert_eq!(some.lives[1].lines, 3);
 }

@@ -14,6 +14,76 @@ use std::time::{Duration, Instant};
 /// A setting's change waits this long for the next before the run.
 const DEBOUNCE: Duration = Duration::from_millis(600);
 
+/// What a setting does (its name's hover) and, in short, what raising or
+/// lowering it does (beside its value).
+struct Help {
+    what: &'static str,
+    effect: &'static str,
+}
+
+const STAGE1: &str = "Stage 1: within each chunk of lines, messages of the same length and first word (and \
+                      fields) that are alike enough join a template; the words where they differ become <*>.";
+const STAGE2: &str = "Stage 2: the templates of all chunks are aligned word by word and character by \
+                      character and joined into patterns, so a varying part may sit inside a word (gear=D), \
+                      come first, or have different lengths ({engaged at <*> C|released}).";
+
+const SIMILARITY: Help = Help {
+    what: "How alike a message must be to join a template: the share of its words that are the same. \
+           0.5: `user anna logged in` joins `user bob logged in` (3 of 4 the same).\n\n\
+           Higher: fewer messages join, so more and narrower patterns; a message differing in one word of \
+           a few stays apart. Lower: more join, fewer and more general patterns with more <*>.",
+    effect: "↑ more, narrower patterns · ↓ fewer, more <*>",
+};
+const NEW_WILDCARDS: Help = Help {
+    what: "How many words of a template may become <*> at once when a message joins it. 1: `door open by \
+           driver` and `door closed by passenger`, two words apart, start two templates (stage 2 may still \
+           join them).\n\n\
+           Higher: they join here, fewer templates (two messages sharing only a few words may become one). \
+           0: a template gets no new <*>; only messages of the same words (values masked) group.",
+    effect: "↑ joins messages differing in more places at once · 0 stricter",
+};
+const HEADER: Help = Help {
+    what: "Header and footer detection. Words most lines of a context (an apid, a file's profile) carry \
+           at the same place from the start or end, such as `LOG:` … `Elapsed[us]: 7; #3`, don't count as \
+           alike: two short messages between them stay two patterns.\n\n\
+           sample: lines of a context held back per chunk to look at; min: the fewest lines to look at \
+           (fewer: no header there); share: a word on more than this share of them is header or footer; \
+           places: how many tokens from the start and the end it may be at.\n\n\
+           Higher share or fewer places: fewer words taken for a frame, so messages sharing one join more \
+           easily. Lower share: more words passed over (a common real word may be, splitting its \
+           messages).",
+    effect: "↑ share, ↓ places: fewer frame words, more joining",
+};
+const MERGE: Help = Help {
+    what: "Stage 2 at all. Off: only messages of the same length and first word group (stage 1), so \
+           `thermal throttling engaged at 92 C` and `thermal throttling released` stay apart, and there \
+           are many more, narrower patterns.",
+    effect: "off: stage 1 only, more patterns",
+};
+const NEW_SLOTS: Help = Help {
+    what: "How many new slots (places neither template has a slot yet) one merge may make. 1: two places \
+           that would become slots at once keep the templates apart (they change together, as far as \
+           anyone can tell), until another pattern shows them varying on their own.\n\n\
+           Higher: such templates join at once, fewer patterns (different messages with the same frame \
+           may join). 0: a merge only fills slots that exist.",
+    effect: "↑ fewer patterns, riskier joins · ↓ more patterns",
+};
+const SIDE: Help = Help {
+    what: "The most tokens (words, values, slots) the longer side of a place two templates differ in may \
+           hold. 4: `job done` and `job done fast` join as `job done {∅|fast}`; `job finished in 5 ms` and \
+           `job of the big nightly batch finished in 5 ms` don't.\n\n\
+           Higher: longer phrases fit one slot, fewer patterns, slots spanning phrases. Lower: only short \
+           variations join.",
+    effect: "↑ longer phrases in one slot · ↓ only short ones",
+};
+const STATE_VALUES: Help = Help {
+    what: "A slot of at most this many values, which repeat and hold a letter, shows as a state, \
+           gear={D|P|N}, and ➕ To library makes it an enum signal. With more values it shows as <*> \
+           (users, addresses). 16 at most: the values a slot keeps while grouping.\n\n\
+           Lower: fewer states, more <*>. Higher: slots of more values listed as states.",
+    effect: "↑ more {a|b|c} states · ↓ more <*>",
+};
+
 /// The rule form's actions.
 const ACTIONS: [(&str, &str); 9] = [
     ("keep", "WORD… never in a slot"),
@@ -357,101 +427,130 @@ impl TuningUi {
                 false
             }
         }
-        egui::Grid::new("tuning-settings").num_columns(4).spacing([10.0, 4.0]).show(ui, |ui| {
-            ui.label(RichText::new("Stage 1").strong());
-            let mut v = s.similarity;
-            ui.label("similarity").on_hover_text("Share of a template's words a message must have to join it");
-            if ui.add(egui::DragValue::new(&mut v).range(0.0..=1.0).speed(0.01).max_decimals(2)).changed() {
-                set.push(Setting::Similarity(v));
-            }
-            if dot(ui, s.similarity != d.similarity, d.similarity.to_string()) {
-                set.push(Setting::Similarity(d.similarity));
-            }
+        /// A setting's name, its help on hover.
+        fn name(ui: &mut egui::Ui, text: &str, help: &Help) {
+            ui.label(text).on_hover_text(help.what);
+        }
+        /// What raising or lowering it does, in short.
+        fn effect(ui: &mut egui::Ui, help: &Help) {
+            ui.add_space(8.0);
+            ui.weak(help.effect).on_hover_text(help.what);
+        }
+        ui.weak(
+            "Each change runs the patterns again on the same lines; Change below says what joined, split, \
+             came or went. Hover a setting's name for what it does.",
+        );
+        egui::Grid::new("tuning-settings").num_columns(3).spacing([10.0, 4.0]).show(ui, |ui| {
+            ui.label(RichText::new("Stage 1").strong()).on_hover_text(STAGE1);
+            name(ui, "similarity", &SIMILARITY);
+            ui.horizontal(|ui| {
+                let mut v = s.similarity;
+                if ui.add(egui::DragValue::new(&mut v).range(0.0..=1.0).speed(0.01).max_decimals(2)).changed() {
+                    set.push(Setting::Similarity(v));
+                }
+                if dot(ui, s.similarity != d.similarity, d.similarity.to_string()) {
+                    set.push(Setting::Similarity(d.similarity));
+                }
+                effect(ui, &SIMILARITY);
+            });
             ui.end_row();
             ui.label("");
-            let mut v = s.new_wildcards;
-            ui.label("new wildcards").on_hover_text("Words a message may turn into wildcards at once");
-            if ui.add(egui::DragValue::new(&mut v).range(0..=8)).changed() {
-                set.push(Setting::NewWildcards(v));
-            }
-            if dot(ui, s.new_wildcards != d.new_wildcards, d.new_wildcards.to_string()) {
-                set.push(Setting::NewWildcards(d.new_wildcards));
-            }
+            name(ui, "new wildcards", &NEW_WILDCARDS);
+            ui.horizontal(|ui| {
+                let mut v = s.new_wildcards;
+                if ui.add(egui::DragValue::new(&mut v).range(0..=8)).changed() {
+                    set.push(Setting::NewWildcards(v));
+                }
+                if dot(ui, s.new_wildcards != d.new_wildcards, d.new_wildcards.to_string()) {
+                    set.push(Setting::NewWildcards(d.new_wildcards));
+                }
+                effect(ui, &NEW_WILDCARDS);
+            });
             ui.end_row();
             ui.label("");
-            ui.label("header").on_hover_text(
-                "Header and footer detection: lines held back per context and chunk, the fewest to detect \
-                 on, the share of lines a word is on (more than), tokens from the start and end",
-            );
+            name(ui, "header", &HEADER);
             ui.horizontal(|ui| {
                 let (mut a, mut b, mut sh, mut p) = (s.header_sample, s.header_min, s.header_share, s.header_places);
-                ui.label("sample");
+                ui.label("sample").on_hover_text("Lines of a context held back per chunk to look at");
                 if ui.add(egui::DragValue::new(&mut a).range(1..=1024)).changed() {
                     set.push(Setting::HeaderSample(a));
                 }
-                ui.label("min");
+                ui.label("min").on_hover_text("The fewest lines to look at: fewer, no header there");
                 if ui.add(egui::DragValue::new(&mut b).range(0..=1024)).changed() {
                     set.push(Setting::HeaderMin(b));
                 }
-                ui.label("share");
+                ui.label("share").on_hover_text("A word on more than this share of them is header or footer");
                 if ui.add(egui::DragValue::new(&mut sh).range(0.0..=1.0).speed(0.01).max_decimals(2)).changed() {
                     set.push(Setting::HeaderShare(sh));
                 }
-                ui.label("places");
+                ui.label("places").on_hover_text("How many tokens from the start and the end it may be at");
                 if ui.add(egui::DragValue::new(&mut p).range(1..=8)).changed() {
                     set.push(Setting::HeaderPlaces(p));
                 }
+                let header_changed = (s.header_sample, s.header_min, s.header_share, s.header_places)
+                    != (d.header_sample, d.header_min, d.header_share, d.header_places);
+                if dot(ui, header_changed, "sample 32 min 8 share 0.5 places 3".into()) {
+                    set.extend([
+                        Setting::HeaderSample(d.header_sample),
+                        Setting::HeaderMin(d.header_min),
+                        Setting::HeaderShare(d.header_share),
+                        Setting::HeaderPlaces(d.header_places),
+                    ]);
+                }
+                effect(ui, &HEADER);
             });
-            let header_changed = (s.header_sample, s.header_min, s.header_share, s.header_places)
-                != (d.header_sample, d.header_min, d.header_share, d.header_places);
-            if dot(ui, header_changed, "sample 32 min 8 share 0.5 places 3".into()) {
-                set.extend([
-                    Setting::HeaderSample(d.header_sample),
-                    Setting::HeaderMin(d.header_min),
-                    Setting::HeaderShare(d.header_share),
-                    Setting::HeaderPlaces(d.header_places),
-                ]);
-            }
             ui.end_row();
-            ui.label(RichText::new("Stage 2").strong());
-            let mut m = s.merge;
-            ui.label("merge").on_hover_text("Align templates into patterns at all");
-            if ui.checkbox(&mut m, "on").changed() {
-                set.push(Setting::Merge(m));
-            }
-            if dot(ui, s.merge != d.merge, "on".into()) {
-                set.push(Setting::Merge(d.merge));
-            }
+            ui.label(RichText::new("Stage 2").strong()).on_hover_text(STAGE2);
+            name(ui, "merge", &MERGE);
+            ui.horizontal(|ui| {
+                let mut m = s.merge;
+                if ui.checkbox(&mut m, "on").changed() {
+                    set.push(Setting::Merge(m));
+                }
+                if dot(ui, s.merge != d.merge, "on".into()) {
+                    set.push(Setting::Merge(d.merge));
+                }
+                effect(ui, &MERGE);
+            });
             ui.end_row();
             ui.label("");
-            let mut v = s.new_slots;
-            ui.label("new slots").on_hover_text("Slots one merge may make: two at once vary together");
-            if ui.add(egui::DragValue::new(&mut v).range(0..=8)).changed() {
-                set.push(Setting::NewSlots(v));
-            }
-            if dot(ui, s.new_slots != d.new_slots, d.new_slots.to_string()) {
-                set.push(Setting::NewSlots(d.new_slots));
-            }
+            name(ui, "new slots", &NEW_SLOTS);
+            ui.horizontal(|ui| {
+                let mut v = s.new_slots;
+                if ui.add(egui::DragValue::new(&mut v).range(0..=8)).changed() {
+                    set.push(Setting::NewSlots(v));
+                }
+                if dot(ui, s.new_slots != d.new_slots, d.new_slots.to_string()) {
+                    set.push(Setting::NewSlots(d.new_slots));
+                }
+                effect(ui, &NEW_SLOTS);
+            });
             ui.end_row();
             ui.label("");
-            let mut v = s.side;
-            ui.label("side").on_hover_text("Tokens on the longer side of a place two templates differ in");
-            if ui.add(egui::DragValue::new(&mut v).range(1..=16)).changed() {
-                set.push(Setting::Side(v));
-            }
-            if dot(ui, s.side != d.side, d.side.to_string()) {
-                set.push(Setting::Side(d.side));
-            }
+            name(ui, "side", &SIDE);
+            ui.horizontal(|ui| {
+                let mut v = s.side;
+                if ui.add(egui::DragValue::new(&mut v).range(1..=16)).changed() {
+                    set.push(Setting::Side(v));
+                }
+                if dot(ui, s.side != d.side, d.side.to_string()) {
+                    set.push(Setting::Side(d.side));
+                }
+                effect(ui, &SIDE);
+            });
             ui.end_row();
             ui.label("");
-            let mut v = s.state_values;
-            ui.label("state values").on_hover_text("A slot with more values is <*>, not a state");
-            if ui.add(egui::DragValue::new(&mut v).range(2..=nerka_core::pattern::MAX_VALUES)).changed() {
-                set.push(Setting::StateValues(v));
-            }
-            if dot(ui, s.state_values != d.state_values, d.state_values.to_string()) {
-                set.push(Setting::StateValues(d.state_values));
-            }
+            name(ui, "state values", &STATE_VALUES);
+            ui.horizontal(|ui| {
+                let mut v = s.state_values;
+                if ui.add(egui::DragValue::new(&mut v).range(2..=nerka_core::pattern::MAX_VALUES)).changed() {
+                    set.push(Setting::StateValues(v));
+                }
+                if dot(ui, s.state_values != d.state_values, d.state_values.to_string()) {
+                    set.push(Setting::StateValues(d.state_values));
+                }
+                effect(ui, &STATE_VALUES);
+            });
             ui.end_row();
         });
         if !set.is_empty() {

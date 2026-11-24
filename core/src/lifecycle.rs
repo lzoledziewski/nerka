@@ -19,6 +19,7 @@
 //! ```text
 //! spec   := NAME ":" clause ( ";" clause )*
 //! clause := "lines" RULE                       -- its lines (default: all)
+//!         | "uptime" RULE                      -- of them, those whose uptime counts
 //!         | "start" RULE                       -- one of them starts one
 //!         | "reset" VALUE [ "tolerance" DUR ]  -- the value goes back
 //!         | "gap" DUR                          -- its lines stop for longer
@@ -37,7 +38,10 @@
 //! [`LifecycleDef::resolved`] expands it with the library.
 //! At least one of `start`, `reset` and `gap` is needed. `uptime` is what
 //! the source records of the line's writer ([`LogSource::uptime`], DLT's
-//! `tmsp`): with `lines` naming one writer it is that writer's.
+//! `tmsp`): with `lines` naming one writer it is that writer's. `uptime
+//! RULE` reads it from those of its lines the rule keeps (`uptime tmsp >
+//! 0`: a writer's messages logged with no uptime don't reset it); the
+//! others stay its lines, for `start`, `planned`, `crash` and its filter.
 
 use crate::dsl::{DslError, Query};
 use crate::engine::search::{Filter, scan};
@@ -241,6 +245,8 @@ fn is_param(word: &str) -> bool {
 pub struct LifecycleDef {
     name: String,
     lines: Option<Rule>,
+    /// Of its lines, those whose uptime counts (none: all).
+    uptime: Option<Rule>,
     start: Option<Rule>,
     reset: Option<Reset>,
     gap: Option<f64>,
@@ -448,6 +454,7 @@ impl LifecycleDef {
         Ok(LifecycleDef {
             name: name.to_ascii_lowercase(),
             lines: None,
+            uptime: None,
             start: None,
             reset: None,
             gap: None,
@@ -465,7 +472,10 @@ impl LifecycleDef {
     pub fn parse_spec(spec: &str) -> Result<LifecycleDef, DslError> {
         let err = |msg: String, pos: usize| DslError { msg, pos };
         let Some(colon) = spec.find(':') else {
-            return Err(err("expected NAME: followed by clauses (lines, start, reset, gap, planned, crash)".into(), 0));
+            return Err(err(
+                "expected NAME: followed by clauses (lines, uptime, start, reset, gap, planned, crash)".into(),
+                0,
+            ));
         };
         let lead = spec.len() - spec.trim_start().len();
         let mut def = LifecycleDef::new(&spec[..colon]).map_err(|m| err(m, lead))?;
@@ -493,6 +503,7 @@ impl LifecycleDef {
             };
             match word.to_ascii_lowercase().as_str() {
                 "lines" => def.lines = Some(query("lines")?),
+                "uptime" => def.uptime = Some(query("uptime")?),
                 "start" => def.start = Some(query("start")?),
                 "planned" => def.planned = Some(query("planned")?),
                 "crash" => def.crash = Some(query("crash")?),
@@ -524,7 +535,7 @@ impl LifecycleDef {
                 }
                 w => {
                     return Err(err(
-                        format!("unknown clause '{w}' (lines, start, reset, gap, planned, crash, late)"),
+                        format!("unknown clause '{w}' (lines, uptime, start, reset, gap, planned, crash, late)"),
                         start,
                     ));
                 }
@@ -547,6 +558,9 @@ impl LifecycleDef {
         let mut clauses = Vec::new();
         if let Some(q) = &self.lines {
             clauses.push(format!("lines {}", q.text()));
+        }
+        if let Some(q) = &self.uptime {
+            clauses.push(format!("uptime {}", q.text()));
         }
         if let Some(q) = &self.start {
             clauses.push(format!("start {}", q.text()));
@@ -586,6 +600,11 @@ impl LifecycleDef {
         self.lines.as_ref()
     }
 
+    /// Of its lines, those whose uptime counts (none: all).
+    pub fn uptime(&self) -> Option<&Rule> {
+        self.uptime.as_ref()
+    }
+
     pub fn start(&self) -> Option<&Rule> {
         self.start.as_ref()
     }
@@ -621,6 +640,7 @@ impl LifecycleDef {
         let r = |q: &Option<Rule>| q.as_ref().map(|q| q.resolved(lib)).transpose();
         let mut out = LifecycleDef {
             lines: r(&self.lines)?,
+            uptime: r(&self.uptime)?,
             start: r(&self.start)?,
             planned: r(&self.planned)?,
             crash: r(&self.crash)?,
@@ -632,16 +652,16 @@ impl LifecycleDef {
         Ok(out)
     }
 
-    /// The NFD of its queries (`lines`, `start`, `planned`, `crash`) as
-    /// they run: a library query's once resolved, else none.
-    pub(crate) fn sources(&self) -> [Option<String>; 4] {
-        [&self.lines, &self.start, &self.planned, &self.crash]
+    /// The NFD of its queries (`lines`, `uptime`, `start`, `planned`,
+    /// `crash`) as they run: a library query's once resolved, else none.
+    pub(crate) fn sources(&self) -> [Option<String>; 5] {
+        [&self.lines, &self.uptime, &self.start, &self.planned, &self.crash]
             .map(|q| q.as_ref().and_then(|q| q.query()).map(|q| q.source().to_owned()))
     }
 
     /// The library queries it uses, not resolved yet.
     pub fn unresolved(&self) -> Vec<&str> {
-        [&self.lines, &self.start, &self.planned, &self.crash]
+        [&self.lines, &self.uptime, &self.start, &self.planned, &self.crash]
             .into_iter()
             .flatten()
             .filter(|q| q.query().is_none())
@@ -651,6 +671,11 @@ impl LifecycleDef {
 
     pub fn with_lines(mut self, nfd: &str) -> Result<LifecycleDef, DslError> {
         self.lines = Self::query_of(nfd)?;
+        Ok(self)
+    }
+
+    pub fn with_uptime(mut self, nfd: &str) -> Result<LifecycleDef, DslError> {
+        self.uptime = Self::query_of(nfd)?;
         Ok(self)
     }
 
@@ -746,7 +771,9 @@ impl LifecycleDef {
         match q.as_ref().and_then(Rule::query) {
             Some(q) => {
                 let q = q.clone().bind(source.schema())?;
-                scan(source, &Filter::Query(q), progress)
+                // Windows (`before(30s, …)`) are found before the scan.
+                let f = if q.uses_windows() { Filter::Query(q).prepare(source, progress)? } else { Filter::Query(q) };
+                scan(source, &f, progress)
             }
             None => Ok(Vec::new()),
         }
@@ -766,6 +793,13 @@ impl LifecycleDef {
         };
         let n = lines.as_ref().map_or(source.line_count() as usize, Vec::len);
         let row_at = |i: usize| lines.as_ref().map_or(i as LineNo, |l| l[i]);
+        // Of them, those whose uptime counts (`uptime`; none: all).
+        let up_rows: Option<Vec<LineNo>> = match &self.uptime {
+            Some(_) => Some(self.hits(&self.uptime, source, progress)?),
+            None => None,
+        };
+        let counts = |r: LineNo| up_rows.as_ref().is_none_or(|u| u.binary_search(&r).is_ok());
+        let uptime_of = |r: LineNo| if counts(r) { source.uptime(r) } else { None };
         let starts = self.hits(&self.start, source, progress)?;
         let planned = self.hits(&self.planned, source, progress)?;
         let crash = self.hits(&self.crash, source, progress)?;
@@ -787,7 +821,10 @@ impl LifecycleDef {
         let reset_on = self.reset.is_some();
         // Some lines may carry none (a DLT message without tmsp): any of the
         // first thousand will do.
-        let has_uptime = (0..n.min(1000)).any(|i| source.uptime(row_at(i)).is_some());
+        let has_uptime = match &up_rows {
+            Some(u) => u.iter().take(1000).any(|&r| source.uptime(r).is_some()),
+            None => (0..n.min(1000)).any(|i| source.uptime(row_at(i)).is_some()),
+        };
         if matches!(self.reset.as_ref().map(|r| &r.value), Some(ResetValue::Uptime)) && n > 0 && !has_uptime {
             return Err(crate::Error::Format(format!(
                 "lifecycle '{}': its lines carry no uptime (DLT: the tmsp header field); reset on a signal instead",
@@ -833,7 +870,7 @@ impl LifecycleDef {
                 .into_par_iter()
                 .map(|i| {
                     let r = row_at(i);
-                    (r, if own_time { source.time(r) } else { None }, if src_up { source.uptime(r) } else { None })
+                    (r, if own_time { source.time(r) } else { None }, if src_up { uptime_of(r) } else { None })
                 })
                 .collect();
             for &(row, row_time, row_up) in &pre {
