@@ -17,7 +17,7 @@
 //!    of the same field values (DLT `apid`, …), token count and first
 //!    literal token are compared token by
 //!    token (a token that is only a masked value doesn't count, nor a header
-//!    or footer of the context: [`Sample`], [`Group`]); one at least
+//!    or footer of the context: `Sample`, `Group`); one at least
 //!    [`Settings::similarity`] like a template, and new in one token
 //!    at most, joins it, its differing tokens becoming slots, else it starts
 //!    one. The chunks' templates are merged the same way.
@@ -29,7 +29,7 @@
 //!    anywhere, inside a token (`gear=D`, `gear=P`), first (`RUNNING state
 //!    entered`), or span different lengths (`throttling engaged at <*> C`,
 //!    `throttling released`). Two templates join when they share enough
-//!    words ([`accept`]) and no field (`apid`) tells them apart; the parts
+//!    words (`accept`) and no field (`apid`) tells them apart; the parts
 //!    where they differ become a slot holding both sides' values. A merge
 //!    makes one new slot at most: two at once would change together (two
 //!    messages), and join only once a third shows them apart, in a later
@@ -289,7 +289,7 @@ pub struct Pattern {
     /// Its lines per set.
     pub sides: Sides,
     /// Not a template: lines of its token count that fit none, past the
-    /// templates kept ([`MAX_PER_CHUNK`]).
+    /// templates kept (8192 per chunk of lines).
     pub unsorted: bool,
     /// Fields with one value on all its lines (and not on all patterns'):
     /// `(name, value)`.

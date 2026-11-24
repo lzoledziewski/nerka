@@ -389,7 +389,7 @@ struct PatternArgs {
     /// setting `merge off`).
     #[arg(long)]
     no_merge: bool,
-    /// Settings and rules (default: the saved ones, <config>/nerka/patterns;
+    /// Settings and rules (default: the saved ones, `<config>/nerka/patterns`;
     /// `-`: none, the defaults).
     #[arg(long, value_name = "FILE")]
     pattern_config: Option<PathBuf>,
