@@ -1,6 +1,6 @@
 ---
 title: "The command line"
-description: "The nerka command line: filter, search, open, lines, check, lifecycles, patterns, compare, export and import, with every option for DLT, pcap, MF4, JSON and text logs."
+description: "The nerka command line: filter, search, open, lines, check, lifecycles, patterns, compare, anonymize, export and import, with every option for DLT, pcap, MF4, JSON and text logs."
 ---
 
 # The command line
@@ -27,6 +27,7 @@ Options for opening files (below) go before or after the command.
 | `lifecycles FILE…` | print the [lifecycles](lifecycles.md) (`--lifecycle`) and their findings |
 | `patterns FILE…` | group lines into message patterns (experimental), each with its count and a query |
 | `compare A B` | what differs between two files, or two filters' lines (experimental): patterns and values new, gone, more or less often |
+| `anonymize -o OUT FILE…` | the lines with every word made up, to share a trace: same structure, same patterns |
 | `export` | write your setup as a [settings bundle](bundles.md) |
 | `import FILE` | read a settings bundle into your setup |
 
@@ -246,6 +247,34 @@ nerka --lifecycle 'ecu1: lines ecu == ECU1; reset uptime; planned payload ~ /shu
 | `--queries` | also each pattern's NFD query |
 | `--field NAME`, `--pattern-config FILE`, `--set`, `--rule`, `--similarity S`, `--no-merge` | as for `patterns` |
 | `--stats` | timing on stderr |
+
+## `anonymize`
+
+`anonymize` writes the files' lines with every word replaced by a
+made-up one, so a trace can be shared (to tune patterns, with a bug
+report) without what it says. A word becomes letters of the same length
+and case, the same everywhere and never another word's, so messages keep
+their structure and the same [patterns](#patterns-experimental) with the
+same counts; a run holding a digit keeps its digits as digits (made up per
+run); spaces and punctuation stay. A DLT file stays DLT: times, levels and
+the ECU, application and context IDs are kept (`--ids`: made up too), the
+payload is written as one string. Other files become text.
+
+The words are keyed at random each time, so nobody can map them back;
+`--seed` makes the same words every time (two files anonymized alike).
+
+| Option | |
+|---|---|
+| `-o, --output OUT` | the file to write (not one of those read) |
+| `--in FILTER` | only the lines an NFD filter keeps |
+| `--keep WORD` | a word left as it is (repeatable, any case): `LOG:`, `Elapsed` |
+| `--seed TEXT` | the same seed, the same words |
+| `--ids` | make up DLT IDs too |
+
+```
+nerka anonymize -o shared.dlt trace.dlt
+nerka anonymize -o shared.log --keep ERROR --keep WARN --in 'level >= WARN' app.log
+```
 
 ## `export` and `import`
 

@@ -33,6 +33,7 @@
 //! * [`bundle`] — settings bundles: export, import and upgrades of the
 //!   analysis setup (packs, presets, plots, checks, signals).
 
+pub mod anonymize;
 pub mod atomic;
 pub mod background;
 pub mod bookmarks;

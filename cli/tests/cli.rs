@@ -604,3 +604,23 @@ fn patterns_take_a_configuration() {
     let o = run(&["--pattern-config", "-", "--rule", "apid NAV: keep x"]);
     assert!(!o.status.success() && err(&o).contains("isn't a rule"), "{}", err(&o));
 }
+
+/// `anonymize`: the words made up, the patterns the same.
+#[test]
+fn anonymize_keeps_the_patterns() {
+    let d = dir("anonymize");
+    let f = log_file(&d);
+    let anon = d.join("anon.log");
+    let o = nerka(&["anonymize", "-o", s(&anon), "--seed", "x", "--keep", "ERROR", s(&f)]);
+    assert!(o.status.success(), "{}", err(&o));
+    assert!(err(&o).contains("5 lines anonymized"), "{}", err(&o));
+    let text = std::fs::read_to_string(&anon).unwrap();
+    assert!(!text.contains("timeout") && text.contains("[ERROR]"), "{text}");
+    let counts = |p: &Path| {
+        let o = nerka(&["patterns", "--pattern-config", "-", "-n", "0", s(p)]);
+        out(&o).lines().map(|l| l.split_whitespace().next().unwrap_or("").to_owned()).collect::<Vec<_>>()
+    };
+    assert_eq!(counts(&f), counts(&anon));
+    let o = nerka(&["anonymize", "-o", s(&f), s(&f)]);
+    assert!(!o.status.success() && err(&o).contains("can't be one of the files read"));
+}

@@ -266,6 +266,10 @@ rules (`PatternConfig::to_text`).
    of their header, then grouped in a drain of their own; past 256 K such
    lines, each chunk's alone as before; the demo drive, the 1 GiB DLT and
    text files and LogHub group exactly as before, timings unchanged).
+   `nerka anonymize` (`core/src/anonymize.rs`) built 2026-11-24: words made
+   up consistently and never two the same (structure and patterns kept,
+   tested: the same pattern counts), digit runs made up per run, DLT
+   written as DLT with its times, levels and IDs.
 
 ## Settled with the owner (2026-11-23)
 
@@ -313,3 +317,6 @@ change if it should be otherwise.
     words.
 15. Pooling rare contexts holds at most 256 K lines; past that, each
     chunk's rare contexts are grouped alone, as before.
+16. `nerka anonymize` is CLI only (no GUI entry); DLT IDs are kept unless
+    `--ids` (rules scoped by `apid` then still apply to the shared trace);
+    the key is random unless `--seed`.

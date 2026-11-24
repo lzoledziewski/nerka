@@ -211,6 +211,31 @@ enum Cmd {
         #[arg(long)]
         stats: bool,
     },
+    /// Write the files' lines with every word made up, so a trace can be
+    /// shared (for tuning patterns, a bug report): the messages keep their
+    /// structure, and so their patterns. DLT stays DLT (times, levels and
+    /// IDs kept); other files become text.
+    Anonymize {
+        /// The files (several: one view).
+        #[arg(required = true, value_name = "FILE")]
+        files: Vec<PathBuf>,
+        /// The file to write.
+        #[arg(short = 'o', long, value_name = "OUT")]
+        output: PathBuf,
+        /// Only the lines matching this NFD filter.
+        #[arg(long = "in", value_name = "FILTER")]
+        within: Option<String>,
+        /// A word to keep as it is (repeatable; any case).
+        #[arg(long, value_name = "WORD")]
+        keep: Vec<String>,
+        /// The same seed makes the same words (default: a random one, so
+        /// nobody can map them back).
+        #[arg(long)]
+        seed: Option<String>,
+        /// Make up DLT ECU, application and context IDs too.
+        #[arg(long)]
+        ids: bool,
+    },
     /// Compare two sets of lines (experimental): two files, or one file's
     /// lines of two filters (--a, --b). Lines are grouped into patterns across
     /// both, then what differs is listed: patterns and slot values new in B,
@@ -1525,6 +1550,33 @@ fn run() -> Result<()> {
                 );
                 eprintln!("{}", engine_stats(&ps.stats));
             }
+        }
+        Cmd::Anonymize { files, output, within, keep, seed, ids } => {
+            let same = |p: &Path| {
+                let c = |x: &Path| std::fs::canonicalize(x).unwrap_or_else(|_| x.to_owned());
+                c(p) == c(&output)
+            };
+            if files.iter().any(|f| same(f)) {
+                anyhow::bail!("{}: the output can't be one of the files read", output.display());
+            }
+            let view = open(&files)?;
+            let f = &*view.source;
+            let lines = match &within {
+                Some(w) => Some(search(f, &with_marks(Filter::Query(compile(w, f)?), &view)?, &Progress::new())?.lines),
+                None => None,
+            };
+            let n = lines.as_ref().map_or(f.line_count(), |l| l.len() as u64);
+            let file = std::fs::File::create(&output).with_context(|| format!("creating {}", output.display()))?;
+            let mut w = BufWriter::new(file);
+            let mut a = nerka_core::anonymize::Anonymizer::new(seed.as_deref(), keep);
+            let what = nerka_core::anonymize::anonymize(f, lines.as_deref(), &mut a, ids, &mut w, &Progress::new())?;
+            w.flush().with_context(|| format!("writing {}", output.display()))?;
+            let what = match what {
+                nerka_core::anonymize::Written::Dlt => "DLT",
+                nerka_core::anonymize::Written::Text => "text",
+            };
+            let key = if seed.is_none() { "; keyed at random: the words can't be mapped back" } else { "" };
+            eprintln!("nerka: {n} lines anonymized into {} ({what}){key}", output.display());
         }
         Cmd::Compare { files, a, b, within, engine, min_score, top, queries, stats } => {
             compare(&files, [a, b], within, engine.options(false)?, min_score, top, queries, stats, &mut out)?;
