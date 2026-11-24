@@ -105,7 +105,8 @@ chosen, or the [pattern configuration](cli.md#the-pattern-configuration)
 or the signals changed.
 
 - **Lines:** all lines, the filter result, one lifecycle (`@ecu1` and its
-  number), or the lines of a filter you type (NFD). **Field:** the text
+  number: every line during it, or with *its lines only* its own lines),
+  or the lines of a filter you type (NFD). **Field:** the text
   grouped (default: a DLT message's `payload`, else the line).
 - **Only** and **Ignore** (NFD), as in Compare, narrow those lines:
   `ecu == ECU1`, or leave out `apid == GPS OR payload ~ /heartbeat/`.
@@ -133,7 +134,8 @@ the score is G², 10.8 or more by default), as
 
 - **A and B:** all lines, the filter result, the lines of a filter,
   lifecycles of `@name` by number (`2`, or a group: `2, 5-7`) or every one
-  of an outcome (every `crash` against every `planned`), or another tab.
+  of an outcome (every `crash` against every `planned`): every line during
+  them, or with *its lines only* their own lines; or another tab.
   With lifecycles, a row also says in how many of a side's lifecycles the
   pattern has lines (`A 3/3 · B 0/5`): a constant symptom, not a one-off.
 - **Only** and **Ignore** (NFD) choose the lines of both sides first:

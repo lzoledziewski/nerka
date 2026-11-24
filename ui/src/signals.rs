@@ -1093,6 +1093,18 @@ fn lifecycles_list(
                                         }
                                         out.filter = Some(nfd);
                                     }
+                                    // Every line during it, whoever wrote it
+                                    // (with no lines rule, ▾ filter is that).
+                                    if def.lines().is_some()
+                                        && ui
+                                            .small_button("▾ during")
+                                            .on_hover_text(
+                                                "Filter to every line during this lifecycle, whoever wrote it",
+                                            )
+                                            .clicked()
+                                    {
+                                        out.filter = Some(format!("@{} == {}", def.name(), x.number));
+                                    }
                                     if x.number > 1
                                         && ui
                                             .small_button("⚖")

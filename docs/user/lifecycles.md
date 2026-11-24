@@ -71,7 +71,8 @@ how often.
   from one boot into the next.
 - **Checks per lifecycle:** `…; per ecu1` ([Checks](checks.md)).
 - **The Signals panel** lists each lifecycle: number, first line (click: go
-  there), duration, outcome, what its checks found, `▾ filter` (its lines).
+  there), duration, outcome, what its checks found, `▾ filter` (its lines),
+  `▾ during` (every line during it, whoever wrote it).
 - **The plot** labels where each plotted lifecycle starts.
 
 ```

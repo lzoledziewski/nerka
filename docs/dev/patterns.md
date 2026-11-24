@@ -304,8 +304,10 @@ them:
   one set of lines, patterns never told apart by file.
 - **Later:** `state-values` (2–16) to be tuned; ⋮ "At most N slots"
   proposing one less; "Why" explaining stage 2 only; pooling rare contexts
-  up to 256 K lines; a lifecycle side's lines (its lines rule, or maybe
-  the lifecycle altogether).
+  up to 256 K lines.
+- **A lifecycle side** (2026-11-24): every line during it by default, *its
+  lines only* a checkbox (its lines rule), in Compare and the Patterns
+  window; ▾ during in the Signals panel.
 - **Open:** presence (`A 3/3 · B 0/5` on a Compare row) was unclear to the
   owner; explained 2026-11-24, to be confirmed.
 

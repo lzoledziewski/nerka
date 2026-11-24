@@ -59,6 +59,9 @@ pub struct Side {
     /// Another tab (its id), and only its filter result.
     pub tab: u64,
     pub filtered: bool,
+    /// Lifecycles: their own lines only (their lines rule), not every
+    /// line during them.
+    pub own: bool,
 }
 
 impl Default for Side {
@@ -70,6 +73,7 @@ impl Default for Side {
             pick: Pick::Numbers(String::new()),
             tab: 0,
             filtered: false,
+            own: false,
         }
     }
 }
@@ -315,7 +319,8 @@ impl CompareUi {
                         (n, what)
                     }
                 };
-                let nfd = tab.lifecycle_nfd(l, &numbers);
+                let nfd = tab.lifecycle_nfd(l, &numbers, side.own);
+                let what = if side.own { format!("{what}, its lines") } else { what };
                 (Base::Search(tab.compile(&nfd)?), what, Some((l.found.clone(), numbers.len())))
             }
             SideFrom::Tab => {
@@ -772,6 +777,10 @@ fn side_ui(ui: &mut egui::Ui, id: (&str, usize), side: &mut Side, input: &Input)
                 }
             }
             ui.weak(format!("of {count}"));
+            ui.checkbox(&mut side.own, "its lines only").on_hover_text(
+                "Only the lifecycles' own lines (their lines rule, e.g. ecu == ECU1); off: every line \
+                 during them, whoever wrote it",
+            );
         }
         SideFrom::Tab => {
             let has_filter = input.tabs.iter().find(|t| t.id == side.tab).is_some_and(|t| t.kept.is_some());

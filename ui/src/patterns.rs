@@ -68,6 +68,8 @@ struct Key {
     query: String,
     /// Only and Ignore, as one NFD.
     content: Option<String>,
+    /// A lifecycle's own lines only.
+    own: bool,
     /// The filter result's address (`From::Filter`).
     kept: usize,
     field: String,
@@ -86,6 +88,7 @@ impl Key {
         } else if self.from != now.from
             || (self.from == From::Query && self.query != now.query)
             || self.content != now.content
+            || (matches!(self.from, From::Lifecycle(..)) && self.own != now.own)
         {
             Some("other lines are chosen")
         } else if self.from == From::Filter && self.kept != now.kept {
@@ -166,6 +169,9 @@ pub struct PatternsUi {
     id: u64,
     from: From,
     query: String,
+    /// A lifecycle's own lines only (its lines rule), not every line
+    /// during it.
+    own_lines: bool,
     /// Only and Ignore: NFD filters narrowing the lines chosen.
     only: String,
     ignore: String,
@@ -197,6 +203,7 @@ impl Default for PatternsUi {
             id: NEXT.fetch_add(1, Ordering::Relaxed),
             from: From::All,
             query: String::new(),
+            own_lines: false,
             only: String::new(),
             ignore: String::new(),
             field: String::new(),
@@ -241,12 +248,12 @@ impl TabRef {
         self.cx.compile(nfd, &*self.file).map(Filter::Query).map_err(|e| e.to_string())
     }
 
-    /// NFD of the lines of lifecycles `numbers` of `l` (its own lines, by
-    /// its lines rule, as the Signals panel filters to one).
-    pub fn lifecycle_nfd(&self, l: &LifeRef, numbers: &[u32]) -> String {
+    /// NFD of the lines of lifecycles `numbers` of `l`: every line during
+    /// them, or with `own` only its own lines (its lines rule).
+    pub fn lifecycle_nfd(&self, l: &LifeRef, numbers: &[u32], own: bool) -> String {
         let one: Vec<String> = numbers.iter().map(|n| format!("@{} == {n}", l.name)).collect();
         let mut nfd = if one.len() == 1 { one[0].clone() } else { format!("({})", one.join(" OR ")) };
-        if let Some(lines) = &l.lines {
+        if let Some(lines) = l.lines.as_ref().filter(|_| own) {
             nfd += &format!(" AND ({lines})");
         }
         nfd
@@ -316,6 +323,7 @@ impl PatternsUi {
             from: self.from.clone(),
             query: self.query.trim().to_owned(),
             content: compare::content_nfd(&self.only, &self.ignore),
+            own: self.own_lines,
             kept: input.tab.kept.as_ref().map_or(0, |r| Arc::as_ptr(r) as usize),
             field: self.field.clone(),
             config: self.config_stamp(),
@@ -357,10 +365,14 @@ impl PatternsUi {
                 .find(|l| l.name == *name)
                 .ok_or_else(|| "not found (yet)".to_owned())
                 .and_then(|l| {
-                    let nfd = input.tab.lifecycle_nfd(l, &[*n as u32]);
+                    let nfd = input.tab.lifecycle_nfd(l, &[*n as u32], self.own_lines);
                     input.tab.compile(&nfd).map(|f| (f, nfd))
                 }) {
-                Ok((f, nfd)) => (Lines::Search(f), format!("lifecycle @{name} #{n}"), Some(nfd)),
+                Ok((f, nfd)) => (
+                    Lines::Search(f),
+                    format!("lifecycle @{name} #{n}{}", if self.own_lines { ", its lines" } else { "" }),
+                    Some(nfd),
+                ),
                 Err(e) => {
                     self.error = Some(format!("Lifecycle @{name}: {e}"));
                     return;
@@ -649,6 +661,10 @@ impl PatternsUi {
                     ui.label("#");
                     ui.add(egui::DragValue::new(n).range(1..=count.max(1)));
                     ui.weak(format!("of {count}"));
+                    ui.checkbox(&mut self.own_lines, "its lines only").on_hover_text(
+                        "Only the lifecycle's own lines (its lines rule, e.g. ecu == ECU1); off: every line \
+                         during it, whoever wrote it",
+                    );
                 }
                 From::Query => {
                     let r = ui.add(
@@ -1012,6 +1028,19 @@ mod tests {
         }
     }
 
+    /// A lifecycle's lines: every line during it by default, its own
+    /// lines (its lines rule) when asked.
+    #[test]
+    fn a_lifecycle_is_every_line_during_it_or_its_own() {
+        let t = tab_of(1, file());
+        let l = LifeRef { name: "ecu1".into(), lines: Some("ecu == ECU1".into()), found: Default::default() };
+        assert_eq!(t.lifecycle_nfd(&l, &[2], false), "@ecu1 == 2");
+        assert_eq!(t.lifecycle_nfd(&l, &[2], true), "@ecu1 == 2 AND (ecu == ECU1)");
+        assert_eq!(t.lifecycle_nfd(&l, &[2, 3], false), "(@ecu1 == 2 OR @ecu1 == 3)");
+        let none = LifeRef { lines: None, ..l };
+        assert_eq!(t.lifecycle_nfd(&none, &[2], true), "@ecu1 == 2");
+    }
+
     /// A list row is lit while the mouse is over it, and only then.
     #[test]
     fn a_row_under_the_mouse_is_lit() {
@@ -1200,6 +1229,7 @@ mod tests {
             from: From::Filter,
             query: String::new(),
             content: None,
+            own: false,
             kept: 5,
             field: String::new(),
             config: None,
