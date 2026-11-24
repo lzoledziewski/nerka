@@ -318,7 +318,9 @@ fn text_from_stdin() {
 #[test]
 fn help_on_nfd_and_fields() {
     let o = nerka(&["help", "nfd"]);
-    assert!(out(&o).contains(nerka_core::dsl::GRAMMAR) && out(&o).contains("Examples"), "{}", out(&o));
+    // A checkout on Windows may give grammar.txt CRLF line ends; `out` has LF.
+    let grammar = nerka_core::dsl::GRAMMAR.replace("\r\n", "\n");
+    assert!(out(&o).contains(&grammar) && out(&o).contains("Examples"), "{}", out(&o));
     let d = dir("help");
     let o = nerka(&["help", "fields", s(&dlt_file(&d))]);
     assert!(out(&o).contains("\napid\ttext\tno\n") && out(&o).contains("payload\ttext\tyes"), "{}", out(&o));
