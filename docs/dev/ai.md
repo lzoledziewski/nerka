@@ -222,4 +222,6 @@ in `ui/src/main.rs` (6,218 non-test lines).
   `<author>` after the anchor, written only for a bookmark not the user's,
   so old sidecars read as before and no migration step is needed; an older
   nerka reading one keeps the bookmark without its anchor and saves it as
-  the user's.
+  the user's. The window shows such a bookmark as an **annotation** (🤖,
+  violet; owner, 2026-11-24) until the user accepts it (✔: then theirs);
+  `gui-decisions.md`.

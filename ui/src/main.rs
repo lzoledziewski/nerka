@@ -2735,11 +2735,25 @@ impl Tab {
 
     fn bookmarks_list(&mut self, ui: &mut egui::Ui, file: &dyn LogSource) {
         ui.weak("m toggle · b / B next / prev");
+        // An agent's annotations: kept apart until accepted (owner, 2026-11-24).
+        let mut accept_all = false;
+        let waiting = self.bookmarks.annotations();
+        if waiting > 0 {
+            ui.horizontal(|ui| {
+                ui.colored_label(view::ANNOTATION_COLOR, format!("{} {waiting}", view::ANNOTATION_GLYPH));
+                ui.label(if waiting == 1 { "annotation by an agent" } else { "annotations by an agent" });
+                accept_all = ui
+                    .small_button("✔ Accept all")
+                    .on_hover_text("Make every annotation your bookmark (names and notes kept)")
+                    .clicked();
+            });
+        }
         ui.separator();
         if self.bookmarks.is_empty() {
             ui.weak("No bookmarks yet.");
             return;
         }
+        let mut accept = None;
         let mut jump = None;
         let mut edits: Vec<(LineNo, String)> = Vec::new();
         let mut remove = None;
@@ -2764,8 +2778,16 @@ impl Tab {
                         ui.colored_label(ui.visuals().warn_fg_color, "?").on_hover_text(UNSURE_MARK);
                     }
                     if let Some(by) = self.bookmarks.author(line) {
-                        ui.label("🤖")
-                            .on_hover_text(format!("Made by {by} (nerka marks --add), not by you: an agent's finding"));
+                        if ui
+                            .small_button("✔")
+                            .on_hover_text("Accept: make it your bookmark (name and note kept)")
+                            .clicked()
+                        {
+                            accept = Some(line);
+                        }
+                        ui.colored_label(view::ANNOTATION_COLOR, view::ANNOTATION_GLYPH).on_hover_text(format!(
+                            "An annotation by {by} (nerka marks --add): an agent's finding, not yours until accepted"
+                        ));
                     }
                     // The name (the plot shows it); edited in place.
                     let mut text = match &self.mark_rename {
@@ -2829,7 +2851,16 @@ impl Tab {
         {
             self.marks_open.insert(l);
         }
-        let changed = !edits.is_empty() || rename.is_some() || remove.is_some();
+        let changed = !edits.is_empty() || rename.is_some() || remove.is_some() || accept.is_some() || accept_all;
+        if accept_all {
+            let n = self.bookmarks.accept_all();
+            self.status = format!("{n} annotation{} accepted as your bookmarks", if n == 1 { "" } else { "s" });
+        }
+        if let Some(l) = accept
+            && self.bookmarks.accept(l)
+        {
+            self.status = format!("Annotation on line {} accepted as your bookmark", l + 1);
+        }
         for (l, t) in edits {
             self.bookmarks.set_note(l, t);
         }
@@ -5670,10 +5701,18 @@ impl App {
                     self.pick_files(&ctx);
                 }
                 ui.separator();
-                let marks = self.tabs.get(self.active).map_or(0, |t| t.bookmarks.len());
-                ui.toggle_value(&mut self.show_bookmarks, format!("🔖 Bookmarks ({marks})")).on_hover_text(
+                let (marks, waiting) =
+                    self.tabs.get(self.active).map_or((0, 0), |t| (t.bookmarks.len(), t.bookmarks.annotations()));
+                // An agent's annotations waiting to be accepted show apart.
+                let label = if waiting > 0 {
+                    format!("🔖 Bookmarks ({} · {} {waiting})", marks - waiting, view::ANNOTATION_GLYPH)
+                } else {
+                    format!("🔖 Bookmarks ({marks})")
+                };
+                ui.toggle_value(&mut self.show_bookmarks, label).on_hover_text(
                     "Mark lines to come back to: m (or right-click) toggles a bookmark on the current line, \
-                     b / Shift+B jump to the next / previous one. Saved next to the log as <file>.nerka-marks.",
+                     b / Shift+B jump to the next / previous one. Saved next to the log as <file>.nerka-marks. \
+                     🤖: an agent's annotations (nerka marks --add), yours once accepted in the panel.",
                 );
                 let queries: usize = self.library.packs().iter().map(|p| p.queries.len()).sum();
                 let signals = self.tabs.get(self.active).map_or(0, |t| t.signals.len());

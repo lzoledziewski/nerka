@@ -81,8 +81,8 @@ missing answer) overall and per lifecycle, with evidence lines.
     nerka marks --remove LINE FILE
 
 Bookmarks are kept next to the file (`FILE.nerka-marks`). The user sees them
-in nerka-gui, marked as made by `ai`; a window that has the file open takes
-them in when it gets the focus back. Bookmark the few lines that explain the
+in nerka-gui as your annotations (🤖) until they accept them as their own;
+a window that has the file open takes them in when it gets the focus back. Bookmark the few lines that explain the
 problem (the first error, the cause, the change), each with a note that
 stands on its own. `bookmark` in a query finds them: `filter 'bookmark'`.
 

@@ -59,10 +59,11 @@ they find their lines again in a changed file (one that can't is marked
 `?`). In queries, `bookmark` is a field: `level >= ERROR OR bookmark`,
 `bookmark ~ /fan/`.
 
-Bookmarks an [AI agent](agents.md) made (`nerka marks --add`) show as
-theirs: `B3 (ai)` in the views, 🤖 in the panel. When the window gets the
-focus back it takes in bookmarks added to the file meanwhile, and saving
-yours never writes over them.
+Bookmarks an [AI agent](agents.md) made (`nerka marks --add`) are
+**annotations**: 🤖 and violet in the views, the plot and the panel, until
+you accept them (✔ in the panel, or ✔ Accept all): then they are your
+bookmarks. When the window gets the focus back it takes in bookmarks added
+to the file meanwhile, and saving yours never writes over them.
 
 ## Several files
 

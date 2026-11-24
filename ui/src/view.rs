@@ -48,6 +48,17 @@ const TAB_COLS: usize = 4;
 const LINES_PER_NOTCH: u64 = 3;
 /// The stripe of a bookmarked line (and of its note).
 const BOOKMARK_COLOR: Color32 = Color32::from_rgb(230, 120, 40);
+/// An annotation's (an agent's bookmark, not accepted yet): its stripe,
+/// its glyph's colour in the panel and the plot.
+pub const ANNOTATION_COLOR: Color32 = Color32::from_rgb(150, 100, 230);
+/// An annotation's glyph, where a bookmark's is 🔖 (owner, 2026-11-24).
+pub const ANNOTATION_GLYPH: &str = "🤖";
+
+/// The glyph and colour of the bookmark on `line`: 🔖 and orange, or an
+/// annotation's 🤖 and violet.
+fn mark_style(b: &Bookmarks, line: LineNo) -> (&'static str, Color32) {
+    if b.is_annotation(line) { (ANNOTATION_GLYPH, ANNOTATION_COLOR) } else { ("🔖", BOOKMARK_COLOR) }
+}
 
 /// A position in the view: row and display column (see [`Cells`]).
 /// `col == usize::MAX` means "end of line".
@@ -154,13 +165,9 @@ enum Slot {
 }
 
 /// A bookmark's name as the views show it: `?` after an unsure one's.
-/// A bookmark's name as the views show it: `B1`, `B1?` (unsure), `B1 (ai)`
-/// (made by an agent).
 fn shown_name(b: &Bookmarks, line: LineNo) -> Option<String> {
     let name = b.name(line)?;
-    let unsure = if b.is_unsure(line) { "?" } else { "" };
-    let by = b.author(line).map(|a| format!(" ({a})")).unwrap_or_default();
-    Some(format!("{name}{unsure}{by}"))
+    Some(if b.is_unsure(line) { format!("{name}?") } else { name.to_owned() })
 }
 
 /// A bookmark's note as the views show it (`name · note`); none without a note.
@@ -925,7 +932,7 @@ pub fn log_view(
         let line = line_of_row(row);
         let k = match slot {
             Slot::Note(note) => {
-                note_slots.push((y, note));
+                note_slots.push((y, note, line));
                 continue;
             }
             Slot::Line(k) => k,
@@ -955,8 +962,9 @@ pub fn log_view(
                 painter.rect_filled(r, 1.0, s.colors[q % s.colors.len().max(1)]);
             }
         }
-        if hl.bookmarks.is_some_and(|b| b.contains(line)) {
-            painter.rect_filled(Rect::from_min_size(row_rect.min, vec2(char_w * 0.6, row_h)), 0.0, BOOKMARK_COLOR);
+        if let Some(b) = hl.bookmarks.filter(|b| b.contains(line)) {
+            let color = mark_style(b, line).1;
+            painter.rect_filled(Rect::from_min_size(row_rect.min, vec2(char_w * 0.6, row_h)), 0.0, color);
         }
         // A lifecycle starts here: a line above the row, its label at the
         // right (on the row's first slot).
@@ -1073,9 +1081,12 @@ pub fn log_view(
         }
         if hl.notes == NoteMode::EndOfLine
             && last
-            && let Some(note) = hl.bookmarks.and_then(|b| shown_note(b, line))
+            && let Some(b) = hl.bookmarks
+            && let Some(note) = shown_note(b, line)
         {
-            let galley = painter.layout_job(note_job(format!("◂ {note}")));
+            // An annotation says so; a bookmark's note goes as it was.
+            let glyph = if b.is_annotation(line) { format!("{ANNOTATION_GLYPH} ") } else { String::new() };
+            let galley = painter.layout_job(note_job(format!("◂ {glyph}{note}")));
             let at = width + char_w * 2.0;
             width = at + galley.size().x;
             painter.with_clip_rect(text_clip).galley(pos2(x + at, snap(y + 1.0)), galley, dim);
@@ -1128,13 +1139,14 @@ pub fn log_view(
         }
     }
 
-    for (y, note) in note_slots {
+    for (y, note, line) in note_slots {
         // The note above its line: no number, never scrolled sideways.
+        let (glyph, color) = hl.bookmarks.map_or(("🔖", BOOKMARK_COLOR), |b| mark_style(b, line));
         let r = Rect::from_min_size(pos2(text_rect.min.x, y), vec2(text_rect.width(), row_h));
         painter.rect_filled(r, 0.0, vis.extreme_bg_color);
         painter.rect_filled(r, 0.0, vis.faint_bg_color);
-        painter.rect_filled(Rect::from_min_size(r.min, vec2(char_w * 0.6, row_h)), 0.0, BOOKMARK_COLOR);
-        let galley = painter.layout_job(note_job(format!("🔖 {note}")));
+        painter.rect_filled(Rect::from_min_size(r.min, vec2(char_w * 0.6, row_h)), 0.0, color);
+        let galley = painter.layout_job(note_job(format!("{glyph} {note}")));
         painter.with_clip_rect(text_clip).galley(pos2(snap(text_x0), snap(y + 1.0)), galley, dim);
     }
 
@@ -1187,10 +1199,14 @@ pub fn log_view(
         && let line = line_of_row(hit(state, p).row)
         && let Some(name) = shown_name(b, line)
     {
-        let tip = match b.note(line).unwrap_or_default() {
-            "" => format!("🔖 {name}"),
-            note => format!("🔖 {name}\n{note}"),
+        let glyph = mark_style(b, line).0;
+        let mut tip = match b.note(line).unwrap_or_default() {
+            "" => format!("{glyph} {name}"),
+            note => format!("{glyph} {name}\n{note}"),
         };
+        if let Some(by) = b.author(line) {
+            tip += &format!("\n\nAn annotation by {by}: ✔ in the 🔖 Bookmarks panel makes it your bookmark");
+        }
         response.clone().on_hover_text_at_pointer(tip);
     }
 

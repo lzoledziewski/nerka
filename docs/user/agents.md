@@ -44,12 +44,21 @@ The agent bookmarks the lines that explain the problem, each with a note:
 nerka marks --add 1234 --note 'first watchdog reset: the bus was down 2 s before' trace.dlt
 ```
 
-They are saved next to the file (`trace.dlt.nerka-marks`), like yours, and
-marked as the agent's: `B3 (ai)` in the views and 🤖 in the 🔖 Bookmarks
-panel. Open the file in nerka-gui and go through them with `b` / `B`. A
-window that already has the file open takes them in when it gets the focus
-back (the status bar says how many); your own bookmarks and its are kept
-together, and where both of you changed the same one, yours stays.
+They are saved next to the file (`trace.dlt.nerka-marks`), like yours, as
+**annotations**: the agent's, until you accept them. nerka-gui shows them
+with 🤖 and in violet, where your bookmarks have 🔖 and orange: the note
+above the line, the mark beside it, the plot's cursors (with a 🤖 checkbox
+of their own next to 🔖), the 🔖 Bookmarks panel and its button
+(`Bookmarks (3 · 🤖 2)`). Go through them with `b` / `B`; in the panel,
+**✔** accepts one (it becomes your bookmark, name and note kept) and **✔
+Accept all** accepts them all. A window that already has the file open
+takes them in when it gets the focus back (the status bar says how many);
+your bookmarks and the agent's are kept together, and where both of you
+changed the same one, yours stays.
+
+🤖 comes from your system's emoji font (Segoe UI Emoji on Windows, Apple
+Color Emoji on macOS, Noto Color Emoji on most Linux desktops); without one
+it shows as a box, and the violet still tells annotations apart.
 
 `nerka marks FILE` lists them all, `--remove LINE` removes one, and
 `--by NAME` says who made one (`--by ''`: yours).

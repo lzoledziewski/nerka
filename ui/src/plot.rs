@@ -189,6 +189,9 @@ pub struct Bookmark {
     pub line: LineNo,
     pub name: String,
     pub note: String,
+    /// An agent's annotation, not accepted yet: drawn apart, with its own
+    /// checkbox.
+    pub annotation: bool,
 }
 
 impl Bookmark {
@@ -196,7 +199,12 @@ impl Bookmark {
     pub fn all(marks: &nerka_core::Bookmarks) -> Vec<Self> {
         marks
             .iter_named()
-            .map(|(line, name, note)| Self { line, name: name.to_owned(), note: note.to_owned() })
+            .map(|(line, name, note)| Self {
+                line,
+                name: name.to_owned(),
+                note: note.to_owned(),
+                annotation: marks.is_annotation(line),
+            })
             .collect()
     }
 }
@@ -307,6 +315,9 @@ pub struct PlotState {
     bookmark_note: String,
     /// Bookmarks aren't drawn.
     pub hide_bookmarks: bool,
+    /// An agent's annotations aren't drawn (not kept with the plot: a
+    /// kept plot's file would need a new format for it).
+    pub hide_annotations: bool,
     /// How far the lanes are scrolled down, in points (more lanes than fit).
     scroll: f32,
     /// The scrollbar is being dragged.
@@ -770,6 +781,13 @@ pub fn plot_panel(ui: &mut egui::Ui, state: &mut PlotState, src: Source<'_>) -> 
                 if ui.checkbox(&mut show, "🔖").on_hover_text("Show the bookmarks (with their notes) as cursors").changed() {
                     state.hide_bookmarks = !show;
                 }
+                if bookmarks.iter().any(|b| b.annotation) {
+                    let mut show = !state.hide_annotations;
+                    let tip = "Show an agent's annotations (nerka marks --add, not accepted yet) as cursors";
+                    if ui.checkbox(&mut show, crate::view::ANNOTATION_GLYPH).on_hover_text(tip).changed() {
+                        state.hide_annotations = !show;
+                    }
+                }
                 ui.weak("ℹ").on_hover_text(
                     "Wheel: zoom (over the lane names: scroll). Drag: pan, up and down through the lanes (drag a time cursor to move it). Double-click: everything. Click: go to the \
                      nearest event. Right-click: place or remove time cursors (Δt between them). Right-click a lane's \
@@ -809,21 +827,20 @@ pub fn plot_panel(ui: &mut egui::Ui, state: &mut PlotState, src: Source<'_>) -> 
         _ => None,
     };
     // Bookmarks as cursors: their line's x, name and note.
-    let marks: Vec<BookmarkCursor> = if state.hide_bookmarks {
-        Vec::new()
-    } else {
-        bookmarks
-            .iter()
-            .filter_map(|b| {
-                Some(BookmarkCursor {
-                    line: b.line,
-                    name: b.name.clone(),
-                    note: b.note.clone(),
-                    x: clock.at(file, clock_series.as_ref(), b.line)?,
-                })
+    // Each kind behind its own checkbox.
+    let marks: Vec<BookmarkCursor> = bookmarks
+        .iter()
+        .filter(|b| if b.annotation { !state.hide_annotations } else { !state.hide_bookmarks })
+        .filter_map(|b| {
+            Some(BookmarkCursor {
+                line: b.line,
+                name: b.name.clone(),
+                note: b.note.clone(),
+                x: clock.at(file, clock_series.as_ref(), b.line)?,
+                annotation: b.annotation,
             })
-            .collect()
-    };
+        })
+        .collect();
     if !state.cursors.is_empty() || !marks.is_empty() {
         ui.horizontal_wrapped(|ui| ui.monospace(cursor_summary(&state.cursors, &marks, clock.is_time())));
     }
@@ -1169,7 +1186,7 @@ pub fn plot_panel(ui: &mut egui::Ui, state: &mut PlotState, src: Source<'_>) -> 
     let amber = Color32::from_rgb(230, 150, 20);
     let red = Color32::from_rgb(220, 60, 60);
     let verticals: Vec<(f32, Color32, bool)> = (state.cursors.iter().map(|&c| (c, amber, true)))
-        .chain(marks.iter().map(|m| (m.x, red, false)))
+        .chain(marks.iter().map(|m| (m.x, if m.annotation { crate::view::ANNOTATION_COLOR } else { red }, false)))
         .filter(|(x, ..)| (x0..=x1).contains(x))
         .map(|(x, c, dashed)| (to_px(x, x0, x1), c, dashed))
         .collect();
@@ -1396,7 +1413,10 @@ pub fn plot_panel(ui: &mut egui::Ui, state: &mut PlotState, src: Source<'_>) -> 
         let next = (k + 1..tags.len()).find(|&j| rows[j] == row).map_or(rect.max.x, |j| tags[j].0);
         let (text, fill, ink) = match tag {
             Tag::Cursor(i) => (cursor_name(*i), amber, Color32::BLACK),
-            Tag::Mark(m) => (format!("🔖{} {}", m.name, m.note).trim_end().to_owned(), red, Color32::WHITE),
+            Tag::Mark(m) => {
+                let fill = if m.annotation { crate::view::ANNOTATION_COLOR } else { red };
+                (format!("{} {}", m.name(), m.note).trim_end().to_owned(), fill, Color32::WHITE)
+            }
         };
         let galley = painter.layout_no_wrap(text, font.clone(), ink);
         let w = (galley.size().x + 4.0).min((next - px - 1.0).max(14.0));
@@ -1813,12 +1833,16 @@ struct BookmarkCursor {
     name: String,
     note: String,
     x: f64,
+    /// An agent's annotation: 🤖 and violet instead of 🔖 and red.
+    annotation: bool,
 }
 
 impl BookmarkCursor {
-    /// Its name in Δt and the summary: 🔖 and the bookmark's name.
+    /// Its name in Δt and the summary: 🔖 (an annotation: 🤖) and the
+    /// bookmark's name.
     fn name(&self) -> String {
-        format!("🔖{}", self.name)
+        let glyph = if self.annotation { crate::view::ANNOTATION_GLYPH } else { "🔖" };
+        format!("{glyph}{}", self.name)
     }
 }
 
@@ -3414,8 +3438,8 @@ mod tests {
             d.series(&file, &nerka_core::Progress::new()).unwrap();
         }
         let marks = [
-            Bookmark { line: 50, name: "B1".into(), note: "first".into() },
-            Bookmark { line: 51, name: "B2".into(), note: "second".into() },
+            Bookmark { line: 50, name: "B1".into(), note: "first".into(), annotation: false },
+            Bookmark { line: 51, name: "B2".into(), note: "second".into(), annotation: true },
         ];
         let mut st = PlotState::default();
         st.toggle("v");
@@ -3471,6 +3495,16 @@ mod tests {
             let (out, _) = step(vec![button(false)], &mut st);
             assert_eq!(out.goto, Some(line), "the click on its tag");
         }
+        // B2 is an agent's annotation: its own checkbox hides it, and only it.
+        let drawn = |line: LineNo| ctx.read_response(scope.with(("bookmark", line))).is_some();
+        st.hide_annotations = true;
+        step(vec![], &mut st);
+        step(vec![], &mut st);
+        assert!(drawn(50) && !drawn(51), "annotations hidden");
+        (st.hide_annotations, st.hide_bookmarks) = (false, true);
+        step(vec![], &mut st);
+        step(vec![], &mut st);
+        assert!(!drawn(50) && drawn(51), "bookmarks hidden");
     }
 
     #[test]
@@ -3555,7 +3589,7 @@ v=2
             "A line 11   B line 5   C line 14   Δ B→A 6 lines   Δ A→C 3 lines"
         );
         // Bookmarks are cursors too.
-        let m = BookmarkCursor { line: 7, name: "B1".into(), note: "boot".into(), x: 7.0 };
+        let m = BookmarkCursor { line: 7, name: "B1".into(), note: "boot".into(), x: 7.0, annotation: false };
         assert_eq!(cursor_summary(&[10.0], &[m], false), "A line 11   🔖B1 line 8   Δ 🔖B1→A 3 lines");
     }
 

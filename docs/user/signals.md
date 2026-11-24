@@ -135,7 +135,8 @@ which no zoom shows apart, are *4 changes at the same time*.
 - **Value markers:** right-click a number lane's name → add a horizontal line
   at a value (a limit, a threshold); the same menu sets the y axis.
 - **Bookmarks** show as red lines with their names and notes and take part
-  in Δt; the plot's menu bookmarks the nearest event of the lane you
+  in Δt (an agent's [annotations](agents.md) in violet with 🤖; the 🔖 and
+  🤖 checkboxes show or hide each); the plot's menu bookmarks the nearest event of the lane you
   clicked, or, clicked near a change, **the change of @ota** (the line
   where the value changed), with a **name** (empty: `B1`, `B2`…, or the one
   it has) and a **note**.

@@ -20,8 +20,9 @@
 //! without anchors (older ones) is taken as it is.
 //!
 //! **Authors** (owner, 2026-11-24, `docs/dev/ai.md`): a bookmark someone
-//! else made than the user (`nerka marks --add`, an agent: `ai`) says so
-//! in a fifth column, written only then (with an empty anchor column if
+//! else made than the user (`nerka marks --add`, an agent: `ai`) is an
+//! **annotation** until the user accepts it ([`Bookmarks::accept`]: it is
+//! then theirs, a bookmark like any other). It says so in a fifth column, written only then (with an empty anchor column if
 //! it has none). Older sidecars have none: the user's. An older nerka
 //! reading the column keeps the bookmark (line, note, name) without its
 //! anchor, and saves it as the user's.
@@ -305,6 +306,35 @@ impl Bookmarks {
         }
     }
 
+    /// Whether the bookmark on `line` is an annotation: made by someone
+    /// else (an agent) and not accepted yet.
+    pub fn is_annotation(&self, line: LineNo) -> bool {
+        self.author(line).is_some()
+    }
+
+    /// How many bookmarks are annotations.
+    pub fn annotations(&self) -> usize {
+        self.marks.values().filter(|m| !m.author.is_empty()).count()
+    }
+
+    /// Accept the annotation on `line`: it becomes the user's bookmark
+    /// (name and note kept). Whether there was one to accept.
+    pub fn accept(&mut self, line: LineNo) -> bool {
+        match self.marks.get_mut(&line) {
+            Some(m) if !m.author.is_empty() => {
+                m.author.clear();
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Accept every annotation; how many there were.
+    pub fn accept_all(&mut self) -> usize {
+        let lines: Vec<LineNo> = self.marks.iter().filter(|(_, m)| !m.author.is_empty()).map(|(l, _)| *l).collect();
+        lines.iter().filter(|&&l| self.accept(l)).count()
+    }
+
     /// Remove the bookmark on `line`; whether there was one.
     pub fn remove(&mut self, line: LineNo) -> bool {
         self.marks.remove(&line).is_some()
@@ -515,6 +545,13 @@ mod tests {
         let mut back = Bookmarks::parse(&s);
         back.resolve(&f);
         assert_eq!((back.author(4), back.note(4)), (Some("ai"), Some("found it")));
+        // Accepted: the user's, as any other.
+        assert_eq!((back.annotations(), back.is_annotation(4)), (1, true));
+        assert!(back.accept(4) && !back.accept(4) && !back.accept(2));
+        assert_eq!((back.annotations(), back.author(4), back.name(4)), (0, None, Some("B2")));
+        back.set_author(2, "ai");
+        back.set_author(4, "ai");
+        assert_eq!((back.accept_all(), back.annotations()), (2, 0));
     }
 
     #[test]

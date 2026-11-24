@@ -53,15 +53,20 @@ jobs:
       - name: Test
         run: cargo test --workspace --locked
       # The GUI started for real: a small generated DLT with its FIBEX, three
-      # signals plotted, the window saved as a PNG by the app itself
+      # signals plotted, a bookmark and an agent's annotation (its 🤖 comes
+      # from the system's emoji font: the PNG shows whether each OS has one),
+      # the window saved as a PNG by the app itself
       # (`--screenshot`) and kept as an artifact to look at. Linux renders in
       # a virtual X display with Mesa's software Vulkan, Windows with WARP.
       # Built after the tests, so the dependencies are compiled once.
       - name: Build the GUI
-        run: cargo build --locked -p nerka-gui --bin nerka-gui -p nerka-core --example gen_fibex_dlt
+        run: cargo build --locked -p nerka-gui --bin nerka-gui -p nerka-cli --bin nerka -p nerka-core --example gen_fibex_dlt
       - name: Test data
         shell: bash
-        run: target/debug/examples/gen_fibex_dlt shot.dlt shot.xml 5 40
+        run: |
+          target/debug/examples/gen_fibex_dlt shot.dlt shot.xml 5 40
+          target/debug/nerka --fibex shot.xml marks --add 4 --note 'a bookmark of yours' --by '' shot.dlt
+          target/debug/nerka --fibex shot.xml marks --add 9 --note "an agent's annotation" shot.dlt
       - name: Screenshot
         shell: bash
         timeout-minutes: 10
