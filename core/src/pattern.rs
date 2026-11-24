@@ -2317,18 +2317,18 @@ fn sample_lines(f: &Family) -> Vec<(usize, LineNo)> {
             out.push((side, line));
         }
     };
-    for side in 0..2 {
-        if f.sides[side].count > 0 {
-            put(side, f.sides[side].first, &mut out);
-            put(side, f.sides[side].last, &mut out);
+    for (side, t) in f.sides.iter().enumerate() {
+        if t.count > 0 {
+            put(side, t.first, &mut out);
+            put(side, t.last, &mut out);
         }
     }
     for p in &f.parts {
         if let Atom::Slot(s) = &p.atom {
             for v in &s.values {
-                for side in 0..2 {
-                    if v.sides[side].count > 0 {
-                        put(side, v.sides[side].first, &mut out);
+                for (side, t) in v.sides.iter().enumerate() {
+                    if t.count > 0 {
+                        put(side, t.first, &mut out);
                     }
                 }
             }
