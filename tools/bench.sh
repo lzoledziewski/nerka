@@ -31,7 +31,8 @@
 set -euo pipefail
 
 if [ "${1:-}" = compare ]; then
-  join -t $'\t' <(tail -n +2 "$2" | sort) <(tail -n +2 "$3" | sort) |
+  # A baseline checked out with CRLF (Windows, autocrlf) compares as LF.
+  join -t $'\t' <(tail -n +2 "$2" | tr -d '\r' | sort) <(tail -n +2 "$3" | tr -d '\r' | sort) |
     awk -F'\t' 'BEGIN { OFS = "\t"; print "query", "before_ms", "after_ms", "change", "matches" }
       { ch = ($2 > 0) ? ($4 - $2) / $2 * 100 : 0
         big = ($4 - $2 > 1 || $2 - $4 > 1)
