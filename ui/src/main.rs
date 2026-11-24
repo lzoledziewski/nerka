@@ -681,6 +681,11 @@ struct Tab {
     filter_preview: PreviewCache,
 
     bookmarks: Bookmarks,
+    /// The bookmarks as the sidecars had them when last read or saved, and
+    /// the sidecars' stamp then: another program (`nerka marks --add`, an
+    /// agent) may write them meanwhile, and its changes are merged in.
+    marks_base: Bookmarks,
+    marks_stamp: Option<sync::Stamp>,
     /// The bookmarks changed since the last frame: what uses them runs again.
     marks_changed: bool,
     /// Where bookmark notes show in the views (the app's setting).
@@ -1360,6 +1365,8 @@ impl Tab {
             chips_open: false,
             filter_preview: PreviewCache::default(),
             bookmarks: Bookmarks::default(),
+            marks_base: Bookmarks::default(),
+            marks_stamp: None,
             marks_changed: false,
             notes: NoteMode::default(),
             marks_open: Default::default(),
@@ -2064,6 +2071,8 @@ impl Tab {
                                 self.status = format!("Could not read bookmarks: {e}");
                                 Bookmarks::default()
                             });
+                            self.marks_base = self.bookmarks.clone();
+                            self.marks_stamp = Some(self.marks_stamp_now());
                             self.columns = Columns::from_defs(f.columns());
                             let f: Arc<dyn LogSource> = Arc::from(f);
                             self.file = Some(f.clone());
@@ -2570,7 +2579,51 @@ impl Tab {
         Bookmarks::load_for_parts(&files)
     }
 
+    /// The stamp of the view's sidecars (`<file>.nerka-marks`).
+    fn marks_stamp_now(&self) -> sync::Stamp {
+        let sidecars: Vec<PathBuf> = self.paths.iter().map(|p| Bookmarks::sidecar_path(p)).collect();
+        sync::Stamp::of(&sidecars)
+    }
+
+    /// Another program changed the sidecars since they were last read or
+    /// saved (an agent's `nerka marks --add`): its changes merged into the
+    /// tab's bookmarks, three-way (`Bookmarks::merge`: where both changed
+    /// one, the tab's stays). Returns what came in.
+    fn take_in_marks(&mut self) -> nerka_core::bookmarks::Merged {
+        let Some(file) = self.file.clone() else { return Default::default() };
+        let now = self.marks_stamp_now();
+        if self.marks_stamp.as_ref().is_some_and(|was| was.changed(&now).is_empty()) {
+            return Default::default();
+        }
+        self.marks_stamp = Some(now);
+        let Ok(theirs) = self.load_bookmarks(&*file) else { return Default::default() };
+        let got = self.bookmarks.merge(&self.marks_base, &theirs);
+        self.marks_base = theirs;
+        if !got.is_empty() {
+            self.marks_changed = true;
+        }
+        got
+    }
+
+    /// The focus came back: bookmarks another program added meanwhile are
+    /// taken in and said in the status bar.
+    fn follow_marks(&mut self) {
+        let got = self.take_in_marks();
+        if !got.is_empty() {
+            self.status = format!("Bookmarks changed in the file meanwhile, taken in: {}", got.summary());
+            // Ours had changes the file doesn't: keep both in the file.
+            if self.bookmarks != self.marks_base {
+                self.save_bookmarks();
+            }
+        }
+    }
+
     fn save_bookmarks(&mut self) {
+        // What another program wrote meanwhile isn't written over.
+        let got = self.take_in_marks();
+        if !got.is_empty() {
+            self.status += &format!(" · taken in from the file meanwhile: {}", got.summary());
+        }
         let Some(file) = self.file.clone() else { return };
         // Merged by time: each file's bookmarks on its own lines.
         let (marks, file) = match file.reordered() {
@@ -2592,6 +2645,8 @@ impl Tab {
         if let Err(e) = res {
             self.status = format!("Could not save bookmarks: {e}");
         }
+        self.marks_base = self.bookmarks.clone();
+        self.marks_stamp = Some(self.marks_stamp_now());
         self.marks_changed = true;
     }
 
@@ -2707,6 +2762,10 @@ impl Tab {
                     }
                     if self.bookmarks.is_unsure(line) {
                         ui.colored_label(ui.visuals().warn_fg_color, "?").on_hover_text(UNSURE_MARK);
+                    }
+                    if let Some(by) = self.bookmarks.author(line) {
+                        ui.label("🤖")
+                            .on_hover_text(format!("Made by {by} (nerka marks --add), not by you: an agent's finding"));
                     }
                     // The name (the plot shows it); edited in place.
                     let mut text = match &self.mark_rename {
@@ -4180,6 +4239,12 @@ impl App {
         if !changed.is_empty() {
             self.config_notice.get_or_insert_with(Default::default).0.extend(changed);
             self.refresh_notice();
+        }
+        // Bookmarks an agent added meanwhile (`nerka marks --add`).
+        if focused {
+            for tab in &mut self.tabs {
+                tab.follow_marks();
+            }
         }
     }
 
@@ -7877,6 +7942,45 @@ gear=D
         settle_app(&mut app, &ctx);
         assert_eq!(app.tabs.iter().map(|t| t.title()).collect::<Vec<_>>(), ["a.log", "b.log"]);
         assert!(app.tabs[1].bookmarks.contains(1));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// An agent writes the sidecar while the tab has the file open
+    /// (`nerka marks --add`): the tab takes its bookmarks in when the focus
+    /// comes back, and a save of the tab's doesn't write over them.
+    #[test]
+    fn bookmarks_an_agent_adds_meanwhile_are_taken_in() {
+        let dir = std::env::temp_dir().join(format!("nerka-gui-agent-marks-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("app.log");
+        std::fs::write(&log, "[INFO] one\n[ERROR] two\n[INFO] three\n[ERROR] four\n[INFO] five\n").unwrap();
+        let ctx = egui::Context::default();
+        let mut app = App::default();
+        app.open_files(&ctx, vec![log.clone()]);
+        settle_app(&mut app, &ctx);
+        let t = &mut app.tabs[0];
+        t.toggle_bookmark_at(0);
+        // What `nerka marks --add 2 --note …` does.
+        let agent = |line: LineNo, note: &str| {
+            let f = nerka_core::open(&log, &nerka_core::Progress::new()).unwrap();
+            let mut m = Bookmarks::load_for(&log, &*f).unwrap();
+            m.set_note(line, note);
+            m.set_author(line, "ai");
+            m.save_for(&log, &*f).unwrap();
+        };
+        agent(1, "the first error");
+        t.follow_marks();
+        assert_eq!(t.bookmarks.note(1), Some("the first error"));
+        assert_eq!(t.bookmarks.author(1), Some("ai"));
+        assert!(t.status.contains("taken in: 1 added"), "{}", t.status);
+        // Another one, then the tab saves one of its own: all three kept.
+        agent(3, "the second");
+        t.toggle_bookmark_at(4);
+        let back = Bookmarks::read(&log).unwrap();
+        let lines: Vec<LineNo> = back.iter().map(|(l, _)| l).collect();
+        assert_eq!(lines, [0, 1, 3, 4]);
+        assert_eq!((back.author(0), back.author(3)), (None, Some("ai")));
+        assert!(t.bookmarks.contains(3));
         std::fs::remove_dir_all(&dir).ok();
     }
 

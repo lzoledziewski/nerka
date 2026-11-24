@@ -207,6 +207,101 @@ fn json_for_scripts_and_agents() {
 }
 
 #[test]
+fn an_agent_leaves_bookmarks() {
+    use nerka_core::json::Value;
+    let d = dir("agent-marks");
+    let f = log_file(&d);
+    let o = nerka(&["marks", "--add", "3", "--note", "the first error", s(&f)]);
+    assert_eq!(out(&o), "B1 (ai) 3: 2026-11-07 10:00:02 [ERROR] net down: timeout\n    # the first error\n");
+    let o = nerka(&["marks", "--add", "5", "--name", "again", "--by", "", s(&f)]);
+    assert!(o.status.success(), "{}", err(&o));
+    // Changing one keeps who made it.
+    nerka(&["marks", "--add", "3", "--note", "net down first", s(&f)]);
+    let o = nerka(&["marks", "--json", s(&f)]);
+    let marks = json_lines(&o);
+    let get = |v: &Value, k: &str| v.get(k).cloned().unwrap_or(Value::Null);
+    assert_eq!(get(&marks[0], "author"), Value::from("ai"));
+    assert_eq!(get(&marks[0], "note"), Value::from("net down first"));
+    assert_eq!((get(&marks[1], "name"), get(&marks[1], "author")), (Value::from("again"), Value::Null));
+    // The sidecar: the author in a fifth column, only for the agent's.
+    let sidecar = std::fs::read_to_string(format!("{}.nerka-marks", s(&f))).unwrap();
+    let rows: Vec<&str> = sidecar.lines().collect();
+    assert!(rows[0].starts_with("3\tnet down first\tB1\t@") && rows[0].ends_with("\tai"), "{sidecar}");
+    assert!(rows[1].starts_with("5\t\tagain\t@") && rows[1].matches('\t').count() == 3, "{sidecar}");
+    // Queries see them.
+    let o = nerka(&["filter", "-c", "bookmark ~ /first/", s(&f)]);
+    assert_eq!(out(&o), "1\n");
+    // Errors: a line the file hasn't, a name taken, nothing to remove.
+    let o = nerka(&["marks", "--add", "9", s(&f)]);
+    assert_eq!((o.status.code(), err(&o).as_str()), (Some(2), "nerka: --add 9: the file has lines 1 to 5\n"));
+    let o = nerka(&["marks", "--add", "1", "--name", "Again", s(&f)]);
+    assert!(err(&o).contains("another bookmark is called so"), "{}", err(&o));
+    let o = nerka(&["marks", "--remove", "5", s(&f)]);
+    assert!(o.status.success() && out(&o).is_empty(), "{}", err(&o));
+    let o = nerka(&["marks", "--remove", "5", s(&f)]);
+    assert_eq!(o.status.code(), Some(2));
+}
+
+/// Split a command line as a shell would for the guide's examples: words,
+/// single quotes kept together.
+fn words(line: &str) -> Vec<String> {
+    let (mut out, mut cur, mut quoted, mut any) = (Vec::new(), String::new(), false, false);
+    for c in line.chars() {
+        match c {
+            '\'' => (quoted, any) = (!quoted, true),
+            ' ' if !quoted => {
+                if any {
+                    out.push(std::mem::take(&mut cur));
+                    any = false;
+                }
+            }
+            c => (cur, any) = (cur + &c.to_string(), true),
+        }
+    }
+    if any {
+        out.push(cur);
+    }
+    out
+}
+
+#[test]
+fn every_command_of_the_agent_guide_runs() {
+    // `nerka help agent` is what an agent learns nerka from: each of its
+    // `nerka` commands must run (exit 0 or 1, not an error).
+    let o = nerka(&["help", "agent"]);
+    let guide = out(&o);
+    assert!(guide.starts_with("# Analysing logs with nerka"), "{guide}");
+    let skill = out(&nerka(&["help", "skill"]));
+    assert!(skill.starts_with("---\nname: nerka\ndescription: ") && skill.ends_with(&guide));
+    let d = dir("guide");
+    let dlt = dlt_file(&d);
+    let log = log_file(&d);
+    let mut ran = 0;
+    for line in guide.lines().filter_map(|l| l.strip_prefix("    nerka ")) {
+        // The command, not the words after it that say what it does.
+        let cmd = line.split("   ").next().unwrap();
+        let mut args: Vec<String> = Vec::new();
+        for w in words(cmd) {
+            match w.as_str() {
+                "FILE" | "good.dlt" | "bad.dlt" => args.push(s(&dlt).to_owned()),
+                "LINE" => args.push("2".into()),
+                "QUERY_A" | "QUERY_B" => args.push("level >= WARN".into()),
+                _ => args.push(w),
+            }
+        }
+        // Bookmarks go next to a text file of the test's own.
+        if args[0] == "marks" {
+            *args.last_mut().unwrap() = s(&log).to_owned();
+        }
+        let a: Vec<&str> = args.iter().map(String::as_str).collect();
+        let o = nerka(&a);
+        assert!(matches!(o.status.code(), Some(0 | 1)), "nerka {line}\n{}", err(&o));
+        ran += 1;
+    }
+    assert!(ran >= 20, "{ran} commands found in the guide");
+}
+
+#[test]
 fn text_from_stdin() {
     let mut child = Command::new(env!("CARGO_BIN_EXE_nerka"))
         .args(["filter", "-c", "level >= ERROR", "-"])

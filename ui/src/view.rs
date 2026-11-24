@@ -154,9 +154,13 @@ enum Slot {
 }
 
 /// A bookmark's name as the views show it: `?` after an unsure one's.
+/// A bookmark's name as the views show it: `B1`, `B1?` (unsure), `B1 (ai)`
+/// (made by an agent).
 fn shown_name(b: &Bookmarks, line: LineNo) -> Option<String> {
     let name = b.name(line)?;
-    Some(if b.is_unsure(line) { format!("{name}?") } else { name.to_owned() })
+    let unsure = if b.is_unsure(line) { "?" } else { "" };
+    let by = b.author(line).map(|a| format!(" ({a})")).unwrap_or_default();
+    Some(format!("{name}{unsure}{by}"))
 }
 
 /// A bookmark's note as the views show it (`name · note`); none without a note.

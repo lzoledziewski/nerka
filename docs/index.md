@@ -57,9 +57,10 @@ plain-text files you can share in git. [The Library →](user/library.md)
 7. [Lifecycles](user/lifecycles.md): boots and runs of a device, and how each ended.
 8. [Checks](user/checks.md): known problems found per log or per boot.
 9. [The command line](user/cli.md): every command and option.
-10. [Protocol definitions](user/protocol-definitions.md): your own protocols in captures, in `.ksy` files.
-11. [Settings bundles](user/bundles.md): export and import your setup.
-12. [Settings and where things are kept](user/settings.md).
+10. [AI agents](user/agents.md): an agent of your choice analysing with the command line, its findings as bookmarks.
+11. [Protocol definitions](user/protocol-definitions.md): your own protocols in captures, in `.ksy` files.
+12. [Settings bundles](user/bundles.md): export and import your setup.
+13. [Settings and where things are kept](user/settings.md).
 
 nerka is at 0.x: file formats, the query language and the window can still
 change. Licensed under MIT or Apache-2.0.

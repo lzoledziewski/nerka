@@ -1,9 +1,11 @@
-# AI preparation (design settled; A1 built)
+# AI preparation (design settled; A1, A2 built)
 
 Status: **settled** with the owner (2026-11-24, "Settled" below). Built:
 step A1 (2026-11-24, branch `claude/ai-prep`: `core/src/json.rs`,
-`core/src/agent.rs`, the CLI; user guide `docs/user/cli.md#for-scripts-and-agents`).
-Next: step A2.
+`core/src/agent.rs`, the CLI; user guide `docs/user/cli.md#for-scripts-and-agents`)
+and step A2 (2026-11-24: `cli/src/agent_guide.md` as `help agent` / `help
+skill`, `marks --add` with an author, `Bookmarks::merge` in the window;
+user guide `docs/user/agents.md`). Next: step B1.
 
 ## What the owner asked for (2026-11-24)
 
@@ -216,4 +218,8 @@ in `ui/src/main.rs` (6,218 non-test lines).
   or the AI). A change of `.nerka-marks` (`line<TAB>note` today): old files
   stay readable; if the format can't be extended compatibly, a migration
   step in `bundle::STEPS` with a test on an old sample
-  (`docs/dev/bundles.md`).
+  (`docs/dev/bundles.md`). Built compatibly (A2): a fifth column
+  `<author>` after the anchor, written only for a bookmark not the user's,
+  so old sidecars read as before and no migration step is needed; an older
+  nerka reading one keeps the bookmark without its anchor and saves it as
+  the user's.

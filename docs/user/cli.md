@@ -20,11 +20,11 @@ files.
 | Command | Does |
 |---|---|
 | `open FILE…` | index the file(s) and print lines, size, throughput, fields, protocols and what was skipped |
-| `help [TOPIC]` | the commands, a command's options, `nfd` (the query language) or `fields FILE…` |
+| `help [TOPIC]` | the commands, a command's options, `nfd` (the query language), `fields FILE…`, `agent` (how to analyse with nerka, for [AI agents](agents.md)) or `skill` (the same as a `SKILL.md`) |
 | `filter QUERY FILE…` | print the lines an [NFD query](queries.md) keeps |
 | `search PATTERN FILE…` | print the lines a regex matches, like `grep -n` |
 | `lines FILE FROM TO` | print a range of lines (1-based, inclusive) |
-| `marks FILE` | list the bookmarks saved for a file |
+| `marks FILE` | list the bookmarks saved for a file; `--add LINE --note TEXT` adds one (an [agent's](agents.md) finding), `--remove LINE` removes one |
 | `expand` | turn [Library](library.md) picks into plain NFD |
 | `packs` | list the loaded packs and their queries |
 | `check FILE…` | run the [checks](checks.md) (`--check`): issues and facts |
@@ -63,7 +63,7 @@ commands that print lines, and one object for the others:
 | `filter`, `search`, `lines` | a line each: `{"file", "line", "time", "level", "raw"}`; `filter --before / --after` adds `"match"` (false: a line around a match), pack picks add `"queries"` |
 | `filter -c`, `search -c` | `{"count": N}` (pack picks: and `"queries": {"pack.q": N}`) |
 | `open` | the files, format, size, lines, index, columns, fields (`name`, `kind`, `costly`), protocols, first and last time, lines per level, how each file was read, notes |
-| `marks` | a bookmark each: `{"file", "line", "name", "note", "unsure", "raw"}` |
+| `marks` | a bookmark each: `{"file", "line", "name", "note", "author", "unsure", "raw"}` (`author`: `ai`, or null for yours) |
 | `patterns` | `{"total", "patterns": […], "more"}`, each pattern with what `--values`, `--queries`, `--lines` add |
 | `compare` | `{"a", "b", "min_score", "differences": […], "more"}` |
 | `check`, `lifecycles` | [their results](checks.md) |
@@ -128,6 +128,21 @@ Instead of a pattern, `search` and `expand` take **pack picks**, and
 nerka --pack examples/packs/ expand -l ota -p cam=CAM1 --parts
 nerka --pack examples/packs/ search --in 'level >= WARN' -l ota -p cam=CAM1 app.log
 nerka filter --before 30s --after 2s 'payload ~ /watchdog reset/' trace.dlt
+```
+
+## `marks`
+
+| Option | |
+|---|---|
+| `--add LINE` | bookmark the line (from 1), or change the bookmark there; prints it |
+| `--note TEXT`, `--name NAME` | with `--add`: its note, its name (default: the first free of `B1`, `B2`…) |
+| `--by WHO` | with `--add`: who made it; a new one is `ai`'s by default, `--by ''` makes it yours |
+| `--remove LINE` | remove the bookmark on the line |
+| `--json` | JSON Lines |
+
+```
+nerka marks --add 1234 --note 'first watchdog reset' trace.dlt
+nerka marks trace.dlt
 ```
 
 ## `check` and `lifecycles`

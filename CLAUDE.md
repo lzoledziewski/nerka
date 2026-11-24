@@ -21,6 +21,8 @@ cargo run -p nerka-cli -- --signal 'v=/v=(?<v>\d+)/' filter '@v > 100' app.log  
 cargo run -p nerka-cli -- filter --json -m 50 --fields apid 'level >= ERROR' trace.dlt   # JSON Lines in pages (--skip N; -c first); exit 0 found, 1 none, 2 error
 cargo run -p nerka-cli -- open --json trace.dlt          # what a file is: fields, time span, levels (core/src/agent.rs)
 cargo run -p nerka-cli -- help nfd                       # the grammar (core/src/dsl/grammar.txt) and examples
+cargo run -p nerka-cli -- help agent                     # the agents' guide (cli/src/agent_guide.md; `help skill`: as a SKILL.md; every command in it is run by a test)
+cargo run -p nerka-cli -- marks --add 42 --note 'the first error' app.log   # an agent's bookmark (author `ai`, merged into an open window)
 cargo run -p nerka-cli -- filter --before 30s --after 2s 'payload ~ /watchdog/' trace.dlt   # lines around a match by time (NFD: before(30s, …), after, around)
 cargo run -p nerka-cli -- --fibex ecu1.xml filter 'apid == NAV' trace.dlt        # DLT non-verbose via FIBEX
 cargo run -p nerka-cli -- --someip-port 30501 filter 'proto == SOMEIP AND type == ERROR' trace.pcap   # protocols by UDP port

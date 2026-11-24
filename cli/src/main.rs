@@ -156,8 +156,10 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
-    /// Help: the commands, `help COMMAND`, `help nfd` (the query language)
-    /// or `help fields FILE…` (the fields queries can use on those files).
+    /// Help: the commands, `help COMMAND`, `help nfd` (the query language),
+    /// `help fields FILE…` (the fields queries can use on those files),
+    /// `help agent` (how to analyse with nerka, for AI agents) or `help
+    /// skill` (the same as a SKILL.md).
     Help {
         #[arg(value_name = "TOPIC")]
         topic: Vec<String>,
@@ -312,13 +314,32 @@ enum Cmd {
     },
     /// List the loaded packs and their queries.
     Packs,
-    /// List bookmarks saved for a file (by the UI).
+    /// List the bookmarks saved for a file (its `.nerka-marks`), or add,
+    /// change or remove one: an agent's findings, there when the file is
+    /// opened in the window (an open window takes them in when it gets
+    /// the focus back).
     Marks {
         file: PathBuf,
-        /// Print JSON Lines: line, name, note, unsure (its anchor didn't
-        /// find its line), raw.
+        /// Print JSON Lines: line, name, note, author, unsure (its anchor
+        /// didn't find its line), raw.
         #[arg(long)]
         json: bool,
+        /// Bookmark this line (from 1), or change the bookmark there; prints it.
+        #[arg(long, value_name = "LINE")]
+        add: Option<u64>,
+        /// With --add: its note.
+        #[arg(long, requires = "add")]
+        note: Option<String>,
+        /// With --add: its name (default: the first free of B1, B2…).
+        #[arg(long, requires = "add")]
+        name: Option<String>,
+        /// With --add: who made it, `ai` by default for a new one; `--by ''`:
+        /// the user's.
+        #[arg(long, requires = "add", value_name = "WHO")]
+        by: Option<String>,
+        /// Remove the bookmark on this line (from 1).
+        #[arg(long, value_name = "LINE", conflicts_with = "add")]
+        remove: Option<u64>,
     },
     /// Print a 1-based inclusive range of lines.
     Lines {
@@ -1968,10 +1989,51 @@ fn run() -> Result<()> {
         }
         Cmd::Export { output, only } => export(output.as_deref(), &only, &mut out)?,
         Cmd::Import { file, dry_run, conflicts } => import(&file, dry_run, conflicts, &mut out)?,
-        Cmd::Marks { file, json } => {
+        Cmd::Marks { file, json, add, note, name, by, remove } => {
+            if file == Path::new("-") {
+                anyhow::bail!("bookmarks are kept next to a file, not for stdin");
+            }
             let f = open(std::slice::from_ref(&file))?.source;
-            let marks = Bookmarks::load_for(&file, &*f)?;
-            for (l, name, note) in marks.iter_named() {
+            let mut marks = Bookmarks::load_for(&file, &*f)?;
+            let row = |line: u64, what: &str| -> Result<LineNo> {
+                if line == 0 || line > f.line_count() {
+                    anyhow::bail!("--{what} {line}: the file has lines 1 to {}", f.line_count());
+                }
+                Ok(line - 1)
+            };
+            let shown: Vec<LineNo> = match (add, remove) {
+                (Some(line), _) => {
+                    let l = row(line, "add")?;
+                    if !marks.contains(l) {
+                        marks.toggle(l);
+                        marks.set_author(l, by.as_deref().unwrap_or("ai"));
+                    } else if let Some(by) = &by {
+                        marks.set_author(l, by);
+                    }
+                    if let Some(n) = note {
+                        marks.set_note(l, n);
+                    }
+                    if let Some(n) = name {
+                        if marks.iter_named().any(|(o, x, _)| o != l && x.eq_ignore_ascii_case(n.trim())) {
+                            anyhow::bail!("--name {n}: another bookmark is called so");
+                        }
+                        marks.set_name(l, n);
+                    }
+                    marks.save_for(&file, &*f).context("saving the bookmarks")?;
+                    vec![l]
+                }
+                (None, Some(line)) => {
+                    let l = row(line, "remove")?;
+                    if !marks.remove(l) {
+                        anyhow::bail!("--remove {line}: no bookmark on that line");
+                    }
+                    marks.save_for(&file, &*f).context("saving the bookmarks")?;
+                    Vec::new()
+                }
+                (None, None) => marks.iter_named().map(|(l, _, _)| l).collect(),
+            };
+            for l in shown {
+                let (name, note) = (marks.name(l).unwrap_or_default(), marks.note(l).unwrap_or_default());
                 let text = f.line_text(l).unwrap_or_default();
                 if json {
                     let mut v = Value::new_object();
@@ -1979,13 +2041,16 @@ fn run() -> Result<()> {
                         .push("line", l + 1)
                         .push("name", name)
                         .push("note", note)
+                        .push("author", marks.author(l))
                         .push("unsure", marks.is_unsure(l))
                         .push("raw", text.into_owned());
                     writeln!(out, "{v}")?;
                     continue;
                 }
                 // Its anchor didn't find its line: it may be elsewhere.
-                let name = if marks.is_unsure(l) { format!("{name}?") } else { name.to_owned() };
+                let unsure = if marks.is_unsure(l) { "?" } else { "" };
+                let by = marks.author(l).map(|a| format!(" ({a})")).unwrap_or_default();
+                let name = format!("{name}{unsure}{by}");
                 if note.is_empty() {
                     writeln!(out, "{name} {}: {text}", l + 1)?;
                 } else {
@@ -2049,13 +2114,29 @@ Examples
 A file's fields: nerka help fields FILE. More: docs/user/queries.md.
 "#;
 
-/// `nerka help [TOPIC]`: the commands, a command, `nfd` or `fields FILE…`.
+/// `nerka help agent`: how an AI agent (or a person) analyses logs with
+/// nerka, in one read (`docs/dev/ai.md`, workflow A).
+const AGENT_GUIDE: &str = include_str!("agent_guide.md");
+
+/// `nerka help skill`: the guide as a skill file (`SKILL.md`) for AI
+/// clients that read skills.
+const SKILL_HEAD: &str = "---
+name: nerka
+description: Analyse logs and traces (text, JSON Lines, DLT, pcap, pcapng, MF4) with the nerka command line - what a file holds, filters, patterns, comparisons, lifecycles, checks - and leave the findings as bookmarks the user sees in nerka-gui. Use for root-cause analysis of a log or trace.
+---
+
+";
+
+/// `nerka help [TOPIC]`: the commands, a command, `nfd`, `agent`, `skill`
+/// or `fields FILE…`.
 fn help(topic: &[String], out: &mut impl Write) -> Result<()> {
     let mut cmd = Cli::command();
     // Subcommands' usage says `nerka filter`, not `filter`.
     cmd.build();
     match topic {
         [] => write!(out, "{}", cmd.render_long_help())?,
+        [t] if t.eq_ignore_ascii_case("agent") => write!(out, "{AGENT_GUIDE}")?,
+        [t] if t.eq_ignore_ascii_case("skill") => write!(out, "{SKILL_HEAD}{AGENT_GUIDE}")?,
         [t] if t.eq_ignore_ascii_case("nfd") => {
             writeln!(out, "NFD, the query language of nerka:\n")?;
             write!(out, "{}{NFD_EXAMPLES}", nerka_core::dsl::GRAMMAR)?;
@@ -2079,9 +2160,11 @@ fn help(topic: &[String], out: &mut impl Write) -> Result<()> {
         }
         [t] => match cmd.find_subcommand_mut(t) {
             Some(sub) => write!(out, "{}", sub.render_long_help())?,
-            None => anyhow::bail!("no help on '{t}': nfd, fields FILE, or a command (nerka help lists them)"),
+            None => {
+                anyhow::bail!("no help on '{t}': agent, skill, nfd, fields FILE, or a command (nerka help lists them)")
+            }
         },
-        _ => anyhow::bail!("help takes one topic: nfd, fields FILE…, or a command"),
+        _ => anyhow::bail!("help takes one topic: agent, skill, nfd, fields FILE…, or a command"),
     }
     Ok(())
 }
