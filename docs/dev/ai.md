@@ -1,9 +1,7 @@
-# AI preparation (design; not built)
+# AI preparation (design settled; not built)
 
-Status: **proposed**. The two workflows, hand-written JSON, bounded
-output, the terminal, what the AI may change and annotations are settled with the owner (2026-11-24, "Settled"
-below). The open questions are at the end. Don't build past workflow A
-before they are answered.
+Status: **settled** with the owner (2026-11-24, "Settled" below); not
+built. Next: step A1.
 
 ## What the owner asked for (2026-11-24)
 
@@ -108,7 +106,7 @@ Added for the AI, beyond R10:
 
 ### The bridge
 
-`nerka mcp` speaks MCP over **stdio** (newline-delimited JSON-RPC 2.0, logs
+`nerka mcp`, a subcommand of the CLI, speaks MCP over **stdio** (newline-delimited JSON-RPC 2.0, logs
 on stderr): `initialize`, `tools/list`, `tools/call`,
 `notifications/progress` (fed from the window's `Progress`),
 `notifications/cancelled` (mapped to `Progress::cancel`). No resources or
@@ -199,6 +197,16 @@ in `ui/src/main.rs` (6,218 non-test lines).
   and context by time with what 0.3.0-alpha.2 built (`before` / `after` /
   `around`, `filter --before / --after`); no line-count context.
 - **Exit status:** grep's 0 / 1 / 2 by default (A1).
+- **The bridge: stdio, in the CLI.** The AI client starts `nerka mcp`
+  (the same configuration for every window and machine); it reaches the
+  window through `instance.rs`'s loopback port and token. Not chosen: MCP
+  over HTTP served by the window (a port per window, an HTTP server in the
+  GUI, an Origin check and a token against other local processes and
+  browser pages), a bridge in `nerka-gui` (no console in a Windows release
+  build) or a binary of its own.
+- **No MCP without a window:** `nerka mcp` doesn't open files of its own;
+  with no window open, each tool says so. An AI without a window uses the
+  CLI (A). Headless MCP only if a client that can't run commands needs it.
 - **The terminal:** the user's own terminal, started from the window with
   the AI command chosen in Settings and `NERKA_WINDOW` set.
 - **What the AI may change:** directly, listed and undoable.
@@ -207,12 +215,3 @@ in `ui/src/main.rs` (6,218 non-test lines).
   stay readable; if the format can't be extended compatibly, a migration
   step in `bundle::STEPS` with a test on an old sample
   (`docs/dev/bundles.md`).
-
-## Questions for the owner
-
-- **Q6 — where the bridge lives.** `nerka mcp` in the CLI (proposed: one
-  binary the AI already uses for A), or in `nerka-gui`, or a binary of its
-  own?
-- **Q7 — MCP without a window.** Proposed: none, since A covers it. Or
-  should `nerka mcp` open files itself (headless MCP) for clients that
-  can't run commands?
