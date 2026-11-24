@@ -114,6 +114,10 @@ or the signals changed.
 - **▾ Filter** puts its query in the Filter box and runs it, **🔍**
   searches for its lines among the filtered ones, **📋** copies the
   query. Sort by most lines, rarest first, or first line.
+- **➕** (to the library) opens the Library's editor on a new query of its
+  lines in the pack `patterns` (made if there is none), each state
+  captured as an enum signal: `gear={D|P|N}` gives `@gear`. Nothing is
+  written until the editor's **Save**.
 
 **⚖ Compare** (in the same window) groups two sets of lines into patterns
 together and lists what differs: patterns and slot values **new in B**,

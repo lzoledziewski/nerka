@@ -257,7 +257,15 @@ rules (`PatternConfig::to_text`).
    (settings, rules, re-run, change since the last run, why apart).
 4. **α3, from the owner's use:** ➕ To library with state signals, pooling
    the header sample per context (rare contexts), `nerka anonymize` if real
-   traces are needed for tuning.
+   traces are needed for tuning. Built 2026-11-24: ➕ To library
+   (`Patterns::library_query`: the query with each state slot a named group,
+   `Pattern::state_names` from the word before it; the Library editor opens
+   on it in pack `patterns`, its groups as `enum` signals) and the pooled
+   header sample (`pool`: each chunk's contexts with fewer than `sample`
+   lines are sampled together over all chunks, with what other chunks knew
+   of their header, then grouped in a drain of their own; past 256 K such
+   lines, each chunk's alone as before; the demo drive, the 1 GiB DLT and
+   text files and LogHub group exactly as before, timings unchanged).
 
 ## Settled with the owner (2026-11-23)
 
@@ -299,3 +307,9 @@ change if it should be otherwise.
 12. "Why" explains stage 2 only, with every word weighing 1.
 13. The tuning pane shows in any version with a `-` (pre-releases) and is
     a Settings switch otherwise.
+14. ➕ To library writes into a pack named `patterns` (made in the pack
+    folder if missing), through the Library editor: the query is shown
+    there, not saved until its Save; its name is the pattern's first three
+    words.
+15. Pooling rare contexts holds at most 256 K lines; past that, each
+    chunk's rare contexts are grouped alone, as before.

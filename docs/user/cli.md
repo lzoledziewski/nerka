@@ -103,7 +103,8 @@ differ becoming slots; a message differing from a template in two words or
 more starts a template of its own. Words most messages share at the same
 place from their start or end whatever their length, a header or footer
 such as `LOG:` … `Elapsed[us]: 412; #3`, don't count as alike: two short
-messages between them are two patterns. Then templates are aligned atom by atom (words and
+messages between them are two patterns (a field's values with only a few
+lines here and there are sampled across the whole file for this). Then templates are aligned atom by atom (words and
 single characters), so a varying part can also sit inside a word
 (`gear=D`), come first (`{RUNNING|IDLE} state entered`) or have different
 lengths (`thermal throttling {engaged at <*> C|released}`, `job done

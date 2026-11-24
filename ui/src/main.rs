@@ -4473,6 +4473,28 @@ impl App {
         }
     }
 
+    /// A pattern into the library: the editor opens on a new query in pack
+    /// `patterns` (made in the pack folder if there is none), its states as
+    /// enum signals; nothing is written until its Save.
+    fn pattern_to_library(&mut self, q: &nerka_core::pattern::LibraryQuery) {
+        const PACK: &str = "patterns";
+        if !self.library.packs().iter().any(|p| p.name == PACK) {
+            let made = pack::default_dir()
+                .ok_or_else(|| "no pack folder".to_owned())
+                .and_then(|dir| pack::create_pack_file(&dir, PACK).map_err(|e| e.to_string()))
+                .and_then(|path| self.library.load(&path).map_err(|e| e.to_string()));
+            if let Err(e) = made {
+                self.status = format!("To the library: pack {PACK}: {e}");
+                return;
+            }
+        }
+        let enum_kind = nerka_core::SignalOptions { kind: Some(nerka_core::SignalKind::Enum), ..Default::default() };
+        let signals = q.states.iter().map(|s| (s.clone(), enum_kind.clone())).collect();
+        let note = "From a pattern: its lines, its states as signals.";
+        library::edit_new(&mut self.library_view, PACK, &q.name, &q.nfd, signals, note);
+        self.show_library = true;
+    }
+
     /// What tab `i`'s Patterns window asked for, done: the filter and the
     /// search run, to record in their histories.
     fn apply_patterns(
@@ -4486,6 +4508,9 @@ impl App {
         {
             self.active = j;
             self.tabs[j].goto_line(line);
+        }
+        if let Some(q) = out.to_library {
+            self.pattern_to_library(&q);
         }
         if out.filter.is_none() && out.search.is_none() {
             return (None, None);
@@ -6976,8 +7001,11 @@ gear=D
         let gear = ps.patterns.iter().find(|p| p.template() == "gear {D|P}").expect("gear");
         let q = ps.query(gear);
         app.active = 1;
-        let out =
-            patterns::Output { goto: Some((app.tabs[0].patterns.id(), 8)), filter: Some(q.clone()), search: None };
+        let out = patterns::Output {
+            goto: Some((app.tabs[0].patterns.id(), 8)),
+            filter: Some(q.clone()),
+            ..Default::default()
+        };
         let (filtered, searched) = app.apply_patterns(&ctx, 0, out);
         assert_eq!((filtered.as_deref(), searched), (Some(q.as_str()), None));
         assert_eq!(app.active, 0);

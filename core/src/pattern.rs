@@ -377,19 +377,76 @@ impl Pattern {
 
     /// A regex matching every message of the pattern, whole.
     pub fn regex(&self) -> String {
+        self.regex_named(&[])
+    }
+
+    /// [`Self::regex`], each state slot captured by the group of its name in
+    /// `states` (in order; past them, not captured).
+    fn regex_named(&self, states: &[String]) -> String {
         let mut re = String::from(r"^\s*");
+        let mut k = 0;
         for (i, p) in self.parts.iter().enumerate() {
             if i > 0 {
                 re.push_str(sep_regex(p.sep));
             }
             match &p.atom {
                 Atom::Lit(l) => text_regex(l, &mut re, self.loose),
+                Atom::Slot(s) if s.is_state() && k < states.len() => {
+                    re.push_str(&format!("(?<{}>", states[k]));
+                    s.regex(&mut re, self.loose);
+                    re.push(')');
+                    k += 1;
+                }
                 Atom::Slot(s) => s.regex(&mut re, self.loose),
             }
         }
         re.push_str(r"\s*$");
         re
     }
+
+    /// Names for its states, as signals: the word before each (`gear=` →
+    /// `gear`), else `state`; numbered where taken. Names are lower case
+    /// letters, digits and `_`.
+    pub fn state_names(&self) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        for (i, p) in self.parts.iter().enumerate() {
+            let Atom::Slot(s) = &p.atom else { continue };
+            if !s.is_state() {
+                continue;
+            }
+            let word = self.parts[..i].iter().rev().take(3).find_map(|q| match &q.atom {
+                Atom::Lit(l) if is_word(l) && l.chars().any(char::is_alphabetic) => Some(l.to_lowercase()),
+                _ => None,
+            });
+            let mut base: String = word
+                .unwrap_or_else(|| "state".into())
+                .chars()
+                .filter(|c| c.is_ascii_alphanumeric() || *c == '_')
+                .collect();
+            if !base.starts_with(|c: char| c.is_ascii_alphabetic()) {
+                base = format!("s_{base}");
+            }
+            let mut name = base.clone();
+            let mut n = 2;
+            while out.contains(&name) {
+                name = format!("{base}_{n}");
+                n += 1;
+            }
+            out.push(name);
+        }
+        out
+    }
+}
+
+/// A pattern as a library query ([`Patterns::library_query`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LibraryQuery {
+    /// Its name: its first words (`gear`, `session_to`).
+    pub name: String,
+    /// NFD finding its lines, each state captured by a named group.
+    pub nfd: String,
+    /// The groups: its states, as enum signals.
+    pub states: Vec<String>,
 }
 
 fn sep_regex(sep: Sep) -> &'static str {
@@ -474,8 +531,37 @@ impl Patterns {
         format!("{scope}: ignore /{}/", p.regex().replace('/', "\\/"))
     }
 
+    /// `p` as a library query: its query, with each state captured by a
+    /// group named for it, so the query makes enum signals of them
+    /// (`gear=(?<gear>(?:D|P|N))`: `@gear`).
+    pub fn library_query(&self, p: &Pattern) -> LibraryQuery {
+        let states = p.state_names();
+        let mut words = Vec::new();
+        for piece in p.pieces() {
+            if let Piece::Text(t) = piece {
+                for w in
+                    t.split(|c: char| !c.is_ascii_alphanumeric()).filter(|w| w.chars().any(|c| c.is_ascii_alphabetic()))
+                {
+                    if words.len() < 3 {
+                        words.push(w.to_lowercase());
+                    }
+                }
+            }
+        }
+        let mut name = words.join("_");
+        if !name.starts_with(|c: char| c.is_ascii_alphabetic()) {
+            name = format!("pattern_{name}").trim_end_matches('_').to_owned();
+        }
+        let nfd = self.query_with(p, &p.regex_named(&states));
+        LibraryQuery { name, nfd, states }
+    }
+
     /// NFD finding the lines of `p`, e.g. `apid == "NAV" AND payload ~ /^…$/`.
     pub fn query(&self, p: &Pattern) -> String {
+        self.query_with(p, &p.regex())
+    }
+
+    fn query_with(&self, p: &Pattern, re: &str) -> String {
         let mut q = String::new();
         for (name, value) in &p.fields {
             q.push_str(name);
@@ -490,8 +576,7 @@ impl Patterns {
         }
         q.push_str(self.field.as_deref().unwrap_or("raw"));
         q.push_str(" ~ /");
-        let re = p.regex().replace('/', r"\x2f");
-        q.push_str(&re);
+        q.push_str(&re.replace('/', r"\x2f"));
         q.push('/');
         q
     }
@@ -579,7 +664,7 @@ fn group(sets: &[Set], options: &PatternOptions, progress: &Progress) -> Result<
     // Stage 1: per chunk its templates, the lines `ignore` rules left out,
     // and with `options.lines` each line's template (an index into them;
     // `u32::MAX`: left out).
-    let parts: Vec<(Drain, Vec<u32>, u64)> = tasks
+    let parts: Vec<(Drain, Vec<u32>, u64, Rest)> = tasks
         .clone()
         .into_par_iter()
         .map(|(side, from, to)| {
@@ -630,7 +715,7 @@ fn group(sets: &[Set], options: &PatternOptions, progress: &Progress) -> Result<
                     ));
                     if s.n >= local.s.header_sample {
                         let s = samples.remove(&ctx).expect("sampled");
-                        flush(&mut d, ctx, s, local, side, from, &mut of_line);
+                        flush(&mut d, ctx, &s, local, side, from, &mut of_line);
                     }
                     continue;
                 }
@@ -639,18 +724,16 @@ fn group(sets: &[Set], options: &PatternOptions, progress: &Progress) -> Result<
                     of_line[i - from] = t as u32;
                 }
             }
-            // Contexts with fewer lines, in the order they began.
+            // Contexts with fewer lines here, in the order they began: pooled
+            // with the other chunks' (`pool`).
             let mut rest: Vec<(u64, Sample)> = samples.into_iter().collect();
             rest.sort_by_key(|(_, s)| s.held[0].0);
-            for (ctx, s) in rest {
-                let held = &s.held[0].3;
-                let local = locals.get(ctx, || held.iter().map(Option::as_deref).collect());
-                flush(&mut d, ctx, s, local, side, from, &mut of_line);
-            }
             progress.add((to - from) as u64);
-            Ok((d, of_line, ignored))
+            Ok((d, of_line, ignored, rest))
         })
         .collect::<Result<_>>()?;
+    let (mut parts, rests): (Vec<Chunk>, Vec<Rest>) = parts.into_iter().map(|(d, o, n, r)| ((d, o, n), r)).unzip();
+    let pooled = pool(&mut parts, rests, &tasks, config, &context, context.len());
     // A template's id: its index in its chunk plus the templates of the
     // chunks before.
     let mut offsets = Vec::with_capacity(parts.len());
@@ -672,6 +755,11 @@ fn group(sets: &[Set], options: &PatternOptions, progress: &Progress) -> Result<
             all.prenote(c, d.groups.get(&c.key).map_or(1, |g| g.clusters.len()));
         }
     }
+    if let Some((d, _)) = &pooled {
+        for c in &d.clusters {
+            all.prenote(c, d.groups.get(&c.key).map_or(1, |g| g.clusters.len()));
+        }
+    }
     let mut locals = Locals::new(config, &context);
     for (d, of_line, _) in parts {
         offsets.push(next);
@@ -686,6 +774,18 @@ fn group(sets: &[Set], options: &PatternOptions, progress: &Progress) -> Result<
         if progress.is_cancelled() {
             return Err(Error::Cancelled);
         }
+    }
+    // The pooled lines' templates, after the chunks'.
+    let mut pooled_lines = Vec::new();
+    if let Some((d, lines)) = pooled {
+        let n = d.clusters.len() as u32;
+        for (k, mut c) in d.clusters.into_iter().enumerate() {
+            c.ids = vec![next + k as u32];
+            let local = locals.get(c.ctx, || c.vals.iter().map(Val::bytes).collect());
+            all.add_cluster(c, local);
+        }
+        pooled_lines = lines.into_iter().map(|(task, i, t)| (task, i, next + t as u32)).collect();
+        next += n;
     }
     // The words stage 1 saw different messages share, per context.
     let mut shared: HashMap<Vec<Val>, Boiler> = HashMap::new();
@@ -801,6 +901,16 @@ fn group(sets: &[Set], options: &PatternOptions, progress: &Progress) -> Result<
                 patterns[pattern_of[(offset + t) as usize] as usize].lines[*side].push(line);
             }
         }
+        if !pooled_lines.is_empty() {
+            for &(task, i, id) in &pooled_lines {
+                let (side, from, _) = tasks[task];
+                let line = sets[side].lines.map_or((from + i) as LineNo, |l| l[from + i]);
+                patterns[pattern_of[id as usize] as usize].lines[side].push(line);
+            }
+            for p in &mut patterns {
+                p.lines.iter_mut().for_each(|l| l.sort_unstable());
+            }
+        }
     }
     let stats = PatternStats {
         templates,
@@ -844,18 +954,118 @@ impl<'c> Locals<'c> {
 /// A context's held lines into `d`, now its header and footer are known
 /// (`local`'s `header` words among them); each line's template into
 /// `of_line` (if kept: [`PatternOptions::lines`]).
-fn flush(d: &mut Drain, ctx: u64, s: Sample, local: &Local, side: usize, from: usize, of_line: &mut [u32]) {
-    let mut words = s.boilerplate(local);
-    words.extend(local.header.iter().cloned());
-    d.boiler.insert(ctx, words.into_iter().collect());
-    for (i, line, toks, vals) in &s.held {
-        let toks: Vec<Cow<str>> = toks.iter().map(|t| Cow::Borrowed(t.as_str())).collect();
-        let vals: Vec<Option<Cow<[u8]>>> = vals.iter().map(|v| v.as_deref().map(Cow::Borrowed)).collect();
-        let t = d.add_line(&toks, side, *line, &vals, ctx, local);
+fn flush(d: &mut Drain, ctx: u64, s: &Sample, local: &Local, side: usize, from: usize, of_line: &mut [u32]) {
+    let ts = flush_with(d, ctx, s, local, &[], &|_| side);
+    for ((i, ..), t) in s.held.iter().zip(ts) {
         if let Some(o) = of_line.get_mut(i - from) {
             *o = t as u32;
         }
     }
+}
+
+/// [`flush`]'s work: the header and footer words (`known`: more, from
+/// elsewhere) and the held lines into `d`, line `k` of set `side_of(k)`;
+/// returns each held line's template.
+fn flush_with(
+    d: &mut Drain,
+    ctx: u64,
+    s: &Sample,
+    local: &Local,
+    known: &[Box<str>],
+    side_of: &dyn Fn(usize) -> usize,
+) -> Vec<usize> {
+    let mut words = s.boilerplate(local);
+    words.extend(local.header.iter().cloned());
+    words.extend(known.iter().cloned());
+    d.boiler.insert(ctx, words.into_iter().collect());
+    let mut out = Vec::with_capacity(s.held.len());
+    for (k, (_, line, toks, vals)) in s.held.iter().enumerate() {
+        let toks: Vec<Cow<str>> = toks.iter().map(|t| Cow::Borrowed(t.as_str())).collect();
+        let vals: Vec<Option<Cow<[u8]>>> = vals.iter().map(|v| v.as_deref().map(Cow::Borrowed)).collect();
+        out.push(d.add_line(&toks, side_of(k), *line, &vals, ctx, local));
+    }
+    out
+}
+
+/// A chunk's stage 1: its templates, each line's template (`u32::MAX`:
+/// left out; none without [`PatternOptions::lines`]), the lines ignored.
+type Chunk = (Drain, Vec<u32>, u64);
+/// A chunk's contexts it saw too few lines of ([`pool`]).
+type Rest = Vec<(u64, Sample)>;
+/// The pooled lines' drain, and each line's (task, index in its chunk,
+/// template).
+type Pooled = (Drain, Vec<(usize, usize, usize)>);
+
+/// Lines held of a context, at most, pooled across chunks ([`pool`]); past
+/// that, each chunk's rare contexts go as they would alone.
+const POOL: usize = 256 * 1024;
+
+/// The contexts each chunk saw too few lines of to tell their header and
+/// footer (`rests`, per task), pooled: their counts summed, so a context
+/// with a few lines in every chunk is sampled on them all, then their
+/// lines grouped in a drain of their own (with what other chunks knew of
+/// the context's header). Returns that drain and each line's (task, index
+/// in its chunk, template); none if there were no such lines. Past
+/// [`POOL`] lines, each chunk's go into its own drain instead (rare
+/// contexts everywhere: holding them all would cost too much memory).
+fn pool(
+    parts: &mut [Chunk],
+    rests: Vec<Rest>,
+    tasks: &[(usize, usize, usize)],
+    config: &PatternConfig,
+    context: &[String],
+    fields: usize,
+) -> Option<Pooled> {
+    let held: usize = rests.iter().flatten().map(|(_, s)| s.held.len()).sum();
+    if held == 0 {
+        return None;
+    }
+    let mut locals = Locals::new(config, context);
+    if held > POOL {
+        for ((d, of_line, _), (rest, &(side, from, _))) in parts.iter_mut().zip(rests.into_iter().zip(tasks)) {
+            for (ctx, s) in rest {
+                let vals = &s.held[0].3;
+                let local = locals.get(ctx, || vals.iter().map(Option::as_deref).collect());
+                flush(d, ctx, &s, local, side, from, of_line);
+            }
+        }
+        return None;
+    }
+    // What the chunks knew of each context's header.
+    let mut known: HashMap<u64, Vec<Box<str>>> = HashMap::new();
+    for (d, _, _) in parts.iter() {
+        for (ctx, words) in &d.boiler {
+            let k = known.entry(*ctx).or_default();
+            k.extend(words.iter().filter(|w| !k.contains(w)).cloned().collect::<Vec<_>>());
+        }
+    }
+    // Per context, in the order first seen: its pooled sample, and each
+    // held line's task.
+    let mut order: Vec<u64> = Vec::new();
+    let mut by_ctx: HashMap<u64, (Sample, Vec<usize>)> = HashMap::new();
+    for (task, rest) in rests.into_iter().enumerate() {
+        for (ctx, s) in rest {
+            let (pooled, from) = by_ctx.entry(ctx).or_insert_with(|| {
+                order.push(ctx);
+                Default::default()
+            });
+            from.extend(std::iter::repeat_n(task, s.held.len()));
+            pooled.absorb(s);
+        }
+    }
+    let mut d = Drain::new(fields, MAX_TEMPLATES);
+    let mut lines = Vec::with_capacity(held);
+    for ctx in order {
+        let (s, from) = by_ctx.remove(&ctx).expect("seen");
+        let vals = &s.held[0].3;
+        let local = locals.get(ctx, || vals.iter().map(Option::as_deref).collect());
+        let empty = Vec::new();
+        let ts = flush_with(&mut d, ctx, &s, local, known.get(&ctx).unwrap_or(&empty), &|k| tasks[from[k]].0);
+        for (((i, ..), task), t) in s.held.iter().zip(&from).zip(ts) {
+            lines.push((*task, i - tasks[*task].1, t));
+        }
+    }
+    Some((d, lines))
 }
 
 /// Slots of more than `n` values (`state-values`): `<*>`, not a state;
@@ -923,6 +1133,23 @@ struct Sample {
 type Held = (usize, LineNo, Vec<String>, Vec<Option<Vec<u8>>>);
 
 impl Sample {
+    /// Add `other`'s counts and lines (another chunk's of the context).
+    fn absorb(&mut self, other: Sample) {
+        self.n += other.n;
+        for (w, c) in other.words {
+            *self.words.entry(w).or_default() += c;
+        }
+        for (k, (len, other_len)) in other.places {
+            match self.places.get_mut(&k) {
+                Some((first, seen)) => *seen |= other_len || *first != len,
+                None => {
+                    self.places.insert(k, (len, other_len));
+                }
+            }
+        }
+        self.held.extend(other.held);
+    }
+
     /// Count a message; `places`: from the start and the end, where a
     /// header or footer may be (`header places`).
     fn count(&mut self, toks: &[Cow<str>], places: usize) {
@@ -3062,6 +3289,59 @@ mod tests {
     }
 
     #[test]
+    fn a_pattern_as_a_library_query_captures_its_states() {
+        let f = states();
+        let ps = detect_with(&f, "");
+        let gear = ps.patterns.iter().find(|p| p.template() == "<*> NAV gear {D|P|N}").unwrap();
+        let q = ps.library_query(gear);
+        assert_eq!((q.name.as_str(), q.states.as_slice()), ("nav_gear", &["gear".to_owned()][..]));
+        assert_eq!(q.nfd, r"raw ~ /^\s*[\w.:\-]+\s+NAV\s+gear\s+(?<gear>(?:D|P|N))\s*$/");
+        // Its signal: the gear on each line.
+        let mut signals = crate::Signals::default();
+        signals.set(crate::SignalDef::parse_spec(&format!("gear(gear):enum={}", q.nfd)).unwrap());
+        let query = Query::compile_in("@gear == N", f.schema(), &signals).unwrap();
+        let res = search(&f, &Filter::Query(query), &Progress::new()).unwrap();
+        assert!(res.lines.contains(&6), "{:?}", res.lines);
+        // No state: no group; the name from the first words.
+        let user = ps.patterns.iter().find(|p| p.template() == "<*> user <*> logged in").unwrap();
+        let q = ps.library_query(user);
+        assert_eq!((q.name.as_str(), q.states.len()), ("user_logged_in", 0));
+        assert_eq!(q.nfd, ps.query(user));
+    }
+
+    /// A context with a few lines in each chunk (too few to tell its
+    /// header alone) is sampled on all its chunks' lines together.
+    #[test]
+    fn rare_contexts_are_sampled_across_chunks() {
+        let msgs =
+            ["LOG: pump on Elapsed[us]: 5; #1", "LOG: fan Elapsed[us]: 7; #2", "LOG: door open now Elapsed[us]: 9; #3"];
+        let config = PatternConfig::default();
+        let tasks: Vec<(usize, usize, usize)> = (0..4).map(|c| (0, c * 100, c * 100 + 100)).collect();
+        let mut parts: Vec<Chunk> = (0..4).map(|_| (Drain::new(0, MAX_PER_CHUNK), Vec::new(), 0)).collect();
+        let rests: Vec<Rest> = tasks
+            .iter()
+            .map(|&(_, from, _)| {
+                let mut s = Sample::default();
+                for (k, m) in msgs.iter().enumerate() {
+                    let toks: Vec<Cow<str>> = m.split_ascii_whitespace().map(mask).collect();
+                    s.count(&toks, 3);
+                    s.held.push((from + k, (from + k) as LineNo, toks.iter().map(|t| t.to_string()).collect(), vec![]));
+                }
+                vec![(7, s)]
+            })
+            .collect();
+        // Three lines a chunk: no header there.
+        assert!(rests[0][0].1.boilerplate(&config.local(&[], &[])).is_empty());
+        let (d, lines) = pool(&mut parts, rests, &tasks, &config, &[], 0).expect("pooled");
+        let mut boiler = d.boiler[&7].clone();
+        boiler.sort();
+        assert_eq!(boiler, ["Elapsed[us]:".into(), "LOG:".into()] as [Box<str>; 2]);
+        assert_eq!(lines.len(), 12);
+        assert_eq!(lines[3], (1, 0, lines[0].2), "chunk 1's first line: the same message as chunk 0's");
+        assert!(parts.iter().all(|(d, _, _)| d.clusters.is_empty()));
+    }
+
+    #[test]
     fn explain_says_why_apart() {
         let f = states();
         let ps = detect_with(&f, "");
@@ -3141,7 +3421,7 @@ mod tests {
         let toks: Vec<Cow<str>> = ["LOG:", "x"].map(Cow::Borrowed).to_vec();
         s.count(&toks, 3);
         s.held.push((0, 0, vec!["LOG:".into(), "x".into()], vec![]));
-        flush(&mut d, 7, s, &local, 0, 0, &mut []);
+        flush(&mut d, 7, &s, &local, 0, 0, &mut []);
         assert_eq!(d.boiler[&7], vec![Box::from("LOG:")]);
     }
 }

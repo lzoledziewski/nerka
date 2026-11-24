@@ -236,6 +236,8 @@ pub struct Output {
     pub filter: Option<String>,
     /// An NFD query for the Search box, to run.
     pub search: Option<String>,
+    /// A pattern for the library: a new query in the editor.
+    pub to_library: Option<pattern::LibraryQuery>,
 }
 
 impl PatternsUi {
@@ -644,6 +646,13 @@ impl PatternsUi {
                             .clicked()
                         {
                             out.search = Some(q.clone());
+                        }
+                        if ui
+                            .small_button("➕")
+                            .on_hover_text("To the library: a query of its lines, its states as enum signals")
+                            .clicked()
+                        {
+                            out.to_library = Some(ps.library_query(p));
                         }
                         if ui.small_button("▾ Filter").on_hover_text(format!("Filter to its lines:\n{q}")).clicked() {
                             out.filter = Some(q);
