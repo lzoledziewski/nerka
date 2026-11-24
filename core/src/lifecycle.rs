@@ -771,7 +771,9 @@ impl LifecycleDef {
         match q.as_ref().and_then(Rule::query) {
             Some(q) => {
                 let q = q.clone().bind(source.schema())?;
-                scan(source, &Filter::Query(q), progress)
+                // Windows (`before(30s, …)`) are found before the scan.
+                let f = if q.uses_windows() { Filter::Query(q).prepare(source, progress)? } else { Filter::Query(q) };
+                scan(source, &f, progress)
             }
             None => Ok(Vec::new()),
         }

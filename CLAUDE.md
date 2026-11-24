@@ -18,6 +18,7 @@ cargo deny check                             # dependency licences / advisories 
 cargo run -p nerka-cli -- filter 'level >= ERROR AND raw ~ /SSL/' app.log
 cargo run -p nerka-gui -- app.log --query 'level >= ERROR'
 cargo run -p nerka-cli -- --signal 'v=/v=(?<v>\d+)/' filter '@v > 100' app.log   # signals (@name)
+cargo run -p nerka-cli -- filter --before 30s --after 2s 'payload ~ /watchdog/' trace.dlt   # lines around a match by time (NFD: before(30s, …), after, around)
 cargo run -p nerka-cli -- --fibex ecu1.xml filter 'apid == NAV' trace.dlt        # DLT non-verbose via FIBEX
 cargo run -p nerka-cli -- --someip-port 30501 filter 'proto == SOMEIP AND type == ERROR' trace.pcap   # protocols by UDP port
 cargo run -p nerka-cli -- --protocol examples/protocols/dlt.ksy --protocol-port DLTK=3491 filter 'proto == DLTK AND apid == NAV' trace.pcap   # a protocol definition (.ksy, docs/dev/protocol-definitions.md)

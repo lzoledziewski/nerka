@@ -59,6 +59,7 @@ whose lines' times go backward.
 | `--stats` | timing on stderr |
 | `search -i`, `-F`, `-v` | ignore case, a literal pattern, the lines that don't match |
 | `search --in FILTER` | search only among the lines an NFD filter keeps |
+| `filter --before DUR`, `--after DUR` | also every line within that time before / after each match (`30s`, `500ms`, `2m`), the matches marked `>`, `--` between windows apart: what led to an error, for a person or an agent ([around a condition](queries.md#around-a-condition-by-time)) |
 
 Instead of a pattern, `search` and `expand` take **pack picks**, and
 `search` then prints which query matched each line:
@@ -76,6 +77,7 @@ Instead of a pattern, `search` and `expand` take **pack picks**, and
 ```
 nerka --pack examples/packs/ expand -l ota -p cam=CAM1 --parts
 nerka --pack examples/packs/ search --in 'level >= WARN' -l ota -p cam=CAM1 app.log
+nerka filter --before 30s --after 2s 'payload ~ /watchdog reset/' trace.dlt
 ```
 
 ## `check` and `lifecycles`

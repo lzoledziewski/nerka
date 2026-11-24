@@ -155,7 +155,7 @@ impl Filter {
     /// can't run on the lines of a [reordered](LogSource::reordered)
     /// source's inner one.
     pub fn uses_rows(&self) -> bool {
-        matches!(self, Filter::Query(q) if q.uses_bookmarks() || !q.signal_names().is_empty())
+        matches!(self, Filter::Query(q) if q.uses_bookmarks() || !q.signal_names().is_empty() || q.uses_windows())
     }
 
     /// Progress units [`Self::prepare`] has to do.
@@ -382,6 +382,64 @@ pub(crate) mod tests {
 
     fn regex_filter(pat: &str, opts: MatcherOptions) -> Filter {
         Filter::Regex(Matcher::new(pat, opts).unwrap())
+    }
+
+    /// Lines with times (seconds), for `before`, `after` and `around`.
+    struct Timed(Vec<(Option<f64>, &'static str)>);
+
+    impl LogSource for Timed {
+        fn name(&self) -> &str {
+            "timed"
+        }
+        fn line_count(&self) -> LineNo {
+            self.0.len() as LineNo
+        }
+        fn line_bytes(&self, line: LineNo) -> Option<std::borrow::Cow<'_, [u8]>> {
+            self.0.get(line as usize).map(|r| std::borrow::Cow::Borrowed(r.1.as_bytes()))
+        }
+        fn schema(&self) -> &[FieldDef] {
+            &[]
+        }
+        fn field(&self, _: LineNo, _: crate::FieldId) -> Option<crate::FieldValue<'_>> {
+            None
+        }
+        fn time(&self, line: LineNo) -> Option<f64> {
+            self.0.get(line as usize)?.0
+        }
+    }
+
+    /// The lines around a condition, by time: before it, after it, both;
+    /// windows that overlap merge; a line without a time is in none.
+    #[test]
+    fn lines_before_after_and_around_a_condition() {
+        let src = Timed(vec![
+            (Some(0.0), "boot"),
+            (Some(10.0), "speed 50"),
+            (Some(25.0), "speed 80"),
+            (Some(30.0), "crash: watchdog"),
+            (None, "  at frame 2"),
+            (Some(31.0), "restart"),
+            (Some(40.0), "speed 20"),
+            (Some(70.0), "crash: panic"),
+            (Some(100.0), "idle"),
+        ]);
+        let q = |s: &str| run_on(&src, &Filter::Query(Query::compile(s).unwrap_or_else(|e| panic!("{s}: {e}"))));
+        assert_eq!(q("before(10s, /crash/)"), [2, 3, 7]);
+        assert_eq!(q("before(10s, /crash/) AND NOT /crash/"), [2]);
+        assert_eq!(q("after(5s, /crash/)"), [3, 5, 7]);
+        assert_eq!(q("around(30s, 10s, /panic/)"), [6, 7]);
+        // Window edges count; two windows overlapping are one.
+        assert_eq!(q("around(20s, 1s, /crash/)"), [1, 2, 3, 5, 7]);
+        assert_eq!(q("around(40s, 1s, /crash/)"), [0, 1, 2, 3, 5, 6, 7]);
+        assert_eq!(q("before(1m, /panic/) AND /speed/"), [1, 2, 6]);
+        // Nested, and with the rest of the language.
+        assert_eq!(q("after(1s, before(5s, /crash: w/))"), [2, 3, 5]);
+        assert_eq!(q("before(0s, /nothing/)"), Vec::<LineNo>::new());
+        // A source without times: an error naming the window.
+        let plain = TextFile::from_bytes("t", b"a crash\nb\n".to_vec());
+        let f = Filter::Query(Query::compile("before(5s, /crash/)").unwrap());
+        let e = search(&plain, &f, &Progress::new()).unwrap_err().to_string();
+        assert!(e.contains("needs times") && e.contains("/crash/"), "{e}");
     }
 
     /// A filter as NFD keeps the same lines, whichever kind it is.

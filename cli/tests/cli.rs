@@ -93,6 +93,30 @@ fn filter_prints_numbered_lines_and_counts() {
     assert_eq!(out(&o), "2026-11-07 10:00:01 [WARN] disk 91% żółw\n", "non-ASCII text comes out as it is");
 }
 
+/// `--before` / `--after`: the lines around each match by time, the
+/// matches marked `>`, `--` between windows apart; a bad duration says so.
+#[test]
+fn filter_lines_around_a_match_by_time() {
+    let d = dir("around");
+    let f = log_file(&d);
+    let o = nerka(&["filter", "--before", "1s", "raw ~ /retry/", s(&f)]);
+    assert!(o.status.success(), "{}", err(&o));
+    assert_eq!(out(&o), " 3:2026-11-07 10:00:02 [ERROR] net down: timeout\n>4:2026-11-07 10:00:03 [INFO] retry\n");
+    let o = nerka(&["filter", "--after", "0s", "level >= ERROR", s(&f)]);
+    assert_eq!(
+        out(&o),
+        ">3:2026-11-07 10:00:02 [ERROR] net down: timeout\n--\n>5:2026-11-07 10:00:04 [ERROR] net down: timeout\n"
+    );
+    let o = nerka(&["filter", "-c", "--before", "2s", "--after", "1s", "raw ~ /retry/", s(&f)]);
+    assert_eq!(out(&o), "4\n");
+    let o = nerka(&["filter", "--before", "soon", "raw ~ /retry/", s(&f)]);
+    assert!(!o.status.success());
+    assert!(err(&o).contains("--before: 'soon' isn't a duration"), "{}", err(&o));
+    // The same in a query, anywhere a query goes.
+    let o = nerka(&["filter", "-c", "before(2s, /retry/) AND level >= ERROR", s(&f)]);
+    assert_eq!(out(&o), "1\n");
+}
+
 #[test]
 fn no_match_is_success_with_no_output() {
     // Today "no match" exits 0, unlike grep (finding R6); this pins it so a

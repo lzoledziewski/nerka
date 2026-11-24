@@ -96,6 +96,24 @@ unknown one is an error. `@time` is the line's time where the file knows it
 (DLT, captures): compare it with a quoted date-time, or a time of day
 (`"10:00:00"`).
 
+## Around a condition, by time
+
+```
+before(30s, payload ~ /crash/)              # up to 30 s before a crash line (and the line)
+after(2s, level >= ERROR)                   # up to 2 s after an error
+around(30s, 5s, {sys.fault}) AND ecu == ECU1
+before(1m, /watchdog/) AND NOT /watchdog/   # what led to it, without it
+```
+
+A line is kept when its time lies within the window before (`before`),
+after (`after`) or around (`around`, before then after) a line the inner
+query keeps; windows that overlap join. The inner query is any query,
+another window too, and runs once over the file before the search. A line
+without a time is in no window; on a file without times it's an error.
+Durations: `500ms`, `30s` (or `30`), `2m`, `1h`. On the command line,
+[`filter --before / --after`](cli.md#filter-and-search) print the same with
+the matches marked.
+
 ## How the boxes read what you type
 
 In the GUI's **Auto** mode (the default), you can type words, a query, or
