@@ -118,6 +118,29 @@ pub fn open_with(path: impl AsRef<Path>, options: &OpenOptions, progress: &Progr
     Ok(if offset != 0.0 { Box::new(timed::Timed::shifted(timed, offset)) } else { timed })
 }
 
+/// Text given as bytes (stdin: `nerka filter Q -`), read as [`open_with`]
+/// reads a text file: its profile (by `name` and the first bytes), its
+/// records and its time. Only text: DLT and captures need a file.
+pub fn open_text_bytes(
+    name: &str,
+    bytes: Vec<u8>,
+    options: &OpenOptions,
+    progress: &Progress,
+) -> Result<Box<dyn LogSource>> {
+    let path = Path::new(name);
+    let head = &bytes[..bytes.len().min(64 * 1024)];
+    if dlt::is_dlt(head) || capture::is_capture(head) {
+        return Err(crate::Error::Format(format!("{name}: DLT and captures are read from a file, not from stdin")));
+    }
+    let (profile, why) = options.profiles.choose(options.profile_for(path), path, head);
+    let split = records::RecordSplit::choose(options.records_for(path).or(profile.records()), head);
+    let text: Box<dyn LogSource> = match split {
+        records::RecordSplit::Lines => Box::new(text::TextFile::from_bytes(name, bytes)),
+        split => Box::new(records::RecordFile::from_bytes(name, bytes, split)),
+    };
+    Ok(Box::new(timed::Timed::text(text, &profile, why, options.offset_for(path), progress)?))
+}
+
 /// A [`LogSource::data_id`] no other source has had in this process.
 pub(crate) fn new_data_id() -> usize {
     static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(1);

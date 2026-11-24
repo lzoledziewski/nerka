@@ -5,6 +5,9 @@
 //! nerka search -i 'error|timeout' app.log
 //! nerka filter 'level >= ERROR AND raw ~ /SSL|CERT/' app.log
 //! nerka lines  app.log 1000 1050
+//! nerka filter --json -m 20 'level >= ERROR' app.log   (JSON Lines, at most 20)
+//! nerka open --json trace.dlt                       (what a file is: fields, time, levels)
+//! nerka help nfd                                    (the query language)
 //! nerka marks  app.log
 //! nerka packs                                       (list loaded query packs)
 //! nerka expand -q vision.frame_drops -p cam=CAM1    (pack picks -> plain NFD)
@@ -19,8 +22,10 @@
 //! ```
 
 use anyhow::{Context, Result};
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
+use nerka_core::agent;
 use nerka_core::bundle::{Bundle, Choice, Item, Kind, Status, Store};
+use nerka_core::json::{Value, string as js};
 use nerka_core::pack::{self, Expansion, Library, ParamValue, Pick, Role, Selection};
 use nerka_core::pattern::{self, PatternConfig, PatternOptions};
 use nerka_core::{
@@ -35,7 +40,9 @@ use std::time::Instant;
 #[command(
     name = "nerka",
     version,
-    about = "Fast log analysis: filter, search, signals, lifecycles and checks over text, JSON, DLT and captures"
+    about = "Fast log analysis: filter, search, signals, lifecycles and checks over text, JSON, DLT and captures",
+    after_help = "Exit status: 0 lines found (or done), 1 no line found (filter, search), an issue                   (--strict) or an invalid item (import), 2 an error.",
+    disable_help_subcommand = true
 )]
 struct Cli {
     /// Load query packs from a .nerka-pack file or a directory of them
@@ -143,6 +150,17 @@ enum Cmd {
     Open {
         #[arg(required = true, value_name = "FILE")]
         files: Vec<PathBuf>,
+        /// Print one JSON object: files, format, size, lines, index,
+        /// columns, fields (name, kind, costly), protocols, first and last
+        /// time, lines per level, how each file was read, notes.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Help: the commands, `help COMMAND`, `help nfd` (the query language)
+    /// or `help fields FILE…` (the fields queries can use on those files).
+    Help {
+        #[arg(value_name = "TOPIC")]
+        topic: Vec<String>,
     },
     /// Print lines matching a regex (like grep -n). With --in, search only
     /// the lines of a filter. With pack picks (-q, -l, -x, -X) instead of a
@@ -215,6 +233,10 @@ enum Cmd {
         /// line numbers.
         #[arg(short = 'l', long, value_name = "N")]
         lines: Option<usize>,
+        /// Print one JSON object: `total`, `patterns` (each with what the
+        /// options above add) and `more`.
+        #[arg(long)]
+        json: bool,
         /// Print timing to stderr.
         #[arg(long)]
         stats: bool,
@@ -273,6 +295,9 @@ enum Cmd {
         /// Also print each pattern's NFD query.
         #[arg(long)]
         queries: bool,
+        /// Print one JSON object: `a`, `b`, `differences` and `more`.
+        #[arg(long)]
+        json: bool,
         /// Print timing to stderr.
         #[arg(long)]
         stats: bool,
@@ -288,7 +313,13 @@ enum Cmd {
     /// List the loaded packs and their queries.
     Packs,
     /// List bookmarks saved for a file (by the UI).
-    Marks { file: PathBuf },
+    Marks {
+        file: PathBuf,
+        /// Print JSON Lines: line, name, note, unsure (its anchor didn't
+        /// find its line), raw.
+        #[arg(long)]
+        json: bool,
+    },
     /// Print a 1-based inclusive range of lines.
     Lines {
         file: PathBuf,
@@ -296,6 +327,8 @@ enum Cmd {
         from: u64,
         /// The last line (included).
         to: u64,
+        #[command(flatten)]
+        json: JsonArgs,
     },
     /// Run the checks (`--check`) on a file: issues and facts, overall and
     /// per lifecycle (`per`).
@@ -439,12 +472,34 @@ impl PatternArgs {
     }
 }
 
+/// `--json` for commands that print lines.
+#[derive(clap::Args)]
+struct JsonArgs {
+    /// Print JSON Lines: an object per line, `{"file", "line", "time",
+    /// "level", "raw"}` (time in UTC, RFC 3339; null where none).
+    #[arg(long)]
+    json: bool,
+    /// With --json: also these fields, typed, as `"fields": {…}`
+    /// (comma-separated; `nerka help fields FILE` lists them).
+    #[arg(long, value_delimiter = ',', value_name = "FIELD,…", requires = "json")]
+    fields: Vec<String>,
+}
+
 #[derive(clap::Args)]
 struct OutputArgs {
     /// Only print the number of matching lines (and, for pack picks, the
-    /// hits per query).
+    /// hits per query); -m and --skip don't change it.
     #[arg(short = 'c', long)]
     count: bool,
+    /// Print at most N lines; how many more there are goes to stderr
+    /// (with --json: a last `{"more": N, "skip": K}` line).
+    #[arg(short = 'm', long = "max-count", value_name = "N")]
+    max: Option<u64>,
+    /// Leave out the first N lines (with -m: the next page).
+    #[arg(long, value_name = "N", default_value_t = 0)]
+    skip: u64,
+    #[command(flatten)]
+    json: JsonArgs,
     /// Do not prefix lines with their number.
     #[arg(short = 'N', long)]
     no_line_numbers: bool,
@@ -608,7 +663,7 @@ fn import(file: &Path, dry_run: bool, conflicts: Conflicts, out: &mut impl Write
     }
     if plan.invalid() > 0 {
         out.flush()?;
-        anyhow::bail!("{} invalid item(s) not imported", plan.invalid());
+        return Err(status1(format!("{} invalid item(s) not imported", plan.invalid())));
     }
     Ok(())
 }
@@ -664,50 +719,133 @@ fn locator(f: &dyn LogSource) -> impl Fn(LineNo) -> (usize, LineNo) + '_ {
     }
 }
 
-/// A printed line's prefix: `LINE:`, or `FILE:LINE:` for a view of several
-/// files (the line its file's own, as grep prints them); `-N` drops the line.
-fn write_prefix(
-    out: &mut impl Write,
-    o: &OutputArgs,
-    view: &Opened,
-    at: &impl Fn(LineNo) -> (usize, LineNo),
-    row: LineNo,
-) -> std::io::Result<()> {
-    if view.paths.len() > 1 {
-        let (k, line) = at(row);
-        write!(out, "{}:", view.paths[k].display())?;
-        if !o.no_line_numbers {
-            write!(out, "{}:", line + 1)?;
+/// Lines as `filter`, `search` print them: `-m` and `--skip` applied, as
+/// text (`LINE:` or `FILE:LINE:` prefixes, as grep prints them) or JSON
+/// Lines ([`agent::line`]).
+struct Printer<'a> {
+    o: &'a OutputArgs,
+    view: &'a Opened,
+    at: Box<dyn Fn(LineNo) -> (usize, LineNo) + 'a>,
+    names: Vec<String>,
+    fields: agent::Fields,
+    /// Lines offered so far, printed or not.
+    seen: u64,
+    printed: u64,
+    /// The last line printed (for `--` between windows apart).
+    last: Option<LineNo>,
+}
+
+impl<'a> Printer<'a> {
+    fn new(o: &'a OutputArgs, view: &'a Opened) -> Result<Self> {
+        let f = &*view.source;
+        let fields = agent::Fields::parse(&o.json.fields, f).map_err(|e| anyhow::anyhow!("--fields: {e}"))?;
+        let names = view.paths.iter().map(|p| p.display().to_string()).collect();
+        Ok(Printer { o, view, at: Box::new(locator(f)), names, fields, seen: 0, printed: 0, last: None })
+    }
+
+    /// Print `row` if it is past `--skip` and within `-m`. `mark`: whether
+    /// it is a match (`filter --before / --after`); `queries`: the pack
+    /// queries that matched it.
+    fn line(&mut self, out: &mut impl Write, row: LineNo, mark: Option<bool>, queries: &[&str]) -> Result<()> {
+        let i = self.seen;
+        self.seen += 1;
+        if i < self.o.skip || self.o.max.is_some_and(|m| self.printed >= m) {
+            return Ok(());
         }
-    } else if !o.no_line_numbers {
-        write!(out, "{}:", row + 1)?;
+        self.printed += 1;
+        let f = &*self.view.source;
+        let (k, line) = (self.at)(row);
+        if self.o.json.json {
+            let mut v = agent::line(f, row, &self.names[k], line, &self.fields);
+            if let Some(m) = mark {
+                v.push("match", m);
+            }
+            if !queries.is_empty() {
+                v.push("queries", queries.iter().map(|q| Value::from(*q)).collect::<Vec<_>>());
+            }
+            writeln!(out, "{v}")?;
+        } else {
+            if let Some(m) = mark {
+                if self.last.is_some_and(|p| row > p + 1) {
+                    out.write_all(b"--\n")?;
+                }
+                out.write_all(if m { b">" } else { b" " })?;
+            }
+            if self.view.paths.len() > 1 {
+                write!(out, "{}:", self.names[k])?;
+                if !self.o.no_line_numbers {
+                    write!(out, "{}:", line + 1)?;
+                }
+            } else if !self.o.no_line_numbers {
+                write!(out, "{}:", row + 1)?;
+            }
+            if !queries.is_empty() {
+                write!(out, "[{}] ", queries.join(","))?;
+            }
+            out.write_all(&f.line_bytes(row).unwrap_or_default())?;
+            out.write_all(b"\n")?;
+        }
+        self.last = Some(row);
+        Ok(())
+    }
+
+    /// How many lines `-m` left out: `{"more": N, "skip": K}` last in
+    /// JSON, a note on stderr in text.
+    fn finish(&self, out: &mut impl Write) -> Result<()> {
+        let next = self.o.skip + self.printed;
+        let more = self.seen.saturating_sub(next);
+        if more > 0 {
+            if self.o.json.json {
+                writeln!(out, "{}", Value::object([("more", Value::from(more)), ("skip", next.into())]))?;
+            } else {
+                out.flush()?;
+                eprintln!("nerka: {more} more line{}: --skip {next} for the next", if more == 1 { "" } else { "s" });
+            }
+        }
+        Ok(())
+    }
+}
+
+/// `-c`: the count, as text or `{"count": N}` (pack picks: and per query).
+fn write_count(out: &mut impl Write, o: &OutputArgs, n: u64, per_query: &[(&str, u64)]) -> Result<()> {
+    if o.json.json {
+        let mut v = Value::object([("count", Value::from(n))]);
+        if !per_query.is_empty() {
+            v.push("queries", Value::object(per_query.iter().map(|&(q, n)| (q, Value::from(n)))));
+        }
+        writeln!(out, "{v}")?;
+    } else {
+        writeln!(out, "{n}")?;
+        for (q, n) in per_query {
+            writeln!(out, "{q}\t{n}")?;
+        }
     }
     Ok(())
 }
 
 /// `build` gets the opened source (its fields, its time), so query errors about
-/// unknown fields point into the query like syntax errors do.
+/// unknown fields point into the query like syntax errors do. Returns the
+/// number of matches.
 fn run_filter(
     files: &[PathBuf],
     build: impl FnOnce(&dyn LogSource) -> Result<Filter>,
     o: &OutputArgs,
     out: &mut impl Write,
-) -> Result<()> {
+) -> Result<u64> {
     let view = open(files)?;
     let (f, t_index) = (&*view.source, view.took);
     let filter = with_marks(build(f)?, &view)?;
-    let at = locator(f);
+    let mut p = Printer::new(o, &view)?;
     let t = Instant::now();
     let res = search(f, &filter, &Progress::new())?;
     let t_search = t.elapsed();
     if o.count {
-        writeln!(out, "{}", res.lines.len())?;
+        write_count(out, o, res.lines.len() as u64, &[])?;
     } else {
         for &l in &res.lines {
-            write_prefix(out, o, &view, &at, l)?;
-            out.write_all(&f.line_bytes(l).unwrap_or_default())?;
-            out.write_all(b"\n")?;
+            p.line(out, l, None, &[])?;
         }
+        p.finish(out)?;
     }
     if o.stats {
         out.flush()?;
@@ -718,12 +856,13 @@ fn run_filter(
             mib_per_s(f.size_bytes(), t_search)
         );
     }
-    Ok(())
+    Ok(res.lines.len() as u64)
 }
 
 /// `filter --before / --after`: every line within `before` before or
 /// `after` after a match, by time (`around(…)`), the matches marked `>`
-/// and `--` between windows apart, as grep's context.
+/// and `--` between windows apart, as grep's context. Returns the number
+/// of matches (not of the lines around them).
 fn run_window(
     files: &[PathBuf],
     query: &str,
@@ -731,31 +870,24 @@ fn run_window(
     after: &str,
     o: &OutputArgs,
     out: &mut impl Write,
-) -> Result<()> {
+) -> Result<u64> {
     let view = open(files)?;
     let (f, t_index) = (&*view.source, view.took);
     // The query alone first: its errors point into it as typed.
     let matches = with_marks(Filter::Query(compile(query, f)?), &view)?;
     let around = with_marks(Filter::Query(compile(&format!("around({before}, {after}, {query})"), f)?), &view)?;
-    let at = locator(f);
+    let mut p = Printer::new(o, &view)?;
     let t = Instant::now();
     let hits = search(f, &matches, &Progress::new())?;
     let res = search(f, &around, &Progress::new())?;
     let t_search = t.elapsed();
     if o.count {
-        writeln!(out, "{}", res.lines.len())?;
+        write_count(out, o, res.lines.len() as u64, &[])?;
     } else {
-        let mut last: Option<LineNo> = None;
         for &l in &res.lines {
-            if last.is_some_and(|p| l > p + 1) {
-                out.write_all(b"--\n")?;
-            }
-            last = Some(l);
-            out.write_all(if hits.lines.binary_search(&l).is_ok() { b">" } else { b" " })?;
-            write_prefix(out, o, &view, &at, l)?;
-            out.write_all(&f.line_bytes(l).unwrap_or_default())?;
-            out.write_all(b"\n")?;
+            p.line(out, l, Some(hits.lines.binary_search(&l).is_ok()), &[])?;
         }
+        p.finish(out)?;
     }
     if o.stats {
         out.flush()?;
@@ -766,11 +898,12 @@ fn run_window(
             f.line_count()
         );
     }
-    Ok(())
+    Ok(hits.lines.len() as u64)
 }
 
 /// Search inside the lines of `within` (every line without it). `names`
 /// are the include queries' names, printed per hit; empty for a pattern.
+/// Returns the number of hits.
 fn run_search_within(
     files: &[PathBuf],
     within: Option<&str>,
@@ -778,7 +911,7 @@ fn run_search_within(
     names: &[String],
     o: &OutputArgs,
     out: &mut impl Write,
-) -> Result<()> {
+) -> Result<u64> {
     let view = open(files)?;
     let (f, t_index) = (&*view.source, view.took);
     let filter = within.map(|q| compile(q, f).and_then(|q| with_marks(Filter::Query(q), &view))).transpose()?;
@@ -786,7 +919,7 @@ fn run_search_within(
         include: set.include.into_iter().map(|q| with_marks(q, &view)).collect::<Result<_>>()?,
         exclude: set.exclude.into_iter().map(|q| with_marks(q, &view)).collect::<Result<_>>()?,
     };
-    let at = locator(f);
+    let mut p = Printer::new(o, &view)?;
     let t = Instant::now();
     let lines = match filter {
         Some(q) => Some(search(f, &q, &Progress::new())?.lines),
@@ -797,22 +930,20 @@ fn run_search_within(
     let hits = search_within(f, lines.as_deref(), &set, &Progress::new())?;
     let t_search = t.elapsed();
     if o.count {
-        writeln!(out, "{}", hits.len())?;
-        if !names.is_empty() {
-            for (name, n) in names.iter().zip(hits.counts(names.len())) {
-                writeln!(out, "{name}\t{n}")?;
-            }
-        }
+        // A pattern has no queries to count by.
+        let per: Vec<(&str, u64)> = if names.is_empty() {
+            Vec::new()
+        } else {
+            names.iter().zip(hits.counts(names.len())).map(|(q, n)| (q.as_str(), n as u64)).collect()
+        };
+        write_count(out, o, hits.len() as u64, &per)?;
     } else {
         for (i, &l) in hits.lines.iter().enumerate() {
-            write_prefix(out, o, &view, &at, l)?;
-            if !names.is_empty() {
-                let ids: Vec<&str> = hits.matched(i).map(|q| names[q].as_str()).collect();
-                write!(out, "[{}] ", ids.join(","))?;
-            }
-            out.write_all(&f.line_bytes(l).unwrap_or_default())?;
-            out.write_all(b"\n")?;
+            let ids: Vec<&str> =
+                if names.is_empty() { Vec::new() } else { hits.matched(i).map(|q| names[q].as_str()).collect() };
+            p.line(out, l, None, &ids)?;
         }
+        p.finish(out)?;
     }
     if o.stats {
         out.flush()?;
@@ -823,7 +954,7 @@ fn run_search_within(
             f.line_count()
         );
     }
-    Ok(())
+    Ok(hits.len() as u64)
 }
 
 /// Print the lifecycles of `file` (all definitions, or the one named);
@@ -1084,25 +1215,6 @@ fn checks(
 /// The `--check` specs, set once in `main`.
 static CHECKS: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
 
-/// A JSON string.
-fn js(s: &str) -> String {
-    let mut o = String::with_capacity(s.len() + 2);
-    o.push('"');
-    for c in s.chars() {
-        match c {
-            '"' => o.push_str("\\\""),
-            '\\' => o.push_str("\\\\"),
-            '\n' => o.push_str("\\n"),
-            '\r' => o.push_str("\\r"),
-            '\t' => o.push_str("\\t"),
-            c if (c as u32) < 0x20 => o.push_str(&format!("\\u{:04x}", c as u32)),
-            c => o.push(c),
-        }
-    }
-    o.push('"');
-    o
-}
-
 /// The `--signal` definitions, set once in `main`.
 static SIGNALS: std::sync::OnceLock<Signals> = std::sync::OnceLock::new();
 
@@ -1185,6 +1297,7 @@ fn compare(
     min_score: f64,
     top: usize,
     queries: bool,
+    json: bool,
     stats: bool,
     out: &mut impl Write,
 ) -> Result<()> {
@@ -1220,9 +1333,65 @@ fn compare(
             None => file,
         }
     };
+    let shown = if top == 0 { diffs.len() } else { top.min(diffs.len()) };
+    if json {
+        let side_json = |side: usize| {
+            let v = view(side);
+            Value::object([
+                ("file", Value::from(v.paths.first().map(|p| p.display().to_string()))),
+                ("filter", filters[side].clone().into()),
+                ("lines", ps.lines[side].into()),
+            ])
+        };
+        let mut list = Vec::new();
+        for d in &diffs[..shown] {
+            let p = &ps.patterns[d.pattern];
+            let side = match d.change() {
+                pattern::Change::New => 1,
+                pattern::Change::Gone => 0,
+                pattern::Change::Changed => usize::from(d.ratio() >= 1.0),
+            };
+            let change = match d.change() {
+                pattern::Change::New => "new",
+                pattern::Change::Gone => "gone",
+                pattern::Change::Changed => "changed",
+            };
+            let mut v = Value::new_object();
+            v.push("change", change).push("score", d.score).push("a", d.counts[0]).push("b", d.counts[1]);
+            if change == "changed" {
+                v.push("ratio", d.ratio());
+            }
+            let sides = match d.value {
+                None => &p.sides,
+                Some((s, k)) => &p.slots().nth(s).expect("a slot").values[k].sides,
+            };
+            let at = place_json(view(side), sides[side].first);
+            v.push("first", at.clone()).push("side", ["a", "b"][side]);
+            v.push("fields", Value::object(p.fields.iter().map(|(n, x)| (n.to_string(), Value::from(x.to_string())))));
+            v.push("template", p.template());
+            if let Some((s, k)) = d.value {
+                v.push("slot", s + 1).push("value", p.slots().nth(s).expect("a slot").values[k].value().to_string());
+            }
+            if queries {
+                v.push("query", ps.query(p));
+            }
+            list.push(v);
+        }
+        let mut v = Value::object([("a", side_json(0)), ("b", side_json(1))]);
+        v.push("min_score", min_score).push("differences", Value::Array(list)).push("more", diffs.len() - shown);
+        writeln!(out, "{v}")?;
+        if stats {
+            out.flush()?;
+            eprintln!(
+                "{} patterns, {} differences | grouped and compared in {took:.2?}",
+                ps.patterns.len(),
+                diffs.len()
+            );
+        }
+        return Ok(());
+    }
     writeln!(out, "A: {} ({} lines)", name(0), ps.lines[0])?;
     writeln!(out, "B: {} ({} lines)", name(1), ps.lines[1])?;
-    let shown = if top == 0 { diffs.len() } else { top.min(diffs.len()) };
     let mut section = None;
     for d in &diffs[..shown] {
         if section != Some(d.change()) {
@@ -1280,6 +1449,13 @@ fn compare(
     Ok(())
 }
 
+/// Where a line of a view is, as JSON: `{"file", "line"}` (from 1, in
+/// its own file).
+fn place_json(view: &Opened, row: LineNo) -> Value {
+    let (k, line) = locator(&*view.source)(row);
+    Value::object([("file", Value::from(view.paths[k].display().to_string())), ("line", (line + 1).into())])
+}
+
 /// One file, or several as one view (review 2026-11-09, R6: the console
 /// opened one file): one after another in the order given, or merged by
 /// time with `--merge`; files of kinds that don't go together are refused.
@@ -1304,6 +1480,16 @@ fn open_silent(paths: &[PathBuf]) -> Result<Opened> {
     }
     let options = &options;
     let progress = Progress::new();
+    // `-`: text from stdin.
+    if paths.iter().any(|p| p == Path::new("-")) {
+        if paths.len() > 1 {
+            anyhow::bail!("- (stdin) is read alone, not in a view with other files");
+        }
+        let mut bytes = Vec::new();
+        std::io::Read::read_to_end(&mut std::io::stdin(), &mut bytes).context("reading stdin")?;
+        let source = nerka_core::open_text_bytes("-", bytes, options, &progress)?;
+        return Ok(Opened { source, took: t.elapsed(), paths: paths.to_vec() });
+    }
     let (source, paths) = match paths {
         [one] => (
             nerka_core::open_with(one, options, &progress).with_context(|| format!("opening {}", one.display()))?,
@@ -1383,6 +1569,25 @@ fn mib_per_s(bytes: u64, d: std::time::Duration) -> f64 {
     bytes as f64 / 1024.0 / 1024.0 / d.as_secs_f64().max(1e-9)
 }
 
+/// Exit status 1 (grep's "nothing found", owner 2026-11-24): no line
+/// found, an issue with `--strict`, an invalid item on import; the message
+/// (if any) goes to stderr. Every other error exits 2.
+#[derive(Debug)]
+struct Status1(String);
+
+impl std::fmt::Display for Status1 {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for Status1 {}
+
+/// Exit with status 1 and `msg` on stderr (empty: nothing said).
+fn status1(msg: impl Into<String>) -> anyhow::Error {
+    Status1(msg.into()).into()
+}
+
 fn main() -> std::process::ExitCode {
     match run() {
         Ok(()) => std::process::ExitCode::SUCCESS,
@@ -1390,9 +1595,16 @@ fn main() -> std::process::ExitCode {
         Err(e) if e.downcast_ref::<std::io::Error>().is_some_and(|e| e.kind() == std::io::ErrorKind::BrokenPipe) => {
             std::process::ExitCode::SUCCESS
         }
+        Err(e) if e.downcast_ref::<Status1>().is_some() => {
+            let msg = e.to_string();
+            if !msg.is_empty() {
+                eprintln!("nerka: {msg}");
+            }
+            std::process::ExitCode::from(1)
+        }
         Err(e) => {
             eprintln!("nerka: {e:#}");
-            std::process::ExitCode::FAILURE
+            std::process::ExitCode::from(2)
         }
     }
 }
@@ -1455,8 +1667,17 @@ fn run() -> Result<()> {
     let stdout = std::io::stdout().lock();
     let mut out = BufWriter::with_capacity(1 << 16, stdout);
 
+    // Filter and search: whether a line was found (exit status 1 if not).
+    let mut found = true;
     match cli.cmd {
-        Cmd::Open { files } => {
+        Cmd::Help { topic } => help(&topic, &mut out)?,
+        Cmd::Open { files, json: true } => {
+            let view = open_silent(&files)?;
+            let names: Vec<String> = view.paths.iter().map(|p| p.display().to_string()).collect();
+            let v = agent::summary(&*view.source, &names, view.took.as_secs_f64(), &Progress::new())?;
+            writeln!(out, "{v}")?;
+        }
+        Cmd::Open { files, json: false } => {
             let view = open_silent(&files)?;
             let (f, took) = (&*view.source, view.took);
             let info = f.info();
@@ -1511,10 +1732,10 @@ fn run() -> Result<()> {
                 (Some(pattern), true) => {
                     let m = Matcher::new(&pattern, options)?;
                     match within {
-                        None => run_filter(&files, |_| Ok(Filter::Regex(m)), &o, &mut out)?,
+                        None => found = run_filter(&files, |_| Ok(Filter::Regex(m)), &o, &mut out)? > 0,
                         Some(w) => {
                             let set = SearchSet { include: vec![Filter::Regex(m)], exclude: vec![] };
-                            run_search_within(&files, Some(&w), set, &[], &o, &mut out)?;
+                            found = run_search_within(&files, Some(&w), set, &[], &o, &mut out)? > 0;
                         }
                     }
                 }
@@ -1524,13 +1745,13 @@ fn run() -> Result<()> {
                     }
                     let e = picks.expand(&library(&cli.pack)?)?;
                     let names: Vec<String> = e.parts_with(Role::Include).map(|p| p.query.clone()).collect();
-                    run_search_within(&files, within.as_deref(), e.search_set()?, &names, &o, &mut out)?;
+                    found = run_search_within(&files, within.as_deref(), e.search_set()?, &names, &o, &mut out)? > 0;
                 }
             }
         }
         Cmd::Filter { query, files, before, after, out: o } => {
             if before.is_none() && after.is_none() {
-                run_filter(&files, |source| Ok(Filter::Query(compile(&query, source)?)), &o, &mut out)?;
+                found = run_filter(&files, |source| Ok(Filter::Query(compile(&query, source)?)), &o, &mut out)? > 0;
             } else {
                 let dur = |d: &Option<String>, what: &str| -> Result<String> {
                     match d {
@@ -1540,10 +1761,10 @@ fn run() -> Result<()> {
                     }
                 };
                 let (b, a) = (dur(&before, "before")?, dur(&after, "after")?);
-                run_window(&files, &query, &b, &a, &o, &mut out)?;
+                found = run_window(&files, &query, &b, &a, &o, &mut out)? > 0;
             }
         }
-        Cmd::Patterns { files, within, engine, top, rare, values, queries, lines: show, stats } => {
+        Cmd::Patterns { files, within, engine, top, rare, values, queries, lines: show, json, stats } => {
             let options = engine.options(show.is_some())?;
             let view = open(&files)?;
             let f = &*view.source;
@@ -1559,6 +1780,58 @@ fn run() -> Result<()> {
             }
             let at = locator(f);
             let shown = if top == 0 { ps.patterns.len() } else { top.min(ps.patterns.len()) };
+            if json {
+                let names: Vec<String> = view.paths.iter().map(|p| p.display().to_string()).collect();
+                let none = agent::Fields::default();
+                let mut list = Vec::new();
+                for p in &ps.patterns[..shown] {
+                    let mut v = Value::new_object();
+                    v.push("count", p.count())
+                        .push("share", p.count() as f64 / ps.total().max(1) as f64)
+                        .push("first", place_json(&view, p.first()))
+                        .push(
+                            "fields",
+                            Value::object(p.fields.iter().map(|(n, x)| (n.to_string(), Value::from(x.to_string())))),
+                        )
+                        .push("template", p.template())
+                        .push("unsorted", p.unsorted);
+                    if values {
+                        let slots = p.slots().enumerate().map(|(k, s)| {
+                            let vals = s.values.iter().map(|x| {
+                                Value::object([
+                                    ("value", Value::from(x.value().to_string())),
+                                    ("count", x.count().into()),
+                                    ("first", place_json(&view, x.first())),
+                                    ("last", place_json(&view, x.last())),
+                                ])
+                            });
+                            Value::object([
+                                ("slot", Value::from(k + 1)),
+                                ("kind", (if s.is_state() { "state" } else { "values" }).into()),
+                                ("overflow", s.overflow.into()),
+                                ("values", Value::Array(vals.collect())),
+                            ])
+                        });
+                        v.push("slots", Value::Array(slots.collect()));
+                    }
+                    if queries {
+                        v.push("query", ps.query(p));
+                    }
+                    if let Some(n) = show {
+                        let n = if n == 0 { usize::MAX } else { n };
+                        let lines = p.lines[0].iter().take(n).map(|&l| {
+                            let (k, line) = at(l);
+                            agent::line(f, l, &names[k], line, &none)
+                        });
+                        v.push("lines", Value::Array(lines.collect()));
+                        v.push("lines_more", p.lines[0].len().saturating_sub(n));
+                    }
+                    list.push(v);
+                }
+                let mut v = Value::object([("total", Value::from(ps.total()))]);
+                v.push("patterns", Value::Array(list)).push("more", ps.patterns.len() - shown);
+                writeln!(out, "{v}")?;
+            }
             let place = |l: LineNo| {
                 if view.paths.len() > 1 {
                     let (k, l) = at(l);
@@ -1567,7 +1840,7 @@ fn run() -> Result<()> {
                     (l + 1).to_string()
                 }
             };
-            for p in &ps.patterns[..shown] {
+            for p in ps.patterns[..shown].iter().filter(|_| !json) {
                 let first = place(p.first());
                 let share = 100.0 * p.count() as f64 / ps.total().max(1) as f64;
                 write!(out, "{:>9} {share:>5.1}%  {first:>7}  ", p.count())?;
@@ -1605,7 +1878,7 @@ fn run() -> Result<()> {
                     }
                 }
             }
-            if shown < ps.patterns.len() {
+            if shown < ps.patterns.len() && !json {
                 writeln!(out, "… {} more (-n 0: all)", ps.patterns.len() - shown)?;
             }
             if stats {
@@ -1646,8 +1919,8 @@ fn run() -> Result<()> {
             let key = if seed.is_none() { "; keyed at random: the words can't be mapped back" } else { "" };
             eprintln!("nerka: {n} lines anonymized into {} ({what}){key}", output.display());
         }
-        Cmd::Compare { files, a, b, within, engine, min_score, top, queries, stats } => {
-            compare(&files, [a, b], within, engine.options(false)?, min_score, top, queries, stats, &mut out)?;
+        Cmd::Compare { files, a, b, within, engine, min_score, top, queries, json, stats } => {
+            compare(&files, [a, b], within, engine.options(false)?, min_score, top, queries, json, stats, &mut out)?;
         }
         Cmd::Expand { picks, parts } => {
             if picks.is_empty() {
@@ -1695,11 +1968,22 @@ fn run() -> Result<()> {
         }
         Cmd::Export { output, only } => export(output.as_deref(), &only, &mut out)?,
         Cmd::Import { file, dry_run, conflicts } => import(&file, dry_run, conflicts, &mut out)?,
-        Cmd::Marks { file } => {
+        Cmd::Marks { file, json } => {
             let f = open(std::slice::from_ref(&file))?.source;
             let marks = Bookmarks::load_for(&file, &*f)?;
             for (l, name, note) in marks.iter_named() {
                 let text = f.line_text(l).unwrap_or_default();
+                if json {
+                    let mut v = Value::new_object();
+                    v.push("file", file.display().to_string())
+                        .push("line", l + 1)
+                        .push("name", name)
+                        .push("note", note)
+                        .push("unsure", marks.is_unsure(l))
+                        .push("raw", text.into_owned());
+                    writeln!(out, "{v}")?;
+                    continue;
+                }
                 // Its anchor didn't find its line: it may be elsewhere.
                 let name = if marks.is_unsure(l) { format!("{name}?") } else { name.to_owned() };
                 if note.is_empty() {
@@ -1713,28 +1997,91 @@ fn run() -> Result<()> {
             let issues = checks(&files, name.as_deref(), json, evidence, &cli.pack, &mut out)?;
             if strict && issues > 0 {
                 out.flush()?;
-                anyhow::bail!("{issues} issue{} found", if issues == 1 { "" } else { "s" });
+                return Err(status1(format!("{issues} issue{} found", if issues == 1 { "" } else { "s" })));
             }
         }
         Cmd::Lifecycles { files, name, json, strict, count } => {
             let found = lifecycles(&files, name.as_deref(), count.as_deref(), json, &mut out)?;
             if strict && found > 0 {
                 out.flush()?;
-                anyhow::bail!("{found} finding{}", if found == 1 { "" } else { "s" });
+                return Err(status1(format!("{found} finding{}", if found == 1 { "" } else { "s" })));
             }
         }
-        Cmd::Lines { file, from, to } => {
+        Cmd::Lines { file, from, to, json } => {
             if from > to {
                 anyhow::bail!("lines {from} to {to}: the first line is after the last");
             }
             let f = open(std::slice::from_ref(&file))?.source;
+            let fields = agent::Fields::parse(&json.fields, &*f).map_err(|e| anyhow::anyhow!("--fields: {e}"))?;
+            let name = file.display().to_string();
             let last = to.min(f.line_count());
             for l in from.max(1)..=last {
-                out.write_all(&f.line_bytes(l - 1).unwrap_or_default())?;
-                out.write_all(b"\n")?;
+                if json.json {
+                    writeln!(out, "{}", agent::line(&*f, l - 1, &name, l - 1, &fields))?;
+                } else {
+                    out.write_all(&f.line_bytes(l - 1).unwrap_or_default())?;
+                    out.write_all(b"\n")?;
+                }
             }
         }
     }
     out.flush()?;
+    if !found {
+        return Err(status1(""));
+    }
+    Ok(())
+}
+
+/// Examples of NFD per kind of file, after the grammar (`nerka help nfd`).
+const NFD_EXAMPLES: &str = r#"
+Examples
+  text      level >= ERROR AND raw ~ /timeout|refused/i
+            "disk full" OR /out of memory/        (a string or a regex alone: raw)
+  JSON      level >= WARN AND user == "bob"       (a record's keys are fields)
+  DLT       apid == NAV AND ctid == MAIN AND level >= WARN
+            ecu == ECU1 AND payload ~ /gps (lost|weak)/
+  captures  proto == SOMEIP AND type == ERROR     (--someip-port PORT)
+  signals   @speed > 100                          (--signal 'speed=/speed=(?<speed>\d+)/')
+  time      @time >= "2026-11-07 10:00:01"
+  windows   before(30s, level >= ERROR)           around(10s, 2s, /crash/)
+  marks     bookmark OR level >= ERROR            (the file's .nerka-marks)
+
+A file's fields: nerka help fields FILE. More: docs/user/queries.md.
+"#;
+
+/// `nerka help [TOPIC]`: the commands, a command, `nfd` or `fields FILE…`.
+fn help(topic: &[String], out: &mut impl Write) -> Result<()> {
+    let mut cmd = Cli::command();
+    // Subcommands' usage says `nerka filter`, not `filter`.
+    cmd.build();
+    match topic {
+        [] => write!(out, "{}", cmd.render_long_help())?,
+        [t] if t.eq_ignore_ascii_case("nfd") => {
+            writeln!(out, "NFD, the query language of nerka:\n")?;
+            write!(out, "{}{NFD_EXAMPLES}", nerka_core::dsl::GRAMMAR)?;
+        }
+        [t, files @ ..] if t.eq_ignore_ascii_case("fields") => {
+            if files.is_empty() {
+                anyhow::bail!("help fields FILE…: give the files");
+            }
+            let paths: Vec<PathBuf> = files.iter().map(PathBuf::from).collect();
+            let f = open(&paths)?.source;
+            writeln!(out, "field\tkind\tcostly")?;
+            writeln!(out, "raw\ttext\tno\t(the line as shown)")?;
+            writeln!(out, "level\tlevel\tno\t(TRACE DEBUG INFO NOTICE WARN ERROR FATAL)")?;
+            for d in f.schema() {
+                let costly = if d.costly { "yes" } else { "no" };
+                writeln!(out, "{}\t{}\t{costly}", d.name, agent::kind_name(d.kind))?;
+            }
+            if f.has_time() {
+                writeln!(out, "@time\ttime\tno\t(a signal: the line's time)")?;
+            }
+        }
+        [t] => match cmd.find_subcommand_mut(t) {
+            Some(sub) => write!(out, "{}", sub.render_long_help())?,
+            None => anyhow::bail!("no help on '{t}': nfd, fields FILE, or a command (nerka help lists them)"),
+        },
+        _ => anyhow::bail!("help takes one topic: nfd, fields FILE…, or a command"),
+    }
     Ok(())
 }

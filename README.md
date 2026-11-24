@@ -146,6 +146,7 @@ The same engine on the command line:
 nerka filter 'level >= ERROR AND raw ~ /SSL|CERT/' app.log
 nerka search -i 'timeout|refused' app.log
 nerka open trace.pcap        # what's in the file: lines, fields, protocols
+nerka filter --json -m 50 'level >= ERROR' trace.dlt   # for scripts and agents: JSON Lines, in pages
 ```
 
 The [user guide](https://lzoledziewski.github.io/nerka/) has the rest,

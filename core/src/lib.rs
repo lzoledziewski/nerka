@@ -33,6 +33,7 @@
 //! * [`bundle`] — settings bundles: export, import and upgrades of the
 //!   analysis setup (packs, presets, plots, checks, signals).
 
+pub mod agent;
 pub mod anonymize;
 pub mod atomic;
 pub mod background;
@@ -44,6 +45,7 @@ pub mod engine;
 pub mod event;
 pub mod history;
 pub mod input;
+pub mod json;
 pub mod lifecycle;
 pub mod pack;
 pub mod pattern;
@@ -66,7 +68,9 @@ pub use input::dlt::DltFile;
 pub use input::dlt::fibex::{ArgType, Argument, Fibex, FibexError};
 pub use input::merged::sort_by_time;
 pub use input::text::TextFile;
-pub use input::{Anchor, ColumnDef, LogSource, OpenOptions, SourceInfo, open, open_with, query_warnings};
+pub use input::{
+    Anchor, ColumnDef, LogSource, OpenOptions, SourceInfo, open, open_text_bytes, open_with, query_warnings,
+};
 pub use pack::{Library, Pack, PackError, PackQuery};
 pub use session::{QueryContext, Session};
 pub use signal::{

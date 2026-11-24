@@ -118,13 +118,119 @@ fn filter_lines_around_a_match_by_time() {
 }
 
 #[test]
-fn no_match_is_success_with_no_output() {
-    // Today "no match" exits 0, unlike grep (finding R6); this pins it so a
-    // change is deliberate.
+fn no_match_exits_1_with_no_output() {
+    // grep's exit status (owner, 2026-11-24, docs/dev/ai.md): 1 when no line
+    // is found, nothing said; `-c` still prints its 0.
     let d = dir("nomatch");
-    let o = nerka(&["filter", "raw ~ /nothing here/", s(&log_file(&d))]);
+    let f = log_file(&d);
+    let o = nerka(&["filter", "raw ~ /nothing here/", s(&f)]);
+    assert_eq!(o.status.code(), Some(1));
+    assert_eq!((out(&o).as_str(), err(&o).as_str()), ("", ""));
+    let o = nerka(&["search", "-c", "nothing here", s(&f)]);
+    assert_eq!((o.status.code(), out(&o).as_str()), (Some(1), "0\n"));
+    let o = nerka(&["filter", "--before", "1s", "raw ~ /nothing/", s(&f)]);
+    assert_eq!(o.status.code(), Some(1));
+    let o = nerka(&["filter", "level >= ERROR", s(&f)]);
     assert_eq!(o.status.code(), Some(0));
-    assert_eq!(out(&o), "");
+}
+
+/// Each line of `o`'s stdout as JSON.
+fn json_lines(o: &Output) -> Vec<nerka_core::json::Value> {
+    out(o).lines().map(|l| nerka_core::json::parse(l).unwrap_or_else(|e| panic!("{e}: {l}"))).collect()
+}
+
+#[test]
+fn json_for_scripts_and_agents() {
+    // Workflow A of docs/dev/ai.md: structured output, bounded.
+    use nerka_core::json::Value;
+    let d = dir("json");
+    let f = log_file(&d);
+    let get = |v: &Value, k: &str| v.get(k).cloned().unwrap_or(Value::Null);
+    // A line: file, line from 1, time in UTC (RFC 3339), level, raw.
+    let o = nerka(&["filter", "--json", "level >= ERROR", s(&f)]);
+    let lines = json_lines(&o);
+    assert_eq!(lines.len(), 2, "{}", out(&o));
+    assert_eq!(get(&lines[0], "line"), Value::UInt(3));
+    assert_eq!(get(&lines[0], "file"), Value::from(s(&f)));
+    assert_eq!(get(&lines[0], "time"), Value::from("2026-11-07T10:00:02.000000Z"));
+    assert_eq!(get(&lines[0], "level"), Value::from("ERROR"));
+    assert_eq!(get(&lines[0], "raw"), Value::from("2026-11-07 10:00:02 [ERROR] net down: timeout"));
+    // -m and --skip page; what's left is said: last in JSON, on stderr in text.
+    let o = nerka(&["filter", "--json", "-m", "2", "--skip", "1", "level >= INFO", s(&f)]);
+    let lines = json_lines(&o);
+    let at: Vec<Value> = lines[..2].iter().map(|v| get(v, "line")).collect();
+    assert_eq!(at, [Value::UInt(2), Value::UInt(3)]);
+    assert_eq!(lines[2].to_string(), r#"{"more":2,"skip":3}"#);
+    let o = nerka(&["search", "-m", "1", "net down", s(&f)]);
+    assert_eq!(out(&o), "3:2026-11-07 10:00:02 [ERROR] net down: timeout\n");
+    assert_eq!(err(&o), "nerka: 1 more line: --skip 1 for the next\n");
+    // -c counts every match, whatever -m says.
+    let o = nerka(&["filter", "--json", "-c", "-m", "1", "level >= INFO", s(&f)]);
+    assert_eq!(out(&o), "{\"count\":5}\n");
+    // Context by time: matches marked.
+    let o = nerka(&["filter", "--json", "--before", "1s", "raw ~ /retry/", s(&f)]);
+    let marks: Vec<Value> = json_lines(&o).iter().map(|v| get(v, "match")).collect();
+    assert_eq!(marks, [Value::Bool(false), Value::Bool(true)]);
+    // Typed fields of a DLT file; an unknown one is an error listing them.
+    let dlt = dlt_file(&d);
+    let o = nerka(&["filter", "--json", "--fields", "apid,mcnt", "apid == COM", s(&dlt)]);
+    let lines = json_lines(&o);
+    assert_eq!(lines.len(), 3, "{}", err(&o));
+    assert_eq!(get(&lines[0], "fields").to_string(), r#"{"apid":"COM","mcnt":2}"#);
+    let o = nerka(&["filter", "--json", "--fields", "nope", "apid == COM", s(&dlt)]);
+    assert_eq!(o.status.code(), Some(2));
+    assert!(err(&o).contains("no field 'nope' (fields: "), "{}", err(&o));
+    // open --json: what the file is.
+    let o = nerka(&["open", "--json", s(&dlt)]);
+    let v = &json_lines(&o)[0];
+    assert_eq!(get(v, "lines"), Value::UInt(6));
+    assert_eq!(get(&get(v, "levels"), "ERROR"), Value::UInt(2));
+    assert!(get(v, "fields").as_array().unwrap().iter().any(|f| get(f, "name") == Value::from("apid")));
+    assert!(get(&get(v, "time"), "first").as_str().unwrap().ends_with('Z'), "{v}");
+    // lines and marks.
+    let o = nerka(&["lines", "--json", s(&f), "4", "4"]);
+    assert_eq!(get(&json_lines(&o)[0], "raw"), Value::from("2026-11-07 10:00:03 [INFO] retry"));
+    std::fs::write(format!("{}.nerka-marks", s(&f)), "3\tthe first one\n").unwrap();
+    let o = nerka(&["marks", "--json", s(&f)]);
+    let m = &json_lines(&o)[0];
+    assert_eq!((get(m, "line"), get(m, "note")), (Value::UInt(3), Value::from("the first one")), "{}", out(&o));
+    // patterns and compare: one object each.
+    let o = nerka(&["patterns", "--json", "--pattern-config", "-", "--values", s(&f)]);
+    let v = &json_lines(&o)[0];
+    assert_eq!(get(v, "total"), Value::UInt(5), "{v}");
+    assert!(!get(v, "patterns").as_array().unwrap().is_empty());
+    let o =
+        nerka(&["compare", "--json", "--pattern-config", "-", "--a", "level == INFO", "--b", "level >= WARN", s(&f)]);
+    let v = &json_lines(&o)[0];
+    assert_eq!(get(&get(v, "b"), "lines"), Value::UInt(3), "{v}");
+    assert!(get(v, "differences").as_array().is_some());
+}
+
+#[test]
+fn text_from_stdin() {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_nerka"))
+        .args(["filter", "-c", "level >= ERROR", "-"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    use std::io::Write;
+    child.stdin.take().unwrap().write_all(LOG.as_bytes()).unwrap();
+    let o = child.wait_with_output().unwrap();
+    assert_eq!((o.status.code(), out(&o).as_str()), (Some(0), "2\n"));
+}
+
+#[test]
+fn help_on_nfd_and_fields() {
+    let o = nerka(&["help", "nfd"]);
+    assert!(out(&o).contains(nerka_core::dsl::GRAMMAR) && out(&o).contains("Examples"), "{}", out(&o));
+    let d = dir("help");
+    let o = nerka(&["help", "fields", s(&dlt_file(&d))]);
+    assert!(out(&o).contains("\napid\ttext\tno\n") && out(&o).contains("payload\ttext\tyes"), "{}", out(&o));
+    let o = nerka(&["help", "filter"]);
+    assert!(out(&o).contains("Usage: nerka filter"), "{}", out(&o));
+    let o = nerka(&["help", "nope"]);
+    assert_eq!(o.status.code(), Some(2));
 }
 
 #[test]
@@ -156,7 +262,7 @@ fn query_errors_point_at_the_column_in_characters() {
     let d = dir("errcol");
     let q = r#"raw ~ "żółw" AND lvl >= ERROR"#;
     let o = nerka(&["filter", q, s(&log_file(&d))]);
-    assert_eq!(o.status.code(), Some(1));
+    assert_eq!(o.status.code(), Some(2));
     let e = err(&o);
     assert!(e.contains("unknown field 'lvl'") && e.contains("(at column 18)"), "{e}");
     let caret = e.lines().last().unwrap();
@@ -164,15 +270,15 @@ fn query_errors_point_at_the_column_in_characters() {
 }
 
 #[test]
-fn errors_exit_1_with_a_reason() {
+fn errors_exit_2_with_a_reason() {
     let d = dir("errors");
     let f = log_file(&d);
     let o = nerka(&["search", "(", s(&f)]);
-    assert_eq!(o.status.code(), Some(1));
+    assert_eq!(o.status.code(), Some(2));
     assert!(err(&o).contains("unclosed group"), "{}", err(&o));
     let missing = d.join("missing.log");
     let o = nerka(&["filter", "level >= ERROR", s(&missing)]);
-    assert_eq!(o.status.code(), Some(1));
+    assert_eq!(o.status.code(), Some(2));
     assert!(err(&o).contains("opening") && err(&o).contains("missing.log"), "{}", err(&o));
     // Bad usage is clap's: exit 2.
     let o = nerka(&["filter"]);
@@ -295,17 +401,17 @@ fn a_protocol_definition_reads_a_capture() {
     let o = nerka(&[&def[..], &["--disable-protocol", "DLTK", "filter", "-c", "level >= WARN", s(&pcap)]].concat());
     assert_eq!(out(&o), "0\n", "{}", err(&o));
     // A rule for a name no protocol has, a bad rule, a broken definition:
-    // exit 1 with why.
+    // exit 2 with why.
     let o = nerka(&["--protocol", s(&ksy), "--protocol-port", "OTHER=1", "open", s(&pcap)]);
-    assert_eq!(o.status.code(), Some(1));
+    assert_eq!(o.status.code(), Some(2));
     assert!(err(&o).contains("no protocol is named OTHER"), "{}", err(&o));
     let o = nerka(&["--route", "DLT:port=1,vlan=9999", "open", s(&pcap)]);
-    assert_eq!(o.status.code(), Some(1));
+    assert_eq!(o.status.code(), Some(2));
     assert!(err(&o).contains("--route DLT:port=1,vlan=9999: VLAN id 9999 isn't 1 to 4094"), "{}", err(&o));
     let broken = d.join("broken.ksy");
     std::fs::write(&broken, "meta: { id: x }\nseq:\n  - { id: a, type: u3 }\n").unwrap();
     let o = nerka(&["--protocol", s(&broken), "open", s(&pcap)]);
-    assert_eq!(o.status.code(), Some(1));
+    assert_eq!(o.status.code(), Some(2));
     assert!(err(&o).contains("broken.ksy: line 3, column 5: there is no type `u3` here"), "{}", err(&o));
 }
 
@@ -399,7 +505,7 @@ fn import_says_what_it_cant_read() {
     assert!(std::fs::read_to_string(home.join("nerka/checks")).unwrap().contains("ok: lines /x/; exists"));
     std::fs::write(&bad, "pack vision\n").unwrap();
     let o = nerka_at(&home, &["import", s(&bad)]);
-    assert_eq!(o.status.code(), Some(1));
+    assert_eq!(o.status.code(), Some(2));
     assert!(err(&o).contains("bad.nerka-bundle:1:1: not a nerka bundle"), "{}", err(&o));
     let o = nerka_at(&home, &["export", "--only", "prefs"]);
     assert!(
@@ -480,12 +586,12 @@ fn several_files_are_one_view() {
     let plain = d.join("plain.log");
     std::fs::write(&plain, "boot ok\nWARN disk\n").unwrap();
     let o = nerka(&["filter", "level >= WARN", s(&plain), a]);
-    assert_eq!(o.status.code(), Some(1));
+    assert_eq!(o.status.code(), Some(2));
     assert!(err(&o).contains("plain.log has no time, so it can't share a view with"), "{}", err(&o));
     let json = d.join("j.json");
     std::fs::write(&json, "{\"level\": \"warn\"}\n").unwrap();
     let o = nerka(&["filter", "level >= WARN", s(&plain), s(&json)]);
-    assert_eq!(o.status.code(), Some(1));
+    assert_eq!(o.status.code(), Some(2));
     assert!(err(&o).contains("only files of one kind open as one view"), "{}", err(&o));
 }
 
@@ -530,7 +636,7 @@ fn text_with_times_merges_with_dlt() {
     assert!(out(&o).contains("time:        trace.dlt: the file's own, moved -1h"), "{}", out(&o));
     // A profile without a time, forced: the text can't join the DLT.
     let o = nerka(&["--profile", "plain: time none", "--profile", "plain", "filter", "x", s(&log), s(&dlt)]);
-    assert_eq!(o.status.code(), Some(1));
+    assert_eq!(o.status.code(), Some(2));
     assert!(err(&o).contains("app.log has no time"), "{}", err(&o));
     // A profile chosen by its rules, with a signal of its own.
     let o = nerka(&[

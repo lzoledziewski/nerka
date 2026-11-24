@@ -1,0 +1,21 @@
+expr    := or
+or      := and ( ("OR" | "||") and )*
+and     := unary ( ("AND" | "&&") unary )*
+unary   := ("NOT" | "!") unary | primary
+primary := "(" expr ")"
+         | REGEX                      -- shorthand for  raw ~ REGEX
+         | STRING                     -- shorthand for  raw contains STRING
+         | FIELD OP VALUE
+         | SIGNAL OP VALUE
+         | "bookmark" [ OP VALUE ]    -- the line's bookmark
+         | WINDOW "(" DUR "," [ DUR "," ] expr ")"
+WINDOW  := before | after | around    -- around takes two DURs
+DUR     := NUMBER [ ms | s | m | h ]  -- default seconds
+FIELD   := raw | level | WORD         -- WORD: a field the source supplies
+SIGNAL  := "@" NAME [ "." VIEW ]      -- a signal the tab defines
+VIEW    := state | event | changed    -- default state; event and
+                                         changed may stand alone
+OP      := == | != | >= | <= | > | < | ~ | !~
+VALUE   := REGEX | STRING | WORD      -- numbers are WORDs: 42, 0x2a
+REGEX   := /pattern/flags             -- flags: i (ignore case)
+STRING  := "text"                     -- \" and \\ escapes

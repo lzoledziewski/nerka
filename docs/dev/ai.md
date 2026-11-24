@@ -1,7 +1,9 @@
-# AI preparation (design settled; not built)
+# AI preparation (design settled; A1 built)
 
-Status: **settled** with the owner (2026-11-24, "Settled" below); not
-built. Next: step A1.
+Status: **settled** with the owner (2026-11-24, "Settled" below). Built:
+step A1 (2026-11-24, branch `claude/ai-prep`: `core/src/json.rs`,
+`core/src/agent.rs`, the CLI; user guide `docs/user/cli.md#for-scripts-and-agents`).
+Next: step A2.
 
 ## What the owner asked for (2026-11-24)
 

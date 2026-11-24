@@ -11,12 +11,16 @@ nerka [OPTIONS] <COMMAND>
 
 `nerka help <command>` (or `nerka <command> --help`) lists every option.
 Options for opening files (below) go before or after the command.
+`nerka help nfd` prints the [query language](queries.md)'s grammar with
+examples; `nerka help fields FILE…` the fields queries can use on those
+files.
 
 ## Commands
 
 | Command | Does |
 |---|---|
 | `open FILE…` | index the file(s) and print lines, size, throughput, fields, protocols and what was skipped |
+| `help [TOPIC]` | the commands, a command's options, `nfd` (the query language) or `fields FILE…` |
 | `filter QUERY FILE…` | print the lines an [NFD query](queries.md) keeps |
 | `search PATTERN FILE…` | print the lines a regex matches, like `grep -n` |
 | `lines FILE FROM TO` | print a range of lines (1-based, inclusive) |
@@ -38,13 +42,59 @@ nerka search -i 'timeout|refused' app.log
 nerka search --in 'level >= WARN' -c timeout app.log     # only among a filter's lines
 nerka open trace.pcap
 nerka lines app.log 100 120
+cat app.log | nerka filter 'level >= WARN' -     # text from stdin
 ```
+
+A file named `-` is text read from stdin (DLT and captures need a file).
 
 ## Output
 
 Lines print with their number (`1234:…`); `-N` leaves it out. With several
 files, each line prints as `FILE:LINE:` with the file's own line number.
 `-c` prints only the count. `--stats` prints timing to stderr.
+
+### For scripts and agents
+
+`--json` prints JSON instead, one compact object per line (JSON Lines) for
+commands that print lines, and one object for the others:
+
+| Command | `--json` prints |
+|---|---|
+| `filter`, `search`, `lines` | a line each: `{"file", "line", "time", "level", "raw"}`; `filter --before / --after` adds `"match"` (false: a line around a match), pack picks add `"queries"` |
+| `filter -c`, `search -c` | `{"count": N}` (pack picks: and `"queries": {"pack.q": N}`) |
+| `open` | the files, format, size, lines, index, columns, fields (`name`, `kind`, `costly`), protocols, first and last time, lines per level, how each file was read, notes |
+| `marks` | a bookmark each: `{"file", "line", "name", "note", "unsure", "raw"}` |
+| `patterns` | `{"total", "patterns": […], "more"}`, each pattern with what `--values`, `--queries`, `--lines` add |
+| `compare` | `{"a", "b", "min_score", "differences": […], "more"}` |
+| `check`, `lifecycles` | [their results](checks.md) |
+
+- `line` counts from 1, in the line's own file; `time` is UTC in RFC 3339
+  (`2026-11-07T10:00:02.000000Z`) whatever `--local-time` says, a time of
+  day as `10:00:02.000000`; `time` and `level` are `null` on a line
+  without one.
+- `--fields apid,ctid` adds `"fields": {"apid": "NAV", "ctid": "MAIN"}`,
+  typed (text as strings, numbers as numbers); an unknown field is an
+  error listing the file's fields.
+
+Big results come in pages:
+
+| Option | |
+|---|---|
+| `-m, --max-count N` | print at most N lines; how many more there are goes to stderr (`nerka: 120 more lines: --skip 20 for the next`), with `--json` as a last line `{"more": 120, "skip": 20}` |
+| `--skip N` | leave out the first N lines: with `-m`, the next page |
+
+`-c` counts every line whatever `-m` and `--skip` say, so a script (or an
+agent) can ask how big a result is before reading it. Lines around a
+condition come by time: `filter --before / --after`, or
+[`before` / `after` / `around`](queries.md#around-a-condition-by-time) in
+a query.
+
+```
+nerka filter -c 'level >= ERROR' trace.dlt
+nerka filter --json -m 50 --fields apid,ctid 'level >= ERROR' trace.dlt
+nerka filter --json -m 50 --skip 50 'level >= ERROR' trace.dlt
+nerka open --json trace.dlt
+```
 
 Warnings go to stderr: a query value no line can have (`proto == FOO` in a
 capture without it, a `file` no file is), what a reader skipped, a check
@@ -318,8 +368,13 @@ These apply to every command:
 
 ## Exit status
 
-- **0:** success, also when nothing matched.
-- **1:** an error (printed as `nerka: …` on stderr), including `check
-  --strict` finding an issue, `lifecycles --strict` a finding, and `import`
-  meeting an invalid item (the others are still imported).
-- **2:** a usage error (an unknown option, a missing argument).
+As grep's:
+
+- **0:** lines found (`filter`, `search`), or done.
+- **1:** nothing found: `filter` and `search` with no line (with `-c`,
+  after printing `0`); also `check --strict` finding an issue,
+  `lifecycles --strict` a finding, and `import` meeting an invalid item
+  (the others are still imported).
+- **2:** an error, printed as `nerka: …` on stderr: a query that doesn't
+  parse, a file that can't be read, a usage error (an unknown option, a
+  missing argument).

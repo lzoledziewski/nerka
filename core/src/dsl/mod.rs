@@ -8,27 +8,7 @@
 //! for why not PEG):
 //!
 //! ```text
-//! expr    := or
-//! or      := and ( ("OR" | "||") and )*
-//! and     := unary ( ("AND" | "&&") unary )*
-//! unary   := ("NOT" | "!") unary | primary
-//! primary := "(" expr ")"
-//!          | REGEX                      -- shorthand for  raw ~ REGEX
-//!          | STRING                     -- shorthand for  raw contains STRING
-//!          | FIELD OP VALUE
-//!          | SIGNAL OP VALUE
-//!          | "bookmark" [ OP VALUE ]    -- the line's bookmark
-//!          | WINDOW "(" DUR "," [ DUR "," ] expr ")"
-//! WINDOW  := before | after | around    -- around takes two DURs
-//! DUR     := NUMBER [ ms | s | m | h ]  -- default seconds
-//! FIELD   := raw | level | WORD         -- WORD: a field the source supplies
-//! SIGNAL  := "@" NAME [ "." VIEW ]      -- a signal the tab defines
-//! VIEW    := state | event | changed    -- default state; event and
-//!                                          changed may stand alone
-//! OP      := == | != | >= | <= | > | < | ~ | !~
-//! VALUE   := REGEX | STRING | WORD      -- numbers are WORDs: 42, 0x2a
-//! REGEX   := /pattern/flags             -- flags: i (ignore case)
-//! STRING  := "text"                     -- \" and \\ escapes
+#![doc = include_str!("grammar.txt")]
 //! ```
 //!
 //! Source fields (DLT `ecu`, `apid`, …) are parsed generically and resolved
@@ -95,6 +75,10 @@
 
 mod auto;
 mod parser;
+
+/// The grammar above as text (`nerka help nfd`): one file, so the two can't
+/// drift apart. Change the grammar in `grammar.txt`.
+pub const GRAMMAR: &str = include_str!("grammar.txt");
 
 use crate::event::{Event, FieldDef, FieldId, FieldKind, FieldValue, Level};
 use crate::signal::{SignalDef, SignalKind, SignalScope, SignalSeries, SignalView, Signals, ValueRef};
