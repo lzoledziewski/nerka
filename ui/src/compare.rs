@@ -403,31 +403,37 @@ impl CompareUi {
         if std::mem::take(&mut self.pending) {
             self.start(ui.ctx(), input, config);
         }
+        let mut go = false;
         egui::Grid::new("compare-sides").num_columns(2).show(ui, |ui| {
             for k in 0..2 {
                 ui.label(RichText::new(["A:", "B:"][k]).strong());
-                ui.horizontal(|ui| side_ui(ui, ("side", k), &mut self.sides[k], input));
+                go |= ui.horizontal(|ui| side_ui(ui, ("side", k), &mut self.sides[k], input)).inner;
                 ui.end_row();
             }
             ui.label("Only:").on_hover_text("Both sides: only the lines this NFD filter keeps");
             ui.horizontal(|ui| {
-                ui.add(
+                let r = ui.add(
                     egui::TextEdit::singleline(&mut self.only)
                         .hint_text("NFD, e.g. ecu == ECU1 AND level >= WARN")
                         .desired_width(300.0),
                 );
+                go |= crate::patterns::entered(ui, &r);
                 ui.label("Ignore:").on_hover_text(
                     "Both sides: leave out the lines this NFD filter keeps (periodic or noisy messages \
                      that differ every boot and say nothing)",
                 );
-                ui.add(
+                let r = ui.add(
                     egui::TextEdit::singleline(&mut self.ignore)
                         .hint_text("NFD, e.g. apid == GPS OR payload ~ /heartbeat/")
                         .desired_width(300.0),
                 );
+                go |= crate::patterns::entered(ui, &r);
             });
             ui.end_row();
         });
+        if go {
+            self.start(ui.ctx(), input, config);
+        }
         ui.horizontal(|ui| {
             if let Some((job, what)) = &self.job {
                 if ui.button("■ Cancel").clicked() {
@@ -703,8 +709,9 @@ impl CompareUi {
     }
 }
 
-/// A side's choice: where its lines come from, and what of it.
-fn side_ui(ui: &mut egui::Ui, id: (&str, usize), side: &mut Side, input: &Input) {
+/// A side's choice: where its lines come from, and what of it; whether
+/// Enter was pressed in one of its text fields.
+fn side_ui(ui: &mut egui::Ui, id: (&str, usize), side: &mut Side, input: &Input) -> bool {
     let shown = match side.from {
         SideFrom::All => "All lines".to_owned(),
         SideFrom::Filter => "Filter result".to_owned(),
@@ -736,7 +743,10 @@ fn side_ui(ui: &mut egui::Ui, id: (&str, usize), side: &mut Side, input: &Input)
     });
     match side.from {
         SideFrom::Query => {
-            ui.add(egui::TextEdit::singleline(&mut side.query).hint_text("NFD, e.g. @ecu1 == 2").desired_width(300.0));
+            let r = ui.add(
+                egui::TextEdit::singleline(&mut side.query).hint_text("NFD, e.g. @ecu1 == 2").desired_width(300.0),
+            );
+            return crate::patterns::entered(ui, &r);
         }
         SideFrom::Lifecycles => {
             let count = input.tab.lifecycles.iter().find(|l| l.name == side.life).map_or(0, |l| l.found.lives.len());
@@ -755,7 +765,11 @@ fn side_ui(ui: &mut egui::Ui, id: (&str, usize), side: &mut Side, input: &Input)
                 }
             });
             if let Pick::Numbers(t) = &mut side.pick {
-                ui.add(egui::TextEdit::singleline(t).hint_text("2, 5-7").desired_width(90.0));
+                let r = ui.add(egui::TextEdit::singleline(t).hint_text("2, 5-7").desired_width(90.0));
+                if crate::patterns::entered(ui, &r) {
+                    ui.weak(format!("of {count}"));
+                    return true;
+                }
             }
             ui.weak(format!("of {count}"));
         }
@@ -765,6 +779,7 @@ fn side_ui(ui: &mut egui::Ui, id: (&str, usize), side: &mut Side, input: &Input)
         }
         SideFrom::All | SideFrom::Filter => {}
     }
+    false
 }
 
 #[cfg(test)]

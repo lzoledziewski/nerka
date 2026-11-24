@@ -135,6 +135,11 @@ fn within(scope: &Option<String>, q: &str) -> String {
     }
 }
 
+/// Enter pressed in the text field `r`: run, as ▶ Run (or ▶ Compare).
+pub(crate) fn entered(ui: &egui::Ui, r: &egui::Response) -> bool {
+    r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter))
+}
+
 /// A row of a list, lit while the mouse is over it: its buttons sit at the
 /// right, far from a short text, and the light says whose they are.
 pub(crate) fn lit_row<R>(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
@@ -512,7 +517,9 @@ impl PatternsUi {
             self.compare.ui(ui, input, config, out);
             return;
         }
-        self.choices(ui, input);
+        if self.choices(ui, input) {
+            self.start(ui.ctx(), input);
+        }
         ui.horizontal(|ui| {
             if let Some((job, _, what, _)) = &self.job {
                 if ui.button("■ Cancel").clicked() {
@@ -610,8 +617,9 @@ impl PatternsUi {
         }
     }
 
-    /// Which lines, which field.
-    fn choices(&mut self, ui: &mut egui::Ui, input: &Input) {
+    /// Which lines, which field; whether Enter was pressed in a filter box.
+    fn choices(&mut self, ui: &mut egui::Ui, input: &Input) -> bool {
+        let mut go = false;
         ui.horizontal(|ui| {
             ui.label("Lines:");
             let shown = match &self.from {
@@ -643,11 +651,12 @@ impl PatternsUi {
                     ui.weak(format!("of {count}"));
                 }
                 From::Query => {
-                    ui.add(
+                    let r = ui.add(
                         egui::TextEdit::singleline(&mut self.query)
                             .hint_text("NFD, e.g. @ecu1 == 2 AND level >= WARN")
                             .desired_width(280.0),
                     );
+                    go |= entered(ui, &r);
                 }
                 _ => {}
             }
@@ -666,19 +675,23 @@ impl PatternsUi {
         });
         // A layer on the lines chosen, as in Compare.
         ui.horizontal(|ui| {
-            ui.label("Only:").on_hover_text("Of the lines chosen, only those this NFD filter keeps");
-            ui.add(
+            ui.label("Only:").on_hover_text("Of the lines chosen, only those this NFD filter keeps (Enter: run)");
+            let r = ui.add(
                 egui::TextEdit::singleline(&mut self.only)
                     .hint_text("NFD, e.g. ecu == ECU1 AND level >= WARN")
                     .desired_width(300.0),
             );
-            ui.label("Ignore:").on_hover_text("Of the lines chosen, leave out those this NFD filter keeps");
-            ui.add(
+            go |= entered(ui, &r);
+            ui.label("Ignore:")
+                .on_hover_text("Of the lines chosen, leave out those this NFD filter keeps (Enter: run)");
+            let r = ui.add(
                 egui::TextEdit::singleline(&mut self.ignore)
                     .hint_text("NFD, e.g. apid == GPS OR payload ~ /heartbeat/")
                     .desired_width(300.0),
             );
+            go |= entered(ui, &r);
         });
+        go
     }
 
     /// The patterns, sorted, the unfolded ones with their slots and lines.
@@ -1035,6 +1048,38 @@ mod tests {
         // Another file: out of date, the result kept.
         assert_eq!(run.key.why_stale(&now), Some("the file was read again"));
         assert!(p.run.is_some());
+    }
+
+    /// Enter in a filter box runs; typing, or leaving it with a click, doesn't.
+    #[test]
+    fn enter_in_a_filter_box_runs() {
+        let ctx = egui::Context::default();
+        let mut text = String::from("ecu == ECU1");
+        let mut frame = |events: Vec<egui::Event>, focus: bool| {
+            let mut go = false;
+            let mut full = ctx.run_ui(egui::RawInput { events, ..Default::default() }, |ui| {
+                let r = ui.add(egui::TextEdit::singleline(&mut text));
+                if focus {
+                    r.request_focus();
+                }
+                go = entered(ui, &r);
+            });
+            full.textures_delta.clear();
+            go
+        };
+        let key = |key| egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: Default::default(),
+        };
+        assert!(!frame(vec![], true));
+        assert!(!frame(vec![egui::Event::Text("x".into())], false));
+        assert!(frame(vec![key(egui::Key::Enter)], false));
+        // Focused again and left with Escape: no run.
+        assert!(!frame(vec![], true));
+        assert!(!frame(vec![key(egui::Key::Escape)], false));
     }
 
     /// Only / Ignore narrow the lines chosen; ▾ Filter and 🔍 Search on a

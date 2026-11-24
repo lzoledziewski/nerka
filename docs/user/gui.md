@@ -109,6 +109,7 @@ or the signals changed.
   grouped (default: a DLT message's `payload`, else the line).
 - **Only** and **Ignore** (NFD), as in Compare, narrow those lines:
   `ecu == ECU1`, or leave out `apid == GPS OR payload ~ /heartbeat/`.
+  Enter in any of these boxes runs, as ▶ Run does (▶ Compare in Compare).
 - Files opened together in one tab are one set of lines: the same message
   in each is one pattern, never told apart by its file.
 - **Each row:** its share and count of lines, the fields that tell it
