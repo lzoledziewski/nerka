@@ -80,7 +80,11 @@ already has):
   source so it can't drift) plus examples per source kind; `nerka help
   fields FILE` = the fields of `open --json`.
 - stdin (`-`) for text.
-- Exit status: see Q3.
+- **Exit status: grep's** (owner, 2026-11-24), the default: 0 lines
+  matched, 1 none, 2 an error. A breaking change while at 0.x: the user
+  guide's CLI page and the release notes say so;
+  `cli/tests/cli.rs::no_match_is_success_with_no_output` becomes a test of
+  exit 1.
 
 Added for the AI, beyond R10:
 
@@ -174,7 +178,7 @@ provider in nerka).
 
 | Step | Gives | Depends on |
 |---|---|---|
-| A1 | `--json`, `-m`, `--skip`, `help nfd`, exit status (R10) | Q3 |
+| A1 | `--json`, `-m`, `--skip`, `help nfd`, exit status (R10) | — |
 | A2 | `help agent` / skill file, `marks --add` with author | A1, the marks format |
 | B1 | `nerka mcp` and the window's read tools | A1 (operations, JSON) |
 | B2 | The window's changing tools, activity list, undo, screenshot | B1 |
@@ -194,6 +198,7 @@ in `ui/src/main.rs` (6,218 non-test lines).
 - **Bounded output: one version of each** (A1): `-c`, `-m N`, `--skip N`,
   and context by time with what 0.3.0-alpha.2 built (`before` / `after` /
   `around`, `filter --before / --after`); no line-count context.
+- **Exit status:** grep's 0 / 1 / 2 by default (A1).
 - **The terminal:** the user's own terminal, started from the window with
   the AI command chosen in Settings and `NERKA_WINDOW` set.
 - **What the AI may change:** directly, listed and undoable.
@@ -205,9 +210,6 @@ in `ui/src/main.rs` (6,218 non-test lines).
 
 ## Questions for the owner
 
-- **Q3 — exit status.** grep's 0 / 1 / 2 (no match = 1) by default while at
-  0.x, or behind a flag? The owner chose 0 on purpose once
-  (`cli/tests/cli.rs::no_match_is_success_with_no_output`).
 - **Q6 — where the bridge lives.** `nerka mcp` in the CLI (proposed: one
   binary the AI already uses for A), or in `nerka-gui`, or a binary of its
   own?
