@@ -17,10 +17,14 @@
 //! `--set` and `--rule` add to it, so a setting's effect is measured.
 //!
 //! `--show SYSTEM` prints that system's patterns which aren't a template
-//! exactly, with the templates their lines have.
+//! exactly, with the templates their lines have, and the queries that
+//! match lines of other patterns.
+//!
+//! `over`: the share of lines that a query of a pattern other than their
+//! own matches too (▾ Filter and 🔍 Search on a pattern use its query).
 
 use nerka_core::pattern::{self, PatternConfig, PatternOptions};
-use nerka_core::{Progress, TextFile};
+use nerka_core::{Filter, LogSource, Progress, Query, TextFile, search};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -59,10 +63,10 @@ fn main() {
         .collect();
     files.sort();
     println!(
-        "{:<12} {:>6} {:>9} {:>9} {:>7} {:>7} {:>7} {:>8}",
-        "system", "lines", "templates", "patterns", "GA", "FGA", "WGA", "ms"
+        "{:<12} {:>6} {:>9} {:>9} {:>7} {:>7} {:>7} {:>7} {:>8}",
+        "system", "lines", "templates", "patterns", "GA", "FGA", "WGA", "over", "ms"
     );
-    let (mut sum_ga, mut sum_fga, mut sum_wga, mut n) = (0.0, 0.0, 0.0, 0);
+    let (mut sum_ga, mut sum_fga, mut sum_wga, mut sum_over, mut n) = (0.0, 0.0, 0.0, 0.0, 0);
     for f in &files {
         let name = f.file_name().unwrap().to_string_lossy();
         let system = name.split('_').next().unwrap_or(&name).to_string();
@@ -80,8 +84,10 @@ fn main() {
         }
         assert!(found.iter().all(|&k| k != usize::MAX), "{system}: a line in no pattern");
         let (ga, fga, wga) = score(&found, &truth);
+        let shows = show.as_deref().is_some_and(|s| s.eq_ignore_ascii_case(&system));
+        let over = overlap(&source, &ps, &found, shows);
         println!(
-            "{system:<12} {:>6} {:>9} {:>9} {ga:>7.3} {fga:>7.3} {wga:>7.3} {ms:>8.1}",
+            "{system:<12} {:>6} {:>9} {:>9} {ga:>7.3} {fga:>7.3} {wga:>7.3} {over:>7.3} {ms:>8.1}",
             truth.len(),
             truth.iter().collect::<std::collections::HashSet<_>>().len(),
             ps.patterns.len()
@@ -89,21 +95,23 @@ fn main() {
         sum_ga += ga;
         sum_fga += fga;
         sum_wga += wga;
+        sum_over += over;
         n += 1;
-        if show.as_deref().is_some_and(|s| s.eq_ignore_ascii_case(&system)) {
+        if shows {
             explain(&ps, &truth);
         }
     }
     if n > 0 {
         println!(
-            "{:<12} {:>6} {:>9} {:>9} {:>7.3} {:>7.3} {:>7.3}",
+            "{:<12} {:>6} {:>9} {:>9} {:>7.3} {:>7.3} {:>7.3} {:>7.3}",
             "average",
             "",
             "",
             "",
             sum_ga / n as f64,
             sum_fga / n as f64,
-            sum_wga / n as f64
+            sum_wga / n as f64,
+            sum_over / n as f64
         );
     }
 }
@@ -144,6 +152,37 @@ fn score(found: &[usize], truth: &[String]) -> (f64, f64, f64) {
     let (p, r) = (right_groups as f64 / pred.len() as f64, right_groups as f64 / real.len() as f64);
     let fga = if p + r == 0.0 { 0.0 } else { 2.0 * p * r / (p + r) };
     (ga, fga, whole_lines as f64 / truth.len() as f64)
+}
+
+/// The share of lines another pattern's query matches too (`found`: each
+/// line's pattern); `show` prints each such query with what it takes.
+fn overlap(source: &dyn LogSource, ps: &pattern::Patterns, found: &[usize], show: bool) -> f64 {
+    let mut over = vec![false; found.len()];
+    for (k, p) in ps.patterns.iter().enumerate() {
+        let q = Query::compile_in(&ps.query(p), source.schema(), &Default::default()).expect("query");
+        let res = search(source, &Filter::Query(q), &Progress::new()).expect("search");
+        let mut taken: HashMap<usize, usize> = HashMap::new();
+        for &l in &res.lines {
+            let of = found[l as usize];
+            if of != k {
+                over[l as usize] = true;
+                *taken.entry(of).or_default() += 1;
+            }
+        }
+        if show && !taken.is_empty() {
+            let mut taken: Vec<_> = taken.into_iter().collect();
+            taken.sort_by_key(|a| std::cmp::Reverse(a.1));
+            let of: Vec<String> =
+                taken.iter().take(3).map(|&(o, c)| format!("{c} of #{o} {}", ps.patterns[o].template())).collect();
+            println!(
+                "  query of #{k} {}
+          also takes {}",
+                p.template(),
+                of.join("; ")
+            );
+        }
+    }
+    over.iter().filter(|&&o| o).count() as f64 / found.len() as f64
 }
 
 /// The patterns that aren't exactly one template's lines.

@@ -183,7 +183,7 @@ fn parse_numbers(text: &str, max: usize) -> Result<Vec<u32>, String> {
 }
 
 /// Only and Ignore as one NFD (`(only) AND NOT (ignore)`), if either.
-fn content_nfd(only: &str, ignore: &str) -> Option<String> {
+pub(crate) fn content_nfd(only: &str, ignore: &str) -> Option<String> {
     let (only, ignore) = (only.trim(), ignore.trim());
     match (only.is_empty(), ignore.is_empty()) {
         (true, true) => None,
@@ -194,7 +194,7 @@ fn content_nfd(only: &str, ignore: &str) -> Option<String> {
 }
 
 /// Lines of both, ascending.
-fn intersect(a: &[LineNo], b: &[LineNo]) -> Vec<LineNo> {
+pub(crate) fn intersect(a: &[LineNo], b: &[LineNo]) -> Vec<LineNo> {
     let (mut i, mut j, mut out) = (0, 0, Vec::new());
     while i < a.len() && j < b.len() {
         match a[i].cmp(&b[j]) {

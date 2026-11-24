@@ -9,7 +9,7 @@
 //! again, other lines, another field, the configuration or the signals
 //! changed.
 
-use crate::compare::CompareUi;
+use crate::compare::{self, CompareUi};
 use crate::job::{Job, Poll};
 use crate::tuning::{self, TuningUi};
 use eframe::egui::{self, Color32, RichText};
@@ -66,6 +66,8 @@ struct Key {
     from: From,
     /// The typed filter (`From::Query`).
     query: String,
+    /// Only and Ignore, as one NFD.
+    content: Option<String>,
     /// The filter result's address (`From::Filter`).
     kept: usize,
     field: String,
@@ -81,7 +83,10 @@ impl Key {
     fn why_stale(&self, now: &Key) -> Option<&'static str> {
         if self.file != now.file {
             Some("the file was read again")
-        } else if self.from != now.from || (self.from == From::Query && self.query != now.query) {
+        } else if self.from != now.from
+            || (self.from == From::Query && self.query != now.query)
+            || self.content != now.content
+        {
             Some("other lines are chosen")
         } else if self.from == From::Filter && self.kept != now.kept {
             Some("the filter changed")
@@ -117,6 +122,17 @@ struct Run {
     took: Duration,
     /// The lines it grouped, in words.
     what: String,
+    /// The lines it grouped as NFD (none: all): ▾ Filter and 🔍 Search on a
+    /// pattern keep to them ([`within`]).
+    scope: Option<String>,
+}
+
+/// `q` among the lines of `scope` (none: all).
+fn within(scope: &Option<String>, q: &str) -> String {
+    match scope {
+        Some(s) => format!("({s}) AND ({q})"),
+        None => q.to_owned(),
+    }
 }
 
 /// A tab's Patterns window and its last result.
@@ -133,10 +149,13 @@ pub struct PatternsUi {
     id: u64,
     from: From,
     query: String,
+    /// Only and Ignore: NFD filters narrowing the lines chosen.
+    only: String,
+    ignore: String,
     /// The field grouped (empty: `payload` if there is one, else the line).
     field: String,
     sort: Sort,
-    job: Option<(Job<Patterns>, Key, String)>,
+    job: Option<(Job<Patterns>, Key, String, Option<String>)>,
     run: Option<Run>,
     error: Option<String>,
     /// Patterns unfolded (their index in the result), with how many of
@@ -161,6 +180,8 @@ impl Default for PatternsUi {
             id: NEXT.fetch_add(1, Ordering::Relaxed),
             from: From::All,
             query: String::new(),
+            only: String::new(),
+            ignore: String::new(),
             field: String::new(),
             sort: Sort::Most,
             job: None,
@@ -181,6 +202,8 @@ pub struct TabRef {
     pub file: Arc<dyn LogSource>,
     /// The filter result (none: no filter).
     pub kept: Option<Arc<SearchResult>>,
+    /// The filter that made it, as NFD.
+    pub filter: Option<String>,
     /// Its signals and bookmarks, to compile filters with.
     pub cx: QueryContext,
     /// Its lifecycles found.
@@ -243,7 +266,7 @@ pub struct Output {
 impl PatternsUi {
     /// Stop a run (the tab closes or reads its files again).
     pub fn cancel(&mut self) {
-        if let Some((j, _, _)) = self.job.take() {
+        if let Some((j, ..)) = self.job.take() {
             j.cancel();
         }
         self.compare.cancel();
@@ -275,6 +298,7 @@ impl PatternsUi {
             file: Arc::as_ptr(&input.tab.file) as *const u8 as usize,
             from: self.from.clone(),
             query: self.query.trim().to_owned(),
+            content: compare::content_nfd(&self.only, &self.ignore),
             kept: input.tab.kept.as_ref().map_or(0, |r| Arc::as_ptr(r) as usize),
             field: self.field.clone(),
             config: self.config_stamp(),
@@ -303,11 +327,11 @@ impl PatternsUi {
             Kept(Arc<SearchResult>),
             Search(Filter),
         }
-        let (lines, what) = match &self.from {
-            From::All => (Lines::All, "all lines".to_owned()),
+        let (lines, what, scope) = match &self.from {
+            From::All => (Lines::All, "all lines".to_owned(), None),
             From::Filter => match &input.tab.kept {
-                Some(r) => (Lines::Kept(r.clone()), "the filter result".to_owned()),
-                None => (Lines::All, "all lines (no filter)".to_owned()),
+                Some(r) => (Lines::Kept(r.clone()), "the filter result".to_owned(), input.tab.filter.clone()),
+                None => (Lines::All, "all lines (no filter)".to_owned(), None),
             },
             From::Lifecycle(name, n) => match input
                 .tab
@@ -315,9 +339,11 @@ impl PatternsUi {
                 .iter()
                 .find(|l| l.name == *name)
                 .ok_or_else(|| "not found (yet)".to_owned())
-                .and_then(|l| input.tab.compile(&input.tab.lifecycle_nfd(l, &[*n as u32])))
-            {
-                Ok(f) => (Lines::Search(f), format!("lifecycle @{name} #{n}")),
+                .and_then(|l| {
+                    let nfd = input.tab.lifecycle_nfd(l, &[*n as u32]);
+                    input.tab.compile(&nfd).map(|f| (f, nfd))
+                }) {
+                Ok((f, nfd)) => (Lines::Search(f), format!("lifecycle @{name} #{n}"), Some(nfd)),
                 Err(e) => {
                     self.error = Some(format!("Lifecycle @{name}: {e}"));
                     return;
@@ -330,7 +356,7 @@ impl PatternsUi {
                     return;
                 }
                 match input.tab.compile(q) {
-                    Ok(f) => (Lines::Search(f), q.to_owned()),
+                    Ok(f) => (Lines::Search(f), q.to_owned(), Some(q.to_owned())),
                     Err(e) => {
                         self.error = Some(e);
                         return;
@@ -338,35 +364,60 @@ impl PatternsUi {
                 }
             }
         };
+        // Only and Ignore: a layer on the lines chosen (as Compare's).
+        let content_q = compare::content_nfd(&self.only, &self.ignore);
+        let content = match content_q.as_deref().map(|q| input.tab.compile(q)).transpose() {
+            Ok(c) => c,
+            Err(e) => {
+                self.error = Some(format!("Only / Ignore: {e}"));
+                return;
+            }
+        };
+        let (what, scope) = match &content_q {
+            Some(c) => (
+                format!("{what}, content chosen"),
+                Some(match scope {
+                    Some(s) => format!("({s}) AND {c}"),
+                    None => c.clone(),
+                }),
+            ),
+            None => (what, scope),
+        };
         let field = (!self.field.is_empty()).then(|| self.field.clone());
         let options = PatternOptions { field, lines: true, config };
         let file = input.tab.file.clone();
         let key = self.key(input);
         let job = Job::spawn(ctx, move |progress| {
-            let found;
-            let lines: Option<&[LineNo]> = match &lines {
+            let base: Option<Vec<LineNo>> = match &lines {
                 Lines::All => None,
-                Lines::Kept(r) => Some(&r.lines),
-                Lines::Search(f) => {
-                    found = nerka_core::search(&*file, f, progress)?;
-                    Some(&found.lines)
+                Lines::Kept(r) => Some(r.lines.clone()),
+                Lines::Search(f) => Some(nerka_core::search(&*file, f, progress)?.lines),
+            };
+            let lines = match &content {
+                None => base,
+                Some(f) => {
+                    let kept = nerka_core::search(&*file, f, progress)?.lines;
+                    Some(match base {
+                        None => kept,
+                        Some(b) => compare::intersect(&b, &kept),
+                    })
                 }
             };
-            pattern::detect(&*file, lines, &options, progress)
+            pattern::detect(&*file, lines.as_deref(), &options, progress)
         });
-        self.job = Some((job, key, what));
+        self.job = Some((job, key, what, scope));
     }
 
     fn poll(&mut self) {
-        let Some((job, _, _)) = &self.job else { return };
+        let Some((job, ..)) = &self.job else { return };
         let Poll::Done(r, took) = job.poll() else { return };
-        let (_, key, what) = self.job.take().expect("polled");
+        let (_, key, what, scope) = self.job.take().expect("polled");
         match r {
             Ok(patterns) => {
                 // The same lines again, other settings: what they did.
                 let same = |k: &Key| {
-                    (k.file, &k.from, &k.query, k.kept, &k.field)
-                        == (key.file, &key.from, &key.query, key.kept, &key.field)
+                    (k.file, &k.from, &k.query, &k.content, k.kept, &k.field)
+                        == (key.file, &key.from, &key.query, &key.content, key.kept, &key.field)
                 };
                 self.tuning.change = match &self.run {
                     Some(old) if same(&old.key) && (old.key.config != key.config || old.key.tuned != key.tuned) => {
@@ -379,7 +430,7 @@ impl PatternsUi {
                     self.shown = PAGE;
                 }
                 self.why.clear();
-                self.run = Some(Run { patterns, key, took, what });
+                self.run = Some(Run { patterns, key, took, what, scope });
             }
             Err(nerka_core::Error::Cancelled) => {}
             Err(e) => self.error = Some(e.to_string()),
@@ -451,7 +502,7 @@ impl PatternsUi {
         }
         self.choices(ui, input);
         ui.horizontal(|ui| {
-            if let Some((job, _, what)) = &self.job {
+            if let Some((job, _, what, _)) = &self.job {
                 if ui.button("■ Cancel").clicked() {
                     job.cancel();
                 }
@@ -601,6 +652,21 @@ impl PatternsUi {
                 }
             });
         });
+        // A layer on the lines chosen, as in Compare.
+        ui.horizontal(|ui| {
+            ui.label("Only:").on_hover_text("Of the lines chosen, only those this NFD filter keeps");
+            ui.add(
+                egui::TextEdit::singleline(&mut self.only)
+                    .hint_text("NFD, e.g. ecu == ECU1 AND level >= WARN")
+                    .desired_width(300.0),
+            );
+            ui.label("Ignore:").on_hover_text("Of the lines chosen, leave out those this NFD filter keeps");
+            ui.add(
+                egui::TextEdit::singleline(&mut self.ignore)
+                    .hint_text("NFD, e.g. apid == GPS OR payload ~ /heartbeat/")
+                    .desired_width(300.0),
+            );
+        });
     }
 
     /// The patterns, sorted, the unfolded ones with their slots and lines.
@@ -640,12 +706,15 @@ impl PatternsUi {
                         if ui.small_button("📋").on_hover_text(format!("Copy its query:\n{q}")).clicked() {
                             ui.ctx().copy_text(q.clone());
                         }
+                        // Among the lines grouped: its query alone takes its
+                        // lines elsewhere in the file too.
+                        let mine = within(&run.scope, &q);
                         if ui
                             .small_button("🔍")
-                            .on_hover_text("Search for its lines (among the filtered ones)")
+                            .on_hover_text(format!("Search for its lines (among the filtered ones):\n{mine}"))
                             .clicked()
                         {
-                            out.search = Some(q.clone());
+                            out.search = Some(mine.clone());
                         }
                         if ui
                             .small_button("➕")
@@ -654,8 +723,9 @@ impl PatternsUi {
                         {
                             out.to_library = Some(ps.library_query(p));
                         }
-                        if ui.small_button("▾ Filter").on_hover_text(format!("Filter to its lines:\n{q}")).clicked() {
-                            out.filter = Some(q);
+                        if ui.small_button("▾ Filter").on_hover_text(format!("Filter to its lines:\n{mine}")).clicked()
+                        {
+                            out.filter = Some(mine);
                         }
                         if tuning {
                             ui.menu_button("⋮", |ui| {
@@ -884,7 +954,15 @@ mod tests {
     }
 
     fn tab_of(id: u64, f: Arc<dyn LogSource>) -> TabRef {
-        TabRef { id, title: format!("t{id}"), file: f, kept: None, cx: QueryContext::default(), lifecycles: vec![] }
+        TabRef {
+            id,
+            title: format!("t{id}"),
+            file: f,
+            kept: None,
+            filter: None,
+            cx: QueryContext::default(),
+            lifecycles: vec![],
+        }
     }
 
     fn input<'a>(tab: &'a TabRef, tabs: &'a [TabRef]) -> Input<'a> {
@@ -928,6 +1006,37 @@ mod tests {
         // Another file: out of date, the result kept.
         assert_eq!(run.key.why_stale(&now), Some("the file was read again"));
         assert!(p.run.is_some());
+    }
+
+    /// Only / Ignore narrow the lines chosen; ▾ Filter and 🔍 Search on a
+    /// pattern keep to the lines grouped, not its query alone (which takes
+    /// its lines anywhere in the file).
+    #[test]
+    fn only_and_ignore_narrow_the_lines_and_a_pattern_keeps_to_them() {
+        let t = [tab_of(1, file())];
+        let ctx = egui::Context::default();
+        let mut p =
+            PatternsUi { open: true, from: From::Query, query: "raw ~ /gear|door/".into(), ..Default::default() };
+        p.ignore = "raw ~ /gear N|closed/".into();
+        let i = input(&t[0], &t);
+        p.start(&ctx, &i);
+        run_until_done(&mut p, &ctx, &i);
+        let run = p.run.as_ref().expect("a result");
+        let ts: Vec<String> = run.patterns.patterns.iter().map(Pattern::template).collect();
+        assert_eq!(ts, ["gear {D|P}", "door open"]);
+        assert_eq!(run.what, "raw ~ /gear|door/, content chosen");
+        let scope = run.scope.clone().expect("a scope");
+        assert_eq!(scope, "(raw ~ /gear|door/) AND NOT (raw ~ /gear N|closed/)");
+        let gear = &run.patterns.patterns[0];
+        let mine = within(&run.scope, &run.patterns.query(gear));
+        let f = t[0].compile(&mine).unwrap();
+        let res = nerka_core::search(&*t[0].file, &f, &nerka_core::Progress::new()).unwrap();
+        assert_eq!(res.lines, [0, 1, 2], "{mine}");
+        // Changed, the result is out of date.
+        let key = run.key.clone();
+        p.only = "raw ~ /gear/".into();
+        assert_eq!(key.why_stale(&p.key(&i)), Some("other lines are chosen"));
+        assert_eq!(within(&None, "x"), "x");
     }
 
     #[test]
@@ -1016,6 +1125,7 @@ mod tests {
             file: 1,
             from: From::Filter,
             query: String::new(),
+            content: None,
             kept: 5,
             field: String::new(),
             config: None,
@@ -1033,6 +1143,7 @@ mod tests {
         let q = Key { from: From::Query, query: "@a == 1".into(), ..k.clone() };
         assert_eq!(q.why_stale(&Key { signals: 1, ..q.clone() }), Some("the signals changed"));
         assert_eq!(q.why_stale(&Key { query: "@a == 2".into(), ..q.clone() }), Some("other lines are chosen"));
+        assert_eq!(k.why_stale(&Key { content: Some("NOT (x)".into()), ..k.clone() }), Some("other lines are chosen"));
     }
 
     #[test]

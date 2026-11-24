@@ -383,25 +383,7 @@ impl Pattern {
     /// [`Self::regex`], each state slot captured by the group of its name in
     /// `states` (in order; past them, not captured).
     fn regex_named(&self, states: &[String]) -> String {
-        let mut re = String::from(r"^\s*");
-        let mut k = 0;
-        for (i, p) in self.parts.iter().enumerate() {
-            if i > 0 {
-                re.push_str(sep_regex(p.sep));
-            }
-            match &p.atom {
-                Atom::Lit(l) => text_regex(l, &mut re, self.loose),
-                Atom::Slot(s) if s.is_state() && k < states.len() => {
-                    re.push_str(&format!("(?<{}>", states[k]));
-                    s.regex(&mut re, self.loose);
-                    re.push(')');
-                    k += 1;
-                }
-                Atom::Slot(s) => s.regex(&mut re, self.loose),
-            }
-        }
-        re.push_str(r"\s*$");
-        re
+        parts_regex(&self.parts, states, self.loose)
     }
 
     /// Names for its states, as signals: the word before each (`gear=` →
@@ -447,6 +429,31 @@ pub struct LibraryQuery {
     pub nfd: String,
     /// The groups: its states, as enum signals.
     pub states: Vec<String>,
+}
+
+/// The regex of a template's `parts`: each state slot captured by the
+/// group of its name in `states` (in order; past them, not captured);
+/// `loose`: masked values any text ([`text_regex`]).
+fn parts_regex(parts: &[Part], states: &[String], loose: bool) -> String {
+    let mut re = String::from(r"^\s*");
+    let mut k = 0;
+    for (i, p) in parts.iter().enumerate() {
+        if i > 0 {
+            re.push_str(sep_regex(p.sep));
+        }
+        match &p.atom {
+            Atom::Lit(l) => text_regex(l, &mut re, loose),
+            Atom::Slot(s) if s.is_state() && k < states.len() => {
+                re.push_str(&format!("(?<{}>", states[k]));
+                s.regex(&mut re, loose);
+                re.push(')');
+                k += 1;
+            }
+            Atom::Slot(s) => s.regex(&mut re, loose),
+        }
+    }
+    re.push_str(r"\s*$");
+    re
 }
 
 fn sep_regex(sep: Sep) -> &'static str {
@@ -629,12 +636,17 @@ fn group(sets: &[Set], options: &PatternOptions, progress: &Progress) -> Result<
             None => schema.iter().position(|d| d.name == "payload" && d.kind == FieldKind::Str),
         })
     };
-    // Context: the cheap text fields of the first set.
+    // Context: the cheap text fields of the first set, but the file: files
+    // opened together are one set (their lifecycles compared across files),
+    // and a configuration's rules outlive the file's name.
     let schema = sets[0].source.schema();
     let field = field_of(sets[0].source)?;
     let context: Vec<String> = (0..schema.len())
         .filter(|&i| {
-            Some(i) != field && !schema[i].costly && matches!(schema[i].kind, FieldKind::Str | FieldKind::Name)
+            Some(i) != field
+                && !schema[i].costly
+                && matches!(schema[i].kind, FieldKind::Str | FieldKind::Name)
+                && schema[i].name != crate::input::concat::FILE_FIELD
         })
         .map(|i| schema[i].name.to_string())
         .collect();
@@ -842,6 +854,8 @@ fn group(sets: &[Set], options: &PatternOptions, progress: &Progress) -> Result<
                 break;
             }
         }
+        // A pattern whose lines another's query takes is that one.
+        families = absorb(families, &locals, sets, &readings, progress)?;
     }
     // A field goes into the queries where patterns differ in it.
     let telling: Vec<bool> = (0..context.len())
@@ -1894,6 +1908,11 @@ impl Family {
         })
     }
 
+    /// Its masked values match any text (`value` rules in its context).
+    fn loose(&self, locals: &[Local]) -> bool {
+        !locals[self.ctx].values.is_empty()
+    }
+
     /// No field tells the two apart (both have one value, and not the same).
     fn compatible(&self, other: &Family) -> bool {
         self.vals.iter().zip(&other.vals).all(|(a, b)| match (a, b) {
@@ -2284,6 +2303,181 @@ fn merge(a: Family, b: &Family, pairs: &[(usize, usize)]) -> Family {
         ids,
         ctx: a.ctx,
     }
+}
+
+/// Lines tried against another pattern's query in [`absorb`].
+const SAMPLE_LINES: usize = 24;
+
+/// Lines of `f` to try a query on: its first and last in each set, then
+/// the first of each value of its slots (up to [`SAMPLE_LINES`]).
+fn sample_lines(f: &Family) -> Vec<(usize, LineNo)> {
+    let mut out: Vec<(usize, LineNo)> = Vec::new();
+    let put = |side: usize, line: LineNo, out: &mut Vec<(usize, LineNo)>| {
+        if out.len() < SAMPLE_LINES && !out.contains(&(side, line)) {
+            out.push((side, line));
+        }
+    };
+    for side in 0..2 {
+        if f.sides[side].count > 0 {
+            put(side, f.sides[side].first, &mut out);
+            put(side, f.sides[side].last, &mut out);
+        }
+    }
+    for p in &f.parts {
+        if let Atom::Slot(s) = &p.atom {
+            for v in &s.values {
+                for side in 0..2 {
+                    if v.sides[side].count > 0 {
+                        put(side, v.sides[side].first, &mut out);
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Stage 2's patterns with each one whose lines another's query takes
+/// merged into it: `a` takes `b` when `a`'s regex matches every line of
+/// `b`'s tried ([`sample_lines`]), their fields don't tell them apart and
+/// `local`'s rules allow it (`keep`, `apart`: [`assess`]'s). Without it a
+/// split message (`proxy.cse.cuhk.edu.hk:<*> open through proxy …`, `<*>
+/// open through proxy …`) is two patterns where the second's query, ▾
+/// Filter or 🔍 Search, shows the first's lines too.
+///
+/// Of those taking `b`, the one of most words joins it (the closest), the
+/// most lines among equals; the most specific go first, so a chain (`b` in
+/// `a`, `a` in `c`) ends in the most general. Only patterns whose words
+/// `b` holds all are tried; one of no words (a catch-all) takes none.
+fn absorb(
+    mut fams: Vec<Family>,
+    locals: &[Local],
+    sets: &[Set],
+    readings: &[Reading],
+    progress: &Progress,
+) -> Result<Vec<Family>> {
+    let words = |f: &Family| {
+        let mut w: Vec<Box<str>> = f.words().map(Into::into).collect();
+        w.sort_unstable();
+        w
+    };
+    let sorted: Vec<Vec<Box<str>>> = fams.iter().map(words).collect();
+    let mut seen: HashMap<&str, usize> = HashMap::new();
+    for w in &sorted {
+        let mut d: Vec<&str> = w.iter().map(|x| &**x).collect();
+        d.dedup();
+        for x in d {
+            *seen.entry(x).or_default() += 1;
+        }
+    }
+    let usable = |f: &Family| !f.unsorted && locals[f.ctx].s.merge && f.parts.len() <= MAX_ATOMS;
+    // Each pattern by its rarest word: those whose rarest word `b` holds
+    // are the only ones that may take it.
+    let mut by_rarest: HashMap<&str, Vec<usize>> = HashMap::new();
+    for (k, w) in sorted.iter().enumerate() {
+        if usable(&fams[k])
+            && let Some(r) = w.iter().map(|x| &**x).min_by_key(|x| (seen[x], *x))
+        {
+            by_rarest.entry(r).or_default().push(k);
+        }
+    }
+    let subset = |a: &[Box<str>], b: &[Box<str>]| {
+        let mut j = 0;
+        a.iter().all(|x| {
+            while j < b.len() && b[j] < *x {
+                j += 1;
+            }
+            let hit = j < b.len() && b[j] == *x;
+            j += 1;
+            hit
+        })
+    };
+    let mut regexes: HashMap<usize, Option<regex::Regex>> = HashMap::new();
+    let mut order: Vec<usize> = (0..fams.len()).collect();
+    order.sort_by(|&x, &y| sorted[y].len().cmp(&sorted[x].len()).then(by_count(&fams[x].sides, &fams[y].sides)));
+    let mut gone = vec![false; fams.len()];
+    for (n, &b) in order.iter().enumerate() {
+        if n % 256 == 0 && progress.is_cancelled() {
+            return Err(Error::Cancelled);
+        }
+        if !usable(&fams[b]) {
+            continue;
+        }
+        let mut candidates: Vec<usize> = Vec::new();
+        let mut distinct: Vec<&str> = sorted[b].iter().map(|x| &**x).collect();
+        distinct.dedup();
+        for w in distinct {
+            for &a in by_rarest.get(w).into_iter().flatten() {
+                if a != b && !gone[a] && fams[a].compatible(&fams[b]) && subset(&sorted[a], &sorted[b]) {
+                    candidates.push(a);
+                }
+            }
+        }
+        candidates
+            .sort_by(|&x, &y| sorted[y].len().cmp(&sorted[x].len()).then(by_count(&fams[x].sides, &fams[y].sides)));
+        let mut texts: Option<Vec<String>> = None;
+        let found = candidates.into_iter().find_map(|a| {
+            let re = regexes
+                .entry(a)
+                .or_insert_with(|| regex::Regex::new(&parts_regex(&fams[a].parts, &[], fams[a].loose(locals))).ok())
+                .as_ref()?;
+            let texts = texts.get_or_insert_with(|| {
+                sample_lines(&fams[b])
+                    .into_iter()
+                    .map(|(side, line)| text_of(sets[side].source, &readings[side], line).into_owned())
+                    .collect()
+            });
+            if !texts.iter().all(|t| re.is_match(t)) {
+                return None;
+            }
+            let pairs = align(&fams[a].parts, &fams[b].parts);
+            rules_allow(&fams[a], &fams[b], &pairs, &locals[fams[a].ctx]).then_some((a, pairs))
+        });
+        if let Some((a, pairs)) = found {
+            let into = std::mem::replace(
+                &mut fams[a],
+                Family {
+                    parts: vec![],
+                    size: 0.0,
+                    sides: Sides::default(),
+                    vals: vec![],
+                    unsorted: false,
+                    apart: false,
+                    grew: 0,
+                    ids: vec![],
+                    ctx: 0,
+                },
+            );
+            fams[a] = merge(into, &fams[b], &pairs);
+            // Its template may have grown slots: its regex again.
+            regexes.remove(&a);
+            gone[b] = true;
+        }
+    }
+    let mut out: Vec<Family> = fams.into_iter().zip(gone).filter(|(_, g)| !g).map(|(f, _)| f).collect();
+    out.sort_by(|a, b| by_count(&a.sides, &b.sides));
+    Ok(out)
+}
+
+/// Whether `local`'s rules let `b` join `a` aligned as `pairs`: no `keep`
+/// word into a slot, no two items of an `apart` group in one (as
+/// [`assess`]).
+fn rules_allow(a: &Family, b: &Family, pairs: &[(usize, usize)], local: &Local) -> bool {
+    if local.keep.is_empty() && local.apart.is_empty() {
+        return true;
+    }
+    let (mut i, mut j) = (0, 0);
+    for &(pi, pj) in pairs.iter().chain(std::iter::once(&(a.parts.len(), b.parts.len()))) {
+        if i < pi || j < pj {
+            let (sa, sb) = (&a.parts[i..pi], &b.parts[j..pj]);
+            let kept = |seg: &[Part]| seg.iter().any(|p| matches!(&p.atom, Atom::Lit(l) if local.keep.contains(l)));
+            if kept(sa) || kept(sb) || local.apart.iter().any(|g| clash(items_in(sa, g), items_in(sb, g))) {
+                return false;
+            }
+        }
+        (i, j) = (pi + 1, pj + 1);
+    }
+    true
 }
 
 /// How many words `f` and a template of words `sorted` hold both (with
@@ -3016,6 +3210,66 @@ mod tests {
                 "LOG: {radar|lidar|imu|gnss|hmi}: {OK|OFFLINE} Elapsed[us]: <*>; #<*>",
             ]
         );
+    }
+
+    /// A message split by the shape of a value (host names here) is one
+    /// pattern where one's query takes the others' lines: no line is
+    /// matched by another pattern's query.
+    #[test]
+    fn a_pattern_whose_lines_another_takes_joins_it() {
+        let hosts = [
+            "a1.cdn.example.com",
+            "api.example.net",
+            "x.y.z.example.org",
+            "static.example.com",
+            "img7.news.example.cn",
+            "mail.example.de",
+            "s3.eu.store.example.io",
+            "w.example.com",
+            "push.mobile.example.com",
+            "dl.example.org",
+            "t.co",
+            "beacon.ads.example.net",
+        ];
+        let mut v = Vec::new();
+        for i in 0..60 {
+            v.push(format!("proxy.lab.example.edu:{} open through proxy proxy.lab.example.edu:5070 HTTPS", 5000 + i));
+            v.push(format!("{}:{} open through proxy proxy.lab.example.edu:5070 HTTPS", hosts[i % 12], 400 + i));
+            if i % 3 == 0 {
+                v.push(format!("{}:{} open through proxy socks.lab.example.edu:1080 SOCKS5", hosts[i % 7], 80 + i));
+            }
+        }
+        let refs: Vec<&str> = v.iter().map(String::as_str).collect();
+        let f = text(&refs);
+        let ps = detect_all(&f);
+        let mut owner = vec![usize::MAX; v.len()];
+        for (k, p) in ps.patterns.iter().enumerate() {
+            for &l in &p.lines[0] {
+                owner[l as usize] = k;
+            }
+        }
+        for (k, p) in ps.patterns.iter().enumerate() {
+            let q = Query::compile_in(&ps.query(p), f.schema(), &Default::default()).unwrap();
+            let res = search(&f, &Filter::Query(q), &Progress::new()).unwrap();
+            let others: Vec<&str> =
+                res.lines.iter().filter(|&&l| owner[l as usize] != k).map(|&l| refs[l as usize]).collect();
+            assert!(others.is_empty(), "{} also takes {others:?}\n{:?}", p.template(), templates(&ps));
+        }
+    }
+
+    /// Files opened together: the same message in each is one pattern,
+    /// and the file is no part of its query or of a rule made from it.
+    #[test]
+    fn the_file_is_no_context() {
+        let part = |name: &str, n: usize| -> Box<dyn LogSource> {
+            let lines: Vec<String> = (0..n).map(|i| format!("connected to node{i} in {} ms", 10 + i)).collect();
+            Box::new(TextFile::from_bytes(name, lines.join("\n").into_bytes()))
+        };
+        let both = crate::input::concat::Concat::new(vec![part("a.log", 20), part("b.log", 20)]).unwrap();
+        let ps = detect_all(&both);
+        assert_eq!(templates(&ps), ["connected to <*> in <*> ms"]);
+        assert!(ps.patterns[0].fields.is_empty(), "{:?}", ps.patterns[0].fields);
+        assert!(ps.ignore_rule(&ps.patterns[0]).starts_with("*: ignore /"), "{}", ps.ignore_rule(&ps.patterns[0]));
     }
 
     #[test]

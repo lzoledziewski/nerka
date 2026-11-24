@@ -280,43 +280,51 @@ WORD` is strict; after the alphas the tuning pane is behind a Settings
 switch, off by default; the configuration is one global file, moved and
 shared with settings bundles (not per pack).
 
-## Assumptions to review (2026-11-24)
+## Reviewed by the owner (2026-11-24)
 
-Taken while building the rounds unattended (owner, 2026-11-24: "you can
-take assumptions, let me review them in the morning"); each is a small
-change if it should be otherwise.
+The assumptions taken while building unattended, as the owner answered
+them:
 
-1. Rules: of those setting one thing (`max-slots`, `no-merge`, `set`) the
-   first that applies counts; list rules (`keep`, `value`, `literal`,
-   `apart`, `header`, `ignore`) add up.
-2. `state-values` is 2–16: a slot keeps 16 values while grouping (more
-   would cost time on every line).
-3. Lines… of a pattern are shown in the Patterns window (▸), not in the
-   bottom pane, which keeps the search hits.
-4. Compare is a mode of the Patterns window, not a window of its own.
-5. Ignoring a row in Compare hides it (by template, for the window's
-   session); it doesn't rewrite the Ignore filter. Save as ignore rule
-   writes a regex rule scoped by the pattern's telling fields.
-6. A lifecycle side takes the lifecycles' own lines (their lines rule).
-7. Presence (`3/3`) is shown for patterns, not for values.
-8. Signals panel: ⚖ on a lifecycle row compares it with the one before and
-   runs at once (the plan said a right-click menu; rows have buttons, not
-   menus, so a button).
-9. Tuning is a mode of the Patterns window; once opened, its configuration
-   (even unsaved) is what that window runs with, until Revert.
-10. Save writes only the settings that differ from the defaults, so a
-    later default reaches files that didn't change it.
-11. ⋮ "At most N slots here" proposes one less than the pattern has (its
-    last merge made one too many); the form can be edited before Add.
-12. "Why" explains stage 2 only, with every word weighing 1.
-13. The tuning pane shows in any version with a `-` (pre-releases) and is
-    a Settings switch otherwise.
-14. ➕ To library writes into a pack named `patterns` (made in the pack
-    folder if missing), through the Library editor: the query is shown
-    there, not saved until its Save; its name is the pattern's first three
-    words.
-15. Pooling rare contexts holds at most 256 K lines; past that, each
-    chunk's rare contexts are grouped alone, as before.
-16. `nerka anonymize` is CLI only (no GUI entry); DLT IDs are kept unless
-    `--ids` (rules scoped by `apid` then still apply to the shared trace);
-    the key is random unless `--seed`.
+- **Kept:** Lines… of a pattern in the Patterns window, not the bottom
+  pane; Compare a mode of the window; ⚖ on a lifecycle row in the Signals
+  panel (a button, runs at once; "like it"); Tuning a mode of the window,
+  its configuration (even unsaved) what the window runs with until Revert;
+  the tuning pane in pre-releases, a Settings switch otherwise; `nerka
+  anonymize` CLI only, DLT IDs kept unless `--ids`, a random key unless
+  `--seed`.
+- **For now:** ignoring a row in Compare hides it, Save as ignore rule
+  writes a regex rule scoped by the telling fields; Save writes only the
+  settings that differ from the defaults; ➕ To library into the pack
+  `patterns` through the Library editor, named by the first three words.
+- **Rules' scope:** setters (`max-slots`, `no-merge`, `set`) the first
+  that applies, list rules adding up, as built. The owner: the file in a
+  rule's scope makes no sense, and the file can't group patterns at all
+  (a tab of several files compares lifecycles from different files).
+  **The file is no context field** (2026-11-24): files read together are
+  one set of lines, patterns never told apart by file.
+- **Later:** `state-values` (2–16) to be tuned; ⋮ "At most N slots"
+  proposing one less; "Why" explaining stage 2 only; pooling rare contexts
+  up to 256 K lines; a lifecycle side's lines (its lines rule, or maybe
+  the lifecycle altogether).
+- **Open:** presence (`A 3/3 · B 0/5` on a Compare row) was unclear to the
+  owner; explained 2026-11-24, to be confirmed.
+
+### Findings of the first use (owner, 2026-11-24)
+
+- Some lines seemed to be in several patterns, a pattern's ▾ Filter showed
+  more lines than the view it was run on, and some patterns seemed generic,
+  matching more specific ones. Two causes, both fixed: ▾ Filter and 🔍
+  Search used a pattern's query alone, which takes its lines anywhere in
+  the file (now `(the lines grouped) AND (its query)`); and a message split
+  by the shape of a value (`proxy.lab.example.edu:<*> open …` beside `<*>
+  open …`) was two patterns, one's query taking the other's lines (now a
+  pattern whose sampled lines another's regex matches joins it, after stage
+  2: `absorb`). LogHub-2.0 2k: the share of lines another pattern's query
+  takes, 0.064 → 0.031 on average (Proxifier 0.83 → 0.38, Mac 0.018 →
+  0.004); GA 0.751 unchanged, FGA 0.748 → 0.760, WGA 0.914 → 0.949. Left:
+  the same message in two patterns as a state's value and a slot (BGL
+  `data storage interrupt`, 1.9 %), templates of slots only (`<*> <*> <*>
+  <*>`) taking any line of their length, and stage 1 splitting a message by
+  the number of words in a value.
+- Compare's Only / Ignore wanted in Patterns too, on top of its Lines
+  selector: built.

@@ -39,7 +39,7 @@ Owner feedback is driving this; these are deliberate choices, keep them:
 
 - **The plot's own window (owner, 2026-11-12):** its title starts with the window's name (`OTA crash · Plot · trace.dlt — nerka`), as the main window's does. One close only: the window's ✖ closes the plot (it docked before; the header's ✖ shows only when docked), and 📈 Plot opens it in its own window again; **⧉ Dock** puts it back under the views.
 
-- **Patterns (owner, 2026-11-23; experimental, design `patterns.md`):** **🧩 Patterns** opens a tab's patterns in a **window of its own** (for now; docking may come later). Patterns are **not computed by themselves**: only ▶ Run groups the lines, and a result stays, marked out of date, until the next run. Compare chooses its content (Only / Ignore filters, ignoring rows from the results) and takes groups of lifecycles in its first round; the tuning pane is behind a Settings switch after the alphas; settings and rules are one global file.
+- **Patterns (owner, 2026-11-23; experimental, design `patterns.md`):** **🧩 Patterns** opens a tab's patterns in a **window of its own** (for now; docking may come later). Patterns are **not computed by themselves**: only ▶ Run groups the lines, and a result stays, marked out of date, until the next run. Compare chooses its content (Only / Ignore filters, ignoring rows from the results) and takes groups of lifecycles in its first round; the tuning pane is behind a Settings switch after the alphas; settings and rules are one global file. The Patterns window has Compare's **Only / Ignore** too, a layer on its Lines selector, and a pattern's ▾ Filter / 🔍 Search keep to the lines grouped (owner, 2026-11-24).
 
 ## Checking the GUI visually
 

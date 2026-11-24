@@ -108,6 +108,15 @@ impl Filter {
         }
     }
 
+    /// The filter as NFD: a query's own text, a regex filter's as
+    /// [`text_to_nfd`] writes it.
+    pub fn nfd(&self) -> String {
+        match self {
+            Filter::Regex(m) => text_to_nfd(m.regex.as_str(), &MatcherOptions { fixed_string: false, ..m.options }),
+            Filter::Query(q) => q.source().to_owned(),
+        }
+    }
+
     /// Resolve query field names against a source's schema (see
     /// [`Query::bind`]). Plain regex filters need no binding.
     pub fn bind(&self, schema: &[FieldDef]) -> std::result::Result<Filter, DslError> {
@@ -373,6 +382,23 @@ pub(crate) mod tests {
 
     fn regex_filter(pat: &str, opts: MatcherOptions) -> Filter {
         Filter::Regex(Matcher::new(pat, opts).unwrap())
+    }
+
+    /// A filter as NFD keeps the same lines, whichever kind it is.
+    #[test]
+    fn a_filter_as_nfd_keeps_its_lines() {
+        let src = TextFile::from_bytes("t", b"a/b x\nA/B y\nc.d\nplain\n".to_vec());
+        let filters = [
+            regex_filter("a/b", MatcherOptions { case_insensitive: true, ..Default::default() }),
+            regex_filter("c.d", MatcherOptions { fixed_string: true, ..Default::default() }),
+            regex_filter("plain", MatcherOptions { invert: true, ..Default::default() }),
+            Filter::Query(Query::compile("raw ~ /x|y/").unwrap()),
+        ];
+        for f in &filters {
+            let again = Filter::Query(Query::compile(&f.nfd()).unwrap());
+            assert_eq!(run_on(&src, f), run_on(&src, &again), "{}", f.nfd());
+        }
+        assert_eq!(filters[3].nfd(), "raw ~ /x|y/");
     }
 
     /// Naive reference: render every line and evaluate it on its own,

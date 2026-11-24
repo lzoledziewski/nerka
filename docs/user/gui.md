@@ -107,13 +107,18 @@ or the signals changed.
 - **Lines:** all lines, the filter result, one lifecycle (`@ecu1` and its
   number), or the lines of a filter you type (NFD). **Field:** the text
   grouped (default: a DLT message's `payload`, else the line).
+- **Only** and **Ignore** (NFD), as in Compare, narrow those lines:
+  `ecu == ECU1`, or leave out `apid == GPS OR payload ~ /heartbeat/`.
+- Files opened together in one tab are one set of lines: the same message
+  in each is one pattern, never told apart by its file.
 - **Each row:** its share and count of lines, the fields that tell it
   apart (`apid=NAV`) and the template, state values in colour. A click
   goes to its first line. **▸** unfolds its slots (each value with its
   count and first and last line, a click goes there) and its lines.
-- **▾ Filter** puts its query in the Filter box and runs it, **🔍**
-  searches for its lines among the filtered ones, **📋** copies the
-  query. Sort by most lines, rarest first, or first line.
+- **▾ Filter** puts its query, kept to the lines grouped (`(the lines
+  chosen) AND (its query)`), in the Filter box and runs it; **🔍** searches
+  for them among the filtered ones; **📋** copies the query alone. Sort by
+  most lines, rarest first, or first line.
 - **➕** (to the library) opens the Library's editor on a new query of its
   lines in the pack `patterns` (made if there is none), each state
   captured as an enum signal: `gear={D|P|N}` gives `@gear`. Nothing is

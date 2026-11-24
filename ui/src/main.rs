@@ -1440,6 +1440,7 @@ impl Tab {
             id: self.patterns.id(),
             title: self.title(),
             kept: self.session.result().cloned(),
+            filter: self.session.filter().map(|f| f.nfd()),
             cx: self.session.context().clone(),
             lifecycles,
             file,
