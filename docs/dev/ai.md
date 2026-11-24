@@ -1,7 +1,7 @@
 # AI preparation (design; not built)
 
-Status: **proposed**. The two workflows, the terminal, what the AI may
-change and annotations are settled with the owner (2026-11-24, "Settled"
+Status: **proposed**. The two workflows, hand-written JSON, bounded
+output, the terminal, what the AI may change and annotations are settled with the owner (2026-11-24, "Settled"
 below). The open questions are at the end. Don't build past workflow A
 before they are answered.
 
@@ -51,7 +51,9 @@ a window is visible there, and the user can undo it.
 
 ## Workflow A: the AI does the analysis with the CLI
 
-Review R10 (2026-11-09) holds the details and is taken over as it stands:
+Review R10 (2026-11-09) holds the details, taken over with the changes
+below (bounded output: one version of each, with what 0.3.0-alpha.2
+already has):
 
 - `nerka open --json FILE`: format, size, lines, columns, fields with kind
   and cost, first and last time, level counts, protocols, notes.
@@ -59,8 +61,21 @@ Review R10 (2026-11-09) holds the details and is taken over as it stands:
   (already on `check`, `lifecycles`): JSON Lines, one object per line
   (`line` 1-based for display, `file`, `time`, `level`, `raw`; with
   `--fields a,b` those fields, typed).
-- `-m N`, `-A / -B / -C N` context, `--offset N` to page; counts first
-  (`-c`), so an AI can check a query's size before reading its lines.
+- **Bounded output** (owner, 2026-11-24: where nerka has it already, that
+  one version, no second):
+  - **Counts first:** `-c` (exists, `OutputArgs`), so an AI checks a
+    query's size before reading its lines.
+  - **At most N:** `-m N` (new, in `OutputArgs`, so on every command that
+    prints lines).
+  - **Paging:** `--skip N` (new). Not `--offset`: that is the global
+    "move a file's times" option.
+  - **Context: by time only,** as built in 0.3.0-alpha.2: NFD
+    `before(DUR, X)`, `after(DUR, X)`, `around(DUR, DUR, X)` and
+    `filter --before DUR --after DUR` (matches marked `>`, `--` between
+    windows). R10's `-A / -B / -C N` (lines) is dropped. In JSON a
+    context line has `"match": false`. A source without times has no
+    context window (an error naming it); lines around a line number come
+    from `nerka lines FILE FROM TO`, which exists.
 - `nerka help nfd`: the grammar from `dsl/mod.rs` (one `include_str!`
   source so it can't drift) plus examples per source kind; `nerka help
   fields FILE` = the fields of `open --json`.
@@ -159,7 +174,7 @@ provider in nerka).
 
 | Step | Gives | Depends on |
 |---|---|---|
-| A1 | `--json`, `-m`, context, `help nfd`, exit status (R10) | Q2, Q3 |
+| A1 | `--json`, `-m`, `--skip`, `help nfd`, exit status (R10) | Q3 |
 | A2 | `help agent` / skill file, `marks --add` with author | A1, the marks format |
 | B1 | `nerka mcp` and the window's read tools | A1 (operations, JSON) |
 | B2 | The window's changing tools, activity list, undo, screenshot | B1 |
@@ -173,6 +188,12 @@ in `ui/src/main.rs` (6,218 non-test lines).
 
 - **Two workflows:** the CLI for an analysis the AI does (A), MCP for
   assisted analysis on the user's window (B).
+- **JSON: hand-written** in core (`core/src/json.rs`): a value, a parser
+  and a writer, no `serde` (spec §3.1: no heavy dependencies), fuzzed by
+  the review gate. The CLI's `--json` and the MCP bridge use the same one.
+- **Bounded output: one version of each** (A1): `-c`, `-m N`, `--skip N`,
+  and context by time with what 0.3.0-alpha.2 built (`before` / `after` /
+  `around`, `filter --before / --after`); no line-count context.
 - **The terminal:** the user's own terminal, started from the window with
   the AI command chosen in Settings and `NERKA_WINDOW` set.
 - **What the AI may change:** directly, listed and undoable.
@@ -184,11 +205,6 @@ in `ui/src/main.rs` (6,218 non-test lines).
 
 ## Questions for the owner
 
-- **Q2 — JSON.** Hand-written value, parser and writer in core, or
-  `serde_json`? Spec §3.1 asks the core for "no heavy dependencies" and a
-  single binary; R10 (2026-11-09) planned `--json` hand-written like
-  `check --json` ("no serde: spec §3.1"). R10 only needed a writer. B also
-  has to parse JSON-RPC requests, which R10 didn't weigh.
 - **Q3 — exit status.** grep's 0 / 1 / 2 (no match = 1) by default while at
   0.x, or behind a flag? The owner chose 0 on purpose once
   (`cli/tests/cli.rs::no_match_is_success_with_no_output`).
