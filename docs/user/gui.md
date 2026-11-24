@@ -143,7 +143,10 @@ the score is G², 10.8 or more by default), as
   (hidden from the results; *Show ignored* brings it back), *Save as
   ignore rule* (added to the [pattern
   configuration](cli.md#the-pattern-configuration), so patterns and
-  compares leave its lines out), *Filter to its lines*, *Copy its query*.
+  compares leave its lines out), *Filter to its lines* and *Search for
+  its lines* (in this window's tab, all its lines: for another tab, copy
+  the query there), *Copy its query*. The row under the mouse is lit, so
+  its buttons at the right are easy to tell apart.
 - In the Signals panel, **⚖** on a lifecycle compares it with the one
   before.
 
@@ -152,7 +155,8 @@ Developer → Pattern tuning) edits the [pattern
 configuration](cli.md#the-pattern-configuration) on the lines at hand:
 
 - **Settings** of both stages, each with **●** while it isn't the default
-  (a click puts the default back). A change runs the patterns again on the
+  (a click puts the default back), and beside it what raising or lowering
+  it does; its name's hover says what it does, with an example. A change runs the patterns again on the
   same lines, and **Change** says what it did: patterns new and gone,
   joined and split (**Show** lists them).
 - **Rules**, one per line, read top to bottom (▲ ▼ to move, − to remove);

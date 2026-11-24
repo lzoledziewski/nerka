@@ -540,7 +540,7 @@ impl CompareUi {
                 let side = usize::from(d.counts[0] == 0);
                 let value = d.value.and_then(|(s, v)| Some((s, &p.slots().nth(s)?.values[v])));
                 let first = value.map_or(p.sides[side].first, |(_, v)| v.sides[side].first);
-                ui.horizontal(|ui| {
+                crate::patterns::lit_row(ui, |ui| {
                     if is_ignored {
                         ui.multiply_opacity(0.5);
                     }
@@ -580,11 +580,16 @@ impl CompareUi {
                                     ui.close();
                                 }
                             }
+                            // In this window's tab, whichever tabs the sides
+                            // read (another tab: copy the query there).
                             let q = ps.query(p);
-                            if run.tabs.contains(&input.tab.id)
-                                && ui.button("▾ Filter to its lines").on_hover_text(q.clone()).clicked()
-                            {
+                            let here = format!("In this tab ({}), all its lines:\n{q}", input.tab.title);
+                            if ui.button("▾ Filter to its lines").on_hover_text(&here).clicked() {
                                 out.filter = Some(q.clone());
+                                ui.close();
+                            }
+                            if ui.button("🔍 Search for its lines").on_hover_text(&here).clicked() {
+                                out.search = Some(q.clone());
                                 ui.close();
                             }
                             if ui.button("📋 Copy its query").on_hover_text(q.clone()).clicked() {

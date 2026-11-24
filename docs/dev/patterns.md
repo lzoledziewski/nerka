@@ -328,3 +328,8 @@ them:
   the number of words in a value.
 - Compare's Only / Ignore wanted in Patterns too, on top of its Lines
   selector: built.
+- Compare rows: their buttons at the right are far from a short text (no
+  grid), so a row is lit under the mouse (Patterns' too); Search for its
+  lines was missing beside Filter: both act in the window's own tab. The
+  tuning pane: each setting explained, with what raising or lowering it
+  does. Built.

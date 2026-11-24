@@ -135,6 +135,18 @@ fn within(scope: &Option<String>, q: &str) -> String {
     }
 }
 
+/// A row of a list, lit while the mouse is over it: its buttons sit at the
+/// right, far from a short text, and the light says whose they are.
+pub(crate) fn lit_row<R>(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
+    let bg = ui.painter().add(egui::Shape::Noop);
+    let row = ui.horizontal(add);
+    let rect = row.response.rect.expand2(egui::vec2(2.0, 1.0));
+    if ui.rect_contains_pointer(rect) {
+        ui.painter().set(bg, egui::Shape::rect_filled(rect, 2.0, ui.visuals().widgets.hovered.weak_bg_fill));
+    }
+    row.inner
+}
+
 /// A tab's Patterns window and its last result.
 pub struct PatternsUi {
     pub open: bool,
@@ -691,7 +703,7 @@ impl PatternsUi {
             for &k in order.iter().take(self.shown) {
                 let p = &ps.patterns[k];
                 let open = self.unfolded.get(&k).copied();
-                ui.horizontal(|ui| {
+                lit_row(ui, |ui| {
                     if ui
                         .small_button(if open.is_some() { "▾" } else { "▸" })
                         .on_hover_text("Its slots and lines")
@@ -985,6 +997,23 @@ mod tests {
             assert!(Instant::now() < until, "the run never finished");
             std::thread::sleep(Duration::from_millis(5));
         }
+    }
+
+    /// A list row is lit while the mouse is over it, and only then.
+    #[test]
+    fn a_row_under_the_mouse_is_lit() {
+        let ctx = egui::Context::default();
+        let lit = |at: egui::Pos2| {
+            let raw = egui::RawInput { events: vec![egui::Event::PointerMoved(at)], ..Default::default() };
+            let mut full = ctx.run_ui(raw, |ui| {
+                lit_row(ui, |ui| ui.label("gear {D|P}"));
+            });
+            full.textures_delta.clear();
+            let fill = ctx.global_style().visuals.widgets.hovered.weak_bg_fill;
+            full.shapes.iter().any(|c| matches!(&c.shape, egui::Shape::Rect(r) if r.fill == fill))
+        };
+        assert!(lit(egui::pos2(8.0, 8.0)));
+        assert!(!lit(egui::pos2(8.0, 400.0)));
     }
 
     #[test]
