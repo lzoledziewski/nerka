@@ -1,4 +1,4 @@
-//! Robustness check for the readers: open mutated copies of seed files and
+//! Robustness check for the readers and the JSON parser: open mutated copies of seed files and
 //! touch every line the way a viewer and a filter do. A panic is a bug (the
 //! readers take untrusted files); an `Err` from `open` is fine.
 //!
@@ -159,6 +159,13 @@ fn main() {
                 let _ = KsyProtocol::parse(&String::from_utf8_lossy(&bytes));
             } else if let Ok(src) = nerka_core::open_with(&path, options, &Progress::new()) {
                 exercise(&*src);
+            }
+            // The JSON parser (the MCP bridge's requests): every input, and
+            // each of its lines (a JSON Lines seed's records).
+            let text = String::from_utf8_lossy(&bytes);
+            let _ = nerka_core::json::parse(&text);
+            for line in text.lines().take(1000) {
+                let _ = nerka_core::json::parse(line);
             }
         }));
         if let Err(p) = r {
