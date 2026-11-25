@@ -660,6 +660,25 @@ mod tests {
         assert_eq!(r.line_count(), 3, "the hint's split makes an entry a record");
     }
 
+    /// `@line`: a row's line in its own file, in a view of several files.
+    #[test]
+    fn at_line_is_the_line_in_its_own_file() {
+        let dir = std::env::temp_dir().join(format!("nerka-at-line-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (a, b) = (dir.join("a.log"), dir.join("b.log"));
+        std::fs::write(&a, "a1\na2\na3\n").unwrap();
+        std::fs::write(&b, "b1\nb2\n").unwrap();
+        let v = crate::open_many(&[a, b], &crate::OpenOptions::default(), &Progress::new()).unwrap();
+        let signals = crate::Signals::default().for_source(&*v);
+        let rows = |q: &str| {
+            let q = crate::Query::compile_in(q, v.schema(), &signals).unwrap();
+            crate::search(&*v, &crate::Filter::Query(q), &Progress::new()).unwrap().lines
+        };
+        assert_eq!(rows("@line == 2"), [1, 4], "a2 and b2");
+        assert_eq!(rows("file == b.log AND @line >= 2"), [4]);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     #[test]
     fn base64_as_rfc_4648() {
         let cases = [

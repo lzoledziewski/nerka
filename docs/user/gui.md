@@ -73,7 +73,7 @@ to the file meanwhile, and saving yours never writes over them.
 
 Files opened together (multi-select in **Open…**, dropping several,
 `nerka-gui a.dlt b.pcap`) become **one tab**, one after another in the
-order given. The tab's menu → **Files…** lists them: move, remove or add
+order given; each line is numbered in its own file (`@line` in queries). The tab's menu → **Files…** lists them: move, remove or add
 files, turn protocols on or off per capture, pick a text file's
 [profile](formats.md#profiles), move a file's times by an
 [offset](formats.md#a-files-offset); below the list, how each file's time

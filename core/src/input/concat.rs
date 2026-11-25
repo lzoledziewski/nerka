@@ -374,6 +374,13 @@ impl LogSource for Concat {
         self.parts[k].file_line(l)
     }
 
+    fn line_in_file(&self, line: LineNo) -> LineNo {
+        match self.locate(line) {
+            Some((k, l)) => self.parts[k].line_in_file(l),
+            None => line,
+        }
+    }
+
     fn size_bytes(&self) -> u64 {
         self.parts.iter().map(|p| p.size_bytes()).sum()
     }
@@ -492,6 +499,10 @@ impl LogSource for View<'_> {
 
     fn file_line(&self, line: LineNo) -> Option<LineNo> {
         self.whole.parts[self.k].file_line(line)
+    }
+
+    fn line_in_file(&self, line: LineNo) -> LineNo {
+        self.whole.parts[self.k].line_in_file(line)
     }
 
     fn columns(&self) -> &[ColumnDef] {

@@ -408,6 +408,10 @@ pub fn signals_panel(ui: &mut egui::Ui, st: &mut SignalsUi, input: Input<'_>) ->
                     }
                     let hover = if d.kind() == SignalKind::Time && d.is_from_source() {
                         "time\nThe file's own time of each line (DLT: when the logger received it)".to_owned()
+                    } else if d.is_source_line() {
+                        "line\nEach line's number in its own file (a record: its first line), also in a tab of \
+                         several files: @line < 526"
+                            .to_owned()
                     } else if let Some(l) = d.as_lifecycle() {
                         format!(
                             "lifecycle: {}\nThe number of the lifecycle each line is in; an event where one starts",
@@ -451,6 +455,7 @@ pub fn signals_panel(ui: &mut egui::Ui, st: &mut SignalsUi, input: Input<'_>) ->
                             Some(t) if d.kind() == SignalKind::Time => {
                                 (fit_time(t, fit + SUFFIX), nerka_core::time::format_time(t, 6))
                             }
+                            Some(n) if d.is_source_line() => (format!("{n}"), format!("{n}")),
                             Some(u) => (format!("{u:.4} s"), format!("{u} s")),
                             None => ("—".to_owned(), "—".to_owned()),
                         };

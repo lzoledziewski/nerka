@@ -663,6 +663,13 @@ pub trait LogSource: Send + Sync {
         None
     }
 
+    /// The line of its own file `line` is (a record: its first line), from
+    /// 0, in a view of several files or sorted by time too: `@line`
+    /// (owner, 2026-11-25).
+    fn line_in_file(&self, line: LineNo) -> LineNo {
+        self.file_line(line).unwrap_or(line)
+    }
+
     /// The line's cells for a detailed view of one line: one per
     /// [`Self::columns`] entry (plain text: the whole line as one cell).
     /// Unlike [`Self::line_text`], which flattens a decoded message's own

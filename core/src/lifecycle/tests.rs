@@ -475,7 +475,8 @@ mod signals {
     fn there_is_no_built_in_uptime_signal() {
         // Whose uptime would it be? Lifecycles read it from their own lines.
         let sig = Signals::default().for_source(&ota());
-        assert_eq!(sig.iter().map(|d| d.name()).collect::<Vec<_>>(), ["time"]);
+        // The built-ins: the file's own time, and each line's number in its file.
+        assert_eq!(sig.iter().map(|d| d.name()).collect::<Vec<_>>(), ["time", "line"]);
     }
 }
 

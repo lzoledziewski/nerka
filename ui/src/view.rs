@@ -928,6 +928,10 @@ pub fn log_view(
     // Fold markers clicked: (file line, unfold).
     let mut folds: Vec<(LineNo, bool)> = Vec::new();
     let mut numbered = None;
+    // A tab of several files numbers each line in its own file, as agents'
+    // answers and @line do (owner, 2026-11-25).
+    let several = source.part_files().len() > 1;
+    let at = nerka_core::agent::locator(source);
     for (y, row, slot) in slots(state.top, state.skipped(), rows, &is_open(state)) {
         let line = line_of_row(row);
         let k = match slot {
@@ -986,10 +990,11 @@ pub fn log_view(
         // Its number on its first slot shown (a record scrolled into).
         if numbered != Some(row) {
             numbered = Some(row);
+            let number = if several { at(line).1 + 1 } else { line + 1 };
             painter.text(
                 pos2(text_rect.min.x + gutter_w - char_w * 0.75, snap(y + 1.0)),
                 Align2::RIGHT_TOP,
-                (line + 1).to_string(),
+                number.to_string(),
                 font.clone(),
                 dim,
             );

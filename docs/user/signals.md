@@ -45,7 +45,8 @@ defaults to the signal's name. Parts:
 - the file: `@time` for files that know their lines' times (DLT,
   captures, text files whose [profile](formats.md#profiles) reads a time:
   by default the date-time each line starts with), moved by the file's
-  [offset](formats.md#a-files-offset);
+  [offset](formats.md#a-files-offset); and `@line`, every line's number in
+  its own file (a record: its first line), also in a tab of several files;
 - a text file's [profile](formats.md#profiles): its `signal` clauses, for
   its files only, shown as `profile NAME` and changed in ⚙ Settings →
   Profiles… (a signal of yours with the same name wins);

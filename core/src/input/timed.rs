@@ -237,6 +237,10 @@ impl LogSource for Timed {
         self.inner.file_line(line)
     }
 
+    fn line_in_file(&self, line: LineNo) -> LineNo {
+        self.inner.line_in_file(line)
+    }
+
     fn line_detail(&self, line: LineNo) -> Option<Vec<String>> {
         let mut cells = self.inner.line_detail(line)?;
         if self.time_column

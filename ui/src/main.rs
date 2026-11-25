@@ -2510,7 +2510,9 @@ impl Tab {
             let base =
                 LineSignal { name: d.name().to_owned(), kind: d.kind().as_str(), origin, value: None, from: None };
             if d.is_from_source() {
-                let value = file.time(line).map(|t| nerka_core::time::format_time(t, 6));
+                let value = d
+                    .source_value(&*file, line)
+                    .map(|v| if d.is_source_line() { format!("{v}") } else { nerka_core::time::format_time(v, 6) });
                 out.push(LineSignal { from: value.as_ref().map(|_| line), value, ..base });
                 continue;
             }
@@ -6739,7 +6741,7 @@ query timeouts  labels: vision
         // (with the file's built-in @time, an event on every DLT line).
         assert_eq!(
             own.iter().map(|s| (s.name.as_str(), s.origin)).collect::<Vec<_>>(),
-            [("time", "built in"), ("free_slots", "FIBEX")]
+            [("time", "built in"), ("line", "built in"), ("free_slots", "FIBEX")]
         );
 
         // Its − in the Signals panel unpicks it (owner, 2026-10-28: it only
@@ -9168,14 +9170,14 @@ query clock  signals: t:time
         tab.refresh_signals(&ctx, &lib, &saved, 0);
         // Nothing picked: only the time its lines start with (the built-in
         // profile: three of its four lines have one).
-        assert_eq!(tab.signals.iter().map(|d| d.name()).collect::<Vec<_>>(), ["time"]);
+        assert_eq!(tab.signals.iter().map(|d| d.name()).collect::<Vec<_>>(), ["time", "line"]);
 
         // A signal pick: its groups are signals; the filter stays empty.
         tab.picks.add(&lib, "p.speed", Use::Signal, None);
         tab.picks.add(&lib, "p.clock", Use::Signal, None);
         tab.refresh_signals(&ctx, &lib, &saved, 0);
         let kinds: Vec<(&str, &str)> = tab.signals.iter().map(|d| (d.name(), d.kind().as_str())).collect();
-        assert_eq!(kinds, [("time", "time"), ("v", "num"), ("gear", "enum"), ("t", "time")]);
+        assert_eq!(kinds, [("time", "time"), ("line", "num"), ("v", "num"), ("gear", "enum"), ("t", "time")]);
         assert_eq!(tab.picks.expand(&lib).unwrap().exp.nfd, "");
         tab.mode = Mode::Query;
         tab.pattern = "@gear == D AND level >= WARN".into();
@@ -9254,7 +9256,7 @@ query clock  signals: t:time
         tab.picks.params.insert("cam".into(), vec![("CAM1".into(), false), ("CAM2".into(), false)]);
         tab.refresh_signals(&ctx, &lib, &saved, 0);
         let names: Vec<&str> = tab.signals.iter().map(|d| d.name()).collect();
-        assert_eq!(names, ["drops_cam1", "total", "drops_cam2"]);
+        assert_eq!(names, ["line", "drops_cam1", "total", "drops_cam2"]);
         let total = tab.signals.get("total").unwrap();
         assert_eq!(total.queries(), ["drops (CAM1)", "drops (CAM2)"]);
         assert!(tab.option_conflicts.is_empty());
