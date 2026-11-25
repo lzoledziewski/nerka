@@ -634,7 +634,9 @@ impl App {
                 .push("search", t.search.pattern.as_str())
                 .push("bookmarks", t.bookmarks.len())
                 .push("annotations", t.bookmarks.annotations())
-                .push("plotted", plot::lock(&t.plot).plotted.clone());
+                .push("plotted", plot::lock(&t.plot).plotted.clone())
+                .push("signals", t.signals.len())
+                .push("library_queries", self.library.packs().iter().map(|p| p.queries.len()).sum::<usize>());
             if let Some(f) = &t.file {
                 let files: Vec<String> = t.paths.iter().map(|p| p.display().to_string()).collect();
                 let row = t.current_line().min(f.line_count().saturating_sub(1));

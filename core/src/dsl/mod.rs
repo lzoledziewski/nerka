@@ -471,8 +471,11 @@ impl FieldCond {
             }
             let mut known: Vec<&str> = vec!["raw", "level"];
             known.extend(schema.iter().map(|d| d.name.as_ref()));
+            // A line's number is the signal @line (evaluation: an agent
+            // wrote `line > 100`).
+            let hint = if self.name.eq_ignore_ascii_case("line") { "; a line's number is @line" } else { "" };
             return Err(DslError {
-                msg: format!("unknown field '{}' (this source has: {})", self.name, known.join(", ")),
+                msg: format!("unknown field '{}' (this source has: {}{hint})", self.name, known.join(", ")),
                 pos: self.pos,
             });
         };

@@ -328,6 +328,28 @@ pub fn hints(source: &dyn LogSource) -> Vec<String> {
         }
     }
     let mut out = Vec::new();
+    // An uptime at the start of each line (`[ 2088.354600]`: dmesg, a
+    // a daemon's own output): a profile reads it as the line's time
+    // .
+    let uptimes = (0..n.min(200))
+        .filter_map(|l| source.line_text(l))
+        .filter(|t| {
+            let b = t.as_bytes();
+            b.first() == Some(&b'[') && {
+                let rest = t[1..].trim_start();
+                let num = rest.split(']').next().unwrap_or("");
+                !num.is_empty() && num.contains('.') && num.bytes().all(|c| c.is_ascii_digit() || c == b'.')
+            }
+        })
+        .count() as u64;
+    if uptimes >= 3 && uptimes * 2 >= n.min(200) && time_span(source).is_none() {
+        let profile = "uptime: time /^.[ ]*(?<time>[0-9]+[.][0-9]+)/; numbers s";
+        out.push(format!(
+            "lines start with an uptime in seconds ([ 2088.354600]): read it as their time with a profile, \
+             --profile '{profile}' --profile uptime (window: Settings → Profiles…); then before / after and \
+             gaps work"
+        ));
+    }
     if go >= 3 && !source.format().starts_with("text records") {
         out.push(format!(
             "a Go goroutine dump ({go} goroutines from line {go_first}): read as records start=/^goroutine [0-9]/ \
@@ -342,7 +364,8 @@ pub fn hints(source: &dyn LogSource) -> Vec<String> {
                 .into(),
         );
     }
-    if source.line_count() > 0 && time_span(source).is_none() {
+    let uptime_said = out.iter().any(|h| h.starts_with("lines start with an uptime"));
+    if source.line_count() > 0 && time_span(source).is_none() && !uptime_said {
         // Many lines start with a time, but under half: entries that span
         // lines (a payload, a trace), read best as records starting at the
         // time (a server's trace log).
@@ -392,6 +415,7 @@ pub fn patterns(ps: &crate::pattern::Patterns, view: &View, top: usize, detail: 
         v.push("count", p.count())
             .push("share", p.count() as f64 / ps.total().max(1) as f64)
             .push("first", view.place(p.first()))
+            .push("last", view.place(p.last()))
             .push("fields", Value::object(p.fields.iter().map(|(n, x)| (n.to_string(), Value::from(x.to_string())))))
             .push("template", p.template())
             .push("unsorted", p.unsorted);
@@ -681,6 +705,18 @@ mod tests {
         assert_eq!(rows("@line == 2"), [1, 4], "a2 and b2");
         assert_eq!(rows("file == b.log AND @line >= 2"), [4]);
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn an_uptime_at_line_starts_is_hinted_with_its_profile() {
+        let log = "[ 2088.354600]~DLT~  587~NOTICE   ~Starting
+[ 2088.354705]~DLT~  587~INFO     ~main()
+[ 2089.1]~DLT~  587~INFO     ~x
+";
+        let f = TextFile::from_bytes("gw.log", log.as_bytes().to_vec());
+        let h = hints(&f);
+        assert_eq!(h.len(), 1, "{h:?}");
+        assert!(h[0].contains("--profile 'uptime: time /^.[ ]*(?<time>[0-9]+[.][0-9]+)/; numbers s'"), "{h:?}");
     }
 
     #[test]
