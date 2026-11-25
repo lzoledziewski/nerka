@@ -134,6 +134,119 @@ fn the_parallel_split_matches_a_plain_one() {
     }
 }
 
+/// A UART log the capture began in the middle of a boot: the lines before
+/// the first boot are one record, a partial session like the others (owner,
+/// 2026-11-25); `outside=rows` makes them a row each.
+#[test]
+fn a_session_before_the_first_start_is_one_record() {
+    let uart = "kernel: eth0 up\napp: ready\nU-Boot 2024.1 boot 2\nkernel: start\napp: ready\nU-Boot 2024.1 boot 3\nkernel: start\n";
+    let f = RecordFile::from_bytes("uart", uart.into(), RecordSplit::parse("start=/U-Boot/").unwrap());
+    assert_eq!(
+        rows(&f),
+        [
+            "kernel: eth0 up\napp: ready",
+            "U-Boot 2024.1 boot 2\nkernel: start\napp: ready",
+            "U-Boot 2024.1 boot 3\nkernel: start"
+        ]
+    );
+    assert_eq!(f.outside_rows(), [0]);
+    assert!(
+        f.info().notes[0].starts_with("the first record (lines 1–2) starts before the first match"),
+        "{:?}",
+        f.info().notes
+    );
+    // Filter whole boots on a startup line, the partial one included.
+    let q = |f: &RecordFile, s: &str| run_on(f, &Filter::Query(Query::compile_for(s, f.schema()).unwrap()));
+    assert_eq!(q(&f, "/app: ready/"), [0, 1]);
+    assert_eq!(q(&f, "NOT outside"), [1, 2]);
+    let rows_out =
+        RecordFile::from_bytes("uart", uart.into(), RecordSplit::parse("start=/U-Boot/ outside=rows").unwrap());
+    assert_eq!(rows_out.line_count(), 4);
+    assert_eq!(rows_out.outside_rows(), [0, 1]);
+}
+
+/// A dump inside a server's log: each goroutine ends at its blank line,
+/// and the server's lines between dumps are rows, not swallowed by the
+/// last goroutine (their levels found).
+#[test]
+fn an_end_keeps_the_log_after_a_dump_out_of_its_records() {
+    let log = "\
+time=1 level=INFO msg=load
+SIGABRT: abort
+
+goroutine 1 [running]:
+main.f()
+
+goroutine 2 [select]:
+main.g()
+
+time=2 level=ERROR msg=\"runner terminated\"
+time=3 level=INFO msg=load
+";
+    let split = RecordSplit::parse("start=/^goroutine [0-9]/ end=/^$/").unwrap();
+    let f = RecordFile::from_bytes("serve.log", log.into(), split);
+    let r = rows(&f);
+    assert_eq!(r.len(), 7, "{r:?}");
+    assert_eq!(r[3], "goroutine 1 [running]:\nmain.f()\n", "the blank end line is the record's");
+    assert_eq!(r[5], "time=2 level=ERROR msg=\"runner terminated\"");
+    assert_eq!(f.outside_rows(), [0, 1, 2, 5, 6]);
+    let q = |s: &str| run_on(&f, &Filter::Query(Query::compile_for(s, f.schema()).unwrap()));
+    assert_eq!(q("level >= ERROR"), [5]);
+    assert_eq!(q("NOT outside"), [3, 4]);
+    assert_eq!(q("outside AND /load/"), [0, 6]);
+    // As the file numbers them: rows start at lines 1, 2, 3, 4, 7, 10, 11.
+    let firsts: Vec<_> = (0..f.line_count()).map(|r| f.file_line(r).unwrap() + 1).collect();
+    assert_eq!(firsts, [1, 2, 3, 4, 7, 10, 11]);
+    // An end alone: a record ends at each match, the next line begins one.
+    let f = RecordFile::from_bytes("t", "a\nb\n---\nc\n---\nd\n".into(), RecordSplit::parse("end=/---/").unwrap());
+    assert_eq!(rows(&f), ["a\nb\n---", "c\n---", "d"]);
+    assert!(f.outside_rows().is_empty());
+}
+
+#[test]
+fn bounds_read_back_and_say_what_is_wrong() {
+    for spec in [
+        r"start=/\d{4}-/",
+        r"start=/^goroutine \d/ end=/^$/",
+        "start=/U-Boot/ outside=rows",
+        "start=/A/ end=/B/ outside=one",
+        "end=/----/",
+        r"start=/a[/]b/ end=/c\/d/",
+    ] {
+        assert_eq!(RecordSplit::parse(spec).unwrap().spec(), spec);
+    }
+    // One part: a bare regex, spaces and all, as specs were before `end=`.
+    assert_eq!(RecordSplit::parse(r"start=\d{4}-\d\d -x").unwrap().spec(), r"start=/\d{4}-\d\d -x/");
+    for (bad, says) in [
+        ("start=/A/ end=/B", "no closing /"),
+        ("start=/A/ outside=maybe", "one or rows"),
+        ("outside=rows", "start=/REGEX/ or end=/REGEX/ is needed"),
+        ("start=/A/ start=/B/", "given twice"),
+        ("start=/A/ until=/B/", "'until'"),
+    ] {
+        let e = RecordSplit::parse(bad).unwrap_err().to_string();
+        assert!(e.contains(says), "{bad}: {e}");
+    }
+}
+
+/// Lines of the file, as agents and the gutter number them: a record by its
+/// first line, a line inside it finds it.
+#[test]
+fn file_lines_find_their_records() {
+    let f = RecordFile::from_bytes("t", LOG.into(), start());
+    let at = crate::agent::locator(&f);
+    assert_eq!((0..5).map(|r| at(r).1 + 1).collect::<Vec<_>>(), [1, 2, 3, 7, 8]);
+    for (line, row) in [(0, 0), (2, 2), (4, 2), (5, 2), (6, 3), (7, 4)] {
+        assert_eq!(crate::agent::row_of_file_line(&f, 0, line), Ok(row), "line {}", line + 1);
+    }
+    assert_eq!(crate::agent::row_of_file_line(&f, 0, 8), Err("the file has lines 1 to 8".into()));
+    assert_eq!(crate::agent::lines_in_record(&f, 2), Some(4));
+    assert_eq!(crate::agent::lines_in_record(&f, 1), None, "one line");
+    // Where a query matches inside a record: its first such line, and how many.
+    let h = Filter::Query(Query::compile("/ at a\\.b/").unwrap()).highlighter();
+    assert_eq!(crate::agent::record_matches(&f, 2, &h), Some((4, 2)));
+}
+
 const JSONL: &str = r#"{"ts": "10:00:00", "level": "info", "msg": "start", "ctx": {"user": "alice", "id": 7}, "latency": 1.25, "status": 200}
 {"ts": "10:00:01", "level": "ERROR", "msg": "db \"down\"", "ctx": {"user": "bob", "id": 8}, "latency": 30, "status": 503, "tags": ["db", "retry"]}
 {"ts": "10:00:02", "level": "warn", "msg": "slow", "ctx": {"user": "alice"}, "latency": 4.5, "status": 200}

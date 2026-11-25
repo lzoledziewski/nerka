@@ -69,7 +69,9 @@ commands that print lines, and one object for the others:
 | `compare` | `{"a", "b", "min_score", "show", "rows", "differences": […], "more"}`; a difference's `change` is `new`, `gone`, `changed` or `same` |
 | `check`, `lifecycles` | [their results](checks.md) |
 
-- `line` counts from 1, in the line's own file; `time` is UTC in RFC 3339
+- `line` counts from 1, in the line's own file (a record: its first line;
+  `"lines"`: how many it holds; with a query, `"match_line"`: its first
+  line that matched, and `"matches"`: how many did); `time` is UTC in RFC 3339
   (`2026-11-07T10:00:02.000000Z`) whatever `--local-time` says, a time of
   day as `10:00:02.000000`; `time` and `level` are `null` on a line
   without one.

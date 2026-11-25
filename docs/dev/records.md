@@ -1,6 +1,6 @@
-# Records: where they end, lines outside them, numbers, matches (design; not built)
+# Records: where they end, lines outside them, numbers, matches
 
-Status: **proposed** (2026-11-25), for the owner's review. Re-evaluated
+Status: **built** (2026-11-25, all five questions answered below), for 0.3.0. Re-evaluated
 from the user's and the agents' side after the evaluation rounds
 (`ai-evaluation.md`); the owner: "I liked the original version for one
 use case … it might be my bias … spend more time on this point".

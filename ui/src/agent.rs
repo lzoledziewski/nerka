@@ -153,7 +153,7 @@ struct Snap {
 
 impl Snap {
     fn view(&self) -> View<'_> {
-        View { source: &*self.source, files: &self.files, compact: true, width: ca::WIDTH }
+        View { source: &*self.source, files: &self.files, compact: true, width: ca::WIDTH, matches: None }
     }
 
     /// `nfd` compiled for the tab: its signals and bookmarks; what can't
@@ -193,16 +193,11 @@ impl Snap {
                 .position(|n| n.ends_with(f) || n.contains(f))
                 .ok_or(format!("no file '{f}' in this tab: {}", self.files.join(", ")))?,
         };
-        let (inner, row_of) = match self.source.reordered() {
-            Some(r) => (r.inner, Some(r.row_of)),
-            None => (&*self.source, None),
-        };
-        let (start, count) = inner.part_files().get(k).copied().unwrap_or((0, inner.line_count()));
-        if line == 0 || line > count {
-            return Err(format!("{key} {line}: the file has lines 1 to {count}"));
+        if line == 0 {
+            return Err(format!("{key} 0: lines count from 1"));
         }
-        let l = start + line - 1;
-        Ok(row_of.map_or(l, |m| m[l as usize]))
+        // The file's line; in records, the record holding it.
+        ca::row_of_file_line(&*self.source, k, line - 1).map_err(|e| format!("{key} {line}: {e}"))
     }
 }
 
@@ -303,6 +298,12 @@ fn read(tool: &str, args: &Value, s: &Snap) -> Result<Value, String> {
             let fields = Fields::parse(&field_list(args), &*s.source)?;
             let (skip, max) = (num_arg(args, "skip", 0), num_arg(args, "max", s.limits.lines).min(s.limits.most));
             let (before, after) = (str_arg(args, "before"), str_arg(args, "after"));
+            // A record says which of its lines the query matched.
+            let hl = q
+                .filter(|q| !q.trim().is_empty())
+                .and_then(|q| s.compile(q, &mut Vec::new()).ok())
+                .map(|f| f.highlighter());
+            view.matches = hl.as_ref();
             if before.is_some() || after.is_some() {
                 let q = q.filter(|q| !q.trim().is_empty()).ok_or("before / after need a query")?;
                 let hits = s.rows(Some(q), in_view, &mut warnings)?;
@@ -651,7 +652,7 @@ impl App {
             if let Some(f) = &t.file {
                 let files: Vec<String> = t.paths.iter().map(|p| p.display().to_string()).collect();
                 let row = t.current_line().min(f.line_count().saturating_sub(1));
-                let mut cur = View { source: &**f, files: &files, compact: false, width: 0 }.place(row);
+                let mut cur = View { source: &**f, files: &files, compact: false, width: 0, matches: None }.place(row);
                 cur.push("raw", f.line_text(row).map(|x| x.into_owned()));
                 v.push("selected", cur);
             }
@@ -756,8 +757,8 @@ impl App {
                 t.reopen(ctx, &self.prefs, self.fibex.clone());
                 self.active = i;
                 let note = if split.is_some() {
-                    "the tab reads its files again: its rows are records now (line numbers count records; \
-                     first_line is where each starts in the file); filter and patterns take whole records"
+                    "the tab reads its files again: its rows are records now (numbered by their first line in \
+                     the file, \"lines\": how many they hold); filter and patterns take whole records"
                 } else {
                     "the tab reads its files again: a row a line, as before"
                 };

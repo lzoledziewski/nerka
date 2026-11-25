@@ -93,8 +93,12 @@ pub fn read_auto_in(src: &str, phrases: &MatcherOptions, schema: &[FieldDef], si
         }
         phrases += 1;
         i += 1;
-        // The bookmark field: kept as typed (alone, the box is text below).
-        if src[start..end].eq_ignore_ascii_case("bookmark") {
+        // The bookmark field, and `outside` where the file has it (records):
+        // kept as typed (alone, the box is text below).
+        let w = &src[start..end];
+        if w.eq_ignore_ascii_case("bookmark")
+            || (w.eq_ignore_ascii_case("outside") && schema.iter().any(|f| f.name == "outside"))
+        {
             continue;
         }
         nfd.push_str(&src[copied..start]);

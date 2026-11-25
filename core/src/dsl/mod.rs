@@ -305,6 +305,7 @@ impl Expr {
                 None => *op == CmpOp::Ne,
             },
             Expr::Cond(Cond::Field(f)) => match (f.id.and_then(|id| ev.field(id)), &f.test) {
+                (Some(_), FieldTest::Any) => true,
                 (Some(FieldValue::Str(v)), FieldTest::Str(op, want)) => op.test(&*v, want.as_slice()),
                 (Some(FieldValue::Str(v)), FieldTest::StrNoCase(op, want)) => {
                     op.test(v.to_ascii_lowercase().as_slice(), want.as_slice())
@@ -483,6 +484,8 @@ impl FieldCond {
         let fail = |msg: String, pos| Err(DslError { msg, pos });
         let test = std::mem::replace(&mut self.test, FieldTest::Num(CmpOp::Eq, 0));
         self.test = match (test, schema[id].kind) {
+            // A field alone (`outside`): the row has it.
+            (t @ FieldTest::Any, _) => t,
             (t @ (FieldTest::Match(_) | FieldTest::Str(..)), FieldKind::Str)
             | (t @ (FieldTest::Match(_) | FieldTest::StrNoCase(..)), FieldKind::Name)
             | (t @ (FieldTest::Num(..) | FieldTest::Match(_)), FieldKind::U64)
@@ -492,11 +495,7 @@ impl FieldCond {
                 None => return fail(format!("'{name}' is a number but '{v}' isn't"), pos),
             },
             (
-                FieldTest::Str(..)
-                | FieldTest::StrNoCase(..)
-                | FieldTest::Num(..)
-                | FieldTest::Any
-                | FieldTest::Time(..),
+                FieldTest::Str(..) | FieldTest::StrNoCase(..) | FieldTest::Num(..) | FieldTest::Time(..),
                 FieldKind::F64,
             ) => {
                 return fail(format!("'{name}' is a number: use ==, !=, >=, <=, >, <, ~ or !~"), self.op_pos);
@@ -511,7 +510,6 @@ impl FieldCond {
                 FieldTest::Literal(..)
                 | FieldTest::Num(..)
                 | FieldTest::Float(..)
-                | FieldTest::Any
                 | FieldTest::Time(..)
                 | FieldTest::StrNoCase(..),
                 FieldKind::Str,
@@ -520,7 +518,6 @@ impl FieldCond {
                 FieldTest::Literal(..)
                 | FieldTest::Num(..)
                 | FieldTest::Float(..)
-                | FieldTest::Any
                 | FieldTest::Time(..)
                 | FieldTest::Str(..),
                 FieldKind::Name,
@@ -532,11 +529,7 @@ impl FieldCond {
                 None => return fail(format!("'{name}' is a number but '{v}' isn't"), pos),
             },
             (
-                FieldTest::Str(..)
-                | FieldTest::StrNoCase(..)
-                | FieldTest::Float(..)
-                | FieldTest::Any
-                | FieldTest::Time(..),
+                FieldTest::Str(..) | FieldTest::StrNoCase(..) | FieldTest::Float(..) | FieldTest::Time(..),
                 FieldKind::U64,
             ) => {
                 return fail(format!("'{name}' is a number: use ==, !=, >=, <=, >, <, ~ or !~"), self.op_pos);
@@ -1092,6 +1085,14 @@ mod tests {
         assert_eq!(e.pos, 11);
         assert!(Query::compile(r"raw ~ /api\/(get|put)/").is_ok());
         assert!(!Query::compile("level >= ERROR )").unwrap_err().msg.contains("slash"));
+        // `outside` alone: a records field; on a file without it, unknown
+        // where it is written.
+        assert!(Query::compile("NOT outside AND level >= ERROR").is_ok());
+        let e = Query::compile_for("level >= WARN AND NOT outside", &[]).unwrap_err();
+        assert!(e.msg.contains("unknown field 'outside'"), "{e}");
+        assert_eq!(e.pos, 22);
+        let schema = [FieldDef::new("outside", FieldKind::U64, false)];
+        assert!(Query::compile_for("outside == 1", &schema).is_ok(), "with an operator: a number");
     }
 
     #[test]

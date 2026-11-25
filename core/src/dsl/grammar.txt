@@ -8,6 +8,8 @@ primary := "(" expr ")"
          | FIELD OP VALUE
          | SIGNAL OP VALUE
          | "bookmark" [ OP VALUE ]    -- the line's bookmark
+         | "outside"                  -- a row outside every record (records
+                                         with start= / end=: NOT outside)
          | WINDOW "(" DUR "," [ DUR "," ] expr ")"
 WINDOW  := before | after | around    -- around takes two DURs
 DUR     := NUMBER [ ms | s | m | h ]  -- default seconds

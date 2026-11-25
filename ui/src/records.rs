@@ -8,7 +8,7 @@
 //! (`offset=+3h`), one line each.
 
 use eframe::egui;
-use nerka_core::input::records::RecordSplit;
+use nerka_core::input::records::{Outside, RecordSplit};
 use std::path::{Path, PathBuf};
 
 fn memo_path() -> Option<PathBuf> {
@@ -95,13 +95,46 @@ enum Kind {
     Json,
 }
 
+/// Lines outside every record, as the window offers it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OutsideChoice {
+    /// The default: one record before the first start, a row each with an end.
+    Auto,
+    One,
+    Rows,
+}
+
 /// The Records window's fields, as typed.
 #[derive(Debug, Clone)]
 pub struct Edit {
     kind: Kind,
     start: String,
+    /// Optional: a line matching it ends a record (owner, 2026-11-25).
+    end: String,
+    outside: OutsideChoice,
     sep: String,
     error: Option<String>,
+}
+
+/// A regex for a spec of several parts: `/…/`, its own slashes escaped.
+fn slashed(re: &str) -> String {
+    let re = re.trim();
+    let re = re.strip_prefix('/').and_then(|r| r.strip_suffix('/')).unwrap_or(re);
+    let mut out = String::with_capacity(re.len() + 2);
+    let (mut esc, mut class) = (false, false);
+    for c in re.chars() {
+        if c == '/' && !esc && !class {
+            out.push('\\');
+        }
+        match c {
+            '[' if !esc => class = true,
+            ']' if !esc => class = false,
+            _ => {}
+        }
+        esc = c == '\\' && !esc;
+        out.push(c);
+    }
+    format!("/{out}/")
 }
 
 impl Edit {
@@ -117,8 +150,20 @@ impl Edit {
             Some(RecordSplit::Separator(_)) => Kind::Separator,
             Some(RecordSplit::Json) => Kind::Json,
         };
-        let start = Some(re("start=")).filter(|s| !s.is_empty()).unwrap_or_else(|| r"\d{4}-\d\d-\d\d".to_owned());
-        Edit { kind, start, sep: re("sep="), error: None }
+        let (start, end, outside) = match split {
+            Some(RecordSplit::Start(b)) => {
+                let (s, e, default) = b.texts();
+                let outside = match (default, b.outside) {
+                    (true, _) => OutsideChoice::Auto,
+                    (false, Outside::One) => OutsideChoice::One,
+                    (false, Outside::Rows) => OutsideChoice::Rows,
+                };
+                (s.unwrap_or_default(), e.unwrap_or_default(), outside)
+            }
+            _ => (String::new(), String::new(), OutsideChoice::Auto),
+        };
+        let start = Some(start).filter(|s| !s.is_empty()).unwrap_or_else(|| r"\d{4}-\d\d-\d\d".to_owned());
+        Edit { kind, start, end, outside, sep: re("sep="), error: None }
     }
 
     fn spec(&self) -> String {
@@ -127,7 +172,18 @@ impl Edit {
             Kind::Lines => "lines".into(),
             Kind::Blank => "blank".into(),
             Kind::Json => "json".into(),
-            Kind::Start => format!("start={}", self.start),
+            Kind::Start => {
+                let mut spec = format!("start={}", slashed(&self.start));
+                if !self.end.trim().is_empty() {
+                    spec += &format!(" end={}", slashed(&self.end));
+                }
+                match self.outside {
+                    OutsideChoice::Auto => {}
+                    OutsideChoice::One => spec += " outside=one",
+                    OutsideChoice::Rows => spec += " outside=rows",
+                }
+                spec
+            }
             Kind::Separator => format!("sep={}", self.sep),
         }
     }
@@ -167,6 +223,40 @@ pub fn window(ctx: &egui::Context, title: &str, files: &[String], edit: &mut Edi
                 );
                 r.on_hover_text("A regex matched at the line's start, e.g. a timestamp: \\d{4}-\\d\\d-\\d\\d");
             });
+            ui.add_enabled_ui(edit.kind == Kind::Start, |ui| {
+                ui.horizontal(|ui| {
+                    ui.add_space(24.0);
+                    ui.label("and one matching this ends it (optional):");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut edit.end)
+                            .font(egui::TextStyle::Monospace)
+                            .hint_text("^$  (a blank line)")
+                            .desired_width(160.0),
+                    )
+                    .on_hover_text(
+                        "The end line is part of the record; the lines after it, up to the next start, are \
+                         outside every record",
+                    );
+                });
+                ui.horizontal(|ui| {
+                    ui.add_space(24.0);
+                    ui.label("Lines outside records:");
+                    let names = [
+                        (OutsideChoice::Auto, "Automatic"),
+                        (OutsideChoice::One, "One record"),
+                        (OutsideChoice::Rows, "One row per line"),
+                    ];
+                    for (c, name) in names {
+                        ui.radio_value(&mut edit.outside, c, name);
+                    }
+                })
+                .response
+                .on_hover_text(
+                    "Before the first start, and between an end and the next start. Automatic: one record \
+                     (a session the log began in) without an end, a row per line with one. NOT outside in a \
+                     filter hides them.",
+                );
+            });
             ui.radio_value(&mut edit.kind, Kind::Blank, "Blank lines separate records");
             ui.horizontal(|ui| {
                 ui.radio_value(&mut edit.kind, Kind::Separator, "Lines matching this separate records:");
@@ -204,7 +294,17 @@ mod tests {
 
     #[test]
     fn the_window_reads_back_what_it_shows() {
-        for spec in ["auto", "lines", "blank", "json", r"start=/\d{4}-/", "sep=/----/"] {
+        for spec in [
+            "auto",
+            "lines",
+            "blank",
+            "json",
+            r"start=/\d{4}-/",
+            "sep=/----/",
+            r"start=/^goroutine \d/ end=/^$/",
+            r"start=/U-Boot/ outside=rows",
+            r"start=/a[/]b/ end=/c\/d/ outside=one",
+        ] {
             let split = RecordSplit::parse_choice(spec).unwrap();
             let e = Edit::of(split.as_ref());
             assert_eq!(RecordSplit::parse_choice(&e.spec()).unwrap(), split, "{spec}");

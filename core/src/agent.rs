@@ -79,9 +79,10 @@ pub fn field_value(v: FieldValue<'_>) -> Value {
 pub fn line(source: &dyn LogSource, row: LineNo, file: &str, line: LineNo, fields: &Fields) -> Value {
     let mut v = Value::new_object();
     v.push("file", file).push("line", line + 1);
-    // A record: where it starts in its file (the evaluation).
-    if let Some(f) = record_first_line(source, row) {
-        v.push("first_line", f);
+    // A record of several lines: how many (its `line` is its first, in the
+    // file: owner, 2026-11-25, one numbering).
+    if let Some(n) = lines_in_record(source, row) {
+        v.push("lines", n);
     }
     v.push("time", source.time(row).map(time_text))
         .push("level", Event::from_source(source, row).level().map(Level::as_str))
@@ -191,7 +192,9 @@ pub fn summary(source: &dyn LogSource, files: &[String], index_seconds: f64, pro
 }
 
 /// Where each row of a view is: its file (an index into the view's
-/// files) and its line there, merged by time or not.
+/// files) and its line there (0-based), merged by time or not. A record's
+/// line is the line it starts at in its file (owner, 2026-11-25: one
+/// numbering, the file's, in the gutter, the CLI, JSON and MCP).
 pub fn locator(source: &dyn LogSource) -> impl Fn(LineNo) -> (usize, LineNo) + '_ {
     let (inner, line_of) = match source.reordered() {
         Some(r) => (r.inner, Some(r.line_of)),
@@ -201,8 +204,62 @@ pub fn locator(source: &dyn LogSource) -> impl Fn(LineNo) -> (usize, LineNo) + '
     move |row| {
         let l = line_of.map_or(row, |m| m[row as usize]);
         let k = starts.partition_point(|&s| s <= l).saturating_sub(1);
-        (k, l - starts.get(k).copied().unwrap_or(0))
+        let line = inner.file_line(l).unwrap_or_else(|| l - starts.get(k).copied().unwrap_or(0));
+        (k, line)
     }
+}
+
+/// How many lines record `row` holds, if it is a record of several.
+pub fn lines_in_record(source: &dyn LogSource, row: LineNo) -> Option<u64> {
+    record_first_line(source, row)?;
+    let n = source.line_bytes(row)?.iter().filter(|&&b| b == b'\n').count() as u64 + 1;
+    (n > 1).then_some(n)
+}
+
+/// The row of `source` holding line `line` (0-based) of its file `k`, as
+/// [`locator`] numbers them: a record holds its lines. `Err` says the
+/// file's lines.
+pub fn row_of_file_line(source: &dyn LogSource, k: usize, line: LineNo) -> std::result::Result<LineNo, String> {
+    let (inner, row_of) = match source.reordered() {
+        Some(r) => (r.inner, Some(r.row_of)),
+        None => (source, None),
+    };
+    let (start, count) = inner.part_files().get(k).copied().unwrap_or((0, inner.line_count()));
+    let first_of = |i: LineNo| inner.file_line(start + i).unwrap_or(i);
+    let lines = match count.checked_sub(1) {
+        Some(last) => {
+            let more = inner.line_bytes(start + last).map_or(0, |b| b.iter().filter(|&&c| c == b'\n').count());
+            first_of(last) + more as u64 + 1
+        }
+        None => 0,
+    };
+    if line >= lines {
+        return Err(format!("the file has lines 1 to {lines}"));
+    }
+    // The last row starting at or before the line.
+    let (mut lo, mut hi) = (0, count);
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        if first_of(mid) <= line { lo = mid + 1 } else { hi = mid }
+    }
+    let l = start + lo.saturating_sub(1);
+    Ok(row_of.map_or(l, |m| m[l as usize]))
+}
+
+/// Where query `h` matches inside record `row` (its lines after the first):
+/// the first such line in the file (0-based) and how many lines match.
+pub fn record_matches(source: &dyn LogSource, row: LineNo, h: &crate::Highlighter) -> Option<(LineNo, usize)> {
+    let first = record_first_line(source, row)?.checked_sub(1)?;
+    let bytes = source.line_bytes(row)?;
+    if !bytes.contains(&b'\n') {
+        return None;
+    }
+    let mut lines: Vec<usize> =
+        h.spans(&bytes).iter().map(|r| bytes[..r.start].iter().filter(|&&b| b == b'\n').count()).collect();
+    lines.dedup();
+    let n = lines.len();
+    let at = *lines.first()?;
+    Some((first + at as u64, n))
 }
 
 /// A view: its source and its files' names, as JSON places and lines
@@ -217,6 +274,9 @@ pub struct View<'a> {
     /// length said (`"raw_chars"`); 0: whole (a DLT
     /// payload of hex ran to thousands of characters a line).
     pub width: usize,
+    /// The query the lines answer: a record says which of its lines match
+    /// (`"match_line"`, `"matches"`; owner, 2026-11-25).
+    pub matches: Option<&'a crate::Highlighter>,
 }
 
 /// MCP's default [`View::width`].
@@ -266,8 +326,8 @@ impl View<'_> {
         self.compact && self.files.len() == 1
     }
 
-    /// `{"file", "line"}` (from 1) of row `row`; a record's
-    /// `first_line` in its file.
+    /// `{"file", "line"}` (from 1, in the file: a record's first line) of
+    /// row `row`.
     pub fn place(&self, row: LineNo) -> Value {
         let (file, line) = self.at(row);
         let mut v = Value::new_object();
@@ -275,9 +335,6 @@ impl View<'_> {
             v.push("file", file);
         }
         v.push("line", line + 1);
-        if let Some(f) = record_first_line(self.source, row) {
-            v.push("first_line", f);
-        }
         v
     }
 
@@ -294,6 +351,9 @@ impl View<'_> {
             if self.compact {
                 pairs.retain(|(k, v)| !(matches!(k.as_str(), "time" | "level") && v.is_null()));
             }
+        }
+        if let Some((at, n)) = self.matches.and_then(|h| record_matches(self.source, row, h)) {
+            v.push("match_line", at + 1).push("matches", n);
         }
         cut_raw(&mut v, self.width);
         v
@@ -391,13 +451,13 @@ pub fn hints(source: &dyn LogSource) -> Vec<String> {
         out.push(format!(
             "{crashes} Go crashes with goroutine dumps (the first at line {crash_first}, {go} goroutines in all): \
              what led to each is usually in the lines just before it (filter 'level >= WARN', or lines around \
-             it); to read a dump's stacks, read as records start=/^goroutine [0-9]/ (CLI: --records \
-             'start=/^goroutine [0-9]/'; window: set_records)"
+             it); to read a dump's stacks, read as records start=/^goroutine [0-9]/ end=/^$/ (CLI: --records \
+             'start=/^goroutine [0-9]/ end=/^$/'; window: set_records)"
         ));
     } else if go >= 3 && !source.format().starts_with("text records") {
         out.push(format!(
-            "a Go goroutine dump ({go} goroutines from line {go_first}): read as records start=/^goroutine [0-9]/ \
-             (CLI: --records 'start=/^goroutine [0-9]/'; window: set_records), each goroutine is one record and \
+            "a Go goroutine dump ({go} goroutines from line {go_first}): read as records start=/^goroutine [0-9]/ end=/^$/ \
+             (CLI: --records 'start=/^goroutine [0-9]/ end=/^$/'; window: set_records), each goroutine is one record and \
              patterns groups identical stacks (lines before the dump stay rows: patterns --in 'raw ~ /^goroutine/' \
              keeps the goroutines only)"
         ));
@@ -711,18 +771,20 @@ mod tests {
         let h = hints(&f);
         assert!(
             h[0].starts_with(
-                "a Go goroutine dump (3 goroutines from line 3): read as records start=/^goroutine [0-9]/"
+                "a Go goroutine dump (3 goroutines from line 3): read as records start=/^goroutine [0-9]/ end=/^$/"
             ),
             "{h:?}"
         );
         assert!(h.iter().any(|x| x.starts_with("no line has a time")), "{h:?}");
-        let split = crate::input::records::RecordSplit::parse(r"start=/^goroutine \d/").unwrap();
+        let split = crate::input::records::RecordSplit::parse(r"start=/^goroutine \d/ end=/^$/").unwrap();
         let r = crate::input::records::RecordFile::from_bytes("dump.txt", dump.as_bytes().to_vec(), split);
-        // The two lines before the dump stay rows, then a record per goroutine.
+        // The two lines before the dump stay rows (outside every record:
+        // `end=`), then a record per goroutine, ending at its blank line.
         assert_eq!(r.line_count(), 5);
         let files = ["dump.txt".to_owned()];
-        let v = View { source: &r, files: &files, compact: true, width: 0 };
-        assert_eq!(v.place(3).to_string(), r#"{"line":4,"first_line":6}"#);
+        let v = View { source: &r, files: &files, compact: true, width: 0, matches: None };
+        // Numbered by the file: the record at row 3 starts at line 6.
+        assert_eq!(v.place(3).to_string(), r#"{"line":6}"#);
         assert!(hints(&r).iter().all(|x| !x.contains("goroutine dump")), "read as records already");
     }
 
@@ -744,7 +806,7 @@ mod tests {
     fn a_long_raw_is_cut_and_its_length_said() {
         let f = TextFile::from_bytes("a.log", format!("{}\nshort\n", "ab".repeat(400)).into_bytes());
         let files = ["a.log".to_owned()];
-        let v = View { source: &f, files: &files, compact: true, width: 10 };
+        let v = View { source: &f, files: &files, compact: true, width: 10, matches: None };
         let fields = Fields::default();
         assert_eq!(v.line(0, &fields).to_string(), r#"{"line":1,"raw":"ababababab…","raw_chars":800}"#);
         assert_eq!(v.line(1, &fields).to_string(), r#"{"line":2,"raw":"short"}"#);

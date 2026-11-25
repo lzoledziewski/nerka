@@ -286,6 +286,18 @@ impl Parser<'_> {
                 if matches!(field, "before" | "after" | "around") && self.tok == Tok::LParen {
                     return self.window(field, pos);
                 }
+                // `outside` alone: a row outside every record (records with
+                // start= / end=; owner, 2026-11-25: `NOT outside` hides them).
+                if field == "outside" && !matches!(self.tok, Tok::Op(_)) {
+                    return Ok(Expr::Cond(Cond::Field(FieldCond {
+                        name: "outside".into(),
+                        pos,
+                        op_pos: pos,
+                        id: None,
+                        test: FieldTest::Any,
+                        costly: false,
+                    })));
+                }
                 if field == "bookmark" { self.bookmark_condition(pos) } else { self.condition(field, pos) }
             }
             Tok::Signal(name, view) => self.signal_condition(name, view, pos),

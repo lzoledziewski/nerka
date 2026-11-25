@@ -58,7 +58,13 @@ pub struct Concat {
 fn kind(s: &dyn LogSource) -> (Vec<&str>, Vec<(&str, FieldKind)>) {
     (
         s.columns().iter().map(|c| c.name.as_ref()).collect(),
-        s.schema().iter().map(|f| (f.name.as_ref(), f.kind)).collect(),
+        // Records' `outside` says how a file is split, not what it is: text
+        // read as records sits beside text read as lines.
+        s.schema()
+            .iter()
+            .filter(|f| f.name != super::records::OUTSIDE_FIELD)
+            .map(|f| (f.name.as_ref(), f.kind))
+            .collect(),
     )
 }
 

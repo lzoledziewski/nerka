@@ -2175,7 +2175,10 @@ impl Tab {
                 Ok(Finished::Done(Stage::Filter)) => {
                     self.filter_failed = None;
                     let n = self.result().map_or(0, |r| r.lines.len());
-                    self.status = format!("Filter keeps {n} lines ({took:.2?})");
+                    // Records counted as records (owner, 2026-11-25).
+                    let what =
+                        if self.file.as_ref().is_some_and(|f| f.file_line(0).is_some()) { "records" } else { "lines" };
+                    self.status = format!("Filter keeps {n} {what} ({took:.2?})");
                     // What it can't find (a `proto` no message has, `net.*`
                     // of senders not kept): said (2026-11-08 R8, 2026-11-09 R2).
                     if let (Some(f), Some(file)) = (self.session.filter(), &self.file)
@@ -3200,6 +3203,10 @@ impl Tab {
         };
         let rows = self.main_rows();
         let boundaries = self.lifecycle_boundaries(file);
+        // Records: the filter's matches highlighted, so a folded record
+        // shows the line it matched on (owner, 2026-11-25).
+        let filter_marks =
+            (file.file_line(0).is_some()).then(|| self.session.filter().map(|f| f.highlighter())).flatten();
         let out = log_view(
             ui,
             "main",
@@ -3209,8 +3216,9 @@ impl Tab {
             file,
             &mut self.columns,
             &Highlight {
-                // Every row matches the filter: only search hits are coloured.
-                highlighter: None,
+                // Every row matches the filter: only search hits are
+                // coloured, but inside a record what the filter matched.
+                highlighter: filter_marks.as_ref(),
                 bookmarks: Some(&self.bookmarks),
                 search: marks.as_ref(),
                 lines: lines.as_ref(),
@@ -5547,7 +5555,15 @@ impl App {
         match jump {
             Some(Some(n)) => {
                 if let Some(t) = self.tabs.get_mut(self.active) {
-                    t.goto_line(n.saturating_sub(1));
+                    // A line of the file: in records, the record holding it.
+                    let row = match &t.file {
+                        Some(f) if f.file_line(0).is_some() => {
+                            nerka_core::agent::row_of_file_line(&**f, 0, n.saturating_sub(1))
+                                .unwrap_or_else(|_| f.line_count().saturating_sub(1))
+                        }
+                        _ => n.saturating_sub(1),
+                    };
+                    t.goto_line(row);
                 }
                 self.goto = None;
             }
@@ -8283,14 +8299,23 @@ v=60
         assert_eq!(lines.len(), 3, "a.log's 3 lines, not on into b.log");
         assert_eq!(lines[0].get("file").and_then(Value::as_str), Some("a.log"));
         assert_eq!(page.get("files").unwrap().as_array().unwrap().len(), 2);
-        // Records in a tab of several files: each says where it starts in its
-        // own file (LogSource::file_line, through the view's parts).
+        // Records in a tab of several files: each is numbered by its first
+        // line in its own file, and says how many it holds (owner,
+        // 2026-11-25: one numbering).
         call(&mut app, "set_records", r#"{"records":"start=/\\[/"}"#);
         settle_app(&mut app, &ctx);
         let page = call(&mut app, "filter", r#"{"query":"file == b.log"}"#);
         let lines = page.get("lines").unwrap().as_array().unwrap();
-        let firsts: Vec<Option<u64>> = lines.iter().map(|l| l.get("first_line").and_then(Value::as_u64)).collect();
-        assert_eq!(firsts, [Some(1), Some(4)], "b.log's records start at its lines 1 and 4: {page}");
+        let at: Vec<(Option<u64>, Option<u64>)> = lines
+            .iter()
+            .map(|l| (l.get("line").and_then(Value::as_u64), l.get("lines").and_then(Value::as_u64)))
+            .collect();
+        assert_eq!(at, [(Some(1), Some(3)), (Some(4), None)], "b.log's records at its lines 1 (3) and 4: {page}");
+        // A line inside a record reads the record holding it.
+        let page = call(&mut app, "lines", r#"{"file":"b.log","from":2,"to":2}"#);
+        let lines = page.get("lines").unwrap().as_array().unwrap();
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].get("line").and_then(Value::as_u64), Some(1), "{page}");
         std::fs::remove_dir_all(&dir).ok();
     }
 

@@ -343,7 +343,15 @@ pub fn log_view(
     let snap = |v: f32| (v * ppp).round() / ppp;
     let row_h = snap(ui.fonts_mut(|f| f.row_height(&font)) + 2.0);
     let char_w = ui.fonts_mut(|f| f.glyph_width(&font, '0'));
-    let total_lines = source.line_count();
+    // Numbers are file lines (a record's first; owner, 2026-11-25): as wide
+    // as the file's last line.
+    let total_lines = match source.line_count().checked_sub(1) {
+        Some(last) => {
+            let more = source.line_bytes(last).map_or(0, |b| b.iter().filter(|&&c| c == b'\n').count() as u64);
+            (nerka_core::agent::locator(source)(last).1 + 1 + more).max(source.line_count())
+        }
+        None => 0,
+    };
     let gutter_w = (digits(total_lines) as f32 + 1.5) * char_w;
 
     let (outer, response) = ui.allocate_exact_size(ui.available_size(), Sense::click_and_drag());
@@ -948,10 +956,10 @@ pub fn log_view(
     // Fold markers clicked: (file line, unfold).
     let mut folds: Vec<(LineNo, bool)> = Vec::new();
     let mut numbered = None;
-    // A tab of several files numbers each line in its own file, as agents'
-    // answers and @line do (owner, 2026-11-25).
-    let several = source.part_files().len() > 1;
+    // Each line numbered in its own file, as agents' answers and @line do;
+    // a record by its lines there (owner, 2026-11-25).
     let at = nerka_core::agent::locator(source);
+    let file_line_of = |line: LineNo| at(line).1;
     for (y, row, slot) in slots(state.top, state.skipped(), rows, &is_open(state)) {
         let line = line_of_row(row);
         let k = match slot {
@@ -1007,10 +1015,10 @@ pub fn log_view(
             painter.rect_filled(Rect::from_min_size(at, galley.size()).expand(1.0), 2.0, vis.panel_fill);
             painter.galley(at, galley, c);
         }
-        // Its number on its first slot shown (a record scrolled into).
-        if numbered != Some(row) {
+        // Its number in the file; an unfolded record's lines each theirs.
+        {
             numbered = Some(row);
-            let number = if several { at(line).1 + 1 } else { line + 1 };
+            let number = file_line_of(line) + 1 + k as u64;
             painter.text(
                 pos2(text_rect.min.x + gutter_w - char_w * 0.75, snap(y + 1.0)),
                 Align2::RIGHT_TOP,
@@ -1095,13 +1103,37 @@ pub fn log_view(
                 }
             }
             // Folded: the rest of the record after the marker, its lines
-            // joined (a pretty JSON record's first line is only `{`).
+            // joined (a pretty JSON record's first line is only `{`); where
+            // a filter or search matched past its first line, from that
+            // line on, its number first, and how many other lines match
+            // (owner, 2026-11-25).
             if !open {
-                let (rest, rest_spans) = folded_preview(&whole, end, &record_spans);
-                let galley = painter.layout_job(spans_job(&format!("  {rest}"), 2, &rest_spans, &font, dim));
+                let mut lines_hit: Vec<usize> =
+                    record_spans.iter().map(|(r, _)| whole[..r.start.min(whole.len())].matches('\n').count()).collect();
+                lines_hit.sort_unstable();
+                lines_hit.dedup();
+                let past_first: Vec<usize> = lines_hit.iter().copied().filter(|&i| i > 0).collect();
+                let (from, prefix) = match past_first.first() {
+                    Some(&i) => {
+                        let from = whole.match_indices('\n').nth(i - 1).map_or(end, |(p, _)| p + 1);
+                        (from, format!("  {}: ", file_line_of(line) + 1 + i as u64))
+                    }
+                    None => (end, "  ".to_owned()),
+                };
+                let (rest, rest_spans) = folded_preview(&whole, from, &record_spans);
+                let galley =
+                    painter.layout_job(spans_job(&format!("{prefix}{rest}"), prefix.len(), &rest_spans, &font, dim));
                 let at = pos2(x + width, snap(y + 1.0));
                 width += galley.size().x;
                 painter.with_clip_rect(text_clip).galley(at, galley, dim);
+                if past_first.len() > 1 {
+                    let more = past_first.len() - 1;
+                    let note = format!("  (+{more} more matching line{})", if more == 1 { "" } else { "s" });
+                    let galley = painter.layout_job(note_job(note));
+                    let at = pos2(x + width, snap(y + 1.0));
+                    width += galley.size().x;
+                    painter.with_clip_rect(text_clip).galley(at, galley, dim);
+                }
             }
         }
         if hl.notes == NoteMode::EndOfLine

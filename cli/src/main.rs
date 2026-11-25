@@ -777,6 +777,8 @@ struct Printer<'a> {
     printed: u64,
     /// The last line printed (for `--` between windows apart).
     last: Option<LineNo>,
+    /// The query: a record says which of its lines match (`match_line`).
+    matches: Option<nerka_core::Highlighter>,
 }
 
 impl<'a> Printer<'a> {
@@ -784,7 +786,7 @@ impl<'a> Printer<'a> {
         let f = &*view.source;
         let fields = agent::Fields::parse(&o.json.fields, f).map_err(|e| anyhow::anyhow!("--fields: {e}"))?;
         let names = view.paths.iter().map(|p| p.display().to_string()).collect();
-        Ok(Printer { o, view, at: Box::new(locator(f)), names, fields, seen: 0, printed: 0, last: None })
+        Ok(Printer { o, view, at: Box::new(locator(f)), names, fields, seen: 0, printed: 0, last: None, matches: None })
     }
 
     /// Print `row` if it is past `--skip` and within `-m`. `mark`: whether
@@ -801,6 +803,9 @@ impl<'a> Printer<'a> {
         let (k, line) = (self.at)(row);
         if self.o.json.json {
             let mut v = agent::line(f, row, &self.names[k], line, &self.fields);
+            if let Some((at, n)) = self.matches.as_ref().and_then(|h| agent::record_matches(f, row, h)) {
+                v.push("match_line", at + 1).push("matches", n);
+            }
             agent::cut_raw(&mut v, self.o.json.width);
             if let Some(m) = mark {
                 v.push("match", m);
@@ -822,7 +827,8 @@ impl<'a> Printer<'a> {
                     write!(out, "{}:", line + 1)?;
                 }
             } else if !self.o.no_line_numbers {
-                write!(out, "{}:", row + 1)?;
+                // The file's line (a record's first: owner, 2026-11-25).
+                write!(out, "{}:", line + 1)?;
             }
             if !queries.is_empty() {
                 write!(out, "[{}] ", queries.join(","))?;
@@ -830,9 +836,12 @@ impl<'a> Printer<'a> {
             let bytes = f.line_bytes(row).unwrap_or_default();
             let width = self.o.json.width;
             if width > 0 && bytes.len() > width {
+                // At most `width` characters of its first line (a record's
+                // other lines: `…`).
                 let text = String::from_utf8_lossy(&bytes);
-                match text.char_indices().nth(width) {
-                    Some((end, _)) => write!(out, "{}…", &text[..end])?,
+                let end = text.char_indices().enumerate().find(|&(n, (_, c))| n == width || c == '\n');
+                match end {
+                    Some((_, (end, _))) => write!(out, "{}…", text[..end].trim_end_matches('\r'))?,
                     None => out.write_all(&bytes)?,
                 }
             } else {
@@ -891,6 +900,7 @@ fn run_filter(
     let (f, t_index) = (&*view.source, view.took);
     let filter = with_marks(build(f)?, &view)?;
     let mut p = Printer::new(o, &view)?;
+    p.matches = Some(filter.highlighter());
     let t = Instant::now();
     let res = search(f, &filter, &Progress::new())?;
     let t_search = t.elapsed();
@@ -932,6 +942,7 @@ fn run_window(
     let matches = with_marks(Filter::Query(compile(query, f)?), &view)?;
     let around = with_marks(Filter::Query(compile(&format!("around({before}, {after}, {query})"), f)?), &view)?;
     let mut p = Printer::new(o, &view)?;
+    p.matches = Some(matches.highlighter());
     let t = Instant::now();
     let hits = search(f, &matches, &Progress::new())?;
     let res = search(f, &around, &Progress::new())?;
@@ -1392,8 +1403,8 @@ fn compare(
     let shown = if top == 0 { diffs.len() } else { top.min(diffs.len()) };
     if json {
         let names = [views[0].names(), view(1).names()];
-        let av = agent::View { source: &*view(0).source, files: &names[0], compact: false, width: 0 };
-        let bv = agent::View { source: &*view(1).source, files: &names[1], compact: false, width: 0 };
+        let av = agent::View { source: &*view(0).source, files: &names[0], compact: false, width: 0, matches: None };
+        let bv = agent::View { source: &*view(1).source, files: &names[1], compact: false, width: 0, matches: None };
         let side = |k: usize| {
             Value::object([
                 ("file", Value::from(view(k).paths.first().map(|p| p.display().to_string()))),
@@ -1484,12 +1495,21 @@ impl Opened {
 /// opened one file): one after another in the order given, or merged by
 /// time with `--merge`; files of kinds that don't go together are refused.
 fn open_silent(paths: &[PathBuf]) -> Result<Opened> {
+    open_as(paths, false)
+}
+
+/// `open_silent`, or with `lines` a line a row whatever `--records` says
+/// (`nerka lines` reads the file's lines: owner, 2026-11-25).
+fn open_as(paths: &[PathBuf], lines: bool) -> Result<Opened> {
     // Said plainly (it was "access denied" on Windows).
     if let Some(dir) = paths.iter().find(|p| p.is_dir()) {
         anyhow::bail!("{} is a folder: give a file", dir.display());
     }
     let t = Instant::now();
     let mut options = OPEN_OPTIONS.get_or_init(Default::default).clone();
+    if lines {
+        options.records = Some(nerka_core::input::records::RecordSplit::Lines);
+    }
     // `--offset`s by the files as given, or their names.
     for (file, ns) in offsets_mut().iter() {
         let name = |p: &PathBuf| p.file_name().is_some_and(|n| n.to_string_lossy() == file.as_str());
@@ -1850,7 +1870,7 @@ fn run() -> Result<()> {
             let shown = if top == 0 { ps.patterns.len() } else { top.min(ps.patterns.len()) };
             if json {
                 let names = view.names();
-                let v = agent::View { source: f, files: &names, compact: false, width: 0 };
+                let v = agent::View { source: f, files: &names, compact: false, width: 0, matches: None };
                 let detail = agent::PatternDetail { values, queries, lines: show };
                 writeln!(out, "{}", agent::patterns(&ps, &v, top, detail))?;
             }
@@ -1997,12 +2017,14 @@ fn run() -> Result<()> {
             }
             let f = open(std::slice::from_ref(&file))?.source;
             let mut marks = Bookmarks::load_for(&file, &*f)?;
+            // A line of the file: in records, the record holding it.
             let row = |line: u64, what: &str| -> Result<LineNo> {
-                if line == 0 || line > f.line_count() {
-                    anyhow::bail!("--{what} {line}: the file has lines 1 to {}", f.line_count());
+                if line == 0 {
+                    anyhow::bail!("--{what} 0: lines count from 1");
                 }
-                Ok(line - 1)
+                agent::row_of_file_line(&*f, 0, line - 1).map_err(|e| anyhow::anyhow!("--{what} {line}: {e}"))
             };
+            let file_line = |row: LineNo| agent::locator(&*f)(row).1 + 1;
             let shown: Vec<LineNo> = match (add, remove) {
                 (Some(line), _) => {
                     let l = row(line, "add")?;
@@ -2040,7 +2062,7 @@ fn run() -> Result<()> {
                 if json {
                     let mut v = Value::new_object();
                     v.push("file", file.display().to_string())
-                        .push("line", l + 1)
+                        .push("line", file_line(l))
                         .push("name", name)
                         .push("note", note)
                         .push("author", marks.author(l))
@@ -2061,9 +2083,9 @@ fn run() -> Result<()> {
                 let by = marks.author(l).map(|a| format!(" ({a})")).unwrap_or_default();
                 let name = format!("{name}{unsure}{by}");
                 if note.is_empty() {
-                    writeln!(out, "{name} {}: {text}", l + 1)?;
+                    writeln!(out, "{name} {}: {text}", file_line(l))?;
                 } else {
-                    writeln!(out, "{name} {}: {text}\n    # {note}", l + 1)?;
+                    writeln!(out, "{name} {}: {text}\n    # {note}", file_line(l))?;
                 }
             }
         }
@@ -2085,7 +2107,9 @@ fn run() -> Result<()> {
             if from > to {
                 anyhow::bail!("lines {from} to {to}: the first line is after the last");
             }
-            let f = open(std::slice::from_ref(&file))?.source;
+            // The file's own lines, whatever --records says: a record's
+            // lines are read by their numbers in the file.
+            let f = open_as(std::slice::from_ref(&file), true)?.source;
             let fields = agent::Fields::parse(&json.fields, &*f).map_err(|e| anyhow::anyhow!("--fields: {e}"))?;
             let name = file.display().to_string();
             let last = to.min(f.line_count());

@@ -209,9 +209,18 @@ fn tools() -> Value {
         ),
         (
             "set_records",
-            "Read the tab's text files as records (multi-line entries: a stack, an exception): start=/REGEX/ (a line matching it starts one, e.g. start=/^goroutine [0-9]/ for a Go dump), sep=/REGEX/, blank, or lines (back to a row a line). The window reads the files again; then line numbers count records (first_line: where each starts). Undoable.",
+            "Read the tab's text files as records (multi-line entries: a stack, an exception, a session): start=/REGEX/ (a line matching it starts one), end=/REGEX/ (one matching it ends it, that line included; e.g. start=/^goroutine [0-9]/ end=/^$/ for a Go dump in a log), outside=one|rows (lines outside every record: one record, the default without end=, or a row each, the default with end=), sep=/REGEX/, blank, or lines (back to a row a line). Lines keep the file's numbers: a record's line is its first, \"lines\" how many it holds, and filter says which of them matched (match_line, matches); the field outside is true outside every record (NOT outside hides them). Undoable.",
             schema(
-                vec![("tab", tab()), ("records", p("string", "start=/REGEX/, sep=/REGEX/, blank or lines"))],
+                vec![
+                    ("tab", tab()),
+                    (
+                        "records",
+                        p(
+                            "string",
+                            "start=/REGEX/ [end=/REGEX/] [outside=one|rows], end=/REGEX/, sep=/REGEX/, blank or lines",
+                        ),
+                    ),
+                ],
                 &["records"],
             ),
         ),

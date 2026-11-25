@@ -44,6 +44,12 @@ words.
   **Copy line**; the line's signals, a value that changed what was held
   before it coloured, with what it was (`was 10`). Long lines also scroll
   sideways (Shift+wheel, ← / →).
+- **Records** (the tab's menu → **Records…**, [Multi-line
+  records](formats.md#multi-line-records)): a record of several lines is
+  one row, folded (`▸ +38 lines`, → or a click unfolds it). The gutter
+  numbers lines as the file does: a record by its first line, each of its
+  lines when unfolded. A folded record a filter or search kept for a later
+  line shows that line, its number first, and `(+2 more matching lines)`.
 - **Selecting:** drag, Shift+click, double-click (a word), Shift+arrows,
   `Ctrl+A`. `Ctrl+C` copies the selection, or the current line.
 - **Picked lines:** `Ctrl+click` (or `Ctrl+Space`) picks single lines

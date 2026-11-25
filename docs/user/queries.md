@@ -23,6 +23,7 @@ apid == NAV AND level >= WARN AND payload ~ "timeout"
 | `"text"` | the whole line contains the text |
 | `@signal OP VALUE` | a [signal](signals.md)'s value compares so |
 | `bookmark` | the line has a bookmark |
+| `outside` | text read as [records](formats.md#multi-line-records): a row outside every record (`NOT outside`: the records only) |
 | `A AND B`, `A OR B`, `NOT A`, `( … )` | logic; also `&&`, `\|\|`, `!` |
 
 **Operators:** `==`, `!=`, `>=`, `<=`, `>`, `<`, and `~` / `!~` (matches /

@@ -77,13 +77,21 @@ records, a goroutine or an exception each: then `filter` gives whole
 stacks, and `patterns` groups identical ones (40 idle workers become one
 line, the few stuck ones stand out):
 
-    nerka --records 'start=/^goroutine [0-9]/' patterns -n 20 FILE
-    nerka --records 'start=/^goroutine [0-9]/' filter --json -m 5 'raw ~ /chan send/' FILE
+    nerka --records 'start=/^goroutine [0-9]/ end=/^$/' patterns -n 20 FILE
+    nerka --records 'start=/^goroutine [0-9]/ end=/^$/' filter --json -m 5 'raw ~ /chan send/' FILE
     nerka search --json -m 100 '^goroutine [0-9]+' FILE
 
-Lines count records then; `first_line` is where each starts in the file
-(bookmark that line). Text before the first match is one record. In a
-regex written inside JSON, `[0-9]` travels better than `\d`.
+`start=` begins a record, `end=` ends it (that line included: a
+goroutine ends at its blank line), and the lines outside every record
+(the log around a dump) stay a row each; the field `outside` is true on
+them (`NOT outside`: the records only). With `start=` alone a record runs
+to the next start, and what comes before the first is one record (a
+session the log began in: `outside=rows` makes it rows). Lines keep the
+file's numbers: a record's `line` is its first, `"lines"` how many it
+holds, and `filter --json` says which of them matched (`match_line`,
+`matches`): bookmark that line. `lines FILE FROM TO` reads the file's
+lines whatever `--records` says. In a regex written inside JSON, `[0-9]`
+travels better than `\d`.
 In Git Bash on Windows, set `MSYS_NO_PATHCONV=1` first: it turns `/…/` in
 an argument into a Windows path.
 
