@@ -335,9 +335,26 @@ pub fn hints(source: &dyn LogSource) -> Vec<String> {
         );
     }
     if source.line_count() > 0 && time_span(source).is_none() {
-        out.push(
-            "no line has a time: before / after (context by time) can't work; read around a line with lines".into(),
-        );
+        // Many lines start with a time, but under half: entries that span
+        // lines (a payload, a trace), read best as records starting at the
+        // time (a server's trace log).
+        let tried: Vec<String> = (0..source.line_count().min(200))
+            .filter_map(|l| source.line_text(l).map(|t| t.into_owned()))
+            .filter(|t| !t.trim().is_empty())
+            .collect();
+        let timed = tried.iter().filter(|t| crate::time::leading_time(t, crate::time::Zone::Utc).is_some()).count();
+        if timed >= 3 && timed * 10 >= tried.len() && !source.format().starts_with("text records") {
+            let split = "start=/^[0-9]{4}[-/][0-9]{2}[-/][0-9]{2}.[0-9]/";
+            out.push(format!(
+                "{timed} of the first {} lines start with a time: its entries span several lines; read as records \
+                 {split} (CLI: --records '{split}'; window: set_records), each entry is one record with its time",
+                tried.len()
+            ));
+        } else {
+            out.push(
+                "no line has a time: before / after (context by time) can't work; read around a line with lines".into(),
+            );
+        }
     }
     out
 }
@@ -621,6 +638,18 @@ mod tests {
         let v = View { source: &r, files: &files, compact: true };
         assert_eq!(v.place(2).to_string(), r#"{"line":3,"first_line":6}"#);
         assert!(hints(&r).iter().all(|x| !x.contains("goroutine dump")), "read as records already");
+    }
+
+    #[test]
+    fn entries_over_several_lines_are_hinted_to_read_as_records() {
+        let log = "2026/04/16 03:08:41 DEBUG : a\n<xml>\n  <b/>\n</xml>\n2026/04/16 03:08:42 DEBUG : c\n<xml>\n  <d/>\n</xml>\n2026/04/16 03:08:43 DEBUG : e\n<x/>\n<y/>\n";
+        let f = TextFile::from_bytes("trace.log", log.as_bytes().to_vec());
+        let h = hints(&f);
+        assert!(h[0].starts_with("3 of the first 11 lines start with a time"), "{h:?}");
+        let spec = h[0].split("records ").nth(1).unwrap().split(' ').next().unwrap();
+        let split = crate::input::records::RecordSplit::parse(spec).unwrap();
+        let r = crate::input::records::RecordFile::from_bytes("trace.log", log.as_bytes().to_vec(), split);
+        assert_eq!(r.line_count(), 3, "the hint's split makes an entry a record");
     }
 
     #[test]
