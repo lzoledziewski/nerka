@@ -263,6 +263,8 @@ pub enum FibexAction {
     Add,
     /// Use none.
     Forget,
+    /// Load the files in use at every start, or not.
+    Autoload(bool),
 }
 
 /// The events each signal shows: all of them, or for a
@@ -310,6 +312,8 @@ pub struct Input<'a> {
     pub kept: Option<&'a Arc<SearchResult>>,
     /// The FIBEX files in use (every tab, this session).
     pub fibex: Option<&'a nerka_core::Fibex>,
+    /// They're loaded at every start (**Load at start**).
+    pub fibex_autoload: bool,
     /// The FIBEX arguments this tab uses as signals.
     pub arg_picks: &'a mut Vec<nerka_core::Argument>,
     /// The query library: lifecycles reuse its queries.
@@ -330,6 +334,7 @@ pub struct Input<'a> {
 
 pub fn signals_panel(ui: &mut egui::Ui, st: &mut SignalsUi, input: Input<'_>) -> Output {
     let Input {
+        fibex_autoload,
         signals,
         generation,
         saved,
@@ -868,7 +873,7 @@ pub fn signals_panel(ui: &mut egui::Ui, st: &mut SignalsUi, input: Input<'_>) ->
                 .min_size(60.0)
                 .frame(egui::Frame::NONE)
                 .show(ui, list);
-            out.fibex = fibex_ui(ui, fibex);
+            out.fibex = fibex_ui(ui, fibex, fibex_autoload);
             // `|=`: a − in the list above may have changed the picks too.
             out.args_changed |= arg_tree(ui, st, f, arg_picks, plot);
         }
@@ -876,7 +881,7 @@ pub fn signals_panel(ui: &mut egui::Ui, st: &mut SignalsUi, input: Input<'_>) ->
             let h = ui.available_height() - 60.0;
             ui.allocate_ui(egui::vec2(ui.available_width(), h.max(60.0)), list);
             ui.separator();
-            out.fibex = fibex_ui(ui, fibex);
+            out.fibex = fibex_ui(ui, fibex, fibex_autoload);
         }
     }
     out
@@ -1250,7 +1255,7 @@ fn fit_time(t: f64, fit: usize) -> String {
 }
 
 /// The FIBEX files: what they describe, and buttons to add or forget them.
-fn fibex_ui(ui: &mut egui::Ui, fibex: Option<&nerka_core::Fibex>) -> Option<FibexAction> {
+fn fibex_ui(ui: &mut egui::Ui, fibex: Option<&nerka_core::Fibex>, autoload: bool) -> Option<FibexAction> {
     let mut action = None;
     ui.horizontal(|ui| {
         ui.label(RichText::new("FIBEX").strong()).on_hover_text(
@@ -1262,6 +1267,17 @@ fn fibex_ui(ui: &mut egui::Ui, fibex: Option<&nerka_core::Fibex>) -> Option<Fibe
         }
         if fibex.is_some() && ui.small_button("Forget").on_hover_text("Decode with no FIBEX").clicked() {
             action = Some(FibexAction::Forget);
+        }
+        let mut on = autoload;
+        if ui
+            .checkbox(&mut on, "Load at start")
+            .on_hover_text(
+                "Load these FIBEX files whenever nerka starts (files added or forgotten later too); \
+                 --fibex on the command line uses its own for that run",
+            )
+            .changed()
+        {
+            action = Some(FibexAction::Autoload(on));
         }
     });
     match fibex {

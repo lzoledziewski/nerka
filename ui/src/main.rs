@@ -331,7 +331,13 @@ fn main() -> eframe::Result {
             app.load_saved_signals();
             app.load_checks();
             if !fibex.is_empty() {
+                // `--fibex` for this run: the files saved to load at start
+                // stay as they are.
+                let keep = std::mem::take(&mut app.prefs.fibex_autoload);
                 app.set_fibex(&cc.egui_ctx, fibex);
+                app.prefs.fibex_autoload = keep;
+            } else if app.prefs.fibex_autoload {
+                app.autoload_fibex(&cc.egui_ctx);
             }
             for c in startup_checks.iter() {
                 app.add_session_check(c.clone());
@@ -4606,24 +4612,17 @@ impl App {
     }
 
     fn save_prefs_from(&mut self, prefs: SearchPrefs) {
-        // A tab knows its search settings only; the ports, the cache and
-        // the times stay.
+        // A tab knows its search settings only (`Tab::search_prefs`): those
+        // five, the rest as they are. Listing what to keep instead lost
+        // what the list missed (the AI command, its limits, checks on
+        // their own, FIBEX at start) to the defaults.
         let prefs = SearchPrefs {
-            dlt_ports: self.prefs.dlt_ports.clone(),
-            someip_ports: self.prefs.someip_ports.clone(),
-            syslog_ports: self.prefs.syslog_ports.clone(),
-            unpack_limit_gib: self.prefs.unpack_limit_gib,
-            local_time: self.prefs.local_time,
-            mf4_local_time: self.prefs.mf4_local_time,
-            bookmark_notes: self.prefs.bookmark_notes,
-            merge_by_time: self.prefs.merge_by_time,
-            theme: self.prefs.theme,
-            plot_window: self.prefs.plot_window,
-            plot_window_maximized: self.prefs.plot_window_maximized,
-            routes: self.prefs.routes.clone(),
-            disabled_protocols: self.prefs.disabled_protocols.clone(),
-            protocols: self.prefs.protocols.clone(),
-            ..prefs
+            mode: prefs.mode,
+            options: prefs.options,
+            search_mode: prefs.search_mode,
+            search_regex: prefs.search_regex,
+            search_ignore_case: prefs.search_ignore_case,
+            ..self.prefs.clone()
         };
         if prefs == self.prefs {
             return;
@@ -4969,10 +4968,46 @@ impl App {
             }
         }
         self.fibex_paths = paths;
+        if self.prefs.fibex_autoload {
+            self.remember_fibex();
+        }
         for t in &mut self.tabs {
             if t.file.as_ref().is_some_and(|f| !f.columns().is_empty()) {
                 t.reopen(ctx, &self.prefs, self.fibex.clone());
             }
+        }
+    }
+
+    /// The FIBEX files in use, saved to load at every start (or none, with
+    /// **Load at start** off).
+    fn remember_fibex(&mut self) {
+        self.prefs.fibex_files = if self.prefs.fibex_autoload {
+            self.fibex_paths.iter().map(|p| p.display().to_string()).collect()
+        } else {
+            Vec::new()
+        };
+        if let Some(path) = prefs_path()
+            && let Err(e) = sync::save_prefs(&mut self.prefs, &mut self.prefs_base, &path)
+        {
+            self.status = format!("Could not save preferences: {e}");
+        }
+    }
+
+    /// The FIBEX files saved to load at start: those still there; the
+    /// status says which are gone.
+    fn autoload_fibex(&mut self, ctx: &egui::Context) {
+        let (there, gone): (Vec<PathBuf>, Vec<PathBuf>) =
+            self.prefs.fibex_files.iter().map(PathBuf::from).partition(|p| p.is_file());
+        if !there.is_empty() {
+            // Not saved again here: a file gone stays listed until the
+            // list changes (a drive not mounted yet).
+            let keep = std::mem::take(&mut self.prefs.fibex_autoload);
+            self.set_fibex(ctx, there);
+            self.prefs.fibex_autoload = keep;
+        }
+        if !gone.is_empty() {
+            let names: Vec<String> = gone.iter().map(|p| p.display().to_string()).collect();
+            self.status = format!("FIBEX not found, not loaded: {}", names.join(", "));
         }
     }
 
@@ -6121,6 +6156,7 @@ impl App {
                         views: &mut tab.views,
                         kept: tab.session.result(),
                         fibex: fibex.as_deref(),
+                        fibex_autoload: self.prefs.fibex_autoload,
                         arg_picks: &mut tab.arg_picks,
                         library: &self.library,
                         check_results: &tab.check_results,
@@ -6458,6 +6494,15 @@ impl App {
                     all.extend(paths);
                     self.set_fibex(&ctx, all);
                 }
+            }
+            Some(signals::FibexAction::Autoload(on)) => {
+                self.prefs.fibex_autoload = on;
+                self.remember_fibex();
+                self.status = if on {
+                    format!("FIBEX: {} files loaded at every start", self.prefs.fibex_files.len())
+                } else {
+                    "FIBEX: none loaded at start".into()
+                };
             }
             Some(signals::FibexAction::Forget) => {
                 self.set_fibex(&ctx, Vec::new());
@@ -6856,6 +6901,7 @@ query timeouts  labels: vision
                         views: &mut tab.views,
                         kept: None,
                         fibex: Some(&*fibex),
+                        fibex_autoload: false,
                         arg_picks: &mut tab.arg_picks,
                         library: &Library::new(),
                         check_results: &[],
@@ -9050,6 +9096,37 @@ query nav
     /// again; removing the last one clears the search.
     /// The line window's Fields: every field of the line, with its value
     /// (DLT's ten and `proto`; a JSON record's keys, missing ones empty).
+    #[test]
+    fn the_app_prefs_outlive_a_tabs_search_settings() {
+        let mut app = App::default();
+        app.prefs.ai_command = "codex".into();
+        app.prefs.ai_top = 7;
+        app.prefs.checks_auto = true;
+        app.fibex_paths = vec![PathBuf::from("D:/fibex/ecu1.xml")];
+        // Load at start on: the files in use are remembered.
+        app.prefs.fibex_autoload = true;
+        app.remember_fibex();
+        assert_eq!(app.prefs.fibex_files, ["D:/fibex/ecu1.xml"]);
+        // A tab saves its search settings: only those change.
+        app.save_prefs_from(SearchPrefs { mode: Mode::Query, search_regex: true, ..SearchPrefs::default() });
+        let p = &app.prefs;
+        assert_eq!((p.mode, p.search_regex), (Mode::Query, true));
+        assert_eq!((p.ai_command.as_str(), p.ai_top, p.checks_auto), ("codex", 7, true));
+        assert!(p.fibex_autoload && p.fibex_files.len() == 1);
+        // Off: nothing is loaded at start.
+        app.prefs.fibex_autoload = false;
+        app.remember_fibex();
+        assert!(app.prefs.fibex_files.is_empty());
+        // A saved file that's gone is said, not loaded.
+        let ctx = egui::Context::default();
+        app.prefs.fibex_autoload = true;
+        app.prefs.fibex_files = vec!["D:/nowhere/gone.xml".into()];
+        app.fibex_paths.clear();
+        app.autoload_fibex(&ctx);
+        assert!(app.fibex.is_none() && app.status.starts_with("FIBEX not found, not loaded: D:/nowhere/gone.xml"));
+        assert_eq!(app.prefs.fibex_files, ["D:/nowhere/gone.xml"], "kept until the list changes");
+    }
+
     #[test]
     fn the_line_window_lists_every_field() {
         use nerka_core::input::dlt::writer::{Msg, Value};

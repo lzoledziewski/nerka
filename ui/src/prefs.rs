@@ -51,6 +51,11 @@ pub struct SearchPrefs {
     pub plot_window_maximized: bool,
     /// What 🤖 AI terminal runs (`claude`, `codex`, `gemini`, …).
     pub ai_command: String,
+    /// The FIBEX files loaded at every start (the Signals panel's **Load
+    /// at start**; owner, 2026-11-25), unless `--fibex` gives others.
+    pub fibex_autoload: bool,
+    /// Those files, as they were last loaded (`fibex_file=` lines).
+    pub fibex_files: Vec<String>,
     /// An agent's answers (`crate::agent::Limits`): lines when it doesn't
     /// say, lines at most, patterns when it doesn't say.
     pub ai_lines: u64,
@@ -91,6 +96,8 @@ impl Default for SearchPrefs {
             plot_window: false,
             plot_window_maximized: false,
             ai_command: "claude".into(),
+            fibex_autoload: false,
+            fibex_files: Vec::new(),
             ai_lines: 50,
             ai_most: 1000,
             ai_top: 30,
@@ -119,6 +126,12 @@ impl SearchPrefs {
                 }
                 "ai_command" => {
                     p.ai_command = value.trim().to_owned();
+                    continue;
+                }
+                "fibex_file" => {
+                    if !value.trim().is_empty() {
+                        p.fibex_files.push(value.trim().to_owned());
+                    }
                     continue;
                 }
                 k @ ("ai_lines" | "ai_most" | "ai_top") => {
@@ -188,6 +201,7 @@ impl SearchPrefs {
                 "checks_auto" => p.checks_auto = flag,
                 "plot_window" => p.plot_window = flag,
                 "plot_window_maximized" => p.plot_window_maximized = flag,
+                "fibex_autoload" => p.fibex_autoload = flag,
                 _ => {}
             }
         }
@@ -226,6 +240,10 @@ impl SearchPrefs {
         out.push_str(&format!("ai_lines={}\nai_most={}\nai_top={}\n", self.ai_lines, self.ai_most, self.ai_top));
         for r in &self.routes {
             out.push_str(&format!("route={r}\n"));
+        }
+        out.push_str(&format!("fibex_autoload={}\n", self.fibex_autoload));
+        for f in &self.fibex_files {
+            out.push_str(&format!("fibex_file={}\n", f.replace(['\n', '\r'], " ")));
         }
         out.push_str(&format!("disabled_protocols={}\n", self.disabled_protocols.join(" ")));
         out
@@ -321,6 +339,8 @@ mod tests {
             plot_window: true,
             plot_window_maximized: true,
             ai_command: "codex --full-auto".into(),
+            fibex_autoload: true,
+            fibex_files: vec!["D:/fibex/ecu1.xml".into(), "/home/u/ecu 2.xml".into()],
             ai_lines: 80,
             ai_most: 2000,
             ai_top: 40,

@@ -125,7 +125,9 @@ ECU's uptime (`tmsp`), `ecu`, `apid`, `ctid`, `type` and the payload as
 text; [fields](queries.md#fields) filter on the headers without decoding
 the payload. **Non-verbose** messages are decoded with **FIBEX** files
 (`--fibex FILE`, or the Signals panel's FIBEX section): their text, APID,
-CTID and level, and their arguments can be [plotted](signals.md).
+CTID and level, and their arguments can be [plotted](signals.md). There,
+**Load at start** loads the FIBEX files in use whenever nerka starts
+(`--fibex` uses its own for that run).
 
 ## Captures: pcap, pcapng, MF4
 
