@@ -26,7 +26,7 @@ Don't settle these silently: ask.
 7. **Pulling a needed query into the Selection** (review 2026-11-09, U7; owner: needs a discussion first) and **query signals with saved signals' options** (U6: a feature of its own, later).
 8. **Patterns: presence on Compare rows** (`A 3/3 · B 0/5`): unclear to the owner on review (2026-11-24), explained; to confirm. The other assumptions are answered (`patterns.md` → Reviewed by the owner), some to follow up later.
 9. **After the review of workflow B** (2026-11-25): the stack-dump design's questions (`stack-dumps.md`: a split or a profile, which formats, the saved records format, a wait-for view); postponed by the owner (2026-11-25): not now, nothing built.
-10. **Records** (2026-11-25, `records.md`): where a record ends (`end=`), lines outside records (`outside=one|rows|drop`, the head back to one record for `start=` alone: the owner's UART sessions), file-line numbering everywhere, the matching line under a folded record; five questions there.
+10. **Records** (2026-11-25, `records.md`): where a record ends (`end=`), lines outside records (`outside=one|rows` and an `outside` field; the head back to one record for `start=` alone: answered 1, 2, 5), file-line numbering everywhere, the matching line under a folded record; five questions there.
 
 ## State
 

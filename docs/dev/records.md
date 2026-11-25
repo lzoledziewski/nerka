@@ -78,16 +78,16 @@ start=/RE/ outside=rows         what to do with lines outside every record (belo
 |---|---|
 | `one` | is one record (a partial session) |
 | `rows` | is a row per line (the log around a dump) |
-| `drop` | isn't shown; the status bar and `nerka open` say how many lines were left out |
 
 - Defaults: **`start=` alone: `one`** (the original rule: the owner's
   UART path is back); **with `end=`: `rows`** (lines between records are
   usually ordinary log lines: shown).
 - The stack-dump hint (and so every agent) says `outside=rows`
-  explicitly; it never suggests `drop`.
+  explicitly.
 - Each row gets the field **`outside`** (true for a row outside every
-  record), so `NOT outside` hides them as `drop` does, reversibly:
-  counts, search and bookmarks still see them.
+  record), so `NOT outside` hides them, reversibly: counts, search and
+  bookmarks still see them (owner, 2026-11-25: the field only, no
+  `outside=drop`).
 - `nerka open` / `summary` say what a split did: records, rows outside
   them, and for `one`: "the first record (lines 1–412) starts before the
   first match: a partial session".
@@ -152,9 +152,10 @@ start=/RE/ outside=rows         what to do with lines outside every record (belo
 
 ## Questions for the owner
 
-1. **The head default:** back to one record for `start=` alone, rows with
-   `end=` (proposed)?
-2. **`drop`:** keep it beside the `outside` field, or the field alone?
+1. ~~The head default~~ **Answered (owner, 2026-11-25): yes**, one record
+   for `start=` alone, rows with `end=`.
+2. ~~`drop`~~ **Answered (owner, 2026-11-25): the field only**: no
+   `outside=drop`; `NOT outside` hides those lines, reversibly.
 3. **Numbering by file line:** in 0.3.0, or after it?
 4. **The matching line under a folded record:** the first match only, or
    every matching line (a boot with many)?
