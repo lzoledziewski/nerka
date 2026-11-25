@@ -194,7 +194,8 @@ pub fn parse(src: &str) -> Result<Expr, DslError> {
         // or `\/` lost to JSON, where `\/` is only `/`.
         let before = src.get(..e.pos).unwrap_or(src).trim_end();
         if e.msg.starts_with("unexpected") && before.ends_with('/') && before.matches('/').count() >= 2 {
-            e.msg += "; a / ended the regex before it: write \\/ for a slash inside a regex (in a JSON string: \\\\/)";
+            e.msg +=
+                r"; a / ended the regex before it: for a slash inside a regex write [/] (or \/; in a JSON string \\/)";
         }
         e
     })

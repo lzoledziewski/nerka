@@ -127,7 +127,7 @@ pub fn level_counts(source: &dyn LogSource, progress: &Progress) -> Result<([u64
 /// Lines looked at from each end for the first and last time.
 const TIME_LOOK: u64 = 10_000;
 
-/// The first and last time among the first and last [`TIME_LOOK`] lines.
+/// The first and last time among the first and last `TIME_LOOK` lines.
 pub fn time_span(source: &dyn LogSource) -> Option<(f64, f64)> {
     let n = source.line_count();
     let first = (0..n.min(TIME_LOOK)).find_map(|l| source.time(l))?;
@@ -281,7 +281,7 @@ impl View<'_> {
         v
     }
 
-    /// Row `row` as a line object ([`line`]).
+    /// Row `row` as a line object ([`line()`]).
     pub fn line(&self, row: LineNo, fields: &Fields) -> Value {
         let (file, line_no) = self.at(row);
         let mut v = line(self.source, row, file, line_no, fields);

@@ -533,9 +533,9 @@ struct JsonArgs {
     /// (comma-separated; `nerka help fields FILE` lists them).
     #[arg(long, value_delimiter = ',', value_name = "FIELD,…", requires = "json")]
     fields: Vec<String>,
-    /// With --json: each line's `raw` at most N characters, cut with `…`
-    /// and its length as `"raw_chars"` (0: whole, the default).
-    #[arg(long, value_name = "N", default_value_t = 0, requires = "json")]
+    /// Each line at most N characters, cut with `…` (with --json: its
+    /// `raw`, its length as `"raw_chars"`); 0: whole, the default.
+    #[arg(long, value_name = "N", default_value_t = 0)]
     width: usize,
 }
 
@@ -827,7 +827,17 @@ impl<'a> Printer<'a> {
             if !queries.is_empty() {
                 write!(out, "[{}] ", queries.join(","))?;
             }
-            out.write_all(&f.line_bytes(row).unwrap_or_default())?;
+            let bytes = f.line_bytes(row).unwrap_or_default();
+            let width = self.o.json.width;
+            if width > 0 && bytes.len() > width {
+                let text = String::from_utf8_lossy(&bytes);
+                match text.char_indices().nth(width) {
+                    Some((end, _)) => write!(out, "{}…", &text[..end])?,
+                    None => out.write_all(&bytes)?,
+                }
+            } else {
+                out.write_all(&bytes)?;
+            }
             out.write_all(b"\n")?;
         }
         self.last = Some(row);

@@ -59,10 +59,12 @@ A good run against a bad one, before against after.
     nerka filter --json --before 30s --after 5s 'raw ~ /watchdog reset/' FILE
     nerka filter --json -m 100 'before(10s, level >= FATAL) AND level >= WARN' FILE
     nerka lines --json FILE 1200 1260
+    nerka filter --json '@line >= 1200 AND @line <= 1260 AND NOT raw ~ /loader/' FILE
 
 `--before` / `--after` give the lines within that time of each match,
 `"match": true` on the matches themselves. Context is by time; for lines
-around a line number, use `lines`.
+around a line number, use `lines`, or `filter` with `@line` (the line's
+number in its file) to read a range without the noise in it.
 
 ## Logs without times; stack dumps
 

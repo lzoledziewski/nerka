@@ -78,7 +78,7 @@ commands that print lines, and one object for the others:
   error listing the file's fields.
 - `--width N` cuts each line's `raw` at N characters, with `…`, and says
   its length as `"raw_chars"` (a DLT payload of hex can run to thousands
-  of characters).
+  of characters); without `--json` it cuts the printed lines.
 
 Big results come in pages:
 

@@ -92,7 +92,7 @@ regression over 15 %; **S3** debt that makes the next change harder;
 | ID | Check | How |
 |---|---|---|
 | SEC-1 | Untrusted files: no unbounded allocation from a length field; regexes from packs have size limits | read readers; `RegexBuilder::size_limit` |
-| SEC-2 | The single-instance listener: loopback only, token compared in constant time, bounded request, no command but `open` | `ui/src/instance.rs` |
+| SEC-2 | The single-instance listener: loopback only, token compared in constant time, bounded request (each line), no command but `open` / `preset` and, after the token, an agent's calls (`agent`: one JSON call a line, the window's tools only; JSON depth bounded) | `ui/src/instance.rs`, `ui/src/agent.rs` |
 | SEC-3 | Unpack cache: names derived by hashing, written to a temp name, never outside the cache folder | `core/src/input/capture/unpack.rs` |
 | SEC-4 | No secrets, real logs or captures committed | `git log -p` for new binaries; `.gitignore` |
 | SEC-5 | Protocol definitions are untrusted input too: bounded file size, nesting, nodes, list items; no panic on any definition over any message | `core/src/input/proto/ksy` limits; `PROBE_ROUNDS=20000 cargo test --release -p nerka-core --test ksy_dlt mutated` |
