@@ -3595,11 +3595,13 @@ struct SettingsFields<'a> {
     mf4_local_time: &'a mut bool,
     pattern_tuning: &'a mut bool,
     ai_command: &'a mut String,
+    /// An agent's answers: lines by default, at most, patterns by default.
+    ai_limits: [&'a mut u64; 3],
 }
 
 /// The Settings window's fields ([`SettingsFields`]).
 fn settings_ui(ui: &mut egui::Ui, f: SettingsFields<'_>) -> SettingsChange {
-    let SettingsFields { name, theme, limit, local_time, mf4_local_time, pattern_tuning, ai_command } = f;
+    let SettingsFields { name, theme, limit, local_time, mf4_local_time, pattern_tuning, ai_command, ai_limits } = f;
     let mut save = SettingsChange::default();
     egui::Grid::new("settings-grid").num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| {
         ui.label(RichText::new("Look").strong());
@@ -3675,6 +3677,20 @@ fn settings_ui(ui: &mut egui::Ui, f: SettingsFields<'_>) -> SettingsChange {
                      --install codex` (or gemini) once. Flags can follow the command.",
                 );
             save.theme |= r.changed();
+        });
+        ui.end_row();
+        ui.label("Answers");
+        ui.horizontal(|ui| {
+            // Agents read in pages: what a page holds (owner, 2026-11-25).
+            let [lines, most, top] = ai_limits;
+            for (v, label, tip) in [
+                (lines, "lines", "Lines an answer gives when the agent doesn't ask for a number"),
+                (most, "at most", "Lines an answer gives at most, whatever the agent asks"),
+                (top, "patterns", "Patterns and differences an answer gives when the agent doesn't ask for a number"),
+            ] {
+                save.theme |= ui.add(egui::DragValue::new(v).range(1..=100_000)).on_hover_text(tip).changed();
+                ui.label(label);
+            }
         });
         ui.end_row();
         ui.label(RichText::new("This window").strong());
@@ -4434,6 +4450,7 @@ impl App {
                         mf4_local_time: &mut self.prefs.mf4_local_time,
                         pattern_tuning: &mut self.prefs.pattern_tuning,
                         ai_command: &mut self.prefs.ai_command,
+                        ai_limits: [&mut self.prefs.ai_lines, &mut self.prefs.ai_most, &mut self.prefs.ai_top],
                     },
                 );
                 ui.separator();
@@ -8528,6 +8545,7 @@ gear=D
                             mf4_local_time: &mut true,
                             pattern_tuning: &mut false,
                             ai_command: &mut String::new(),
+                            ai_limits: [&mut 50, &mut 1000, &mut 30],
                         };
                         settings_ui(ui, fields);
                         let change = protocols::settings_section(ui, edit, &prefs, &[]);

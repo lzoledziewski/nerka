@@ -76,9 +76,23 @@ pub enum Undo {
     },
 }
 
-/// Answers are bounded (an agent's context is small): lines a call gives
-/// at most.
-const MAX_LINES: u64 = 1000;
+/// Answers are bounded (an agent's context is small); the owner
+/// (2026-11-25): settable, Settings → AI agents.
+#[derive(Debug, Clone, Copy)]
+pub struct Limits {
+    /// Lines an answer gives when the agent doesn't say (`max`).
+    pub lines: u64,
+    /// Lines an answer gives at most, whatever the agent asks.
+    pub most: u64,
+    /// Patterns and differences an answer gives when the agent doesn't say.
+    pub top: u64,
+}
+
+impl Default for Limits {
+    fn default() -> Self {
+        Limits { lines: 50, most: 1000, top: 30 }
+    }
+}
 
 /// Each tool's arguments: any other is an error, not ignored (evaluation
 /// round 1: `limit` and `query` were taken for `max` and `in`, silently).
@@ -134,6 +148,7 @@ struct Snap {
     filter: String,
     search: String,
     plotted: Vec<String>,
+    limits: Limits,
 }
 
 impl Snap {
@@ -285,7 +300,7 @@ fn read(tool: &str, args: &Value, s: &Snap) -> Result<Value, String> {
         "filter" => {
             let q = str_arg(args, "query");
             let fields = Fields::parse(&field_list(args), &*s.source)?;
-            let (skip, max) = (num_arg(args, "skip", 0), num_arg(args, "max", 50).min(MAX_LINES));
+            let (skip, max) = (num_arg(args, "skip", 0), num_arg(args, "max", s.limits.lines).min(s.limits.most));
             let (before, after) = (str_arg(args, "before"), str_arg(args, "after"));
             if before.is_some() || after.is_some() {
                 let q = q.filter(|q| !q.trim().is_empty()).ok_or("before / after need a query")?;
@@ -317,8 +332,8 @@ fn read(tool: &str, args: &Value, s: &Snap) -> Result<Value, String> {
             let at = ca::locator(&*s.source);
             let file = at(from).0;
             let rows: Vec<LineNo> =
-                (from.min(to)..=to.max(from)).filter(|&r| at(r).0 == file).take(MAX_LINES as usize).collect();
-            Ok(view.page(&rows, 0, MAX_LINES, &fields, None))
+                (from.min(to)..=to.max(from)).filter(|&r| at(r).0 == file).take(s.limits.most as usize).collect();
+            Ok(view.page(&rows, 0, s.limits.most, &fields, None))
         }
         "bookmarks" => {
             let list = s.bookmarks.iter_named().map(|(l, name, note)| {
@@ -349,7 +364,8 @@ fn read(tool: &str, args: &Value, s: &Snap) -> Result<Value, String> {
                 queries: bool_arg(args, "queries", false),
                 lines,
             };
-            Ok(with_warnings(ca::patterns(&ps, &view, num_arg(args, "top", 30) as usize, detail), warnings))
+            let top = num_arg(args, "top", s.limits.top) as usize;
+            Ok(with_warnings(ca::patterns(&ps, &view, top, detail), warnings))
         }
         "compare" => {
             let side = |key: &str, warnings: &mut Vec<String>| -> Result<(String, Vec<LineNo>), String> {
@@ -372,7 +388,7 @@ fn read(tool: &str, args: &Value, s: &Snap) -> Result<Value, String> {
                 Value::object([("filter", Value::from(fa)), ("lines", ps.lines[0].into())]),
                 Value::object([("filter", Value::from(fb)), ("lines", ps.lines[1].into())]),
             ];
-            let top = num_arg(args, "top", 30) as usize;
+            let top = num_arg(args, "top", s.limits.top) as usize;
             let v = ca::compare(&ps, &diffs, [&view, &view], sides, min_score, top, bool_arg(args, "queries", true));
             Ok(with_warnings(v, warnings))
         }
@@ -397,7 +413,7 @@ fn read(tool: &str, args: &Value, s: &Snap) -> Result<Value, String> {
             let n = s.source.line_count();
             let from = if args.get("from").is_some() { s.row(args, "from")? } else { 0 };
             let to = if args.get("to").is_some() { s.row(args, "to")? } else { n.saturating_sub(1) };
-            Ok(ca::signal(def, &series, &view, from, to, num_arg(args, "points", 100).min(MAX_LINES) as usize))
+            Ok(ca::signal(def, &series, &view, from, to, num_arg(args, "points", 100).min(s.limits.most) as usize))
         }
         "lifecycles" => {
             let want = str_arg(args, "name");
@@ -516,6 +532,7 @@ impl App {
             filter: t.pattern.clone(),
             search: t.search.pattern.clone(),
             plotted: plot::lock(&t.plot).plotted.clone(),
+            limits: Limits { lines: self.prefs.ai_lines, most: self.prefs.ai_most, top: self.prefs.ai_top },
         })
     }
 

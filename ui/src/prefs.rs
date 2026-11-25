@@ -54,6 +54,11 @@ pub struct SearchPrefs {
     pub pattern_tuning: bool,
     /// What 🤖 AI terminal runs (`claude`, `codex`, `gemini`, …).
     pub ai_command: String,
+    /// An agent's answers (`crate::agent::Limits`): lines when it doesn't
+    /// say, lines at most, patterns when it doesn't say.
+    pub ai_lines: u64,
+    pub ai_most: u64,
+    pub ai_top: u64,
     /// Light, dark, or as the system says (egui falls back to dark where
     /// it can't tell, as on many Linux desktops).
     pub theme: egui::ThemePreference,
@@ -90,6 +95,9 @@ impl Default for SearchPrefs {
             plot_window_maximized: false,
             pattern_tuning: false,
             ai_command: "claude".into(),
+            ai_lines: 50,
+            ai_most: 1000,
+            ai_top: 30,
             theme: egui::ThemePreference::System,
             routes: Vec::new(),
             disabled_protocols: Vec::new(),
@@ -115,6 +123,18 @@ impl SearchPrefs {
                 }
                 "ai_command" => {
                     p.ai_command = value.trim().to_owned();
+                    continue;
+                }
+                k @ ("ai_lines" | "ai_most" | "ai_top") => {
+                    if let Ok(n) = value.trim().parse::<u64>()
+                        && n > 0
+                    {
+                        match k {
+                            "ai_lines" => p.ai_lines = n,
+                            "ai_most" => p.ai_most = n,
+                            _ => p.ai_top = n,
+                        }
+                    }
                     continue;
                 }
                 _ => {}
@@ -209,6 +229,7 @@ impl SearchPrefs {
         out.push_str(&format!("theme={}\n", theme_key(self.theme)));
         out.push_str(&format!("pattern_tuning={}\n", self.pattern_tuning));
         out.push_str(&format!("ai_command={}\n", self.ai_command.replace(['\n', '\r'], " ")));
+        out.push_str(&format!("ai_lines={}\nai_most={}\nai_top={}\n", self.ai_lines, self.ai_most, self.ai_top));
         for r in &self.routes {
             out.push_str(&format!("route={r}\n"));
         }
@@ -307,6 +328,9 @@ mod tests {
             plot_window_maximized: true,
             pattern_tuning: true,
             ai_command: "codex --full-auto".into(),
+            ai_lines: 80,
+            ai_most: 2000,
+            ai_top: 40,
             theme: egui::ThemePreference::Light,
             routes: vec!["DLT:port=3490,vlan=5".into()],
             disabled_protocols: vec!["syslog".into()],
