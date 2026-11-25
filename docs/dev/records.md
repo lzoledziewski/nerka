@@ -156,7 +156,9 @@ start=/RE/ outside=rows         what to do with lines outside every record (belo
    for `start=` alone, rows with `end=`.
 2. ~~`drop`~~ **Answered (owner, 2026-11-25): the field only**: no
    `outside=drop`; `NOT outside` hides those lines, reversibly.
-3. **Numbering by file line:** in 0.3.0, or after it?
-4. **The matching line under a folded record:** the first match only, or
-   every matching line (a boot with many)?
+3. ~~Numbering by file line~~ **Answered (owner, 2026-11-25): in 0.3.0**
+   (the agents' `line` is a contract once released).
+4. ~~The matching line~~ **Answered (owner, 2026-11-25): the first match
+   and the count of the others** (`(+2 more matches)`; unfolding or the
+   search pane lists them all); JSON `match_line` and `matches`.
 5. ~~`cont=`~~ **Answered (owner, 2026-11-25): later.** Added when a real log needs a negation `start=` can't say.
