@@ -424,8 +424,7 @@ pub fn hints(source: &dyn LogSource) -> Vec<String> {
     }
     let mut out = Vec::new();
     // An uptime at the start of each line (`[ 2088.354600]`: dmesg, a
-    // a daemon's own output): a profile reads it as the line's time
-    // .
+    // daemon's own output): a profile reads it as the line's time.
     let uptimes = (0..n.min(200))
         .filter_map(|l| source.line_text(l))
         .filter(|t| {

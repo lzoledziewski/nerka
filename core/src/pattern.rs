@@ -3636,7 +3636,7 @@ mod tests {
 
     #[test]
     fn a_lone_word_is_its_own_pattern() {
-        // a daemon's own log: a level glued to the pid, then function
+        // A daemon's own log: a level glued to the pid, then function
         // names, each a message of one word.
         let names = ["dlt_message_init()", "dlt_message_free()", "dlt_message_read()"];
         let lines: Vec<String> = (0..90)

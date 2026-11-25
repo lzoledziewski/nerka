@@ -33,10 +33,10 @@ the `patterns` file and bundle kind, `--pattern-config` / `--set` /
   header or footer word (`Local::header_words`: stage 1's boilerplate and
   `header` rules) or a level, and a pattern of header words only absorbs
   nothing. Measured: LogHub-2.0 2k unchanged (GA 0.751, FGA 0.760, WGA
-  0.949); that log: 33 → 82 patterns, each function its own; of 21 other
+  0.949); that log 33 → 82 patterns, each function its own; of 21 other
   evaluation logs, 6 changed: a Java dump's prefix-only pattern took 59 %
-  of lines, now 23 % (its messages apart), and four trace logs join
-  one message logged at NOTICE and INFO (`{NOTICE|INFO}`); the test
+  of lines, now 23 % (its messages apart), and four trace logs join one
+  message logged at NOTICE and INFO (`{NOTICE|INFO}`); the test
   `LOG: radar: OK` / `LOG: imu: OFFLINE` is now two patterns, not one of
   two slots. 1 GiB: patterns identical, time unchanged (text ~620 →
   ~635 ms, noise; DLT payloads have no level check).

@@ -49,8 +49,8 @@ the records **fields**, as `json` gives a record's keys:
 | `waits_on` | `- waiting to lock <0x…>` / `- parking to wait for <0x…>` |
 | `stack` | the signature |
 
-With them, that deadlock is three queries, the same in the CLI, the window and
-MCP:
+With them, that deadlock is three queries, the same in the CLI, the
+window and MCP:
 
 ```
 state == "chan send"                       # the two holders
@@ -63,10 +63,9 @@ whatever their arguments: the panicparse view, in the existing pattern
 engine, its configuration and `compare` (two dumps of one hang, taken a
 minute apart: which goroutines didn't move).
 
-**A log with a dump in it** (debug lines, then the dump): lines
-before the first goroutine stay rows (built,
-`ai-evaluation.md`), so the log and the dump are one tab; the fields are
-empty on the log's rows.
+**A log with a dump in it** (debug lines, then the dump): read with
+`end=` (`records.md`), the log's lines stay rows, so the log and the dump
+are one tab; the fields are empty on the log's rows.
 
 ## Where
 

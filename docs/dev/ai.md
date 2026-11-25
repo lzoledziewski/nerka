@@ -10,8 +10,7 @@ unattended, "Assumptions to review" below: `cli/src/mcp.rs`,
 `core/src/link.rs`, `ui/src/instance.rs` (the agent channel),
 `ui/src/agent.rs` (the tools, 🤖 Agent, undo), `ui/src/terminal.rs`
 (🤖 AI); user guide `docs/user/agents.md#with-you-on-your-window-mcp`).
-Next: the owner's review of the assumptions; the evaluation on real
-bug reports (`docs/dev/ai-evaluation.md`).
+Evaluated on real bug reports: `ai-evaluation.md`.
 
 ## What the owner asked for (2026-11-24)
 
@@ -236,13 +235,10 @@ left to the postponed refactoring.
   (`stack-dumps.md`).
 - **Patterns over stack frames** tried on other dumps (Java, Python, more
   Go) before deciding anything for the engine.
-- **A DLT log:** a daemon's log (size checked first,
-  unpacked into a folder of its own, read only with nerka).
 
-Lines before a record split's first match stay rows (evaluated on real
-files, kept: `ai-evaluation.md`). **An idea, not now:** a diff
-inside one line (`compare` compares templates and slot values, not order
-inside a line).
+Records were re-evaluated after (`records.md`). **An idea, not now:** a
+diff inside one line (`compare` compares templates and slot values, not
+order inside a line).
 
 ## Settled (owner, 2026-11-24)
 

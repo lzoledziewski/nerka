@@ -4,23 +4,27 @@ The dated log of the project, newest first; append-only: add an entry at the top
 
 ## 2026-11-25
 
-Records re-evaluated from the user's and the agents' side (owner: the head change broke the UART-session use): `records.md` proposes `end=`, `outside=one|rows|drop` with the head back to one record for `start=` alone, file-line numbering and the matching line; not built, questions pending (status 10).
+0.3.0 prepared (a release; not yet merged or tagged), after 0.3.0-alpha.2:
 
-0.3.0 prepared (a release, owner: "build release and prepare bump to 0.3.0"; on `claude/ai-prep`, not pushed, merged or tagged): the AI preparation (CLI JSON, `nerka mcp` on the window, annotations, the agents' guide, evaluated on real bug reports), patterns and compare with `lone-word` and what stayed the same, FIBEX Load at start, the owner's GUI items. Verified: the gate on Windows (PASS) and fmt, clippy and tests in the Linux VM (core 449, GUI 179, CLI 24, integration 7). After the bump, the owner's last items: FIBEX Load at start, Copilot as an AI client with a missing command said, a failed plotted signal left out and said, the Signals list keeping its room beside FIBEX.
-
-Evaluation rounds 5 and 6 (`ai-evaluation.md`): a DLT trace (a DLT trace, the attachment downloaded at the owner's request) and a server's log with crash dumps (a logfmt server log), 8 blind runs, all right; fixed from them: logfmt times, `--width` / MCP `width`, a crash hint, the regex-slash advice. Owner's GUI items: changed signal values coloured in the line window, Show in search results, resizing a window over a view no longer scrolls it; tuning in the Patterns window in every build. Gate before 0.3.0 (Windows): PASS (WARN: PERF-2 within machine noise on re-runs, ARCH-2/3/4, DOC-3, MSRV-1); Linux not checked (the VM was off).
-
-Patterns (owner): Compare lists what is the same on both sides too, and patterns or values only (CLI `--show` / `--rows`, MCP, the window); the setting `lone-word` (on by default) keeps a message's only word out of slots, which fixed a daemon's log's function traces (`patterns.md`; LogHub unchanged).
-
-The owner kept lines before a record split's first match as rows (`ai-evaluation.md`); the stack-dump hint says how to group only the goroutines.
-
-The review's list built (`ai.md` → Reviewed by the owner): the AI command from a list; `LogSource::file_line` (`first_line` in every view); numbered `nerka lines`; `@line` (a built-in signal, `LogSource::line_in_file`) and per-file numbers in a several-file tab's gutter; a read-only `queries` tool and the library's queries with notes in `help agent`; answer limits in Settings; the tools timed on 1 GiB text and DLT (all under 1.2 s but a time window on text, 13 s); a prototype keeping lines before a record split's first match as rows (to keep or drop); patterns tried on Go and Python traces (records fix the over-merge; a stack signature needed for Go); the DLT bug report a daemon's log's (the gateway's own log) evaluated, both workflows mostly right; `stack-dumps.md` designed. Decisions pending 9.
-
-The owner reviewed workflow B's assumptions (`ai.md` → Reviewed by the owner): kept as built, with a list to build: settable answer limits and a 1 GiB measurement, the AI command from a list, a `queries` tool and the library's queries with notes in the agent's help, `first_line` in several-file tabs, `line` as a field and per-file numbers in the gutter, numbered `lines`, the stack-dump profile designed first, patterns tried on other dumps, the DLT bug report a daemon's log's; to evaluate first: lines before a record split's first match kept as rows.
-
-The AI workflows evaluated (`ai-evaluation.md`; owner: "test both approaches on real bug reports, loop, iterate"): real bug reports (two Go goroutine dumps, one pair of trace logs compared good against bad), 10 blind agent runs in 3 rounds (A: the CLI, B: MCP on a window): 6 right, 2 mostly, 2 partly, none wrong; fixed between rounds: unknown MCP arguments an error, compact answers, hints (stack dumps and entries spanning lines read as records; no times), `set_records`, `first_line`, grep's `-n`, a Git Bash warning, the top bar's file text cut short, `lines` kept in its file. Open for the owner: the evaluation's "Next".
-
-AI preparation, workflow B built unattended (owner: "proceed with MCP, carry out the plan, take assumptions"; `ai.md` → Assumptions to review; Decisions pending 9): `nerka mcp`, an MCP server over stdio (`cli/src/mcp.rs`), linked to a window through the loopback port and token (`core/src/link.rs`, the agent channel in `ui/src/instance.rs`); 17 tools on the window's tabs (`ui/src/agent.rs`: reading tools on a thread with a snapshot, answers built in core like `--json`); changes listed in 🤖 Agent with ↶ Undo; `screenshot` as an MCP image; 🤖 AI opening the user's terminal with the AI command (`ui/src/terminal.rs`; Claude Code with `--mcp-config`); `nerka mcp --install` / `--config`. Before it, CI on Windows: the `help nfd` test compared the grammar with CRLF line ends (fixed); the CI screenshot on macOS showed 🤖 well and 🔖 poorly (owner: leave it for now).
+- **AI preparation** (`ai.md`): workflow A, an agent with the CLI
+  (`--json` in pages, `help agent` / `help skill`, `marks` with an
+  author); workflow B, `nerka mcp` on the user's window (tools to read,
+  filter, bookmark as annotations and plot; every change listed and
+  undoable; the 🤖 AI terminal with Claude Code, Copilot, Codex and
+  Gemini presets, a client not installed said). Evaluated on real bug
+  reports with public logs (`ai-evaluation.md`); what the agents tripped
+  over fixed.
+- **Records** (`records.md`): `end=`, lines outside records
+  (`outside=one|rows`, the field `outside`), the file's numbering
+  everywhere, the line a folded record matched on.
+- **Patterns** (`patterns.md`): Compare lists what stayed the same, and
+  patterns or values only; the setting `lone-word`; tuning in every build.
+- **Text times:** logfmt's `time=`; a log with a tool's output between its
+  timed lines.
+- **The window:** changed signal values coloured in the line window, Show
+  in search results, a plotted signal that fails left out and said, FIBEX
+  Load at start, the Signals list keeping its room beside FIBEX, resizing
+  a window over a view no longer scrolls it.
 
 ## 2026-11-24
 

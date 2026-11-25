@@ -31,16 +31,16 @@ search in".
    boot is scattered into rows.
 2. **A record never ends before the next start.** In a log with a dump
    inside it, everything after the dump is swallowed by its last record.
-   A server's log with crash dumps, read as goroutine records: 3,394 lines become 398 rows,
-   one record 38,177 characters holding the next session's server lines;
-   a record's level and time are its first line's (`goroutine …`: none),
-   so `level >= ERROR` misses the four "llama runner terminated" lines,
-   silently. For an agent this is a wrong count that looks right.
+   A server's log with five crash dumps, read as goroutine records:
+   3,394 lines become 398 rows, one record 38,177 characters holding the
+   next session's server lines; a record's level and time are its first
+   line's (`goroutine …`: none), so `level >= ERROR` misses the four
+   errors after the crashes, silently. For an agent this is a wrong count that looks right.
 3. **Two numbering systems.** In records mode the gutter, Ctrl+G and
    the CLI / MCP `line` count records; since the head change they equal
-   file lines up to the first record, then drift (record 580 is
-   file line 1352): wrong in a way that looks right. Agents juggle `line`
-   and `first_line` (evaluation rounds 2–4).
+   file lines up to the first record, then drift (record 580 is file
+   line 1352): wrong in a way that looks right. Agents juggled `line` and
+   `first_line` (`ai-evaluation.md`).
 4. **Why a record matched is hidden.** A filter keeps a record when any
    of its lines matches (right: a frame keeps its goroutine, a startup
    line its boot), but a folded record shows its first line only:
