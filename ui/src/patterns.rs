@@ -270,7 +270,7 @@ pub struct Input<'a> {
     pub title: String,
     /// The pattern configuration to run with (the saved one).
     pub config: fn() -> Result<PatternConfig, String>,
-    /// The tuning pane is shown (alpha builds, or ⚙ Settings).
+    /// The tuning pane is shown (every build; tests turn it off).
     pub tuning: bool,
 }
 

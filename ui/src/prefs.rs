@@ -49,9 +49,6 @@ pub struct SearchPrefs {
     pub plot_window: bool,
     /// The plot's own window opens maximized (as it was last left).
     pub plot_window_maximized: bool,
-    /// The Patterns window's tuning pane in a release build (alpha builds
-    /// always show it; owner, 2026-11-23).
-    pub pattern_tuning: bool,
     /// What 🤖 AI terminal runs (`claude`, `codex`, `gemini`, …).
     pub ai_command: String,
     /// An agent's answers (`crate::agent::Limits`): lines when it doesn't
@@ -93,7 +90,6 @@ impl Default for SearchPrefs {
             checks_auto: true,
             plot_window: false,
             plot_window_maximized: false,
-            pattern_tuning: false,
             ai_command: "claude".into(),
             ai_lines: 50,
             ai_most: 1000,
@@ -192,7 +188,6 @@ impl SearchPrefs {
                 "checks_auto" => p.checks_auto = flag,
                 "plot_window" => p.plot_window = flag,
                 "plot_window_maximized" => p.plot_window_maximized = flag,
-                "pattern_tuning" => p.pattern_tuning = flag,
                 _ => {}
             }
         }
@@ -227,7 +222,6 @@ impl SearchPrefs {
         out.push_str(&format!("plot_window={}\n", self.plot_window));
         out.push_str(&format!("plot_window_maximized={}\n", self.plot_window_maximized));
         out.push_str(&format!("theme={}\n", theme_key(self.theme)));
-        out.push_str(&format!("pattern_tuning={}\n", self.pattern_tuning));
         out.push_str(&format!("ai_command={}\n", self.ai_command.replace(['\n', '\r'], " ")));
         out.push_str(&format!("ai_lines={}\nai_most={}\nai_top={}\n", self.ai_lines, self.ai_most, self.ai_top));
         for r in &self.routes {
@@ -326,7 +320,6 @@ mod tests {
             checks_auto: false,
             plot_window: true,
             plot_window_maximized: true,
-            pattern_tuning: true,
             ai_command: "codex --full-auto".into(),
             ai_lines: 80,
             ai_most: 2000,

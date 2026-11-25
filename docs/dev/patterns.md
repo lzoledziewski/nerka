@@ -217,9 +217,9 @@ run at once. Changing the minimum score filters the rows without a new run.
 
 ## The tuning pane (🛠)
 
-For the alpha rounds; visible in alpha builds, behind ⚙ Settings →
-*Developer: pattern tuning* after (owner, 2026-11-23: a switch, off by
-default; the configuration file works either way).
+Shown in the Patterns window in every build, releases too (owner,
+2026-11-25: it stays there for 0.3.0; the Settings switch that hid it in
+releases is gone).
 
 ```
 ┌ 🛠 Pattern tuning ─────────────── config: patterns (saved) [Save][Load][Export] ┐
@@ -250,9 +250,7 @@ default; the configuration file works either way).
   with a bug report and it is loaded as it was.
 
 As built (2026-11-24, α2; `ui/src/tuning.rs`): **🛠 Tuning** is the third
-mode of the Patterns window, shown when the version is a pre-release
-(`-alpha…`) or ⚙ Settings → Developer → Pattern tuning (`prefs`:
-`pattern_tuning`) is on. The pane loads the saved configuration once and
+mode of the Patterns window. The pane loads the saved configuration once and
 from then on the window's runs use the pane's (saved or not); a change
 runs again after 0.6 s on the same lines. **Change** follows each line
 from the run before to this one (joins and splits; past 4 M lines only new
@@ -316,7 +314,7 @@ them:
   pane; Compare a mode of the window; ⚖ on a lifecycle row in the Signals
   panel (a button, runs at once; "like it"); Tuning a mode of the window,
   its configuration (even unsaved) what the window runs with until Revert;
-  the tuning pane in pre-releases, a Settings switch otherwise; `nerka
+  the tuning pane in every build (2026-11-25); `nerka
   anonymize` CLI only, DLT IDs kept unless `--ids`, a random key unless
   `--seed`.
 - **For now:** ignoring a row in Compare hides it, Save as ignore rule

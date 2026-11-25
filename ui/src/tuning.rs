@@ -2,9 +2,9 @@
 //! α2), a mode of the Patterns window: the pattern configuration's settings
 //! and rules edited on the trace at hand, each change re-running the
 //! patterns (debounced, on the same lines), what the change did, and why
-//! two patterns were kept apart or joined. Visible in pre-release (alpha)
-//! builds, else behind ⚙ Settings → *Developer: pattern tuning* (owner,
-//! 2026-11-23). Nothing is written until Save; Export and Load move a
+//! two patterns were kept apart or joined. Shown in every build (owner,
+//! 2026-11-25: it stays in the Patterns window for 0.3.0). Nothing is
+//! written until Save; Export and Load move a
 //! configuration between testers.
 
 use eframe::egui::{self, RichText};

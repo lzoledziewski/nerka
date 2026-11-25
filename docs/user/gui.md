@@ -169,8 +169,7 @@ the score is G², 10.8 or more by default), as
 - In the Signals panel, **⚖** on a lifecycle compares it with the one
   before.
 
-**🛠 Tuning** (in the same window; alpha builds, else ⚙ Settings →
-Developer → Pattern tuning) edits the [pattern
+**🛠 Tuning** (in the same window) edits the [pattern
 configuration](cli.md#the-pattern-configuration) on the lines at hand:
 
 - **Settings** of both stages, each with **●** while it isn't the default
