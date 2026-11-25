@@ -24,7 +24,7 @@ A stack trace belongs to its message. Read text as **records**:
 
 | Spec | A record |
 |---|---|
-| `start=/REGEX/` | starts at each line matching the regex (e.g. a date: `start=/\d{4}-\d\d-\d\d/`) |
+| `start=/REGEX/` | starts at each line matching the regex (e.g. a date: `start=/\d{4}-\d\d-\d\d/`); lines before the first match stay one row each |
 | `blank` | is separated from the next by blank lines |
 | `sep=/REGEX/` | is separated by lines matching the regex (not part of either record) |
 | `json` | is a JSON value (below) |

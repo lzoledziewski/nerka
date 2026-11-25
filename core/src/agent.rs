@@ -354,7 +354,8 @@ pub fn hints(source: &dyn LogSource) -> Vec<String> {
         out.push(format!(
             "a Go goroutine dump ({go} goroutines from line {go_first}): read as records start=/^goroutine [0-9]/ \
              (CLI: --records 'start=/^goroutine [0-9]/'; window: set_records), each goroutine is one record and \
-             patterns groups identical stacks"
+             patterns groups identical stacks (lines before the dump stay rows: patterns --in 'raw ~ /^goroutine/' \
+             keeps the goroutines only)"
         ));
     }
     if java >= 5 && !source.format().starts_with("text records") {

@@ -239,8 +239,8 @@ left to the postponed refactoring.
 - **A DLT log:** a daemon's log (size checked first,
   unpacked into a folder of its own, read only with nerka).
 
-**To evaluate first:** keeping lines before a record split's first match
-as rows (a prototype shown on real files). **An idea, not now:** a diff
+Lines before a record split's first match stay rows (evaluated on real
+files, kept: `ai-evaluation.md`). **An idea, not now:** a diff
 inside one line (`compare` compares templates and slot values, not order
 inside a line).
 

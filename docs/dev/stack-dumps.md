@@ -64,7 +64,7 @@ engine, its configuration and `compare` (two dumps of one hang, taken a
 minute apart: which goroutines didn't move).
 
 **A log with a dump in it** (debug lines, then the dump): lines
-before the first goroutine stay rows (the prototype in
+before the first goroutine stay rows (built,
 `ai-evaluation.md`), so the log and the dump are one tab; the fields are
 empty on the log's rows.
 
