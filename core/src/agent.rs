@@ -183,6 +183,7 @@ pub fn summary(source: &dyn LogSource, files: &[String], index_seconds: f64, pro
     });
     v.push("reading", Value::Array(reading.collect()));
     v.push("notes", info.notes.clone());
+    v.push("hints", hints(source));
     Ok(v)
 }
 
@@ -206,6 +207,20 @@ pub fn locator(source: &dyn LogSource) -> impl Fn(LineNo) -> (usize, LineNo) + '
 pub struct View<'a> {
     pub source: &'a dyn LogSource,
     pub files: &'a [String],
+    /// A view of one file names it once (a page's `file`), not on each
+    /// line (the path was most of an answer).
+    pub compact: bool,
+}
+
+/// Where record `row` of a source read as records starts in its file
+/// (line from 1); `None` for other sources (and files over 256 MiB).
+pub fn record_first_line(source: &dyn LogSource, row: LineNo) -> Option<u64> {
+    if !source.format().starts_with("text records") {
+        return None;
+    }
+    let data = source.contiguous().filter(|d| d.len() <= 256 << 20)?;
+    let off = (source.line_start(row) as usize).min(data.len());
+    Some(memchr::memchr_iter(b'\n', &data[..off]).count() as u64 + 1)
 }
 
 impl View<'_> {
@@ -215,16 +230,39 @@ impl View<'_> {
         (self.files.get(k).or(self.files.first()).map_or("", String::as_str), line)
     }
 
-    /// `{"file", "line"}` (from 1) of row `row`.
+    /// One file named once: lines and places leave `file` out.
+    fn one_file(&self) -> bool {
+        self.compact && self.files.len() == 1
+    }
+
+    /// `{"file", "line"}` (from 1) of row `row`; a record's
+    /// `first_line` in its file.
     pub fn place(&self, row: LineNo) -> Value {
         let (file, line) = self.at(row);
-        Value::object([("file", Value::from(file)), ("line", (line + 1).into())])
+        let mut v = Value::new_object();
+        if !self.one_file() {
+            v.push("file", file);
+        }
+        v.push("line", line + 1);
+        if let Some(f) = record_first_line(self.source, row) {
+            v.push("first_line", f);
+        }
+        v
     }
 
     /// Row `row` as a line object ([`line`]).
     pub fn line(&self, row: LineNo, fields: &Fields) -> Value {
         let (file, line_no) = self.at(row);
-        line(self.source, row, file, line_no, fields)
+        let mut v = line(self.source, row, file, line_no, fields);
+        if let Value::Object(pairs) = &mut v {
+            if self.one_file() {
+                pairs.retain(|(k, _)| k != "file");
+            }
+            if let Some(f) = record_first_line(self.source, row) {
+                pairs.insert(2, ("first_line".into(), Value::from(f)));
+            }
+        }
+        v
     }
 
     /// A page of `rows`: `{"total", "lines": [...], "more", "skip"}`,
@@ -249,9 +287,54 @@ impl View<'_> {
             v
         });
         let mut v = Value::object([("total", Value::from(rows.len()))]);
+        if self.one_file() {
+            v.push("file", self.files[0].as_str());
+        }
         v.push("lines", Value::Array(lines.collect())).push("more", rows.len() - to).push("skip", to);
         v
     }
+}
+
+/// What a source's lines suggest about reading it (the evaluation):
+/// a stack dump read better as records, a log without times. Looks at
+/// the first 200,000 lines.
+pub fn hints(source: &dyn LogSource) -> Vec<String> {
+    let n = source.line_count().min(200_000);
+    let (mut go, mut go_first, mut java) = (0u64, 0u64, 0u64);
+    for l in 0..n {
+        let Some(t) = source.line_text(l) else { continue };
+        if let Some(rest) = t.strip_prefix("goroutine ")
+            && rest.starts_with(|c: char| c.is_ascii_digit())
+        {
+            if go == 0 {
+                go_first = l + 1;
+            }
+            go += 1;
+        } else if t.starts_with(char::is_whitespace) && t.trim_start().starts_with("at ") && t.ends_with(')') {
+            java += 1;
+        }
+    }
+    let mut out = Vec::new();
+    if go >= 3 && !source.format().starts_with("text records") {
+        out.push(format!(
+            "a Go goroutine dump ({go} goroutines from line {go_first}): read as records start=/^goroutine \\d/ \
+             (CLI: --records 'start=/^goroutine \\d/'; window: set_records), each goroutine is one record and \
+             patterns groups identical stacks"
+        ));
+    }
+    if java >= 5 && !source.format().starts_with("text records") {
+        out.push(
+            "Java stack traces: read as records start=/^\\S/ (CLI: --records 'start=/^\\S/'; window: set_records), \
+             each line keeps its indented `at` lines"
+                .into(),
+        );
+    }
+    if source.line_count() > 0 && time_span(source).is_none() {
+        out.push(
+            "no line has a time: before / after (context by time) can't work; read around a line with lines".into(),
+        );
+    }
+    out
 }
 
 /// What [`patterns`] adds to each pattern.
@@ -512,6 +595,22 @@ mod tests {
             Fields::parse(&["apid".into()], &f).unwrap_err(),
             "no field 'apid': this file has none (plain text: raw and level)"
         );
+    }
+
+    #[test]
+    fn a_stack_dump_is_hinted_and_records_say_where_they_start() {
+        let dump = "SIGQUIT: quit\n\ngoroutine 1 gp=0x1 m=nil [select]:\nmain.f()\n\ngoroutine 2 [chan send]:\nmain.g()\n\ngoroutine 3 [chan send]:\nmain.g()\n";
+        let f = TextFile::from_bytes("dump.txt", dump.as_bytes().to_vec());
+        let h = hints(&f);
+        assert!(h[0].starts_with("a Go goroutine dump (3 goroutines from line 3)"), "{h:?}");
+        assert!(h.iter().any(|x| x.starts_with("no line has a time")), "{h:?}");
+        let split = crate::input::records::RecordSplit::parse(r"start=/^goroutine \d/").unwrap();
+        let r = crate::input::records::RecordFile::from_bytes("dump.txt", dump.as_bytes().to_vec(), split);
+        assert_eq!(r.line_count(), 4);
+        let files = ["dump.txt".to_owned()];
+        let v = View { source: &r, files: &files, compact: true };
+        assert_eq!(v.place(2).to_string(), r#"{"line":3,"first_line":6}"#);
+        assert!(hints(&r).iter().all(|x| !x.contains("goroutine dump")), "read as records already");
     }
 
     #[test]

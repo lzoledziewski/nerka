@@ -8079,6 +8079,20 @@ gear=D
         settle_app(&mut app, &ctx);
         assert_eq!(app.tabs[0].pattern, "", "the filter undone");
         assert!(app.agent.log.iter().all(|a| a.undone));
+        // An argument a tool doesn't take is an error that names the ones it does.
+        let e = call(&mut app, "filter", r#"{"query":"level >= ERROR","limit":5}"#).unwrap_err();
+        assert!(e.starts_with("filter has no argument 'limit': it takes tab, query, max"), "{e}");
+        // One file: named once per page, not on each line.
+        let page = call(&mut app, "filter", r#"{"query":"level >= ERROR"}"#).unwrap();
+        assert!(page.get("file").is_some() && page.get("lines").unwrap().as_array().unwrap()[0].get("file").is_none());
+        // Records: rows become records (a line `[` starts one), undone back to lines.
+        call(&mut app, "set_records", r#"{"records":"start=/\\[ERROR/"}"#).unwrap();
+        settle_app(&mut app, &ctx);
+        assert_eq!(app.tabs[0].file.as_ref().unwrap().line_count(), 3, "head, and a record per ERROR");
+        let k = app.agent.log.len() - 1;
+        app.agent_undo(&ctx, k);
+        settle_app(&mut app, &ctx);
+        assert_eq!(app.tabs[0].file.as_ref().unwrap().line_count(), 5);
         std::fs::remove_dir_all(&dir).ok();
     }
 

@@ -14,6 +14,7 @@ use crate::instance::AgentCall;
 use crate::{App, Mode, plot};
 use eframe::egui;
 use nerka_core::agent::{self as ca, Fields, View};
+use nerka_core::input::records::RecordSplit;
 use nerka_core::json::Value;
 use nerka_core::pattern::{self, PatternConfig, PatternOptions};
 use nerka_core::{Bookmarks, Filter, LineNo, LogSource, Progress, Query, SearchResult, Signals, search};
@@ -68,11 +69,57 @@ pub enum Undo {
         plotted: Vec<String>,
         shown: bool,
     },
+    /// How the tab's files were read: their record splits.
+    Records {
+        paths: Vec<PathBuf>,
+        before: Vec<(PathBuf, RecordSplit)>,
+    },
 }
 
 /// Answers are bounded (an agent's context is small): lines a call gives
 /// at most.
 const MAX_LINES: u64 = 1000;
+
+/// Each tool's arguments: any other is an error, not ignored (evaluation
+/// round 1: `limit` and `query` were taken for `max` and `in`, silently).
+const ARGS: &[(&str, &[&str])] = &[
+    ("window", &[]),
+    ("summary", &["tab"]),
+    ("help", &["tab"]),
+    ("count", &["tab", "query", "in_view"]),
+    ("filter", &["tab", "query", "max", "skip", "fields", "before", "after", "in_view"]),
+    ("lines", &["tab", "file", "line", "before", "after", "from", "to", "fields"]),
+    ("bookmarks", &["tab"]),
+    ("patterns", &["tab", "in", "rare", "top", "values", "queries", "lines", "in_view", "field"]),
+    ("compare", &["tab", "a", "b", "in", "top", "min_score", "queries", "in_view", "field"]),
+    ("signals", &["tab"]),
+    ("signal", &["tab", "name", "file", "from", "to", "points"]),
+    ("lifecycles", &["tab", "name"]),
+    ("show", &["tab", "file", "line"]),
+    ("set_filter", &["tab", "query"]),
+    ("set_search", &["tab", "query"]),
+    ("set_records", &["tab", "records"]),
+    ("bookmark", &["tab", "file", "line", "note", "name", "by"]),
+    ("plot", &["tab", "signals", "only"]),
+    ("screenshot", &["of"]),
+];
+
+/// An argument the tool doesn't take, said with the ones it does.
+fn check_args(tool: &str, args: &Value) -> Result<(), String> {
+    let Some((_, known)) = ARGS.iter().find(|(t, _)| *t == tool) else {
+        let all: Vec<&str> = ARGS.iter().map(|(t, _)| *t).collect();
+        return Err(format!("no tool '{tool}' (tools: {})", all.join(", ")));
+    };
+    match args {
+        Value::Object(pairs) => match pairs.iter().find(|(k, _)| !known.contains(&k.as_str())) {
+            Some((k, _)) if known.is_empty() => Err(format!("{tool} takes no arguments, not '{k}'")),
+            Some((k, _)) => Err(format!("{tool} has no argument '{k}': it takes {}", known.join(", "))),
+            None => Ok(()),
+        },
+        Value::Null => Ok(()),
+        _ => Err(format!("{tool}'s arguments are an object of named values")),
+    }
+}
 
 /// A tab as a reading tool sees it, taken on the window's thread.
 struct Snap {
@@ -90,7 +137,7 @@ struct Snap {
 
 impl Snap {
     fn view(&self) -> View<'_> {
-        View { source: &*self.source, files: &self.files }
+        View { source: &*self.source, files: &self.files, compact: true }
     }
 
     /// `nfd` compiled for the tab: its signals and bookmarks; what can't
@@ -203,10 +250,26 @@ fn read(tool: &str, args: &Value, s: &Snap) -> Result<Value, String> {
                     ("costly", d.costly.into()),
                 ])
             });
-            let signals = s
-                .signals
-                .iter()
-                .map(|d| Value::object([("name", Value::from(d.name())), ("kind", d.kind().as_str().into())]));
+            // Where each comes from: the user's saved signals are for every
+            // file, and may have nothing to do with this one.
+            let signals = s.signals.iter().map(|d| {
+                let origin = if d.is_from_source() {
+                    "the file's own"
+                } else if d.argument_index().is_some() {
+                    "FIBEX"
+                } else if d.as_lifecycle().is_some() {
+                    "a lifecycle"
+                } else if !d.queries().is_empty() {
+                    "a library query the user picked"
+                } else {
+                    "saved by the user, for every file: may not match this one"
+                };
+                Value::object([
+                    ("name", Value::from(d.name())),
+                    ("kind", d.kind().as_str().into()),
+                    ("from", origin.into()),
+                ])
+            });
             let mut v = Value::object([("grammar", Value::from(nerka_core::dsl::GRAMMAR))]);
             v.push("always", "raw (the line as shown), level (TRACE DEBUG INFO NOTICE WARN ERROR FATAL), bookmark")
                 .push("fields", Value::Array(fields.collect()))
@@ -277,7 +340,7 @@ fn read(tool: &str, args: &Value, s: &Snap) -> Result<Value, String> {
             }
             let detail = ca::PatternDetail {
                 values: bool_arg(args, "values", false),
-                queries: bool_arg(args, "queries", true),
+                queries: bool_arg(args, "queries", false),
                 lines,
             };
             Ok(with_warnings(ca::patterns(&ps, &view, num_arg(args, "top", 30) as usize, detail), warnings))
@@ -376,6 +439,10 @@ impl App {
     /// screenshot) after the next frames.
     pub(crate) fn agent_call(&mut self, ctx: &egui::Context, call: AgentCall) {
         let AgentCall { tool, args, reply } = call;
+        if let Err(e) = check_args(&tool, &args) {
+            let _ = reply.send(Err(e));
+            return;
+        }
         match tool.as_str() {
             "window" => {
                 let _ = reply.send(Ok(self.agent_window()));
@@ -393,7 +460,7 @@ impl App {
                     });
                 }
             },
-            "show" | "set_filter" | "set_search" | "bookmark" | "plot" => {
+            "show" | "set_filter" | "set_search" | "set_records" | "bookmark" | "plot" => {
                 let r = self.agent_change(ctx, &tool, &args);
                 let _ = reply.send(r);
             }
@@ -462,7 +529,7 @@ impl App {
             if let Some(f) = &t.file {
                 let files: Vec<String> = t.paths.iter().map(|p| p.display().to_string()).collect();
                 let row = t.current_line().min(f.line_count().saturating_sub(1));
-                let mut cur = View { source: &**f, files: &files }.place(row);
+                let mut cur = View { source: &**f, files: &files, compact: false }.place(row);
                 cur.push("raw", f.line_text(row).map(|x| x.into_owned()));
                 v.push("selected", cur);
             }
@@ -547,6 +614,33 @@ impl App {
                     .push("author", t.bookmarks.author(row));
                 let what = format!("bookmarked line {}: {}", row_text(&v), t.bookmarks.note(row).unwrap_or_default());
                 (what, Some(Undo::Bookmark { paths: paths.clone(), row, before }), v)
+            }
+            "set_records" => {
+                let spec = str_arg(args, "records").ok_or(
+                    "give \"records\": start=/REGEX/ (a line matching it starts a record), sep=/REGEX/, blank, \
+                     or lines (a row a line)",
+                )?;
+                let split = match spec.trim() {
+                    "lines" => None,
+                    s => Some(RecordSplit::parse(s).map_err(|e| format!("records {s}: {e}"))?),
+                };
+                let before = t.records_for.clone();
+                for p in &paths {
+                    t.records_for.retain(|(q, _)| q != p);
+                    if let Some(s) = &split {
+                        t.records_for.push((p.clone(), s.clone()));
+                    }
+                }
+                t.reopen(ctx, &self.prefs, self.fibex.clone());
+                self.active = i;
+                let note = "the tab reads its files again: its rows are records now (line numbers count records; \
+                            first_line is where each starts in the file); filter and patterns take whole records";
+                let undo = Undo::Records { paths: paths.clone(), before };
+                (
+                    format!("read the tab as records {spec}"),
+                    Some(undo),
+                    Value::object([("ok", Value::from(true)), ("note", note.into())]),
+                )
             }
             "plot" => {
                 let names: Vec<String> = match args.get("signals") {
@@ -688,7 +782,8 @@ impl App {
             Undo::Filter { paths, .. }
             | Undo::Search { paths, .. }
             | Undo::Bookmark { paths, .. }
-            | Undo::Plot { paths, .. } => paths.clone(),
+            | Undo::Plot { paths, .. }
+            | Undo::Records { paths, .. } => paths.clone(),
         };
         let Some(t) = self.tabs.iter_mut().find(|t| t.paths == paths) else { return };
         match u {
@@ -716,6 +811,10 @@ impl App {
                 let mut p = plot::lock(&t.plot);
                 p.plotted = plotted;
                 p.shown = shown;
+            }
+            Undo::Records { before, .. } => {
+                t.records_for = before;
+                t.reopen(ctx, &self.prefs, self.fibex.clone());
             }
         }
         t.status = "🤖 Agent's change undone".into();

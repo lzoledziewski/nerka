@@ -62,6 +62,25 @@ against after.
 `"match": true` on the matches themselves. Context is by time; for lines
 around a line number, use `lines`.
 
+## Logs without times; stack dumps
+
+`open --json` says so in `hints`. Without times, `--before` / `--after`
+can't work: read around a line with `lines FILE FROM TO` (the line numbers
+come from `filter` or `search`).
+
+A **stack dump** (Go's goroutines, Java's exceptions) reads best as
+records, a goroutine or an exception each: then `filter` gives whole
+stacks, and `patterns` groups identical ones (40 idle workers become one
+line, the few stuck ones stand out):
+
+    nerka --records 'start=/^goroutine \d/' patterns -n 20 FILE
+    nerka --records 'start=/^goroutine \d/' filter --json -m 5 'raw ~ /chan send/' FILE
+    nerka search --json -m 100 '^goroutine \d+' FILE
+
+Lines count records then; `first_line` is where each starts in the file.
+In Git Bash on Windows, set `MSYS_NO_PATHCONV=1` first: it turns `/…/` in
+an argument into a Windows path.
+
 ## 5. Over time: lifecycles, signals, checks
 
     nerka --lifecycle 'ecu1: lines ecu == ECU1; reset uptime' lifecycles --json FILE

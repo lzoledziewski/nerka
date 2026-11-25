@@ -537,6 +537,9 @@ struct OutputArgs {
     /// Leave out the first N lines (with -m: the next page).
     #[arg(long, value_name = "N", default_value_t = 0)]
     skip: u64,
+    /// grep's -n: line numbers are printed anyway (accepted, nothing to do).
+    #[arg(short = 'n', long = "line-number", hide = true)]
+    _line_number: bool,
     #[command(flatten)]
     json: JsonArgs,
     /// Do not prefix lines with their number.
@@ -1362,8 +1365,8 @@ fn compare(
     let shown = if top == 0 { diffs.len() } else { top.min(diffs.len()) };
     if json {
         let names = [views[0].names(), view(1).names()];
-        let av = agent::View { source: &*view(0).source, files: &names[0] };
-        let bv = agent::View { source: &*view(1).source, files: &names[1] };
+        let av = agent::View { source: &*view(0).source, files: &names[0], compact: false };
+        let bv = agent::View { source: &*view(1).source, files: &names[1], compact: false };
         let side = |k: usize| {
             Value::object([
                 ("file", Value::from(view(k).paths.first().map(|p| p.display().to_string()))),
@@ -1603,6 +1606,14 @@ fn main() -> std::process::ExitCode {
 }
 
 fn run() -> Result<()> {
+    // Git Bash turns an argument like `start=/^x/` or `/timeout/` into a
+    // Windows path before nerka sees it (the evaluation).
+    if cfg!(windows) && std::env::args().skip(1).any(|a| a.contains(":/Program Files/Git/")) {
+        eprintln!(
+            "nerka: warning: Git Bash turned an argument with /…/ into a Windows path (…/Program Files/Git/…): \
+             set MSYS_NO_PATHCONV=1 first"
+        );
+    }
     let cli = Cli::parse();
     // A config folder written by an earlier nerka: to this one's formats.
     if let Some(m) = nerka_core::bundle::Store::user().and_then(|s| s.upgrade().message()) {
@@ -1736,6 +1747,9 @@ fn run() -> Result<()> {
             for n in &info.notes {
                 writeln!(out, "note:        {n}")?;
             }
+            for h in agent::hints(f) {
+                writeln!(out, "hint:        {h}")?;
+            }
         }
         Cmd::Search { args, within, picks, ignore_case, fixed, invert, out: o } => {
             let options = MatcherOptions { case_insensitive: ignore_case, fixed_string: fixed, invert };
@@ -1804,7 +1818,7 @@ fn run() -> Result<()> {
             let shown = if top == 0 { ps.patterns.len() } else { top.min(ps.patterns.len()) };
             if json {
                 let names = view.names();
-                let v = agent::View { source: f, files: &names };
+                let v = agent::View { source: f, files: &names, compact: false };
                 let detail = agent::PatternDetail { values, queries, lines: show };
                 writeln!(out, "{}", agent::patterns(&ps, &v, top, detail))?;
             }

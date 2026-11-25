@@ -52,7 +52,7 @@ fn tools() -> Value {
         ),
         (
             "summary",
-            "What a tab's files are: format, lines, fields (name, kind, costly), first and last time, lines per level, notes (what the reader skipped or dropped).",
+            "What a tab's files are: format, lines, fields (name, kind, costly), first and last time, lines per level, notes (what the reader skipped or dropped), and hints (a stack dump better read as records: set_records; a log without times).",
             schema(vec![("tab", tab())], &[]),
         ),
         ("help", "The NFD query grammar, the tab's fields and its signals.", schema(vec![("tab", tab())], &[])),
@@ -63,12 +63,12 @@ fn tools() -> Value {
         ),
         (
             "filter",
-            "The lines an NFD query keeps, a page at a time: {total, lines: [{file, line, time, level, raw}], more, skip}. With before / after (durations: 30s, 500ms): also the lines around each match, by time, matches marked.",
+            "The lines an NFD query keeps, a page at a time: {total, file, lines: [{line, time, level, raw}], more, skip}. Lines are numbered from 1 in their file; more: lines after this page; skip: give it back for the next page. With before / after (durations: 30s, 500ms; logs with times only): also the lines around each match, matches marked.",
             schema(
                 vec![
                     ("tab", tab()),
                     ("query", query("NFD")),
-                    ("max", p("integer", "Lines at most (default 50, at most 1000)")),
+                    ("max", p("integer", "Lines at most: default 50, at most 1000")),
                     ("skip", p("integer", "Lines left out first: the next page")),
                     ("fields", p("string", "Fields to add, typed: `apid,ctid`")),
                     ("before", p("string", "Also lines up to this long before each match")),
@@ -80,7 +80,7 @@ fn tools() -> Value {
         ),
         (
             "lines",
-            "Lines around a line (line, before, after: counts) or a range (from, to).",
+            "Lines around a line (line; before, after: how many lines) or a range (from, to), at most 1000. Lines are numbered from 1.",
             schema(
                 vec![
                     ("tab", tab()),
@@ -97,7 +97,7 @@ fn tools() -> Value {
         ),
         (
             "patterns",
-            "Message patterns (templates with <*> where values differ), most lines first or the rarest (rare), each with its count, first line and an NFD query for its lines.",
+            "Message patterns (templates with <*> where values differ), most lines first or the rarest (rare), each with its count and first line. In a tab read as records (set_records), a pattern is a whole record: a dump's identical stacks grouped.",
             schema(
                 vec![
                     ("tab", tab()),
@@ -106,6 +106,7 @@ fn tools() -> Value {
                     ("top", p("integer", "Patterns at most (default 30, 0: all)")),
                     ("values", p("boolean", "Each slot's values")),
                     ("lines", p("integer", "Each pattern's first N lines")),
+                    ("queries", p("boolean", "Each pattern's NFD query (longer answers)")),
                     ("in_view", in_view()),
                 ],
                 &[],
@@ -172,6 +173,14 @@ fn tools() -> Value {
             schema(vec![("tab", tab()), ("query", query("NFD; empty clears the search"))], &["query"]),
         ),
         (
+            "set_records",
+            "Read the tab's text files as records (multi-line entries: a stack, an exception): start=/REGEX/ (a line matching it starts one, e.g. start=/^goroutine \\d/ for a Go dump), sep=/REGEX/, blank, or lines (back to a row a line). The window reads the files again; then line numbers count records (first_line: where each starts). Undoable.",
+            schema(
+                vec![("tab", tab()), ("records", p("string", "start=/REGEX/, sep=/REGEX/, blank or lines"))],
+                &["records"],
+            ),
+        ),
+        (
             "bookmark",
             "Bookmark a line with a note: the user sees it as your annotation (🤖) and can accept it. Use for findings: the first error, the cause, the change.",
             schema(
@@ -204,7 +213,7 @@ fn tools() -> Value {
         ),
     ];
     let tools = list.into_iter().map(|(name, description, input)| {
-        let read_only = !matches!(name, "show" | "set_filter" | "set_search" | "bookmark" | "plot");
+        let read_only = !matches!(name, "show" | "set_filter" | "set_search" | "set_records" | "bookmark" | "plot");
         Value::object([
             ("name", Value::from(name)),
             ("description", description.into()),
