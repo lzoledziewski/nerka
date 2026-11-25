@@ -473,6 +473,10 @@ struct PlotData {
     /// x range of all events.
     full: (f64, f64),
     is_time: bool,
+    /// Plotted signals that can't be (their lifecycle failed, a field the
+    /// file hasn't): name and why. Left out, said in red; the rest drawn
+    /// (owner, 2026-11-25: one such signal kept the whole plot waiting).
+    failed: Vec<(String, String)>,
 }
 
 /// Where a plotted lifecycle's lifecycles start, sorted by x (worked out
@@ -635,11 +639,14 @@ fn build(
         Lives(Arc<nerka_core::lifecycle::Lifecycles>),
     }
     let mut ready = Vec::new();
+    let mut failed = Vec::new();
     for name in &state.plotted {
         let Some(def) = signals.get(name) else { continue };
-        // Failed for good: said, not waited for (no "…").
-        if let Some(e) = def.failed(file) {
-            return Err(format!("@{name} can't be plotted: {e}"));
+        // Failed for good (its lifecycle, or a field this file hasn't):
+        // left out and said, not waited for; the others are plotted.
+        if let Some(e) = def.failed(file).or_else(|| def.bind(file.schema()).err().map(|e| e.msg)) {
+            failed.push((name.clone(), e));
+            continue;
         }
         let r = match def.as_lifecycle() {
             Some(life) => Ready::Lives(life.cached(file).ok_or("Finding lifecycles…")?),
@@ -711,7 +718,7 @@ fn build(
     } else {
         (0.0, 1.0)
     };
-    Ok(PlotData { lanes, lives: life_marks, full, is_time: clock.is_time() })
+    Ok(PlotData { lanes, lives: life_marks, full, is_time: clock.is_time(), failed })
 }
 
 /// What a plot is drawn from: the tab's signals (`generation` changes
@@ -919,6 +926,10 @@ pub fn plot_panel(ui: &mut egui::Ui, state: &mut PlotState, src: Source<'_>) -> 
         }
     }
     let Some((_, data)) = &state.data else { return out };
+    for (name, why) in &data.failed {
+        ui.colored_label(ui.visuals().error_fg_color, format!("✖ @{name} not plotted: {why}"))
+            .on_hover_text("Fix or remove it in 📈 Signals; the other signals are plotted");
+    }
     if !data.is_time {
         ui.weak("No time in this file: plotted by line number. Define a signal of kind time to plot by time.");
     }
@@ -2514,17 +2525,25 @@ mod tests {
         assert_eq!(fifth["v"].kind, SignalKind::Enum);
     }
 
-    /// A lifecycle that failed (a field the file hasn't): the plot of it, or
-    /// of a signal bound to it, says why instead of waiting for good.
+    /// A lifecycle that failed (a field the file hasn't), a signal bound to
+    /// it, a signal naming a field the file hasn't: each is left out and
+    /// said, not waited for, and the other signals are plotted (owner,
+    /// 2026-11-25: one such signal kept the whole plot "collecting").
     #[test]
-    fn a_failed_lifecycle_is_said_not_waited_for() {
-        let file = nerka_core::TextFile::from_bytes("t", b"s=up\ns=down\n".to_vec());
+    fn a_failed_signal_is_said_and_the_others_plotted() {
+        let file = nerka_core::TextFile::from_bytes("t", b"s=up v=1\ns=down v=2\n".to_vec());
         let mut signals = Signals::default();
-        for spec in ["lifecycle a: lines ecu == A; reset uptime", r"s:enum:per(a)=/s=(?<s>\w+)/"] {
+        for spec in [
+            "lifecycle a: lines ecu == A; reset uptime",
+            r"s:enum:per(a)=/s=(?<s>\w+)/",
+            r"e=ecu == A AND /v=(?<e>\d+)/",
+            r"v=/v=(?<v>\d+)/",
+        ] {
             signals.set(SignalDef::parse_spec(spec).unwrap());
         }
-        let try_build = |plotted: &str| {
-            let state = PlotState { plotted: vec![plotted.into()], ..Default::default() };
+        signals.collect(&file, &nerka_core::Progress::new()).ok();
+        let try_build = |plotted: &[&str]| {
+            let state = PlotState { plotted: plotted.iter().map(|p| p.to_string()).collect(), ..Default::default() };
             let mut series_of = |d: &SignalDef| d.cached_series(&file).map(Arc::new);
             build(
                 &state,
@@ -2535,18 +2554,17 @@ mod tests {
                 &mut series_of,
                 &mut build_here(&file),
             )
-            .err()
-            .unwrap()
         };
-        // Not tried yet: waited for.
-        assert!(try_build("s").ends_with('…'));
         let life = signals.get("a").unwrap().as_lifecycle().unwrap();
         assert!(life.lifecycles(&file, &nerka_core::Progress::new()).is_err());
-        for name in ["s", "a"] {
-            let why = try_build(name);
-            assert!(why.starts_with(&format!("@{name} can't be plotted: ")), "{why}");
-            assert!(why.contains("unknown field 'ecu'") && !why.ends_with('…'), "{why}");
-        }
+        let data = try_build(&["v", "s", "a", "e"]).expect("the plot, without the failed ones");
+        assert_eq!(data.lanes.len(), 1, "v alone");
+        let failed: Vec<&str> = data.failed.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(failed, ["s", "a", "e"]);
+        assert!(data.failed.iter().all(|(_, why)| why.contains("unknown field 'ecu'")), "{:?}", data.failed);
+        // Nothing to plot but the failed: an empty plot that says why.
+        let data = try_build(&["e"]).unwrap();
+        assert!(data.lanes.is_empty() && data.failed.len() == 1);
     }
 
     /// A signal bound to a lifecycle of two ECUs: a lane per ECU, a

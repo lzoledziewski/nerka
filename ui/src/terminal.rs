@@ -4,8 +4,11 @@
 //! folder of the active tab's file, with `NERKA_WINDOW` set to this
 //! window's process, so `nerka mcp` works on this window. For Claude Code
 //! the command gets `--mcp-config` with a file that runs `nerka mcp` (next
-//! to nerka-gui), so nothing has to be installed first; other clients need
-//! `nerka mcp --install CLIENT` once.
+//! to nerka-gui), GitHub Copilot CLI `--additional-mcp-config`, so nothing
+//! has to be installed first; other clients need `nerka mcp --install
+//! CLIENT` once. A command that isn't installed is said before a terminal
+//! opens (owner, 2026-11-25: the Claude desktop app has no `claude` on
+//! PATH).
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -13,16 +16,62 @@ use std::process::Command;
 /// AI clients to pick in Settings → AI command (owner, 2026-11-25: a list
 /// and Custom): their name and command. Each speaks MCP, so it can work on
 /// the window.
-pub const PRESETS: &[(&str, &str)] = &[("Claude Code", "claude"), ("Codex", "codex"), ("Gemini CLI", "gemini")];
+pub const PRESETS: &[(&str, &str)] =
+    &[("Claude Code", "claude"), ("GitHub Copilot CLI", "copilot"), ("Codex", "codex"), ("Gemini CLI", "gemini")];
+
+/// How to install each preset's command line, for when it isn't found.
+fn install_hint(program: &str) -> &'static str {
+    match program.to_ascii_lowercase().as_str() {
+        "claude" => {
+            "install Claude Code's command line (https://claude.com/claude-code: the desktop app doesn't put one \
+             on PATH)"
+        }
+        "copilot" => "install GitHub Copilot CLI (npm install -g @github/copilot)",
+        "codex" => "install Codex (npm install -g @openai/codex)",
+        "gemini" => "install Gemini CLI (npm install -g @google/gemini-cli)",
+        _ => "install it, or give its full path",
+    }
+}
+
+/// Where `program` is: a path as given, else on PATH or in the folders
+/// installers put command lines in (a window started from the desktop may
+/// not have the shell's PATH). On Windows with the extensions it may have.
+pub fn find_program(program: &str) -> Option<PathBuf> {
+    let given = Path::new(program);
+    let exts: Vec<String> = if cfg!(windows) {
+        let pathext = std::env::var("PATHEXT").unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".into());
+        std::iter::once(String::new()).chain(pathext.split(';').map(|e| e.to_ascii_lowercase())).collect()
+    } else {
+        vec![String::new()]
+    };
+    let with_ext = |p: &Path| exts.iter().map(|e| PathBuf::from(format!("{}{e}", p.display()))).find(|c| c.is_file());
+    if given.components().count() > 1 {
+        return with_ext(given);
+    }
+    let home = std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" }).map(PathBuf::from);
+    let mut dirs: Vec<PathBuf> =
+        std::env::var_os("PATH").map(|p| std::env::split_paths(&p).collect()).unwrap_or_default();
+    if let Some(h) = &home {
+        dirs.extend([h.join(".local").join("bin"), h.join(".claude").join("local"), h.join(".npm-global").join("bin")]);
+    }
+    if let Some(a) = std::env::var_os("APPDATA") {
+        dirs.push(PathBuf::from(a).join("npm"));
+    }
+    dirs.extend(["/usr/local/bin", "/opt/homebrew/bin"].map(PathBuf::from));
+    dirs.iter().find_map(|d| with_ext(&d.join(program)))
+}
 
 /// The command line the terminal runs: `NERKA_WINDOW` set, then `command`
-/// (with `--mcp-config` for Claude Code when `mcp_config` is given).
+/// (with `--mcp-config` for Claude Code, `--additional-mcp-config` for
+/// Copilot, when `mcp_config` is given).
 pub fn inner_command(command: &str, pid: u32, mcp_config: Option<&Path>, windows: bool) -> String {
     let mut cmd = command.trim().to_owned();
-    if let Some(cfg) = mcp_config
-        && is_claude(&cmd)
-    {
-        cmd += &format!(" --mcp-config \"{}\"", cfg.display());
+    if let Some(cfg) = mcp_config {
+        match client(&cmd) {
+            Client::Claude => cmd += &format!(" --mcp-config \"{}\"", cfg.display()),
+            Client::Copilot => cmd += &format!(" --additional-mcp-config \"@{}\"", cfg.display()),
+            Client::Other => {}
+        }
     }
     if windows {
         format!("set NERKA_WINDOW={pid}&& {cmd}")
@@ -32,11 +81,22 @@ pub fn inner_command(command: &str, pid: u32, mcp_config: Option<&Path>, windows
     }
 }
 
-/// Whether `command` starts Claude Code.
-fn is_claude(command: &str) -> bool {
+/// The AI client a command starts, for the MCP configuration it takes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Client {
+    Claude,
+    Copilot,
+    Other,
+}
+
+fn client(command: &str) -> Client {
     let first = command.split_whitespace().next().unwrap_or_default();
     let name = Path::new(first).file_stem().and_then(|s| s.to_str()).unwrap_or_default();
-    name.eq_ignore_ascii_case("claude")
+    match name.to_ascii_lowercase().as_str() {
+        "claude" => Client::Claude,
+        "copilot" => Client::Copilot,
+        _ => Client::Other,
+    }
 }
 
 /// The `nerka` command line next to this `nerka-gui`, if it is there.
@@ -47,15 +107,21 @@ fn nerka_cli() -> Option<PathBuf> {
 }
 
 /// An MCP configuration that runs `nerka mcp`, written to the config folder
-/// (`<config>/nerka/mcp.json`) for `--mcp-config`.
-fn mcp_config_file() -> Option<PathBuf> {
+/// (`<config>/nerka/mcp.json`; Copilot's, which names its type and tools,
+/// `mcp-copilot.json`) for the client's flag.
+fn mcp_config_file(client: Client) -> Option<PathBuf> {
+    use nerka_core::json::Value;
     let cli = nerka_cli()?;
-    let server = nerka_core::json::Value::object([
-        ("command", nerka_core::json::Value::from(cli.display().to_string())),
-        ("args", vec!["mcp"].into()),
-    ]);
-    let v = nerka_core::json::Value::object([("mcpServers", nerka_core::json::Value::object([("nerka", server)]))]);
-    let path = nerka_core::config_dir()?.join("mcp.json");
+    let mut server = Value::object([("command", Value::from(cli.display().to_string())), ("args", vec!["mcp"].into())]);
+    let name = match client {
+        Client::Copilot => {
+            server.push("type", "local").push("tools", vec!["*"]);
+            "mcp-copilot.json"
+        }
+        _ => "mcp.json",
+    };
+    let v = Value::object([("mcpServers", Value::object([("nerka", server)]))]);
+    let path = nerka_core::config_dir()?.join(name);
     nerka_core::write_atomic(&path, v.to_string()).ok()?;
     Some(path)
 }
@@ -66,7 +132,17 @@ pub fn open(dir: &Path, command: &str) -> Result<(), String> {
     if command.trim().is_empty() {
         return Err("no AI command: set one in Settings → AI command (e.g. claude)".into());
     }
-    let cfg = if is_claude(command) { mcp_config_file() } else { None };
+    let program = command.split_whitespace().next().unwrap_or_default();
+    if find_program(program).is_none() {
+        return Err(format!(
+            "'{program}' isn't installed (not on PATH): {}; or choose another in ⚙ Settings → AI command",
+            install_hint(Path::new(program).file_stem().and_then(|s| s.to_str()).unwrap_or(program))
+        ));
+    }
+    let cfg = match client(command) {
+        Client::Other => None,
+        c => mcp_config_file(c),
+    };
     let inner = inner_command(command, std::process::id(), cfg.as_deref(), cfg!(windows));
     launch(dir, &inner)
 }
@@ -141,7 +217,26 @@ mod tests {
         );
         assert_eq!(inner_command("  codex ", 42, Some(cfg), true), "set NERKA_WINDOW=42&& codex");
         assert_eq!(inner_command("gemini", 7, None, false), "export NERKA_WINDOW=7; gemini; exec \"${SHELL:-sh}\"");
-        assert!(is_claude("/usr/local/bin/claude --model x") && is_claude("Claude.exe") && !is_claude("claudette"));
+        assert_eq!(client("/usr/local/bin/claude --model x"), Client::Claude);
+        assert_eq!((client("Claude.exe"), client("claudette")), (Client::Claude, Client::Other));
+        // Copilot: its own flag, the file prefixed with @.
+        assert_eq!(
+            inner_command("copilot", 42, Some(Path::new("C:\\n\\mcp-copilot.json")), true),
+            "set NERKA_WINDOW=42&& copilot --additional-mcp-config \"@C:\\n\\mcp-copilot.json\""
+        );
+    }
+
+    /// A command that isn't installed is said before a terminal opens, with
+    /// how to install it (the Claude desktop app has no `claude` on PATH).
+    #[test]
+    fn a_command_not_installed_is_said() {
+        let shell = if cfg!(windows) { "cmd" } else { "sh" };
+        assert!(find_program(shell).is_some(), "{shell} on PATH");
+        assert!(find_program("nerka-no-such-client").is_none());
+        let e = open(Path::new("."), "nerka-no-such-client --x").unwrap_err();
+        assert!(e.starts_with("'nerka-no-such-client' isn't installed (not on PATH)"), "{e}");
+        assert!(install_hint("claude").contains("claude.com/claude-code"));
+        assert!(install_hint("copilot").contains("@github/copilot"));
     }
 
     /// A real terminal opens (run by hand: `cargo test -p nerka-gui -- --ignored terminal`):
@@ -154,7 +249,7 @@ mod tests {
         let out = dir.join("seen.txt");
         // The environment as the command sees it (cmd expands %X% when it
         // reads the line, before `set` has run: `set` lists it as it is).
-        let cmd = if cfg!(windows) { "set > seen.txt&& exit" } else { "env > seen.txt; exit" };
+        let cmd = if cfg!(windows) { "cmd /c set > seen.txt&& exit" } else { "env > seen.txt; exit" };
         open(&dir, cmd).unwrap();
         let start = std::time::Instant::now();
         while !out.is_file() && start.elapsed() < std::time::Duration::from_secs(20) {

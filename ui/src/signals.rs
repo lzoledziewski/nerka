@@ -865,12 +865,16 @@ pub fn signals_panel(ui: &mut egui::Ui, st: &mut SignalsUi, input: Input<'_>) ->
     };
     match fibex {
         Some(f) => {
-            // Room for the list as it is, at most half the panel at first.
-            let want = (n_signals as f32 * 24.0 + 60.0).clamp(100.0, (ui.available_height() * 0.5).max(100.0));
+            // Room for the list as it is (its lifecycles too), up to 60 % of
+            // the panel, also when the list grew after the panel first
+            // showed (FIBEX picks remembered: owner, 2026-11-25, the
+            // argument tree took the panel and hid the lifecycles). Drag the
+            // divider for more; the tree has the rest.
+            let want = (n_signals as f32 * 24.0 + 90.0).clamp(100.0, (ui.available_height() * 0.6).max(100.0));
             egui::Panel::top("signals_list")
                 .resizable(true)
                 .default_size(want)
-                .min_size(60.0)
+                .min_size(want)
                 .frame(egui::Frame::NONE)
                 .show(ui, list);
             out.fibex = fibex_ui(ui, fibex, fibex_autoload);

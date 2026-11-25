@@ -6,7 +6,7 @@ description: "Let an AI agent of your choice analyse logs and traces with nerka:
 # AI agents
 
 nerka ships no model and needs no account: the agent is yours (Claude Code,
-Codex, Gemini CLI, or any other). It works with nerka in two ways:
+GitHub Copilot CLI, Codex, Gemini CLI, or any other). It works with nerka in two ways:
 
 - **On its own, with the command line:** it runs `nerka` as you would, on
   any file, and leaves its findings as bookmarks for you to look at later.
@@ -78,9 +78,15 @@ its own: open the files in nerka-gui first.
 
 **🤖 AI** in the window's top bar opens a terminal (Windows Terminal or a
 console window, your desktop's terminal, Terminal on macOS) in the active
-file's folder, running your AI command (Settings → **AI command**,
-`claude` by default), set up to work on this window. Claude Code gets
-`nerka mcp` at once; other clients need it registered once:
+file's folder, running your AI command (Settings → **AI command**: Claude
+Code, GitHub Copilot CLI, Codex, Gemini CLI or your own; `claude` by
+default), set up to work on this window. Claude Code and Copilot get
+`nerka mcp` at once (`--mcp-config`, `--additional-mcp-config`); other
+clients need it registered once. The command line must be installed:
+nerka looks for it first and says how to install it if it isn't (the
+Claude desktop app has none on PATH: install Claude Code's command line,
+or in the app add `nerka mcp` as an MCP server with the JSON of
+`nerka mcp --config`).
 
 ```
 nerka mcp --install codex        # or claude, gemini: runs the client's own `mcp add`
