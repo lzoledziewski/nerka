@@ -533,6 +533,10 @@ struct JsonArgs {
     /// (comma-separated; `nerka help fields FILE` lists them).
     #[arg(long, value_delimiter = ',', value_name = "FIELD,…", requires = "json")]
     fields: Vec<String>,
+    /// With --json: each line's `raw` at most N characters, cut with `…`
+    /// and its length as `"raw_chars"` (0: whole, the default).
+    #[arg(long, value_name = "N", default_value_t = 0, requires = "json")]
+    width: usize,
 }
 
 #[derive(clap::Args)]
@@ -797,6 +801,7 @@ impl<'a> Printer<'a> {
         let (k, line) = (self.at)(row);
         if self.o.json.json {
             let mut v = agent::line(f, row, &self.names[k], line, &self.fields);
+            agent::cut_raw(&mut v, self.o.json.width);
             if let Some(m) = mark {
                 v.push("match", m);
             }
@@ -1377,8 +1382,8 @@ fn compare(
     let shown = if top == 0 { diffs.len() } else { top.min(diffs.len()) };
     if json {
         let names = [views[0].names(), view(1).names()];
-        let av = agent::View { source: &*view(0).source, files: &names[0], compact: false };
-        let bv = agent::View { source: &*view(1).source, files: &names[1], compact: false };
+        let av = agent::View { source: &*view(0).source, files: &names[0], compact: false, width: 0 };
+        let bv = agent::View { source: &*view(1).source, files: &names[1], compact: false, width: 0 };
         let side = |k: usize| {
             Value::object([
                 ("file", Value::from(view(k).paths.first().map(|p| p.display().to_string()))),
@@ -1596,6 +1601,10 @@ impl std::error::Error for Status1 {}
 fn status1(msg: impl Into<String>) -> anyhow::Error {
     Status1(msg.into()).into()
 }
+
+/// `marks` shows a bookmark's line at most this many characters (cut with
+/// `…`; the evaluation: each bookmark printed kilobytes of hex).
+const MARK_WIDTH: usize = 200;
 
 fn main() -> std::process::ExitCode {
     match run() {
@@ -1831,7 +1840,7 @@ fn run() -> Result<()> {
             let shown = if top == 0 { ps.patterns.len() } else { top.min(ps.patterns.len()) };
             if json {
                 let names = view.names();
-                let v = agent::View { source: f, files: &names, compact: false };
+                let v = agent::View { source: f, files: &names, compact: false, width: 0 };
                 let detail = agent::PatternDetail { values, queries, lines: show };
                 writeln!(out, "{}", agent::patterns(&ps, &v, top, detail))?;
             }
@@ -2027,9 +2036,16 @@ fn run() -> Result<()> {
                         .push("author", marks.author(l))
                         .push("unsure", marks.is_unsure(l))
                         .push("raw", text.into_owned());
+                    agent::cut_raw(&mut v, MARK_WIDTH);
                     writeln!(out, "{v}")?;
                     continue;
                 }
+                // The line for orientation: a payload of hex is cut short.
+                let text: String = if text.chars().count() > MARK_WIDTH {
+                    text.chars().take(MARK_WIDTH).chain(std::iter::once('…')).collect()
+                } else {
+                    text.into_owned()
+                };
                 // Its anchor didn't find its line: it may be elsewhere.
                 let unsure = if marks.is_unsure(l) { "?" } else { "" };
                 let by = marks.author(l).map(|a| format!(" ({a})")).unwrap_or_default();
@@ -2065,7 +2081,9 @@ fn run() -> Result<()> {
             let last = to.min(f.line_count());
             for l in from.max(1)..=last {
                 if json.json {
-                    writeln!(out, "{}", agent::line(&*f, l - 1, &name, l - 1, &fields))?;
+                    let mut v = agent::line(&*f, l - 1, &name, l - 1, &fields);
+                    agent::cut_raw(&mut v, json.width);
+                    writeln!(out, "{v}")?;
                 } else {
                     // Numbered as filter numbers them (owner, 2026-11-25).
                     if !no_line_numbers {

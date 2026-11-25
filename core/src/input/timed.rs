@@ -92,6 +92,8 @@ impl Timed {
         };
         let rule = profile.time().clone();
         let (mut tried, mut found, mut first) = (0usize, 0usize, None);
+        // Whether the first line with text has a time (`opens`).
+        let mut opens = false;
         if !matches!(rule, TimeRule::None) {
             for l in 0..inner.line_count() {
                 if tried == SAMPLE || (l % 4096 == 0 && progress.is_cancelled()) {
@@ -104,6 +106,7 @@ impl Timed {
                 tried += 1;
                 if let Some(t) = rule.read(&text, zone, numbers) {
                     found += 1;
+                    opens |= tried == 1;
                     first.get_or_insert((l, t));
                 }
             }
@@ -117,10 +120,22 @@ impl Timed {
                 reading.time = "none (no lines with text)".into();
                 false
             }
-            TimeRule::Leading if found * 2 < tried => {
-                reading.time =
-                    format!("none found: {found} of the first {tried} lines start with a time (half are needed)");
+            // A server's log where a tool's output runs between its own
+            // timed lines (a model server's: its runner's): the
+            // first line timed, a tenth at least (10 lines or more).
+            TimeRule::Leading if found * 2 < tried && !(opens && found >= 10 && found * 10 >= tried) => {
+                reading.time = format!(
+                    "none found: {found} of the first {tried} lines start with a time (half are needed, or a tenth \
+                     and the first)"
+                );
                 false
+            }
+            TimeRule::Leading if found * 2 < tried => {
+                reading.time = format!(
+                    "the time each line starts with ({found} of the first {tried} lines; the others carry the time \
+                     before them)"
+                );
+                true
             }
             TimeRule::Regex(r) if found == 0 => {
                 reading.time = format!("none found: /{}/ read no time in the first {tried} lines", r.as_str());

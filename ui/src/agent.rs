@@ -101,8 +101,8 @@ const ARGS: &[(&str, &[&str])] = &[
     ("summary", &["tab"]),
     ("help", &["tab"]),
     ("count", &["tab", "query", "in_view"]),
-    ("filter", &["tab", "query", "max", "skip", "fields", "before", "after", "in_view"]),
-    ("lines", &["tab", "file", "line", "before", "after", "from", "to", "fields"]),
+    ("filter", &["tab", "query", "max", "skip", "fields", "before", "after", "in_view", "width"]),
+    ("lines", &["tab", "file", "line", "before", "after", "from", "to", "fields", "width"]),
     ("bookmarks", &["tab"]),
     ("queries", &["tab", "counts", "library", "label"]),
     ("patterns", &["tab", "in", "rare", "top", "values", "queries", "lines", "in_view", "field"]),
@@ -153,7 +153,7 @@ struct Snap {
 
 impl Snap {
     fn view(&self) -> View<'_> {
-        View { source: &*self.source, files: &self.files, compact: true }
+        View { source: &*self.source, files: &self.files, compact: true, width: ca::WIDTH }
     }
 
     /// `nfd` compiled for the tab: its signals and bookmarks; what can't
@@ -248,7 +248,8 @@ fn read(tool: &str, args: &Value, s: &Snap) -> Result<Value, String> {
     let progress = Progress::new();
     let mut warnings = Vec::new();
     let in_view = bool_arg(args, "in_view", false);
-    let view = s.view();
+    let mut view = s.view();
+    view.width = num_arg(args, "width", ca::WIDTH as u64) as usize;
     match tool {
         "summary" => {
             let mut v = ca::summary(&*s.source, &s.files, 0.0, &progress).map_err(|e| e.to_string())?;
@@ -650,7 +651,7 @@ impl App {
             if let Some(f) = &t.file {
                 let files: Vec<String> = t.paths.iter().map(|p| p.display().to_string()).collect();
                 let row = t.current_line().min(f.line_count().saturating_sub(1));
-                let mut cur = View { source: &**f, files: &files, compact: false }.place(row);
+                let mut cur = View { source: &**f, files: &files, compact: false, width: 0 }.place(row);
                 cur.push("raw", f.line_text(row).map(|x| x.into_owned()));
                 v.push("selected", cur);
             }

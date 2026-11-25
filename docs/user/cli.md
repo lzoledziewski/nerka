@@ -76,6 +76,9 @@ commands that print lines, and one object for the others:
 - `--fields apid,ctid` adds `"fields": {"apid": "NAV", "ctid": "MAIN"}`,
   typed (text as strings, numbers as numbers); an unknown field is an
   error listing the file's fields.
+- `--width N` cuts each line's `raw` at N characters, with `…`, and says
+  its length as `"raw_chars"` (a DLT payload of hex can run to thousands
+  of characters).
 
 Big results come in pages:
 

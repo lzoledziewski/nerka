@@ -1,6 +1,6 @@
 ---
 title: "nerka: a fast log viewer for DLT, pcap and text logs"
-description: "nerka opens big log files fast: filter and search in milliseconds, plot the values your logs carry, keep your queries in a library. Text, JSON, AUTOSAR DLT and pcap, pcapng or MF4 captures. Windows, Linux and macOS."
+description: "nerka opens big log files fast: filter and search in milliseconds, plot the values your logs carry, keep your queries in a library, group messages into patterns, and let an AI agent of your choice work with you. Text, JSON, AUTOSAR DLT and pcap, pcapng or MF4 captures. Windows, Linux and macOS."
 ---
 
 # nerka
@@ -46,10 +46,29 @@ colours its lines, a parameter picks one query for several ECUs, named
 groups become signals, a preset saves the whole analysis. The Library is
 plain-text files you can share in git. [The Library →](user/library.md)
 
+## What a log says, in patterns
+
+**🧩 Patterns** groups a log's messages into templates, the parts that
+vary as slots (`gear={D|P|N}`, `session <*> to <*>`), the rarest first:
+a million lines read as a page of messages. **⚖ Compare** puts two sets
+side by side (two boots, a good run and a bad one, two files) and lists
+the patterns and values new, gone or more frequent, or what stayed the
+same. Experimental, and tunable on the trace at hand.
+[Patterns →](user/gui.md#patterns)
+
+## Your AI agent, on your logs
+
+nerka ships no model: bring Claude Code, Codex, Gemini CLI or another.
+On its own, an agent analyses any file with the command line (JSON in
+pages, a guide written for it); with you, **🤖 AI** opens it in a
+terminal working on your window through MCP: it reads what you have open,
+filters, plots and leaves its findings as 🤖 annotations you accept or
+undo. [AI agents →](user/agents.md)
+
 ## User guide
 
 1. [Getting started](user/getting-started.md): install, the demo trace, the first filter.
-2. [The desktop viewer](user/gui.md): tabs, the Filter and Search boxes, bookmarks, keys.
+2. [The desktop viewer](user/gui.md): tabs, the Filter and Search boxes, bookmarks, patterns, keys.
 3. [The Library](user/library.md): queries you use again, presets.
 4. [Signals and plots](user/signals.md): values taken from lines, plotted over time.
 5. [Queries (NFD)](user/queries.md): the filter language, and how the boxes read what you type.
@@ -57,7 +76,7 @@ plain-text files you can share in git. [The Library →](user/library.md)
 7. [Lifecycles](user/lifecycles.md): boots and runs of a device, and how each ended.
 8. [Checks](user/checks.md): known problems found per log or per boot.
 9. [The command line](user/cli.md): every command and option.
-10. [AI agents](user/agents.md): an agent of your choice analysing with the command line, its findings as bookmarks.
+10. [AI agents](user/agents.md): an agent of your choice, with the command line or on your window (MCP), its findings as annotations.
 11. [Protocol definitions](user/protocol-definitions.md): your own protocols in captures, in `.ksy` files.
 12. [Settings bundles](user/bundles.md): export and import your setup.
 13. [Settings and where things are kept](user/settings.md).

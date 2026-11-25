@@ -93,8 +93,8 @@ The agent's tools:
 |---|---|
 | `window` | your tabs: files, lines, your filter and search, how many lines the filter shows, bookmarks, plotted signals, the selected line |
 | `summary`, `help` | what a tab's files are (format, fields, time span, levels, what was skipped); the query language and the tab's fields and signals |
-| `count`, `filter`, `lines` | lines by an NFD query, in pages, also only among the lines your filter shows (`in_view`) and around matches by time; a range or the lines around one |
-| `patterns`, `compare` | message patterns (the rarest first), and what differs between two sets of lines |
+| `count`, `filter`, `lines` | lines by an NFD query, in pages, also only among the lines your filter shows (`in_view`) and around matches by time; a range or the lines around one; each line's text cut at 500 characters (`width`) |
+| `patterns`, `compare` | message patterns (the rarest first), and what differs between two sets of lines (`show: same`: also what stayed the same) |
 | `queries` | your queries: those picked in the tab's Library (each with its NFD and how many lines it matches) and the library's saved queries with their notes; read-only |
 | `bookmarks`, `signals`, `signal`, `lifecycles` | your bookmarks; the tab's signals and a signal's values; its lifecycles |
 | `show` | goes to a line in your window |

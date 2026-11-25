@@ -213,6 +213,28 @@ pub struct View<'a> {
     /// A view of one file names it once (a page's `file`), not on each
     /// line (the path was most of an answer).
     pub compact: bool,
+    /// A line's `raw` at most this many characters, cut with `…` and its
+    /// length said (`"raw_chars"`); 0: whole (a DLT
+    /// payload of hex ran to thousands of characters a line).
+    pub width: usize,
+}
+
+/// MCP's default [`View::width`].
+pub const WIDTH: usize = 500;
+
+/// `v`'s `raw` cut to `width` characters (0: whole), its length then said.
+pub fn cut_raw(v: &mut Value, width: usize) {
+    let Value::Object(pairs) = v else { return };
+    let Some(at) = pairs.iter().position(|(k, _)| k == "raw") else { return };
+    let Value::Str(raw) = &mut pairs[at].1 else { return };
+    let chars = raw.chars().count();
+    if width == 0 || chars <= width {
+        return;
+    }
+    let end = raw.char_indices().nth(width).map_or(raw.len(), |(i, _)| i);
+    raw.truncate(end);
+    raw.push('…');
+    pairs.insert(at + 1, ("raw_chars".into(), Value::from(chars)));
 }
 
 /// Where record `row` of a source read as records starts in its file
@@ -273,6 +295,7 @@ impl View<'_> {
                 pairs.retain(|(k, v)| !(matches!(k.as_str(), "time" | "level") && v.is_null()));
             }
         }
+        cut_raw(&mut v, self.width);
         v
     }
 
@@ -314,8 +337,20 @@ impl View<'_> {
 pub fn hints(source: &dyn LogSource) -> Vec<String> {
     let n = source.line_count().min(200_000);
     let (mut go, mut go_first, mut java) = (0u64, 0u64, 0u64);
+    // Go crashes (`panic: `, `fatal error: `, `SIGABRT: abort`): the first.
+    let (mut crashes, mut crash_first) = (0u64, 0u64);
     for l in 0..n {
         let Some(t) = source.line_text(l) else { continue };
+        let crash = t.starts_with("panic: ")
+            || t.starts_with("fatal error: ")
+            || t.strip_prefix("SIG")
+                .is_some_and(|r| r.split_once(": ").is_some_and(|(s, _)| s.bytes().all(|b| b.is_ascii_uppercase())));
+        if crash {
+            if crashes == 0 {
+                crash_first = l + 1;
+            }
+            crashes += 1;
+        }
         if let Some(rest) = t.strip_prefix("goroutine ")
             && rest.starts_with(|c: char| c.is_ascii_digit())
         {
@@ -350,7 +385,16 @@ pub fn hints(source: &dyn LogSource) -> Vec<String> {
              gaps work"
         ));
     }
-    if go >= 3 && !source.format().starts_with("text records") {
+    if go >= 3 && crashes >= 2 && !source.format().starts_with("text records") {
+        // A server's log with crashes in it (a model server's
+        // runner, five times): the dumps are what followed, not the story.
+        out.push(format!(
+            "{crashes} Go crashes with goroutine dumps (the first at line {crash_first}, {go} goroutines in all): \
+             what led to each is usually in the lines just before it (filter 'level >= WARN', or lines around \
+             it); to read a dump's stacks, read as records start=/^goroutine [0-9]/ (CLI: --records \
+             'start=/^goroutine [0-9]/'; window: set_records)"
+        ));
+    } else if go >= 3 && !source.format().starts_with("text records") {
         out.push(format!(
             "a Go goroutine dump ({go} goroutines from line {go_first}): read as records start=/^goroutine [0-9]/ \
              (CLI: --records 'start=/^goroutine [0-9]/'; window: set_records), each goroutine is one record and \
@@ -677,9 +721,35 @@ mod tests {
         // The two lines before the dump stay rows, then a record per goroutine.
         assert_eq!(r.line_count(), 5);
         let files = ["dump.txt".to_owned()];
-        let v = View { source: &r, files: &files, compact: true };
+        let v = View { source: &r, files: &files, compact: true, width: 0 };
         assert_eq!(v.place(3).to_string(), r#"{"line":4,"first_line":6}"#);
         assert!(hints(&r).iter().all(|x| !x.contains("goroutine dump")), "read as records already");
+    }
+
+    #[test]
+    fn crashes_in_a_server_log_are_hinted_as_crashes() {
+        let one = "time=2026-04-02T10:00:00Z level=INFO msg=load\nSIGABRT: abort\nPC=0x1\n\ngoroutine 1 gp=0x1 m=0 [running]:\nmain.f()\n\ngoroutine 2 [select]:\nmain.g()\n\ngoroutine 3 [select]:\nmain.g()\n";
+        let f = TextFile::from_bytes("serve.log", one.repeat(2).into_bytes());
+        let h = hints(&f);
+        assert!(
+            h[0].starts_with("2 Go crashes with goroutine dumps (the first at line 2, 6 goroutines in all)"),
+            "{h:?}"
+        );
+        // One dump: read as records.
+        let f = TextFile::from_bytes("serve.log", one.into());
+        assert!(hints(&f)[0].starts_with("a Go goroutine dump"), "{:?}", hints(&f));
+    }
+
+    #[test]
+    fn a_long_raw_is_cut_and_its_length_said() {
+        let f = TextFile::from_bytes("a.log", format!("{}\nshort\n", "ab".repeat(400)).into_bytes());
+        let files = ["a.log".to_owned()];
+        let v = View { source: &f, files: &files, compact: true, width: 10 };
+        let fields = Fields::default();
+        assert_eq!(v.line(0, &fields).to_string(), r#"{"line":1,"raw":"ababababab…","raw_chars":800}"#);
+        assert_eq!(v.line(1, &fields).to_string(), r#"{"line":2,"raw":"short"}"#);
+        let v = View { width: 0, ..v };
+        assert!(!v.line(0, &fields).to_string().contains("raw_chars"));
     }
 
     #[test]

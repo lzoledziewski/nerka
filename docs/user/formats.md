@@ -49,7 +49,7 @@ CLAUSES`, the clauses separated by `;`:
 | `name *.log, app-*.txt` | the profile is for files whose name matches (`*`, `?`; any case) |
 | `first /REGEX/` | … whose first non-empty line matches |
 | `records lines`, `start=/REGEX/`, `sep=/REGEX/`, `blank`, `json`, `auto` | how lines group into rows ([Multi-line records](#multi-line-records); `auto` by default) |
-| `time auto` | a line's time is the date-time it starts with |
+| `time auto` | a line's time is the date-time it starts with (also logfmt's first key: `time=2025-10-17T10:00:01Z level=INFO …`, `ts=`, `t=`) |
 | `time /REGEX/` | a line's time is the regex's group `time` (or the whole match) |
 | `time none` | no time |
 | `zone utc`, `zone local`, `zone +02:00` | the zone of times written without one (default: as shown, [Times](#times)) |
@@ -89,8 +89,9 @@ each file's time is read.
 **When a time can't be read** (best effort):
 
 - `time auto` is used for a file only if at least half of its first 200
-  non-empty lines start with a time; a profile's own regex if any of them
-  has one. Otherwise the file has no time, as if the profile had `time
+  non-empty lines start with a time, or a tenth of them (10 at least) and
+  the first (a server's log with a tool's output between its own lines); a
+  profile's own regex if any of them has one. Otherwise the file has no time, as if the profile had `time
   none`, and **Files…** / `nerka open` say so.
 - A line without a time of its own (a stack trace's next lines, a wrapped
   message) has the time of the line before it, and lines before the first

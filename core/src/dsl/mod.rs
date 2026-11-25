@@ -1086,6 +1086,12 @@ mod tests {
         assert!(e.msg.contains("unknown field 'service'"), "{e}");
         assert_eq!(e.pos, 0);
         assert!(Query::compile("apid ~ 5").unwrap_err().msg.contains("regex"));
+        // A slash meant inside a regex (or `\/` lost to JSON) ended it.
+        let e = Query::compile("raw ~ /api/(get|put)/").unwrap_err();
+        assert!(e.msg.contains(r"write \/ for a slash"), "{e}");
+        assert_eq!(e.pos, 11);
+        assert!(Query::compile(r"raw ~ /api\/(get|put)/").is_ok());
+        assert!(!Query::compile("level >= ERROR )").unwrap_err().msg.contains("slash"));
     }
 
     #[test]

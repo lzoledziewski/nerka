@@ -35,6 +35,12 @@ fn tools() -> Value {
         )
     };
     let query = |d: &str| p("string", d);
+    let width = || {
+        p(
+            "integer",
+            "Each line's raw text at most this many characters, cut with … and its length as raw_chars (default 500; 0: whole)",
+        )
+    };
     let schema = |props: Vec<(&str, Value)>, required: &[&str]| {
         let mut v = Value::object([("type", Value::from("object"))]);
         v.push("properties", Value::object(props));
@@ -71,6 +77,7 @@ fn tools() -> Value {
                     ("max", p("integer", "Lines at most: default 50, at most 1000")),
                     ("skip", p("integer", "Lines left out first: the next page")),
                     ("fields", p("string", "Fields to add, typed: `apid,ctid`")),
+                    ("width", width()),
                     ("before", p("string", "Also lines up to this long before each match")),
                     ("after", p("string", "Also lines up to this long after each match")),
                     ("in_view", in_view()),
@@ -91,6 +98,7 @@ fn tools() -> Value {
                     ("from", p("integer", "First line of a range")),
                     ("to", p("integer", "Last line of a range")),
                     ("fields", p("string", "Fields to add: `apid,ctid`")),
+                    ("width", width()),
                 ],
                 &[],
             ),

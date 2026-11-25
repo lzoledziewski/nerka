@@ -17,5 +17,6 @@ VIEW    := state | event | changed    -- default state; event and
                                          changed may stand alone
 OP      := == | != | >= | <= | > | < | ~ | !~
 VALUE   := REGEX | STRING | WORD      -- numbers are WORDs: 42, 0x2a
-REGEX   := /pattern/flags             -- flags: i (ignore case)
+REGEX   := /pattern/flags             -- flags: i (ignore case); \/ for a
+                                         slash inside (in JSON: \\/)
 STRING  := "text"                     -- \" and \\ escapes

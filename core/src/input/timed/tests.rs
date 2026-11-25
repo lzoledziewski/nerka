@@ -86,6 +86,20 @@ fn the_builtin_rule_needs_half_the_lines() {
     assert!(!f.has_time());
     let f = timed("a.log", few, "p: time none", 0.0);
     assert!(!f.has_time());
+    // A server's log with a tool's output between its timed lines:
+    // the first line timed and a tenth of them (10 at least) is enough, the
+    // others carry the time before them; not when the first has none.
+    let mut log = String::new();
+    for k in 0..12 {
+        log += &format!("time=2025-10-17T10:00:{k:02}Z level=INFO msg=load\n");
+        log += &"llama_model_loader: - kv tensor\n".repeat(6);
+    }
+    let f = timed("serve.log", &log, "default: time auto", 0.0);
+    assert!(f.has_time(), "{}", f.info().reading[0].time);
+    assert_eq!(f.time(8), Some(T0 + 1.0));
+    assert!(f.info().reading[0].time.contains("the others carry the time before them"));
+    let f = timed("serve.log", &format!("starting\n{log}"), "default: time auto", 0.0);
+    assert!(!f.has_time());
 }
 
 #[test]

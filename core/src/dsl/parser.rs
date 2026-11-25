@@ -189,6 +189,18 @@ pub(super) fn tokens(src: &str) -> Result<Vec<(Tok, std::ops::Range<usize>)>, Ds
 }
 
 pub fn parse(src: &str) -> Result<Expr, DslError> {
+    parse_query(src).map_err(|mut e| {
+        // Right after a regex: often a slash meant inside it (`/api/(get|put)/`),
+        // or `\/` lost to JSON, where `\/` is only `/`.
+        let before = src.get(..e.pos).unwrap_or(src).trim_end();
+        if e.msg.starts_with("unexpected") && before.ends_with('/') && before.matches('/').count() >= 2 {
+            e.msg += "; a / ended the regex before it: write \\/ for a slash inside a regex (in a JSON string: \\\\/)";
+        }
+        e
+    })
+}
+
+fn parse_query(src: &str) -> Result<Expr, DslError> {
     let mut lex = Lexer { s: src, pos: 0 };
     let (tok, pos) = lex.next()?;
     let mut p = Parser { lex, tok, pos };

@@ -30,7 +30,9 @@ explain a gap in the log.
 
 A line is `{"file", "line", "time", "level", "raw"}`; `--fields apid,ctid`
 adds `"fields"`, typed. When `-m` cut the result, the last line is
-`{"more": N, "skip": K}`: `--skip K` for the next page.
+`{"more": N, "skip": K}`: `--skip K` for the next page. Long lines (a DLT
+payload of hex runs to thousands of characters): `--width 300` cuts each
+`raw` there, with its length as `"raw_chars"`.
 
     nerka search --json -i -m 50 'timeout|refused' FILE    a regex, like grep
     nerka search --json --in 'level >= WARN' -m 50 timeout FILE
@@ -49,8 +51,8 @@ unusual things happen.
     nerka compare --json --a 'QUERY_A' --b 'QUERY_B' FILE
 
 What differs between two sets of lines: patterns and values new in B, gone
-from B, more or less often (scored). A good run against a bad one, before
-against after.
+from B, more or less often (scored); `--show same` lists what both do alike.
+A good run against a bad one, before against after.
 
 ## 4. Around a finding
 
@@ -93,6 +95,11 @@ an argument into a Windows path.
 A lifecycle is one entity's run (an ECU's boot to its reset); a signal is a
 value lines carry (`@speed`); a check tests a condition (a rate, a gap, a
 missing answer) overall and per lifecycle, with evidence lines.
+
+A signal's regex reads the whole line as `raw` does (in DLT, the time and
+IDs come first: anchor on the payload's words, not `^`), and its value
+carries on to the lines after it: to count the lines it was read on, use
+`@speed.event` (`filter -c '@speed.event > 100'`), not `@speed`.
 
 ## 6. Leave your findings for the user
 
