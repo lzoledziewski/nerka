@@ -24,8 +24,8 @@ pub enum RecordSplit {
     #[default]
     Lines,
     /// A line matching the regex starts a record; the lines after it, up
-    /// to the next such line, belong to it (lines before the first one are
-    /// a record too).
+    /// to the next such line, belong to it (lines before the first one stay
+    /// a row each; no line matching: the whole file is one record).
     Start(Regex),
     /// Records are separated by blank lines (awk's `RS=""`).
     Blank,
