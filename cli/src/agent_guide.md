@@ -73,11 +73,13 @@ records, a goroutine or an exception each: then `filter` gives whole
 stacks, and `patterns` groups identical ones (40 idle workers become one
 line, the few stuck ones stand out):
 
-    nerka --records 'start=/^goroutine \d/' patterns -n 20 FILE
-    nerka --records 'start=/^goroutine \d/' filter --json -m 5 'raw ~ /chan send/' FILE
-    nerka search --json -m 100 '^goroutine \d+' FILE
+    nerka --records 'start=/^goroutine [0-9]/' patterns -n 20 FILE
+    nerka --records 'start=/^goroutine [0-9]/' filter --json -m 5 'raw ~ /chan send/' FILE
+    nerka search --json -m 100 '^goroutine [0-9]+' FILE
 
-Lines count records then; `first_line` is where each starts in the file.
+Lines count records then; `first_line` is where each starts in the file
+(bookmark that line). Text before the first match is one record. In a
+regex written inside JSON, `[0-9]` travels better than `\d`.
 In Git Bash on Windows, set `MSYS_NO_PATHCONV=1` first: it turns `/…/` in
 an argument into a Windows path.
 

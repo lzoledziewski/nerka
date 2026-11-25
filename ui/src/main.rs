@@ -5728,7 +5728,9 @@ impl App {
                 let (marks, waiting) =
                     self.tabs.get(self.active).map_or((0, 0), |t| (t.bookmarks.len(), t.bookmarks.annotations()));
                 // An agent's annotations waiting to be accepted show apart.
-                let label = if waiting > 0 {
+                let label = if waiting > 0 && marks == waiting {
+                    format!("🔖 Bookmarks ({} {waiting})", view::ANNOTATION_GLYPH)
+                } else if waiting > 0 {
                     format!("🔖 Bookmarks ({} · {} {waiting})", marks - waiting, view::ANNOTATION_GLYPH)
                 } else {
                     format!("🔖 Bookmarks ({marks})")
@@ -5811,7 +5813,17 @@ impl App {
                         }
                         tip += "\n\nClick: where, one by one (and an export for a bug report)";
                     }
-                    let r = ui.add(egui::Label::new(text).sense(egui::Sense::click())).on_hover_text(tip);
+                    // Cut short (… and the hover has it all) so it never runs
+                    // under the buttons at the right (a
+                    // records spec did).
+                    const RIGHT: f32 = 250.0;
+                    let room = (ui.available_width() - RIGHT).max(80.0);
+                    let r = ui
+                        .allocate_ui(egui::vec2(room, ui.spacing().interact_size.y), |ui| {
+                            ui.add(egui::Label::new(text).truncate().sense(egui::Sense::click()))
+                        })
+                        .inner
+                        .on_hover_text(tip);
                     if warned && r.clicked() {
                         open_skips = true;
                     }

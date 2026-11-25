@@ -78,9 +78,12 @@ pub fn field_value(v: FieldValue<'_>) -> Value {
 /// object). `time` and `level` are null on a line without one.
 pub fn line(source: &dyn LogSource, row: LineNo, file: &str, line: LineNo, fields: &Fields) -> Value {
     let mut v = Value::new_object();
-    v.push("file", file)
-        .push("line", line + 1)
-        .push("time", source.time(row).map(time_text))
+    v.push("file", file).push("line", line + 1);
+    // A record: where it starts in its file (the evaluation).
+    if let Some(f) = record_first_line(source, row) {
+        v.push("first_line", f);
+    }
+    v.push("time", source.time(row).map(time_text))
         .push("level", Event::from_source(source, row).level().map(Level::as_str))
         .push("raw", source.line_text(row).map(|t| t.into_owned()));
     if !fields.0.is_empty() {
@@ -258,8 +261,10 @@ impl View<'_> {
             if self.one_file() {
                 pairs.retain(|(k, _)| k != "file");
             }
-            if let Some(f) = record_first_line(self.source, row) {
-                pairs.insert(2, ("first_line".into(), Value::from(f)));
+            // Compact: a line without a time or a level doesn't say so on
+            // each line (the evaluation).
+            if self.compact {
+                pairs.retain(|(k, v)| !(matches!(k.as_str(), "time" | "level") && v.is_null()));
             }
         }
         v
@@ -317,8 +322,8 @@ pub fn hints(source: &dyn LogSource) -> Vec<String> {
     let mut out = Vec::new();
     if go >= 3 && !source.format().starts_with("text records") {
         out.push(format!(
-            "a Go goroutine dump ({go} goroutines from line {go_first}): read as records start=/^goroutine \\d/ \
-             (CLI: --records 'start=/^goroutine \\d/'; window: set_records), each goroutine is one record and \
+            "a Go goroutine dump ({go} goroutines from line {go_first}): read as records start=/^goroutine [0-9]/ \
+             (CLI: --records 'start=/^goroutine [0-9]/'; window: set_records), each goroutine is one record and \
              patterns groups identical stacks"
         ));
     }
@@ -602,7 +607,12 @@ mod tests {
         let dump = "SIGQUIT: quit\n\ngoroutine 1 gp=0x1 m=nil [select]:\nmain.f()\n\ngoroutine 2 [chan send]:\nmain.g()\n\ngoroutine 3 [chan send]:\nmain.g()\n";
         let f = TextFile::from_bytes("dump.txt", dump.as_bytes().to_vec());
         let h = hints(&f);
-        assert!(h[0].starts_with("a Go goroutine dump (3 goroutines from line 3)"), "{h:?}");
+        assert!(
+            h[0].starts_with(
+                "a Go goroutine dump (3 goroutines from line 3): read as records start=/^goroutine [0-9]/"
+            ),
+            "{h:?}"
+        );
         assert!(h.iter().any(|x| x.starts_with("no line has a time")), "{h:?}");
         let split = crate::input::records::RecordSplit::parse(r"start=/^goroutine \d/").unwrap();
         let r = crate::input::records::RecordFile::from_bytes("dump.txt", dump.as_bytes().to_vec(), split);
