@@ -1,4 +1,4 @@
-# AI preparation (design settled; A1, A2, B1–B3 built)
+# AI preparation (design settled; A1, A2, B1–B3 built and reviewed)
 
 Status: **settled** with the owner (2026-11-24, "Settled" below). Built:
 step A1 (2026-11-24, branch `claude/ai-prep`: `core/src/json.rs`,
@@ -196,67 +196,53 @@ Each step is a pre-release on its own branch. A1 closes R10; B1 gets the
 window's handlers a module of their own (`ui/src/agent.rs`), not more lines
 in `ui/src/main.rs` (6,218 non-test lines).
 
-## Assumptions to review (B1–B3, built unattended 2026-11-25)
+## Reviewed by the owner (2026-11-25)
 
-The owner (2026-11-25): "you can take assumptions, will review in the
-morning". Each is a choice made while building; change any.
+Workflow B was built unattended on assumptions; the owner reviewed them
+the next morning. **Kept as built:** the 18 tools (a `check` tool when
+agents ask; `filter` with `raw ~` instead of a regex `search`); a tab by
+number or title, lines from 1 in their own file; reading on a thread,
+changes on the window's thread, never the focus; `set_filter` /
+`set_search` in NFD, undone with the box's mode and text; `bookmark` as an
+annotation, the author kept on edits; `plot` adds lanes, `show` not
+undoable; 🤖 Agent with ↶ Undo, no redo; no `screenshot` of a minimized
+window (egui draws no frame for it; the agent is told after 20 s); which
+window `nerka mcp` takes; `raw` as shown, `time` in UTC (no strong view);
+the evaluation's fixes; 🔖 on macOS left for now; `ui/src/main.rs`'s size
+left to the postponed refactoring.
 
-1. **Tools** (17): `window`, `summary`, `help`, `count`, `filter`,
-   `lines`, `patterns`, `compare`, `bookmarks`, `signals`, `signal`,
-   `lifecycles` (reading); `show`, `set_filter`, `set_search`,
-   `bookmark`, `plot` (changing); `screenshot`. No `check` tool yet (the
-   CLI's `--check` covers it). `search` (regex) left out: NFD's `raw ~
-   /…/` in `filter` does it.
-2. **A tab** is named by `tab`: its number from 1, or part of its title;
-   default the active tab. Line numbers are from 1 in their own file, with
-   `file` (part of a name) in a tab of several files.
-3. **Bounded answers:** `filter` gives 50 lines by default, 1000 at most;
-   `lines` ±10 around a line, 1000 at most; `signal` 100 points;
-   `patterns` / `compare` 30. `in_view` reads only the lines the user's
-   filter shows.
-4. **Threads:** reading tools run on a thread of their own with a snapshot
-   of the tab; changing tools on the window's thread. An agent's call
-   never brings the window to the front.
-5. **`set_filter` / `set_search`** switch the box to NFD and put the query
-   in, as if typed; the result arrives a moment later (the answer says
-   so). Undo puts the box's mode and text back.
-6. **`bookmark`** makes an annotation (author `ai`, or `by`); changing an
-   existing bookmark keeps its author. Undo restores the bookmark as it
-   was (or none).
-7. **`plot`** adds lanes (`only`: replaces them) and shows the plot; undo
-   restores the lanes and whether it was shown. **`show`** isn't undoable
-   (navigation).
-8. **🤖 Agent** (top bar, shown once an agent changed something): the
-   changes, newest first, each with ↶ Undo; no redo; undone ones struck
-   through. The status bar says each change.
-9. **`screenshot`**: the window, or the plot's own window (`of: plot`), as
-   a PNG in an MCP image; a minimized window gives none (20 s).
-10. **No MCP progress or cancellation** yet: a call runs to its end (10
-    minutes at most).
-11. **Which window:** `--window PID`, else `NERKA_WINDOW`, else the window
-    focused last; the link is made again once if the window went away.
-12. **🤖 AI** (top bar) opens Windows Terminal (`wt.exe`) if there is one,
-    else a console window; `$TERMINAL` or the usual terminals on Linux;
-    Terminal on macOS. Settings → **AI command**, default `claude`. Claude
-    Code gets `--mcp-config` with `<config>/nerka/mcp.json` (the `nerka`
-    next to `nerka-gui`); others need `nerka mcp --install CLIENT`, which
-    runs the client's own `mcp add` (user scope).
-13. **`raw`** in answers is the line as the window shows it (its time
-    column in local time when the window shows local time); `time` is UTC.
-    Said in the server's instructions.
-14. **The 🔖 glyph** draws poorly on macOS (CI screenshot, owner
-    2026-11-25): left as it is for now.
-15. **From the evaluation (`ai-evaluation.md`), built the same night:**
-    an argument a tool doesn't take is an error naming the ones it takes;
-    a one-file tab names its file once per answer (several files: their
-    names, the paths once), and null time / level are left out; `summary`
-    and `open --json` give **hints** (a Go goroutine dump or Java traces
-    read best as records; entries spanning lines read as records starting
-    at a date; a log without times); **`set_records`**, an 18th tool,
-    reads a tab as records (undoable, for the session only, not saved as
-    the user's choice); records give `first_line`; `patterns`' queries are
-    off by default; the CLI takes grep's `-n` and warns when Git Bash has
-    turned `/…/` into a path; the top bar's file text is cut short.
+**Decided, to build:**
+
+- **Answer limits** (owner: "okish… wondering if with GB logs this can
+  affect troubleshooting"): the defaults and caps settable (Settings → AI
+  agents), and every tool measured on 1 GiB traces; MCP progress and
+  cancellation if a tool is slow there.
+- **AI command:** a list to pick from (Claude Code, Codex, Gemini CLI,
+  Aider) and Custom.
+- **The library for agents** (owner: "available queries with their notes
+  is where the knowledge is"): a read-only `queries` tool (the tab's picks
+  with their NFD and counts, and the packs' queries with their notes), and
+  the packs' queries with notes exported into `help agent` / `help skill`.
+  The agent proposes changes to queries; it never edits the library.
+- **`first_line`** in a tab of several files: a method "where this row
+  starts in its file" that records files answer and views pass on (not the
+  search's fast path).
+- **`line`** (owner: "both; it could become a signal just like file"): a
+  row's line in its own file as a field in NFD (`line < 526`, `file ==
+  vlc.log AND line >= 190`; a record: its first line), and per-file
+  numbers in a several-file tab's gutter, the tab's row in the hover.
+- **The CLI's `lines`** prints line numbers (`-N`: none), like `filter`.
+- **A stack-dump profile** (owner: "plan the feature"): design first
+  (`stack-dumps.md`).
+- **Patterns over stack frames** tried on other dumps (Java, Python, more
+  Go) before deciding anything for the engine.
+- **A DLT log:** a daemon's log (size checked first,
+  unpacked into a folder of its own, read only with nerka).
+
+**To evaluate first:** keeping lines before a record split's first match
+as rows (a prototype shown on real files). **An idea, not now:** a diff
+inside one line (`compare` compares templates and slot values, not order
+inside a line).
 
 ## Settled (owner, 2026-11-24)
 
