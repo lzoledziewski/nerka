@@ -351,7 +351,10 @@ pub fn hints(source: &dyn LogSource) -> Vec<String> {
             .filter(|t| !t.trim().is_empty())
             .collect();
         let timed = tried.iter().filter(|t| crate::time::leading_time(t, crate::time::Zone::Utc).is_some()).count();
-        if timed >= 3 && timed * 10 >= tried.len() && !source.format().starts_with("text records") {
+        // The first line timed is enough: an entry may be long (a Python
+        // traceback of ~17 lines: 6 % of the lines start with a time).
+        let first_timed = tried.first().is_some_and(|t| crate::time::leading_time(t, crate::time::Zone::Utc).is_some());
+        if timed >= 3 && (first_timed || timed * 10 >= tried.len()) && !source.format().starts_with("text records") {
             let split = "start=/^[0-9]{4}[-/][0-9]{2}[-/][0-9]{2}.[0-9]/";
             out.push(format!(
                 "{timed} of the first {} lines start with a time: its entries span several lines; read as records \
