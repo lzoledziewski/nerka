@@ -305,10 +305,18 @@ enum Cmd {
         within: Option<String>,
         #[command(flatten)]
         engine: PatternArgs,
-        /// Only changes at least this sure (new and gone ones are always
-        /// shown): G², 3.84 is p = 0.05, 10.8 is p = 0.001.
-        #[arg(long, default_value_t = 10.8)]
+        /// A change in count at least this sure is `changed`, a less sure
+        /// one `same`: G², 3.84 is p = 0.05, 10.8 is p = 0.001.
+        #[arg(long, default_value_t = pattern::MIN_SCORE)]
         min_score: f64,
+        /// What to list, comma-separated: new, gone, changed, same (in
+        /// both, not changed: the same behaviour on both sides), or all.
+        #[arg(long, value_name = "LIST", default_value = "new,gone,changed", value_parser = pattern::Listed::parse_changes)]
+        show: [bool; 4],
+        /// Which rows: all, patterns (no slot values) or values (slot
+        /// values only).
+        #[arg(long, value_name = "ROWS", default_value = "all", value_parser = pattern::Rows::parse)]
+        rows: pattern::Rows,
         /// Print at most this many differences (0: all).
         #[arg(short = 'n', long, default_value_t = 30)]
         top: usize,
@@ -1326,13 +1334,14 @@ fn compare(
     filters: [Option<String>; 2],
     within: Option<String>,
     options: PatternOptions,
-    min_score: f64,
+    listed: &pattern::Listed,
     top: usize,
     queries: bool,
     json: bool,
     stats: bool,
     out: &mut impl Write,
 ) -> Result<()> {
+    let min_score = listed.min_score;
     if files.len() == 1 && filters.iter().any(Option::is_none) {
         anyhow::bail!("one file: give a filter per set (--a FILTER --b FILTER), or two files");
     }
@@ -1355,7 +1364,7 @@ fn compare(
     let set = |side: usize| pattern::Set { source: &*view(side).source, lines: lines[side].as_deref() };
     let t = Instant::now();
     let ps = pattern::compare(set(0), set(1), &options, &Progress::new())?;
-    let diffs = pattern::differences(&ps, min_score);
+    let diffs = pattern::differences(&ps, listed);
     let took = t.elapsed();
     let name = |side: usize| {
         let v = view(side);
@@ -1377,7 +1386,7 @@ fn compare(
                 ("lines", ps.lines[k].into()),
             ])
         };
-        let v = agent::compare(&ps, &diffs, [&av, &bv], [side(0), side(1)], min_score, top, queries);
+        let v = agent::compare(&ps, &diffs, [&av, &bv], [side(0), side(1)], listed, top, queries);
         writeln!(out, "{v}")?;
         if stats {
             out.flush()?;
@@ -1393,12 +1402,13 @@ fn compare(
     writeln!(out, "B: {} ({} lines)", name(1), ps.lines[1])?;
     let mut section = None;
     for d in &diffs[..shown] {
-        if section != Some(d.change()) {
-            section = Some(d.change());
-            let title = match d.change() {
+        if section != Some(d.change) {
+            section = Some(d.change);
+            let title = match d.change {
                 pattern::Change::New => "New in B".to_owned(),
                 pattern::Change::Gone => "Gone from B".to_owned(),
                 pattern::Change::Changed => format!("Changed (score {min_score} or more)"),
+                pattern::Change::Same => format!("Same in both (score below {min_score})"),
             };
             writeln!(
                 out,
@@ -1414,12 +1424,7 @@ fn compare(
             [_, 0] => "gone".to_owned(),
             _ => format!("×{:.2}", d.ratio()),
         };
-        // Where to look: the side it's on, or grew on.
-        let side = match d.change() {
-            pattern::Change::New => 1,
-            pattern::Change::Gone => 0,
-            pattern::Change::Changed => usize::from(d.ratio() >= 1.0),
-        };
+        let side = agent::compare_side(d);
         let (sides, what) = match d.value {
             None => (&p.sides, p.template()),
             Some((s, v)) => {
@@ -1438,7 +1443,12 @@ fn compare(
         writeln!(out, "… {} more (-n 0: all)", diffs.len() - shown)?;
     }
     if diffs.is_empty() {
-        writeln!(out, "nothing new or gone, and no change scoring {min_score} or more")?;
+        if listed.changes == pattern::Listed::default().changes && listed.rows == pattern::Rows::All {
+            writeln!(out, "nothing new or gone, and no change scoring {min_score} or more")?;
+        } else {
+            let (show, rows) = (listed.changes_text(), listed.rows.name());
+            writeln!(out, "nothing listed (--show {show}, --rows {rows}, --min-score {min_score})")?;
+        }
     }
     if stats {
         out.flush()?;
@@ -1912,8 +1922,9 @@ fn run() -> Result<()> {
             let key = if seed.is_none() { "; keyed at random: the words can't be mapped back" } else { "" };
             eprintln!("nerka: {n} lines anonymized into {} ({what}){key}", output.display());
         }
-        Cmd::Compare { files, a, b, within, engine, min_score, top, queries, json, stats } => {
-            compare(&files, [a, b], within, engine.options(false)?, min_score, top, queries, json, stats, &mut out)?;
+        Cmd::Compare { files, a, b, within, engine, min_score, show, rows, top, queries, json, stats } => {
+            let listed = pattern::Listed { min_score, changes: show, rows };
+            compare(&files, [a, b], within, engine.options(false)?, &listed, top, queries, json, stats, &mut out)?;
         }
         Cmd::Expand { picks, parts } => {
             if picks.is_empty() {

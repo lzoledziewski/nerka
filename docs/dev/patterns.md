@@ -22,6 +22,14 @@ the `patterns` file and bundle kind, `--pattern-config` / `--set` /
   computed automatically for now; they run only when asked (▶ Run).
 - **Compare chooses its content (owner, 2026-11-23):** the lines compared
   can be narrowed to what matters, and unwanted content ignored.
+- **Compare shows what it compared (owner, 2026-11-25):** besides new,
+  gone and changed, what is in both and didn't change (**Same**: scoring
+  under the minimum), to confirm the same behaviour on both sides; and
+  patterns without their values, or values only. Built: `Listed` /
+  `Rows` in `core/src/pattern.rs` (`differences` takes them); CLI `--show
+  new,gone,changed,same|all`, `--rows all|patterns|values`; MCP `show`,
+  `rows`; the window's Show checkboxes (Same off at first) and Rows,
+  listing again without a new run.
 
 ## Principle
 

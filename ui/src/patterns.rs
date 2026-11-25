@@ -1193,6 +1193,18 @@ mod tests {
         // Ignored, it leaves the list.
         p.compare.ignore_for_test("panic in task");
         assert!(!p.compare.rows_for_test().contains(&"new panic in task".to_owned()));
+        // The same ones, patterns only: the doors, in both and not changed;
+        // listed again without a new run.
+        use nerka_core::pattern::{Listed, Rows};
+        let same = Listed { changes: [false, false, false, true], rows: Rows::Patterns, ..Default::default() };
+        p.compare.list_for_test(same);
+        let rows = p.compare.rows_for_test();
+        assert!(!rows.is_empty() && rows.iter().all(|r| r.starts_with("same ") && !r.contains("slot")), "{rows:?}");
+        assert!(rows.iter().any(|r| r.starts_with("same door")), "{rows:?}");
+        // Values only.
+        p.compare.list_for_test(Listed { rows: Rows::Values, ..Default::default() });
+        let rows = p.compare.rows_for_test();
+        assert!(!rows.is_empty() && rows.iter().all(|r| r.contains("slot")), "{rows:?}");
     }
 
     /// Tuning (α2): a setting changed in the pane runs the same lines

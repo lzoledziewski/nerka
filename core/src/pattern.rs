@@ -2739,17 +2739,11 @@ pub struct Difference {
     /// of freedom: 3.84 is p = 0.05, 10.8 is p = 0.001). Unlike a ratio it
     /// weighs the evidence: 0 → 1 line scores low, 0 → 500 high.
     pub score: f64,
+    /// What it is, at the [`Listed::min_score`] it was listed with.
+    pub change: Change,
 }
 
 impl Difference {
-    pub fn change(&self) -> Change {
-        match self.counts {
-            [0, _] => Change::New,
-            [_, 0] => Change::Gone,
-            _ => Change::Changed,
-        }
-    }
-
     /// How many times more often in B than in A, by rate (smoothed, so a
     /// side with none stays finite).
     pub fn ratio(&self) -> f64 {
@@ -2776,28 +2770,138 @@ pub enum Change {
     New,
     /// Lines in A only.
     Gone,
-    /// Lines in both, more or fewer.
+    /// Lines in both, more or fewer, scoring [`Listed::min_score`] at least.
     Changed,
+    /// Lines in both, scoring less: the same behaviour on both sides, as
+    /// far as the counts tell.
+    Same,
+}
+
+impl Change {
+    pub const ALL: [Change; 4] = [Change::New, Change::Gone, Change::Changed, Change::Same];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Change::New => "new",
+            Change::Gone => "gone",
+            Change::Changed => "changed",
+            Change::Same => "same",
+        }
+    }
+}
+
+/// The rows a compare lists: patterns, their slots' values, or both.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Rows {
+    #[default]
+    All,
+    Patterns,
+    Values,
+}
+
+impl Rows {
+    pub const ALL: [Rows; 3] = [Rows::All, Rows::Patterns, Rows::Values];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Rows::All => "all",
+            Rows::Patterns => "patterns",
+            Rows::Values => "values",
+        }
+    }
+
+    pub fn parse(text: &str) -> std::result::Result<Rows, String> {
+        Rows::ALL
+            .into_iter()
+            .find(|r| r.name().eq_ignore_ascii_case(text.trim()))
+            .ok_or_else(|| format!("rows '{text}': all, patterns or values"))
+    }
+
+    fn keeps(self, value: bool) -> bool {
+        match self {
+            Rows::All => true,
+            Rows::Patterns => !value,
+            Rows::Values => value,
+        }
+    }
+}
+
+/// A compare's default minimum score: G² 10.8 is p = 0.001.
+pub const MIN_SCORE: f64 = 10.8;
+
+/// What [`differences`] lists: which [`Change`]s, the score that tells a
+/// change from the same, and which rows.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Listed {
+    pub min_score: f64,
+    /// New, gone, changed, same: as [`Change::ALL`].
+    pub changes: [bool; 4],
+    pub rows: Rows,
+}
+
+impl Default for Listed {
+    /// New, gone and changed, patterns and values.
+    fn default() -> Self {
+        Listed { min_score: MIN_SCORE, changes: [true, true, true, false], rows: Rows::All }
+    }
+}
+
+impl Listed {
+    pub fn shows(&self, c: Change) -> bool {
+        self.changes[c as usize]
+    }
+
+    /// `new,gone,changed,same` (any of them, comma-separated), or `all`.
+    pub fn parse_changes(text: &str) -> std::result::Result<[bool; 4], String> {
+        let mut out = [false; 4];
+        for w in text.split(',').map(str::trim).filter(|w| !w.is_empty()) {
+            if w.eq_ignore_ascii_case("all") {
+                out = [true; 4];
+                continue;
+            }
+            let c = Change::ALL
+                .into_iter()
+                .find(|c| c.name().eq_ignore_ascii_case(w))
+                .ok_or_else(|| format!("'{w}': new, gone, changed, same or all"))?;
+            out[c as usize] = true;
+        }
+        if out == [false; 4] {
+            return Err("nothing to list: new, gone, changed, same or all".into());
+        }
+        Ok(out)
+    }
+
+    /// The changes listed, as [`Listed::parse_changes`] reads them.
+    pub fn changes_text(&self) -> String {
+        Change::ALL.into_iter().filter(|&c| self.shows(c)).map(Change::name).collect::<Vec<_>>().join(",")
+    }
 }
 
 /// What changed between the sets of a [`compare`]: each pattern's lines
 /// against all lines, and, where a pattern has lines on both sides, each
 /// value of its slots (all values kept, `!overflow`) against the pattern's
-/// lines. New ones first, then gone ones (most lines first, whatever their
-/// score: one line in B only is weak evidence of a change in rate, but a
-/// message that never showed in A is what one looks for), then changed ones
-/// scoring `min_score` at least, surest first.
-pub fn differences(ps: &Patterns, min_score: f64) -> Vec<Difference> {
+/// lines; those `listed` shows. New ones first, then gone ones (most lines
+/// first, whatever their score: one line in B only is weak evidence of a
+/// change in rate, but a message that never showed in A is what one looks
+/// for), then changed ones scoring `min_score` at least, surest first, then
+/// the same ones (lines on both sides, scoring less), most lines first.
+pub fn differences(ps: &Patterns, listed: &Listed) -> Vec<Difference> {
     let mut out = Vec::new();
-    let mut add = |d: Difference| {
-        if d.change() != Change::Changed || d.score >= min_score {
-            out.push(d);
+    let mut add = |pattern: usize, value: Option<(usize, usize)>, counts: [u64; 2], of: [u64; 2]| {
+        let score = g2(counts[0], of[0], counts[1], of[1]);
+        let change = match counts {
+            [0, _] => Change::New,
+            [_, 0] => Change::Gone,
+            _ if score >= listed.min_score => Change::Changed,
+            _ => Change::Same,
+        };
+        if listed.shows(change) && listed.rows.keeps(value.is_some()) {
+            out.push(Difference { pattern, value, counts, of, score, change });
         }
     };
     for (k, p) in ps.patterns.iter().enumerate() {
         let counts = [p.sides[0].count, p.sides[1].count];
-        let score = g2(counts[0], ps.lines[0], counts[1], ps.lines[1]);
-        add(Difference { pattern: k, value: None, counts, of: ps.lines, score });
+        add(k, None, counts, ps.lines);
         if counts[0] == 0 || counts[1] == 0 {
             continue;
         }
@@ -2806,17 +2910,15 @@ pub fn differences(ps: &Patterns, min_score: f64) -> Vec<Difference> {
                 continue;
             }
             for (v, value) in slot.values.iter().enumerate() {
-                let c = [value.sides[0].count, value.sides[1].count];
-                let score = g2(c[0], counts[0], c[1], counts[1]);
-                add(Difference { pattern: k, value: Some((s, v)), counts: c, of: counts, score });
+                add(k, Some((s, v)), [value.sides[0].count, value.sides[1].count], counts);
             }
         }
     }
     out.sort_by(|a, b| {
         let lines = |d: &Difference| d.counts[0] + d.counts[1];
-        a.change()
-            .cmp(&b.change())
-            .then_with(|| match a.change() {
+        a.change
+            .cmp(&b.change)
+            .then_with(|| match a.change {
                 Change::Changed => b.score.total_cmp(&a.score),
                 _ => lines(b).cmp(&lines(a)),
             })
@@ -3338,7 +3440,7 @@ mod tests {
         assert_eq!(templates(&ps), ["{voltage=|undervoltage} <*> mV", "door {open|closed}", "panic in task"]);
         // The alarm, merged into the readings' pattern, still stands out as a
         // value; the panic as a pattern; the doors don't.
-        let d = differences(&ps, 3.84);
+        let d = differences(&ps, &Listed { min_score: 3.84, ..Default::default() });
         let what: Vec<(String, [u64; 2])> = d
             .iter()
             .map(|d| {
@@ -3358,7 +3460,7 @@ mod tests {
                 ("voltage=".to_owned(), [100, 100])
             ]
         );
-        assert_eq!(d.iter().map(Difference::change).collect::<Vec<_>>(), [Change::New, Change::New, Change::Changed]);
+        assert_eq!(d.iter().map(|d| d.change).collect::<Vec<_>>(), [Change::New, Change::New, Change::Changed]);
         assert!(d[0].ratio() > 5.0 && d[1].ratio() > 5.0 && d[2].ratio() < 1.0);
         // Where each side's lines are: B's first alarm, A's first reading.
         let p = &ps.patterns[0];
@@ -3386,8 +3488,36 @@ mod tests {
         assert_eq!(y.values[0].sides, [Tally { count: 1, first: 1, last: 1 }, Tally { count: 2, first: 5, last: 6 }]);
         assert_eq!(y.values[1].sides[1].count, 0);
         // Too few lines to be sure of a change; `off` is gone, though.
-        let d = differences(&ps, 3.84);
-        assert_eq!((d.len(), d[0].change(), d[0].counts), (1, Change::Gone, [1, 0]));
+        let d = differences(&ps, &Listed { min_score: 3.84, ..Default::default() });
+        assert_eq!((d.len(), d[0].change, d[0].counts), (1, Change::Gone, [1, 0]));
+        // The same ones too: `x` and `y` and `on` are on both sides; most
+        // lines first.
+        let all = Listed { min_score: 3.84, changes: [true; 4], rows: Rows::All };
+        let d = differences(&ps, &all);
+        let what = |d: &[Difference]| -> Vec<(Change, Option<(usize, usize)>)> {
+            d.iter().map(|d| (d.change, d.value)).collect()
+        };
+        assert_eq!(
+            what(&d),
+            [(Change::Gone, Some((0, 1))), (Change::Same, None), (Change::Same, None), (Change::Same, Some((0, 0)))]
+        );
+        assert_eq!((d[1].pattern, d[2].pattern), (0, 1), "x and y: 4 lines each, by pattern");
+        // Only the same ones, patterns only; values only.
+        let same = Listed { changes: Listed::parse_changes("same").unwrap(), rows: Rows::Patterns, ..all };
+        assert_eq!(what(&differences(&ps, &same)), [(Change::Same, None), (Change::Same, None)]);
+        let values = Listed { rows: Rows::Values, ..all };
+        assert_eq!(what(&differences(&ps, &values)), [(Change::Gone, Some((0, 1))), (Change::Same, Some((0, 0)))]);
+    }
+
+    #[test]
+    fn listed_parses() {
+        assert_eq!(Listed::parse_changes("new, Same").unwrap(), [true, false, false, true]);
+        assert_eq!(Listed::parse_changes("all").unwrap(), [true; 4]);
+        assert!(Listed::parse_changes("").unwrap_err().contains("nothing"));
+        assert!(Listed::parse_changes("new,odd").unwrap_err().contains("'odd'"));
+        assert_eq!(Listed::default().changes_text(), "new,gone,changed");
+        assert_eq!(Rows::parse("Values").unwrap(), Rows::Values);
+        assert!(Rows::parse("slots").is_err());
     }
 
     #[test]

@@ -207,6 +207,40 @@ fn json_for_scripts_and_agents() {
 }
 
 #[test]
+fn compare_lists_the_same_too() {
+    use nerka_core::json::Value;
+    let get = |v: &Value, k: &str| v.get(k).cloned().unwrap_or(Value::Null);
+    let d = dir("compare-same");
+    let (a, b) = (d.join("good.log"), d.join("bad.log"));
+    let lines = |extra: &str| {
+        let mut t: String = (0..40).map(|k| format!("tick {k}\nstate {}\n", ["on", "off"][k % 2])).collect();
+        t += extra;
+        t
+    };
+    std::fs::write(&a, lines("")).unwrap();
+    std::fs::write(&b, lines("panic in task 7\n")).unwrap();
+    // By default: only what changed.
+    let o = nerka(&["compare", "--pattern-config", "-", s(&a), s(&b)]);
+    assert!(out(&o).contains("New in B") && !out(&o).contains("Same in both"), "{}", out(&o));
+    // The same ones, patterns only: what didn't change.
+    let o = nerka(&["compare", "--pattern-config", "-", "--show", "same", "--rows", "patterns", s(&a), s(&b)]);
+    let t = out(&o);
+    assert!(t.contains("Same in both (score below 10.8)") && t.contains("tick <*>"), "{t}");
+    assert!(!t.contains("New in B") && !t.contains("slot"), "{t}");
+    let o = nerka(&["compare", "--json", "--pattern-config", "-", "--show", "all", "--rows", "values", s(&a), s(&b)]);
+    let v = &json_lines(&o)[0];
+    assert_eq!((get(v, "show"), get(v, "rows")), (Value::from("new,gone,changed,same"), Value::from("values")));
+    let rows = get(v, "differences");
+    let rows = rows.as_array().unwrap();
+    assert!(!rows.is_empty() && rows.iter().all(|r| get(r, "change") == Value::from("same")), "{v}");
+    assert!(rows.iter().all(|r| get(r, "value") != Value::Null && get(r, "ratio") != Value::Null), "{v}");
+    // A wrong list says what it takes.
+    let o = nerka(&["compare", "--show", "unchanged", s(&a), s(&b)]);
+    assert_eq!(o.status.code(), Some(2));
+    assert!(err(&o).contains("new, gone, changed, same or all"), "{}", err(&o));
+}
+
+#[test]
 fn an_agent_leaves_bookmarks() {
     use nerka_core::json::Value;
     let d = dir("agent-marks");

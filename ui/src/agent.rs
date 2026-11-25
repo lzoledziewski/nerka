@@ -106,7 +106,7 @@ const ARGS: &[(&str, &[&str])] = &[
     ("bookmarks", &["tab"]),
     ("queries", &["tab", "counts", "library", "label"]),
     ("patterns", &["tab", "in", "rare", "top", "values", "queries", "lines", "in_view", "field"]),
-    ("compare", &["tab", "a", "b", "in", "top", "min_score", "queries", "in_view", "field"]),
+    ("compare", &["tab", "a", "b", "in", "top", "min_score", "show", "rows", "queries", "in_view", "field"]),
     ("signals", &["tab"]),
     ("signal", &["tab", "name", "file", "from", "to", "points"]),
     ("lifecycles", &["tab", "name"]),
@@ -382,14 +382,24 @@ fn read(tool: &str, args: &Value, s: &Snap) -> Result<Value, String> {
             let options = pattern_options(args, false)?;
             let set = |lines| pattern::Set { source: &*s.source, lines: Some(lines) };
             let ps = pattern::compare(set(&a), set(&b), &options, &progress).map_err(|e| e.to_string())?;
-            let min_score = args.get("min_score").and_then(Value::as_f64).unwrap_or(10.8);
-            let diffs = pattern::differences(&ps, min_score);
+            let listed = pattern::Listed {
+                min_score: args.get("min_score").and_then(Value::as_f64).unwrap_or(pattern::MIN_SCORE),
+                changes: match str_arg(args, "show") {
+                    Some(t) => pattern::Listed::parse_changes(t).map_err(|e| format!("show: {e}"))?,
+                    None => pattern::Listed::default().changes,
+                },
+                rows: match str_arg(args, "rows") {
+                    Some(t) => pattern::Rows::parse(t)?,
+                    None => pattern::Rows::All,
+                },
+            };
+            let diffs = pattern::differences(&ps, &listed);
             let sides = [
                 Value::object([("filter", Value::from(fa)), ("lines", ps.lines[0].into())]),
                 Value::object([("filter", Value::from(fb)), ("lines", ps.lines[1].into())]),
             ];
             let top = num_arg(args, "top", s.limits.top) as usize;
-            let v = ca::compare(&ps, &diffs, [&view, &view], sides, min_score, top, bool_arg(args, "queries", true));
+            let v = ca::compare(&ps, &diffs, [&view, &view], sides, &listed, top, bool_arg(args, "queries", true));
             Ok(with_warnings(v, warnings))
         }
         "signals" => {

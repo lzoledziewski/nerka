@@ -142,6 +142,12 @@ together and lists what differs: patterns and slot values **new in B**,
 the score is G², 10.8 or more by default), as
 [`nerka compare`](cli.md#compare-experimental) does.
 
+- **Show:** *New*, *Gone*, *Changed* and *Same*: the last (off at first)
+  lists what is in both and scores less, most lines first, to confirm the
+  same behaviour on both sides. **Rows:** patterns and values, the
+  patterns only (no slot values), or the values only. Both list the
+  results again without a new run, as the minimum score does.
+
 - **A and B:** all lines, the filter result, the lines of a filter,
   lifecycles of `@name` by number (`2`, or a group: `2, 5-7`) or every one
   of an outcome (every `crash` against every `planned`): every line during

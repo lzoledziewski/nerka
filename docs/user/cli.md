@@ -66,7 +66,7 @@ commands that print lines, and one object for the others:
 | `open` | the files, format, size, lines, index, columns, fields (`name`, `kind`, `costly`), protocols, first and last time, lines per level, how each file was read, notes |
 | `marks` | a bookmark each: `{"file", "line", "name", "note", "author", "unsure", "raw"}` (`author`: `ai`, or null for yours) |
 | `patterns` | `{"total", "patterns": […], "more"}`, each pattern with what `--values`, `--queries`, `--lines` add |
-| `compare` | `{"a", "b", "min_score", "differences": […], "more"}` |
+| `compare` | `{"a", "b", "min_score", "show", "rows", "differences": […], "more"}`; a difference's `change` is `new`, `gone`, `changed` or `same` |
 | `check`, `lifecycles` | [their results](checks.md) |
 
 - `line` counts from 1, in the line's own file; `time` is UTC in RFC 3339
@@ -285,18 +285,24 @@ others add up (two `keep` rules keep both words).
 ## `compare` (experimental)
 
 `compare` groups two sets of lines into patterns together, so a pattern is
-the same on both sides, then lists what differs, in three parts:
+the same on both sides, then lists what differs, in three parts (a fourth
+on request):
 
 - **New in B**: patterns, and values of a pattern's slots, that only B has;
 - **Gone from B**: those only A has;
 - **Changed**: those in both, more or less often (a pattern against all of
-  its side's lines, a value against its pattern's), surest first.
+  its side's lines, a value against its pattern's), surest first;
+- **Same** (`--show same`, or `all`): those in both whose change scores
+  less than `--min-score`, most lines first: what both sets do alike, to
+  confirm the same behaviour on both sides.
 
 So a value stands out even inside a pattern it was merged into:
 `undervoltage` new in B, while `{voltage=|undervoltage} <*> mV` holds
 steady. The score is a log-likelihood ratio (G²): it weighs the evidence,
 so 1 line against none scores low and 500 against none high; `--min-score`
-applies to changes only, new and gone ones are always listed. Each line
+tells a change from the same, new and gone ones are listed whatever their
+score. `--rows patterns` leaves the values out (the patterns only),
+`--rows values` lists the values only. Each line
 prints the score, the lines in A and B, the change (`new`, `gone`, `×2.08`:
 how many times as often, by share), and the first line on the side it's on
 or grew on (`B:6412`).
@@ -307,6 +313,7 @@ The sets are two files, or one file's lines of two filters, e.g. two
 ```
 nerka compare good.dlt bad.dlt
 nerka compare --in 'apid == NAV' good.dlt bad.dlt
+nerka compare --show same --rows patterns good.dlt bad.dlt
 nerka --lifecycle 'ecu1: lines ecu == ECU1; reset uptime; planned payload ~ /shutdown/' compare --a '@ecu1 == 1' --b '@ecu1 == 2' trace.dlt
 ```
 
@@ -314,7 +321,9 @@ nerka --lifecycle 'ecu1: lines ecu == ECU1; reset uptime; planned payload ~ /shu
 |---|---|
 | `--a FILTER`, `--b FILTER` | set A's, set B's lines: only those an NFD filter keeps (one file: both needed) |
 | `--in FILTER` | both sets: only the lines an NFD filter keeps |
-| `--min-score S` | only changes at least this sure (default 10.8, p = 0.001; 3.84 is p = 0.05) |
+| `--min-score S` | a change at least this sure is *changed*, a less sure one *same* (default 10.8, p = 0.001; 3.84 is p = 0.05) |
+| `--show LIST` | what to list, comma-separated: `new`, `gone`, `changed`, `same`, or `all` (default `new,gone,changed`) |
+| `--rows ROWS` | `all` (default), `patterns` (no slot values) or `values` (slot values only) |
 | `-n, --top N` | print at most N differences (default 30; `0`: all) |
 | `--queries` | also each pattern's NFD query |
 | `--field NAME`, `--pattern-config FILE`, `--set`, `--rule`, `--similarity S`, `--no-merge` | as for `patterns` |

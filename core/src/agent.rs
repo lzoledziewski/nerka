@@ -462,7 +462,7 @@ pub fn compare(
     diffs: &[crate::pattern::Difference],
     views: [&View; 2],
     sides: [Value; 2],
-    min_score: f64,
+    listed: &crate::pattern::Listed,
     top: usize,
     queries: bool,
 ) -> Value {
@@ -471,19 +471,10 @@ pub fn compare(
     let mut list = Vec::new();
     for d in &diffs[..shown] {
         let p = &ps.patterns[d.pattern];
-        let side = match d.change() {
-            Change::New => 1,
-            Change::Gone => 0,
-            Change::Changed => usize::from(d.ratio() >= 1.0),
-        };
-        let change = match d.change() {
-            Change::New => "new",
-            Change::Gone => "gone",
-            Change::Changed => "changed",
-        };
+        let side = compare_side(d);
         let mut v = Value::new_object();
-        v.push("change", change).push("score", d.score).push("a", d.counts[0]).push("b", d.counts[1]);
-        if change == "changed" {
+        v.push("change", d.change.name()).push("score", d.score).push("a", d.counts[0]).push("b", d.counts[1]);
+        if matches!(d.change, Change::Changed | Change::Same) {
             v.push("ratio", d.ratio());
         }
         let at = match d.value {
@@ -503,8 +494,22 @@ pub fn compare(
     }
     let [a, b] = sides;
     let mut v = Value::object([("a", a), ("b", b)]);
-    v.push("min_score", min_score).push("differences", Value::Array(list)).push("more", diffs.len() - shown);
+    v.push("min_score", listed.min_score)
+        .push("show", listed.changes_text())
+        .push("rows", listed.rows.name())
+        .push("differences", Value::Array(list))
+        .push("more", diffs.len() - shown);
     v
+}
+
+/// Where to look for a difference: the side it's on, or grew on.
+pub fn compare_side(d: &crate::pattern::Difference) -> usize {
+    use crate::pattern::Change;
+    match d.change {
+        Change::New => 1,
+        Change::Gone => 0,
+        Change::Changed | Change::Same => usize::from(d.ratio() >= 1.0),
+    }
 }
 
 /// A signal's values between rows `from` and `to` (inclusive): how many

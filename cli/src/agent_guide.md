@@ -119,6 +119,7 @@ picture to look at, or to give the user.
 1. `open --json`: the format, the time span, the levels, the notes.
 2. `filter -c` by level; `patterns --json --rare --in 'level >= WARN'`.
 3. Read around the first serious error: `filter --json --before 30s`.
-4. `compare` a good part against the bad one (two files, or `--a` / `--b`).
+4. `compare` a good part against the bad one (two files, or `--a` / `--b`);
+   `--show same` lists what both do alike, to rule a part out.
 5. Bookmark what explains it with `marks --add`, and tell the user which
    bookmarks to look at.
