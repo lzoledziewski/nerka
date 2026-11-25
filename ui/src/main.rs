@@ -8093,6 +8093,10 @@ gear=D
         let e = call(&mut app, "count", r#"{"query":"lvl >= ERROR"}"#).unwrap_err();
         assert!(e.contains("unknown field 'lvl'"), "{e}");
         assert!(call(&mut app, "nope", "{}").unwrap_err().contains("no tool 'nope'"));
+        // The user's queries: nothing picked here; the box's filter said.
+        let q = call(&mut app, "queries", r#"{"library":false}"#).unwrap();
+        assert_eq!(q.get("picked").and_then(Value::as_array).map(<[Value]>::len), Some(0), "{q}");
+        assert!(q.get("filter").is_some() && q.get("library").is_some(), "{q}");
         // Changes: the filter, a bookmark; listed, undone.
         call(&mut app, "set_filter", r#"{"query":"level >= ERROR"}"#).unwrap();
         settle_app(&mut app, &ctx);

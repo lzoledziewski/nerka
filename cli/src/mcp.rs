@@ -134,6 +134,19 @@ fn tools() -> Value {
             ),
         ),
         (
+            "queries",
+            "The user's queries: those picked in the tab's Library (role, NFD, how many lines each matches) and the library's saved queries with their notes, where the user's knowledge of these logs is. Read-only: propose changes, the user makes them.",
+            schema(
+                vec![
+                    ("tab", tab()),
+                    ("counts", p("boolean", "Count each picked query's lines (default true)")),
+                    ("library", p("boolean", "Also the library's queries with their notes (default true)")),
+                    ("label", p("string", "Only library queries with this label")),
+                ],
+                &[],
+            ),
+        ),
+        (
             "bookmarks",
             "The tab's bookmarks: line, name, note, author (null: the user's; else an agent's annotation).",
             schema(vec![("tab", tab())], &[]),

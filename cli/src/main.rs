@@ -1677,7 +1677,7 @@ fn run() -> Result<()> {
     // Filter and search: whether a line was found (exit status 1 if not).
     let mut found = true;
     match cli.cmd {
-        Cmd::Help { topic } => help(&topic, &mut out)?,
+        Cmd::Help { topic } => help(&topic, &cli.pack, &mut out)?,
         Cmd::Mcp { window, config, install } => {
             let exe = std::env::current_exe().context("finding nerka's own path")?;
             let exe = exe.display().to_string();
@@ -2105,14 +2105,46 @@ description: Analyse logs and traces (text, JSON Lines, DLT, pcap, pcapng, MF4) 
 
 /// `nerka help [TOPIC]`: the commands, a command, `nfd`, `agent`, `skill`
 /// or `fields FILE…`.
-fn help(topic: &[String], out: &mut impl Write) -> Result<()> {
+/// The library's queries with their notes, for an agent's guide (owner,
+/// 2026-11-25: "available queries with their notes is where the knowledge
+/// is"): a section after the guide, empty without packs.
+fn library_for_agents(packs: &[PathBuf]) -> String {
+    let lib = match library(packs) {
+        Ok(lib) => lib,
+        // Said, not left out silently.
+        Err(e) => return format!("\n## The user's query library\n\nIt couldn't be read: {e:#}\n"),
+    };
+    let mut out = String::new();
+    for p in lib.packs() {
+        for q in &p.queries {
+            let params = if q.params.is_empty() { String::new() } else { format!("({})", q.params.join(", ")) };
+            let labels = if q.labels.is_empty() { String::new() } else { format!(" [{}]", q.labels.join(", ")) };
+            let note = q.note.trim().replace('\n', " ");
+            let note = if note.is_empty() { String::new() } else { format!(": {note}") };
+            out +=
+                &format!("- `{}.{}{params}`{labels}{note}\n  `{}`\n", p.name, q.id, q.text.trim().replace('\n', " "));
+        }
+    }
+    if out.is_empty() {
+        return out;
+    }
+    format!(
+        "\n## The user's query library\n\nQueries saved in the user's packs, each with its note: what they \
+         know about these logs. Pick one by name (`nerka --pack DIR search -q pack.query FILE`, `-p NAME=VALUE` \
+         for a parameter) or use its NFD. Propose new or better ones to the user; don't edit their packs.\n\n{out}"
+    )
+}
+
+fn help(topic: &[String], packs: &[PathBuf], out: &mut impl Write) -> Result<()> {
     let mut cmd = Cli::command();
     // Subcommands' usage says `nerka filter`, not `filter`.
     cmd.build();
     match topic {
         [] => write!(out, "{}", cmd.render_long_help())?,
-        [t] if t.eq_ignore_ascii_case("agent") => write!(out, "{AGENT_GUIDE}")?,
-        [t] if t.eq_ignore_ascii_case("skill") => write!(out, "{SKILL_HEAD}{AGENT_GUIDE}")?,
+        [t] if t.eq_ignore_ascii_case("agent") => write!(out, "{AGENT_GUIDE}{}", library_for_agents(packs))?,
+        [t] if t.eq_ignore_ascii_case("skill") => {
+            write!(out, "{SKILL_HEAD}{AGENT_GUIDE}{}", library_for_agents(packs))?
+        }
         [t] if t.eq_ignore_ascii_case("nfd") => {
             writeln!(out, "NFD, the query language of nerka:\n")?;
             write!(out, "{}{NFD_EXAMPLES}", nerka_core::dsl::GRAMMAR)?;

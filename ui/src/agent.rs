@@ -90,6 +90,7 @@ const ARGS: &[(&str, &[&str])] = &[
     ("filter", &["tab", "query", "max", "skip", "fields", "before", "after", "in_view"]),
     ("lines", &["tab", "file", "line", "before", "after", "from", "to", "fields"]),
     ("bookmarks", &["tab"]),
+    ("queries", &["tab", "counts", "library", "label"]),
     ("patterns", &["tab", "in", "rare", "top", "values", "queries", "lines", "in_view", "field"]),
     ("compare", &["tab", "a", "b", "in", "top", "min_score", "queries", "in_view", "field"]),
     ("signals", &["tab"]),
@@ -452,6 +453,7 @@ impl App {
             "window" => {
                 let _ = reply.send(Ok(self.agent_window()));
             }
+            "queries" => self.agent_queries(&args, reply),
             "summary" | "help" | "count" | "filter" | "lines" | "bookmarks" | "patterns" | "compare" | "signals"
             | "signal" | "lifecycles" => match self.agent_snap(&args) {
                 Err(e) => {
@@ -515,6 +517,91 @@ impl App {
             search: t.search.pattern.clone(),
             plotted: plot::lock(&t.plot).plotted.clone(),
         })
+    }
+
+    /// `queries`: the tab's picked library queries (each with its NFD and,
+    /// on a thread, how many lines it matches) and the library's queries
+    /// with their notes (owner, 2026-11-25: "available queries with their
+    /// notes is where the knowledge is"). Read-only: an agent proposes, the
+    /// user changes the library.
+    fn agent_queries(&mut self, args: &Value, reply: Reply) {
+        let snap = match self.agent_snap(args) {
+            Ok(s) => s,
+            Err(e) => {
+                let _ = reply.send(Err(e));
+                return;
+            }
+        };
+        let t = &self.tabs[self.agent_tab(args).expect("checked by the snapshot")];
+        let role = |r: nerka_core::pack::Role| match r {
+            nerka_core::pack::Role::Include => "include",
+            nerka_core::pack::Role::Require => "require",
+            nerka_core::pack::Role::Exclude => "exclude",
+            nerka_core::pack::Role::Signal => "signal",
+        };
+        let picked: Vec<(String, &'static str, String, String)> = match t.picks.expand(&self.library) {
+            Ok(a) => a
+                .exp
+                .parts
+                .iter()
+                .map(|p| {
+                    let args: Vec<String> = p.args.iter().map(|(k, v)| format!("{k}={}", v.value)).collect();
+                    (p.query.clone(), role(p.role), args.join(", "), a.exp.part_nfd(p).to_owned())
+                })
+                .collect(),
+            Err(_) => Vec::new(),
+        };
+        let label = str_arg(args, "label").map(str::to_lowercase);
+        let library: Vec<Value> = if bool_arg(args, "library", true) {
+            self.library
+                .packs()
+                .iter()
+                .flat_map(|p| p.queries.iter().map(move |q| (p, q)))
+                .filter(|(_, q)| {
+                    label.as_ref().is_none_or(|l| q.labels.iter().any(|x| x.to_lowercase().starts_with(l.as_str())))
+                })
+                .map(|(p, q)| {
+                    let mut v = Value::object([("query", Value::from(format!("{}.{}", p.name, q.id)))]);
+                    if !q.params.is_empty() {
+                        v.push("params", q.params.clone());
+                    }
+                    if !q.labels.is_empty() {
+                        v.push("labels", q.labels.clone());
+                    }
+                    if let Some(parent) = p.parent_of(q) {
+                        v.push("parent", parent);
+                    }
+                    v.push("note", q.note.as_str()).push("nfd", q.text.trim());
+                    v
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let counts = bool_arg(args, "counts", true);
+        std::thread::spawn(move || {
+            let picks: Vec<Value> = picked
+                .into_iter()
+                .map(|(query, role, args, nfd)| {
+                    let mut v = Value::object([("query", Value::from(query)), ("role", role.into())]);
+                    if !args.is_empty() {
+                        v.push("args", args);
+                    }
+                    if counts {
+                        let mut w = Vec::new();
+                        match snap.rows(Some(&nfd), false, &mut w) {
+                            Ok(rows) => v.push("count", rows.len()),
+                            Err(e) => v.push("error", e),
+                        };
+                    }
+                    v.push("nfd", nfd);
+                    v
+                })
+                .collect();
+            let mut v = Value::object([("picked", Value::Array(picks))]);
+            v.push("filter", snap.filter.as_str()).push("library", Value::Array(library));
+            let _ = reply.send(Ok(v));
+        });
     }
 
     /// `window`: the tabs, what each shows, and the active one.

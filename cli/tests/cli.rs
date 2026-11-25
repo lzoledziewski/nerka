@@ -317,6 +317,15 @@ fn text_from_stdin() {
 
 #[test]
 fn help_on_nfd_and_fields() {
+    // The agent's guide ends with the library's queries and their notes.
+    let packs = concat!(env!("CARGO_MANIFEST_DIR"), "/../examples/packs");
+    let o = nerka(&["--pack", packs, "help", "agent"]);
+    assert!(out(&o).contains("## The user's query library"), "{}", out(&o));
+    assert!(
+        out(&o).contains("- `demo.warnings` [severity]: Warnings and worse, from every ECU.\n  `level >= WARN`"),
+        "{}",
+        out(&o)
+    );
     let o = nerka(&["help", "nfd"]);
     // A checkout on Windows may give grammar.txt CRLF line ends; `out` has LF.
     let grammar = nerka_core::dsl::GRAMMAR.replace("\r\n", "\n");

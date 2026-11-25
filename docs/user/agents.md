@@ -21,7 +21,7 @@ Codex, Gemini CLI, or any other). It works with nerka in two ways:
 nerka help agent
 ```
 
-prints a guide written for an agent: what to run first (`open --json`),
+prints a guide written for an agent, followed by your library's queries with their notes (what you know about your logs): what to run first (`open --json`),
 how to count before reading (`-c`) and read in pages (`-m`, `--skip`), how
 to find what stands out (`patterns`, `compare`), how to read around a
 finding (`filter --before / --after`), and how to leave its findings for
@@ -95,6 +95,7 @@ The agent's tools:
 | `summary`, `help` | what a tab's files are (format, fields, time span, levels, what was skipped); the query language and the tab's fields and signals |
 | `count`, `filter`, `lines` | lines by an NFD query, in pages, also only among the lines your filter shows (`in_view`) and around matches by time; a range or the lines around one |
 | `patterns`, `compare` | message patterns (the rarest first), and what differs between two sets of lines |
+| `queries` | your queries: those picked in the tab's Library (each with its NFD and how many lines it matches) and the library's saved queries with their notes; read-only |
 | `bookmarks`, `signals`, `signal`, `lifecycles` | your bookmarks; the tab's signals and a signal's values; its lifecycles |
 | `show` | goes to a line in your window |
 | `set_filter`, `set_search` | puts a query in the Filter or Search box |
