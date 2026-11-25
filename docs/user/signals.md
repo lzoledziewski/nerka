@@ -80,7 +80,9 @@ zones (`Z`, `UTC`, `+02:00`) and plain numbers (seconds since 1970, or ms,
 the current line: `• event` when the line itself carries it, else `↑ N`
 (the line of the event that set it; click to go there). ✎ edits, − removes,
 the checkbox switches a saved signal on or off, **New signal or lifecycle**
-adds one. The line window (`Enter`) lists the line's own signals.
+adds one. The line window (`Enter`) lists the line's own signals, a
+value that changed what was held before coloured (`was 10`), and below,
+folded, the others' states held from earlier lines.
 
 A query's or FIBEX signal's kind, scope and ⚙ (lifecycle, default) change
 it **in this tab only**. A query signal changed so shows ●; 💾 (**Save

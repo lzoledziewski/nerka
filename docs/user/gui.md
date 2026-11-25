@@ -16,7 +16,9 @@ switched on and checks switched on.
   every line again (↑ in the box brings the filter back).
 - **Search** (at the bottom) looks only among the lines the filter kept.
   Its hits are listed in the pane below it (click one to go there) and
-  coloured in the view; `n` / `N` jump to the next / previous hit.
+  coloured in the view; `n` / `N` jump to the next / previous hit. The
+  way back: right-click a line of the main view → **Show in search
+  results** selects it there (or the next hit after it).
 
 Each box has a **mode**:
 
@@ -39,7 +41,9 @@ words.
 - **Enter** on a line (or the right-click menu's **Show whole line…**)
   opens the line window: for DLT and captures the header fields as a grid,
   then the message with its own line breaks and tabs; **Copy message** /
-  **Copy line**. Long lines also scroll sideways (Shift+wheel, ← / →).
+  **Copy line**; the line's signals, a value that changed what was held
+  before it coloured, with what it was (`was 10`). Long lines also scroll
+  sideways (Shift+wheel, ← / →).
 - **Selecting:** drag, Shift+click, double-click (a word), Shift+arrows,
   `Ctrl+A`. `Ctrl+C` copies the selection, or the current line.
 - **Picked lines:** `Ctrl+click` (or `Ctrl+Space`) picks single lines

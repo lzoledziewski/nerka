@@ -270,6 +270,9 @@ pub struct Highlight<'a> {
     /// Where lifecycles start (file lines, ascending): a line above the row,
     /// labelled, red after one that ended badly (`docs/dev/lifecycles.md`).
     pub lifecycles: Option<&'a [Boundary]>,
+    /// The main view with a search: its menu offers **Show in search
+    /// results** (owner, 2026-11-25: the way back from a hit's click).
+    pub in_hits: bool,
 }
 
 /// A lifecycle's start, as the view marks it.
@@ -316,6 +319,8 @@ pub struct ViewOutput {
     pub detail: Option<u64>,
     /// The selection moved to this row in this frame (a click, the keys).
     pub moved_to: Option<u64>,
+    /// "Show in search results" chosen from the context menu, for this row.
+    pub in_hits: Option<u64>,
 }
 
 /// Draw `rows` rows; `line_of_row` maps a view row to a file line.
@@ -570,6 +575,10 @@ pub fn log_view(
             i.pointer.interact_pos(),
         )
     });
+    // The press is the view's: no other widget took it (egui's hit test), as
+    // a window's resize edge reaching over the view does, which then
+    // scrolled the view as if selecting past its edge (owner, 2026-11-25).
+    let own_press = ui.ctx().dragged_id().is_none_or(|d| d == response.id);
     // ----- table header: drag a divider to resize its column -----
     let x0 = snap(text_x0 - state.x_off);
     let divider_x =
@@ -582,7 +591,7 @@ pub fn log_view(
             .filter(|p| header_rect.contains(*p) && response.contains_pointer())
             .and_then(|p| (0..n).find(|&k| (p.x - divider_x(&starts, &columns.widths, k)).abs() <= 4.0));
         over_divider = near.is_some();
-        if pressed && near.is_some() {
+        if pressed && near.is_some() && own_press {
             state.resizing = near;
         }
         if let Some(k) = state.resizing {
@@ -603,6 +612,7 @@ pub fn log_view(
         && let Some(p) = pointer
         && rows_rect.contains(p)
         && response.contains_pointer()
+        && own_press
     {
         let pos = hit(state, p);
         if command && !shift {
@@ -752,6 +762,7 @@ pub fn log_view(
     }
 
     let mut toggle_bookmark = None;
+    let mut in_hits = None;
     response.context_menu(|ui| {
         let has_sel = state.selection().is_some();
         let label = match state.picked.len() {
@@ -774,6 +785,15 @@ pub fn log_view(
         }
         if ui.add_enabled(state.selected.is_some(), egui::Button::new("Show whole line…  (Enter)")).clicked() {
             detail = state.selected;
+            ui.close();
+        }
+        if hl.in_hits
+            && ui
+                .add_enabled(state.selected.is_some(), egui::Button::new("Show in search results"))
+                .on_hover_text("Selects this line in the search results below, or the next hit after it")
+                .clicked()
+        {
+            in_hits = state.selected;
             ui.close();
         }
         ui.separator();
@@ -1216,7 +1236,7 @@ pub fn log_view(
     }
 
     let moved_to = state.selected.filter(|_| state.selected != selected_before);
-    ViewOutput { clicked, has_focus, copied, toggle_bookmark, detail, moved_to }
+    ViewOutput { clicked, has_focus, copied, toggle_bookmark, detail, moved_to, in_hits }
 }
 
 /// How a line's characters map to display columns. In plain text a tab is
@@ -1590,6 +1610,7 @@ mod tests {
             lines: None,
             notes: NoteMode::Off,
             lifecycles: None,
+            in_hits: false,
         };
         let mut rect = Rect::NOTHING;
         let mut out = ctx.run_ui(input, |ui| {
@@ -1667,6 +1688,7 @@ mod tests {
             lines: None,
             notes: NoteMode::Off,
             lifecycles: None,
+            in_hits: false,
         };
         let mut t = 0.0;
         let mut step = |events: Vec<egui::Event>, state: &mut ViewState, columns: &mut Columns| {
@@ -1722,6 +1744,7 @@ mod tests {
             lines: None,
             notes: NoteMode::Off,
             lifecycles: None,
+            in_hits: false,
         };
         let mut t = 0.0;
         let mut step = |events: Vec<egui::Event>, state: &mut ViewState, file: &nerka_core::TextFile| {
@@ -1805,6 +1828,7 @@ mod tests {
                 lines: None,
                 notes: NoteMode::Off,
                 lifecycles: None,
+                in_hits: false,
             };
             let mut out = ctx.run_ui(input, |ui| {
                 egui::CentralPanel::default().frame(egui::Frame::NONE).show(ui, |ui| {
@@ -1914,6 +1938,7 @@ mod tests {
                 lines: None,
                 notes: NoteMode::Off,
                 lifecycles: None,
+                in_hits: false,
             };
             let mut out = ctx.run_ui(input, |ui| {
                 egui::CentralPanel::default().frame(egui::Frame::NONE).show(ui, |ui| {
@@ -1976,6 +2001,7 @@ mod tests {
                 lines: None,
                 notes: NoteMode::Off,
                 lifecycles: None,
+                in_hits: false,
             };
             let mut out = ctx.run_ui(input, |ui| {
                 egui::CentralPanel::default().frame(egui::Frame::NONE).show(ui, |ui| {
@@ -2082,6 +2108,7 @@ mod tests {
                 lines: None,
                 notes,
                 lifecycles: None,
+                in_hits: false,
             };
             let mut out = ctx.run_ui(input, |ui| {
                 egui::CentralPanel::default().frame(egui::Frame::NONE).show(ui, |ui| {
@@ -2157,6 +2184,7 @@ mod tests {
                     lines: None,
                     notes,
                     lifecycles: None,
+                    in_hits: false,
                 };
                 let mut out = ctx.run_ui(input, |ui| {
                     egui::CentralPanel::default().frame(egui::Frame::NONE).show(ui, |ui| {
@@ -2193,6 +2221,7 @@ mod tests {
             lines: None,
             notes: NoteMode::Off,
             lifecycles: None,
+            in_hits: false,
         };
         let mut t = 0.0;
         let mut step = |events: Vec<egui::Event>, state: &mut ViewState| {
@@ -2273,6 +2302,7 @@ mod tests {
             lines: None,
             notes: NoteMode::Off,
             lifecycles: None,
+            in_hits: false,
         };
         let mut t = 0.0;
         // Wherever the long line is, one of these rows is the cut-off last one.
@@ -2298,6 +2328,67 @@ mod tests {
         }
     }
 
+    /// Resizing a window over the view (the line window) from its edge,
+    /// down past the view: the view neither selects nor scrolls (owner,
+    /// 2026-11-25: it scrolled as if selecting past its edge).
+    #[test]
+    fn a_window_resized_over_the_view_doesnt_scroll_it() {
+        let text: String = (0..500).map(|i| format!("line {i}\n")).collect();
+        let file = nerka_core::TextFile::from_bytes("t", text.into_bytes());
+        let ctx = egui::Context::default();
+        let hl = Highlight {
+            highlighter: None,
+            bookmarks: None,
+            search: None,
+            lines: None,
+            notes: NoteMode::Off,
+            lifecycles: None,
+            in_hits: false,
+        };
+        let mut s = ViewState::default();
+        let mut win = None;
+        let mut t = 0.0;
+        let mut frame = |events: Vec<egui::Event>, s: &mut ViewState, win: &mut Option<Rect>| {
+            t += 1.0 / 60.0;
+            let screen = Rect::from_min_size(pos2(0.0, 0.0), vec2(600.0, 400.0));
+            let input = egui::RawInput { screen_rect: Some(screen), time: Some(t), events, ..Default::default() };
+            let mut out = ctx.run_ui(input, |ui| {
+                egui::CentralPanel::default().frame(egui::Frame::NONE).show(ui, |ui| {
+                    log_view(ui, "v", s, file.line_count(), &|r| r, &file, &mut Columns::default(), &hl);
+                });
+                let r = egui::Window::new("Line 1")
+                    .resizable(true)
+                    .default_pos(pos2(100.0, 50.0))
+                    .default_size([200.0, 100.0])
+                    .show(ui.ctx(), |ui| ui.label("detail"));
+                *win = r.map(|r| r.response.rect);
+            });
+            out.textures_delta.clear();
+        };
+        for _ in 0..3 {
+            frame(vec![], &mut s, &mut win);
+        }
+        let w = win.expect("the window");
+        // Its right edge, just outside the frame, over the view.
+        let edge = pos2(w.right() + 2.0, w.center().y);
+        let button = |pos, pressed| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        frame(vec![egui::Event::PointerMoved(edge)], &mut s, &mut win);
+        frame(vec![button(edge, true)], &mut s, &mut win);
+        let below = pos2(edge.x + 40.0, 395.0);
+        for k in 0..10 {
+            let p = pos2(below.x, below.y + k as f32);
+            frame(vec![egui::Event::PointerMoved(p)], &mut s, &mut win);
+        }
+        frame(vec![button(below, false)], &mut s, &mut win);
+        assert_eq!((s.top, s.sel), (0, None), "the view neither scrolled nor selected");
+        assert!(win.unwrap().width() > w.width(), "the window was resized: {w:?} → {:?}", win.unwrap());
+    }
+
     #[test]
     fn ctrl_click_picks_single_lines_and_copy_takes_them() {
         let text: String = (0..20).map(|i| format!("line {i}\n")).collect();
@@ -2312,6 +2403,7 @@ mod tests {
             lines: None,
             notes: NoteMode::Off,
             lifecycles: None,
+            in_hits: false,
         };
         let mut t = 0.0;
         let mut step = |events: Vec<egui::Event>, state: &mut ViewState| {

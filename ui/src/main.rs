@@ -830,6 +830,17 @@ struct LineSignal {
     value: Option<String>,
     /// The line of the event that set the value; this line for an event.
     from: Option<LineNo>,
+    /// An event: the value held before this line (`None`: its first, or a
+    /// signal without a state before, as the line's own fields).
+    before: Option<String>,
+}
+
+impl LineSignal {
+    /// An event whose value differs from the one held before it (its first
+    /// event too: nothing was held).
+    fn changed(&self, line: LineNo) -> bool {
+        self.from == Some(line) && self.before.as_ref() != self.value.as_ref()
+    }
 }
 
 /// The line window's Signals section: the signals the line carries (its
@@ -847,12 +858,26 @@ fn signals_section(ui: &mut egui::Ui, line: LineNo, signals: &[LineSignal]) -> O
             if events.is_empty() {
                 ui.weak("None: this line carries no signal's value.");
             }
-            egui::Grid::new("line-detail-signals-grid").num_columns(3).spacing([12.0, 2.0]).striped(true).show(
+            // A value that changed what was held is coloured, with what it
+            // was (owner, 2026-11-25); the same value again stays plain.
+            let changed_color = ui.visuals().warn_fg_color;
+            egui::Grid::new("line-detail-signals-grid").num_columns(4).spacing([12.0, 2.0]).striped(true).show(
                 ui,
                 |ui| {
                     for s in &events {
                         ui.label(RichText::new(format!("@{}", s.name)).monospace().strong());
-                        ui.monospace(s.value.as_deref().unwrap_or("—"));
+                        let value = s.value.as_deref().unwrap_or("—");
+                        if s.changed(line) {
+                            ui.label(RichText::new(value).monospace().strong().color(changed_color))
+                                .on_hover_text("Changed on this line");
+                            match &s.before {
+                                Some(b) => ui.weak(format!("was {b}")),
+                                None => ui.weak("first value"),
+                            };
+                        } else {
+                            ui.monospace(value);
+                            ui.weak("");
+                        }
                         ui.weak(format!("{} · {}", s.kind, s.origin));
                         ui.end_row();
                     }
@@ -2507,13 +2532,22 @@ impl Tab {
             } else {
                 "saved"
             };
-            let base =
-                LineSignal { name: d.name().to_owned(), kind: d.kind().as_str(), origin, value: None, from: None };
+            let base = LineSignal {
+                name: d.name().to_owned(),
+                kind: d.kind().as_str(),
+                origin,
+                value: None,
+                from: None,
+                before: None,
+            };
             if d.is_from_source() {
                 let value = d
                     .source_value(&*file, line)
                     .map(|v| if d.is_source_line() { format!("{v}") } else { nerka_core::time::format_time(v, 6) });
-                out.push(LineSignal { from: value.as_ref().map(|_| line), value, ..base });
+                // Built in (`@time`, `@line`): a value on every line, no
+                // state to compare with.
+                let before = value.clone();
+                out.push(LineSignal { from: value.as_ref().map(|_| line), value, before, ..base });
                 continue;
             }
             let Some(series) = self.views.series(d, &*file, kept.as_ref(), self.signals_gen) else {
@@ -2521,7 +2555,16 @@ impl Tab {
                 continue;
             };
             match series.state(line) {
-                Some((row, v)) => out.push(LineSignal { value: Some(d.format(v)), from: Some(row), ..base }),
+                Some((row, v)) => {
+                    // An event here: what was held before it, to tell a
+                    // change from the same value again (owner, 2026-11-25).
+                    let before = if row == line {
+                        line.checked_sub(1).and_then(|l| series.state(l)).map(|(_, b)| d.format(b))
+                    } else {
+                        None
+                    };
+                    out.push(LineSignal { value: Some(d.format(v)), from: Some(row), before, ..base })
+                }
                 None => out.push(base),
             }
         }
@@ -2546,6 +2589,7 @@ impl Tab {
                     kind: a.ty.kind().as_str(),
                     origin: "FIBEX, not used",
                     from: value.as_ref().map(|_| line),
+                    before: value.clone(),
                     value,
                 });
             }
@@ -3022,6 +3066,7 @@ impl Tab {
                     lines: lines.as_ref(),
                     notes: self.notes,
                     lifecycles: None,
+                    in_hits: false,
                 },
             );
             self.view_output(&out, true, |row| hits.lines[row as usize]);
@@ -3165,9 +3210,31 @@ impl Tab {
                 lines: lines.as_ref(),
                 notes: self.notes,
                 lifecycles: Some(boundaries.as_slice()),
+                in_hits: search_hits.is_some(),
             },
         );
         self.view_output(&out, false, line_of_row);
+        if let Some(row) = out.in_hits {
+            self.show_in_hits(line_of_row(row));
+        }
+    }
+
+    /// Select `line` in the search results, or the next hit after it (the
+    /// main view's **Show in search results**); the status says which.
+    fn show_in_hits(&mut self, line: LineNo) {
+        let Some((_, hits)) = self.search_hits() else { return };
+        let i = hits.position_at_or_after(line);
+        if i >= hits.len() {
+            self.status = format!("No search hit at line {} or after it", line + 1);
+            return;
+        }
+        self.hits_view.select(i as u64, hits.len() as u64);
+        let at = hits.lines[i];
+        self.status = if at == line {
+            format!("Line {} in the search results: hit {} of {}", line + 1, i + 1, hits.len())
+        } else {
+            format!("Line {} isn't a hit: the next one, line {} (hit {} of {})", line + 1, at + 1, i + 1, hits.len())
+        };
     }
 
     /// Where the tab's lifecycles start (found already), for the view; made
@@ -6825,6 +6892,7 @@ query timeouts  labels: vision
 boot
 v=60
 gear=D
+v=60
 ",
         )
         .unwrap();
@@ -6841,6 +6909,13 @@ gear=D
             s.iter().map(|s| (s.name.as_str(), s.value.as_deref(), s.from)).collect();
         assert_eq!(rows, [("v", Some("60"), Some(2)), ("gear", Some("P"), Some(0))], "events first");
         assert_eq!(tab.line_signals(1, &[])[0].from, Some(0), "a state");
+        // A change is told from the same value again: v 10 → 60 here, 60
+        // again on line 5; its first value is a change too.
+        assert_eq!((s[0].before.as_deref(), s[0].changed(2)), (Some("10"), true));
+        let again = tab.line_signals(4, &[]);
+        assert_eq!((again[0].before.as_deref(), again[0].changed(4)), (Some("60"), false));
+        assert!(tab.line_signals(0, &[]).iter().all(|s| s.changed(0) && s.before.is_none()));
+        assert!(!s[1].changed(2), "held, not an event here");
         // The window follows the line selected in a view.
         let file = tab.file.clone().unwrap();
         tab.detail = LineDetail::of(&*file, 0);
@@ -9100,6 +9175,17 @@ query nav
         tab.jump_match(true);
         assert_eq!(tab.current_line(), 5);
         assert_eq!(tab.hits_view.selected, Some(1));
+        // Show in search results (the main view's menu): a hit's line, or
+        // the next hit after a line that isn't one; past the last, none.
+        tab.show_in_hits(1);
+        assert_eq!(tab.hits_view.selected, Some(0));
+        assert!(tab.status.contains("hit 1 of 2"), "{}", tab.status);
+        tab.show_in_hits(2);
+        assert_eq!(tab.hits_view.selected, Some(1));
+        assert!(tab.status.contains("isn't a hit: the next one, line 6"), "{}", tab.status);
+        tab.show_in_hits(6);
+        assert_eq!(tab.hits_view.selected, Some(1), "unchanged");
+        assert!(tab.status.starts_with("No search hit"), "{}", tab.status);
 
         // Editing the box drops the chips; the text is a plain query.
         tab.search.pattern.push_str(" OR /disk/");
