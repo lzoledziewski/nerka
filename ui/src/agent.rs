@@ -311,7 +311,12 @@ fn read(tool: &str, args: &Value, s: &Snap) -> Result<Value, String> {
                     (at + num_arg(args, "after", 10)).min(n.saturating_sub(1)),
                 )
             };
-            let rows: Vec<LineNo> = (from.min(to)..=to.max(from)).take(MAX_LINES as usize).collect();
+            // A range stays in its file (it ran on into
+            // the tab's next file).
+            let at = ca::locator(&*s.source);
+            let file = at(from).0;
+            let rows: Vec<LineNo> =
+                (from.min(to)..=to.max(from)).filter(|&r| at(r).0 == file).take(MAX_LINES as usize).collect();
             Ok(view.page(&rows, 0, MAX_LINES, &fields, None))
         }
         "bookmarks" => {
@@ -633,8 +638,12 @@ impl App {
                 }
                 t.reopen(ctx, &self.prefs, self.fibex.clone());
                 self.active = i;
-                let note = "the tab reads its files again: its rows are records now (line numbers count records; \
-                            first_line is where each starts in the file); filter and patterns take whole records";
+                let note = if split.is_some() {
+                    "the tab reads its files again: its rows are records now (line numbers count records; \
+                     first_line is where each starts in the file); filter and patterns take whole records"
+                } else {
+                    "the tab reads its files again: a row a line, as before"
+                };
                 let undo = Undo::Records { paths: paths.clone(), before };
                 (
                     format!("read the tab as records {spec}"),

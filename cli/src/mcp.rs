@@ -114,7 +114,7 @@ fn tools() -> Value {
         ),
         (
             "compare",
-            "What differs between two sets of lines of a tab (two NFD queries, e.g. two lifecycles, before and after): patterns and values new in B, gone from B, more or less often, scored.",
+            "What differs between two sets of lines of a tab (two NFD queries: two files of the tab, two lifecycles, before and after): message templates and their values new in B or gone from B (always listed), and those more or less often, scored (min_score). It compares templates and counts, not the order of things inside a line.",
             schema(
                 vec![
                     ("tab", tab()),
@@ -122,7 +122,13 @@ fn tools() -> Value {
                     ("b", query("NFD for set B")),
                     ("in", query("Both sets: only lines this keeps")),
                     ("top", p("integer", "Differences at most (default 30)")),
-                    ("min_score", p("number", "Changes at least this sure (default 10.8)")),
+                    (
+                        "min_score",
+                        p(
+                            "number",
+                            "Changes in count at least this sure (default 10.8); new and gone are listed whatever their score",
+                        ),
+                    ),
                 ],
                 &["a", "b"],
             ),

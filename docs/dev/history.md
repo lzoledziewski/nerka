@@ -4,6 +4,8 @@ The dated log of the project, newest first; append-only: add an entry at the top
 
 ## 2026-11-25
 
+The AI workflows evaluated (`ai-evaluation.md`; owner: "test both approaches on real bug reports, loop, iterate"): real bug reports (two Go goroutine dumps, one pair of trace logs compared good against bad), 10 blind agent runs in 3 rounds (A: the CLI, B: MCP on a window): 6 right, 2 mostly, 2 partly, none wrong; fixed between rounds: unknown MCP arguments an error, compact answers, hints (stack dumps and entries spanning lines read as records; no times), `set_records`, `first_line`, grep's `-n`, a Git Bash warning, the top bar's file text cut short, `lines` kept in its file. Open for the owner: the evaluation's "Next".
+
 AI preparation, workflow B built unattended (owner: "proceed with MCP, carry out the plan, take assumptions"; `ai.md` → Assumptions to review; Decisions pending 9): `nerka mcp`, an MCP server over stdio (`cli/src/mcp.rs`), linked to a window through the loopback port and token (`core/src/link.rs`, the agent channel in `ui/src/instance.rs`); 17 tools on the window's tabs (`ui/src/agent.rs`: reading tools on a thread with a snapshot, answers built in core like `--json`); changes listed in 🤖 Agent with ↶ Undo; `screenshot` as an MCP image; 🤖 AI opening the user's terminal with the AI command (`ui/src/terminal.rs`; Claude Code with `--mcp-config`); `nerka mcp --install` / `--config`. Before it, CI on Windows: the `help nfd` test compared the grammar with CRLF line ends (fixed); the CI screenshot on macOS showed 🤖 well and 🔖 poorly (owner: leave it for now).
 
 ## 2026-11-24

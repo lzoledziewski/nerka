@@ -218,6 +218,15 @@ pub struct View<'a> {
 /// Where record `row` of a source read as records starts in its file
 /// (line from 1); `None` for other sources (and files over 256 MiB).
 pub fn record_first_line(source: &dyn LogSource, row: LineNo) -> Option<u64> {
+    // A view of several files (or sorted by time): ask the file the row is
+    // in (a tab of two files had no first_line).
+    if let Some(r) = source.reordered() {
+        return record_first_line(r.inner, *r.line_of.get(row as usize)?);
+    }
+    if let Some(parts) = source.parts() {
+        let p = parts.iter().rev().find(|p| p.first <= row)?;
+        return record_first_line(p.source.as_ref(), row - p.first);
+    }
     if !source.format().starts_with("text records") {
         return None;
     }
@@ -227,10 +236,17 @@ pub fn record_first_line(source: &dyn LogSource, row: LineNo) -> Option<u64> {
 }
 
 impl View<'_> {
-    /// Row `row`'s file name and line in it (0-based).
+    /// Row `row`'s file name and line in it (0-based); compact, a view of
+    /// several files names each by its file name (the paths are given
+    /// once, in a page's `files`).
     pub fn at(&self, row: LineNo) -> (&str, LineNo) {
         let (k, line) = locator(self.source)(row);
-        (self.files.get(k).or(self.files.first()).map_or("", String::as_str), line)
+        let file = self.files.get(k).or(self.files.first()).map_or("", String::as_str);
+        if self.compact && self.files.len() > 1 {
+            let name = file.rsplit(['/', '\\']).next().unwrap_or(file);
+            return (name, line);
+        }
+        (file, line)
     }
 
     /// One file named once: lines and places leave `file` out.
@@ -294,6 +310,8 @@ impl View<'_> {
         let mut v = Value::object([("total", Value::from(rows.len()))]);
         if self.one_file() {
             v.push("file", self.files[0].as_str());
+        } else if self.compact {
+            v.push("files", self.files.to_vec());
         }
         v.push("lines", Value::Array(lines.collect())).push("more", rows.len() - to).push("skip", to);
         v

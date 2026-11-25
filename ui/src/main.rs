@@ -8108,6 +8108,41 @@ gear=D
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// A tab of two files (the evaluation): a range stays in its file,
+    /// lines name their file briefly (the paths once), and records say where
+    /// they start in their own file.
+    #[test]
+    fn an_agent_on_a_tab_of_two_files() {
+        use nerka_core::json::Value;
+        let dir = std::env::temp_dir().join(format!("nerka-gui-agent2-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (a, b) = (dir.join("a.log"), dir.join("b.log"));
+        std::fs::write(&a, "[INFO] a one\n  more\n[ERROR] a two\n").unwrap();
+        std::fs::write(&b, "[ERROR] b one\n  more\n  more\n[INFO] b two\n").unwrap();
+        let ctx = egui::Context::default();
+        let mut app = App::default();
+        app.open_files(&ctx, vec![a.clone(), b.clone()]);
+        settle_app(&mut app, &ctx);
+        let call = |app: &mut App, tool: &str, args: &str| -> Value {
+            let (tx, rx) = std::sync::mpsc::channel();
+            let args = nerka_core::json::parse(args).unwrap();
+            app.agent_call(&ctx, instance::AgentCall { tool: tool.into(), args, reply: tx });
+            rx.recv_timeout(Duration::from_secs(10)).expect("an answer").unwrap()
+        };
+        let page = call(&mut app, "lines", r#"{"file":"a.log","from":1,"to":99}"#);
+        let lines = page.get("lines").unwrap().as_array().unwrap();
+        assert_eq!(lines.len(), 3, "a.log's 3 lines, not on into b.log");
+        assert_eq!(lines[0].get("file").and_then(Value::as_str), Some("a.log"));
+        assert_eq!(page.get("files").unwrap().as_array().unwrap().len(), 2);
+        // Records in a tab of several files. first_line isn't there yet: a
+        // part of the view doesn't give its file's bytes (ai-evaluation.md).
+        call(&mut app, "set_records", r#"{"records":"start=/\\[/"}"#);
+        settle_app(&mut app, &ctx);
+        let page = call(&mut app, "filter", r#"{"query":"file == b.log"}"#);
+        assert_eq!(page.get("total").and_then(Value::as_u64), Some(2), "b.log as 2 records");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     /// An agent writes the sidecar while the tab has the file open
     /// (`nerka marks --add`): the tab takes its bookmarks in when the focus
     /// comes back, and a save of the tab's doesn't write over them.

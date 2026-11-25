@@ -246,6 +246,17 @@ morning". Each is a choice made while building; change any.
     Said in the server's instructions.
 14. **The 🔖 glyph** draws poorly on macOS (CI screenshot, owner
     2026-11-25): left as it is for now.
+15. **From the evaluation (`ai-evaluation.md`), built the same night:**
+    an argument a tool doesn't take is an error naming the ones it takes;
+    a one-file tab names its file once per answer (several files: their
+    names, the paths once), and null time / level are left out; `summary`
+    and `open --json` give **hints** (a Go goroutine dump or Java traces
+    read best as records; entries spanning lines read as records starting
+    at a date; a log without times); **`set_records`**, an 18th tool,
+    reads a tab as records (undoable, for the session only, not saved as
+    the user's choice); records give `first_line`; `patterns`' queries are
+    off by default; the CLI takes grep's `-n` and warns when Git Bash has
+    turned `/…/` into a path; the top bar's file text is cut short.
 
 ## Settled (owner, 2026-11-24)
 
