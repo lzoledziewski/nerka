@@ -98,6 +98,7 @@ The agent's tools:
 | `bookmarks`, `signals`, `signal`, `lifecycles` | your bookmarks; the tab's signals and a signal's values; its lifecycles |
 | `show` | goes to a line in your window |
 | `set_filter`, `set_search` | puts a query in the Filter or Search box |
+| `set_records` | reads the tab as records (a stack of a dump, an entry over several lines each), as **Records…** does; `summary` hints when that helps |
 | `bookmark` | bookmarks a line with a note: an annotation (🤖) you accept or not |
 | `plot` | plots signals of the tab |
 | `screenshot` | a picture of the window or the plot, for the agent to look at |
