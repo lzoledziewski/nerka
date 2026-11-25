@@ -216,23 +216,13 @@ pub struct View<'a> {
 }
 
 /// Where record `row` of a source read as records starts in its file
-/// (line from 1); `None` for other sources (and files over 256 MiB).
+/// (line from 1), through views of several files; `None` when a row is a line.
 pub fn record_first_line(source: &dyn LogSource, row: LineNo) -> Option<u64> {
-    // A view of several files (or sorted by time): ask the file the row is
-    // in (a tab of two files had no first_line).
+    // Sorted by time: the row's line in the files, then where it starts.
     if let Some(r) = source.reordered() {
         return record_first_line(r.inner, *r.line_of.get(row as usize)?);
     }
-    if let Some(parts) = source.parts() {
-        let p = parts.iter().rev().find(|p| p.first <= row)?;
-        return record_first_line(p.source.as_ref(), row - p.first);
-    }
-    if !source.format().starts_with("text records") {
-        return None;
-    }
-    let data = source.contiguous().filter(|d| d.len() <= 256 << 20)?;
-    let off = (source.line_start(row) as usize).min(data.len());
-    Some(memchr::memchr_iter(b'\n', &data[..off]).count() as u64 + 1)
+    source.file_line(row).map(|l| l + 1)
 }
 
 impl View<'_> {

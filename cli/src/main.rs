@@ -359,13 +359,16 @@ enum Cmd {
         #[arg(long, value_name = "LINE", conflicts_with = "add")]
         remove: Option<u64>,
     },
-    /// Print a 1-based inclusive range of lines.
+    /// Print a 1-based inclusive range of lines, each with its number.
     Lines {
         file: PathBuf,
         /// The first line (1-based).
         from: u64,
         /// The last line (included).
         to: u64,
+        /// Do not prefix lines with their number.
+        #[arg(short = 'N', long)]
+        no_line_numbers: bool,
         #[command(flatten)]
         json: JsonArgs,
     },
@@ -2041,7 +2044,7 @@ fn run() -> Result<()> {
                 return Err(status1(format!("{found} finding{}", if found == 1 { "" } else { "s" })));
             }
         }
-        Cmd::Lines { file, from, to, json } => {
+        Cmd::Lines { file, from, to, no_line_numbers, json } => {
             if from > to {
                 anyhow::bail!("lines {from} to {to}: the first line is after the last");
             }
@@ -2053,6 +2056,10 @@ fn run() -> Result<()> {
                 if json.json {
                     writeln!(out, "{}", agent::line(&*f, l - 1, &name, l - 1, &fields))?;
                 } else {
+                    // Numbered as filter numbers them (owner, 2026-11-25).
+                    if !no_line_numbers {
+                        write!(out, "{l}:")?;
+                    }
                     out.write_all(&f.line_bytes(l - 1).unwrap_or_default())?;
                     out.write_all(b"\n")?;
                 }

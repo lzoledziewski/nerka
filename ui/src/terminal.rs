@@ -10,6 +10,11 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+/// AI clients to pick in Settings → AI command (owner, 2026-11-25: a list
+/// and Custom): their name and command. Each speaks MCP, so it can work on
+/// the window.
+pub const PRESETS: &[(&str, &str)] = &[("Claude Code", "claude"), ("Codex", "codex"), ("Gemini CLI", "gemini")];
+
 /// The command line the terminal runs: `NERKA_WINDOW` set, then `command`
 /// (with `--mcp-config` for Claude Code when `mcp_config` is given).
 pub fn inner_command(command: &str, pid: u32, mcp_config: Option<&Path>, windows: bool) -> String {

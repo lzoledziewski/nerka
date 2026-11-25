@@ -655,6 +655,14 @@ pub trait LogSource: Send + Sync {
         })
     }
 
+    /// The line of its file `line` starts on (from 0) when a row isn't a
+    /// line of the file (a record of several lines); `None`: the row is the
+    /// file's line of that number (`docs/dev/ai.md`: an agent bookmarks the
+    /// file's line, not the record's number).
+    fn file_line(&self, _line: LineNo) -> Option<LineNo> {
+        None
+    }
+
     /// The line's cells for a detailed view of one line: one per
     /// [`Self::columns`] entry (plain text: the whole line as one cell).
     /// Unlike [`Self::line_text`], which flattens a decoded message's own

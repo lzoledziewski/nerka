@@ -120,6 +120,9 @@ pub struct RecordFile {
     /// JSON records: the fields their keys give.
     json: Option<JsonFields>,
     data_id: usize,
+    /// Each record's first line in the file (from 0), counted once when
+    /// first asked ([`LogSource::file_line`]).
+    file_lines: std::sync::OnceLock<Vec<LineNo>>,
 }
 
 /// The fields of JSON records: every key path with a value in any record
@@ -390,7 +393,17 @@ impl RecordFile {
         let name = path.display().to_string();
         let json = (how == RecordSplit::Json).then(|| JsonFields::of(data.bytes(), &starts, &ends));
         let path = Some(path.to_path_buf());
-        Ok(Self { name, path, data, starts, ends, split: how, json, data_id: new_data_id() })
+        Ok(Self {
+            name,
+            path,
+            data,
+            starts,
+            ends,
+            split: how,
+            json,
+            data_id: new_data_id(),
+            file_lines: Default::default(),
+        })
     }
 
     /// In-memory text, handy for tests.
@@ -406,6 +419,7 @@ impl RecordFile {
             split: how,
             json,
             data_id: new_data_id(),
+            file_lines: Default::default(),
         }
     }
 
@@ -427,6 +441,22 @@ impl RecordFile {
 impl LogSource for RecordFile {
     fn data_id(&self) -> usize {
         self.data_id
+    }
+
+    fn file_line(&self, line: LineNo) -> Option<LineNo> {
+        let lines = self.file_lines.get_or_init(|| {
+            // One pass: the line breaks before each record's start.
+            let buf = self.data.bytes();
+            let (mut out, mut at, mut n) = (Vec::with_capacity(self.starts.len()), 0usize, 0u64);
+            for &s in &self.starts {
+                let s = (s as usize).min(buf.len());
+                n += memchr::memchr_iter(b'\n', &buf[at..s]).count() as u64;
+                at = s;
+                out.push(n);
+            }
+            out
+        });
+        lines.get(line as usize).copied()
     }
 
     fn schema(&self) -> &[FieldDef] {

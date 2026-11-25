@@ -3649,14 +3649,31 @@ fn settings_ui(ui: &mut egui::Ui, f: SettingsFields<'_>) -> SettingsChange {
         ui.label(RichText::new("AI agents").strong());
         ui.end_row();
         ui.label("AI command");
-        let r = ui
-            .add(egui::TextEdit::singleline(ai_command).hint_text("claude").desired_width(200.0))
-            .on_hover_text(
-                "What 🤖 AI opens a terminal with, in the active file's folder (claude, codex, gemini, …). It gets \
-                 NERKA_WINDOW, so `nerka mcp` works on this window; Claude Code gets it at once, others need \
-                 `nerka mcp --install codex` (or gemini) once.",
-            );
-        save.theme |= r.changed();
+        ui.horizontal(|ui| {
+            // A client to pick (owner, 2026-11-25), or Custom: the command line
+            // below is what runs, either way.
+            let picked = terminal::PRESETS.iter().find(|(_, cmd)| ai_command.trim() == *cmd).map(|(name, _)| *name);
+            egui::ComboBox::from_id_salt("ai-command").selected_text(picked.unwrap_or("Custom")).show_ui(ui, |ui| {
+                for (name, cmd) in terminal::PRESETS {
+                    if ui.selectable_label(picked == Some(*name), format!("{name}  ({cmd})")).clicked() {
+                        *ai_command = (*cmd).to_owned();
+                        save.theme = true;
+                    }
+                }
+                if ui.selectable_label(picked.is_none(), "Custom…").clicked() && picked.is_some() {
+                    ai_command.clear();
+                    save.theme = true;
+                }
+            });
+            let r = ui
+                .add(egui::TextEdit::singleline(ai_command).hint_text("command line").desired_width(160.0))
+                .on_hover_text(
+                    "What 🤖 AI opens a terminal with, in the active file's folder. It gets NERKA_WINDOW, so \
+                     `nerka mcp` works on this window; Claude Code gets it at once, others need `nerka mcp \
+                     --install codex` (or gemini) once. Flags can follow the command.",
+                );
+            save.theme |= r.changed();
+        });
         ui.end_row();
         ui.label(RichText::new("This window").strong());
         ui.end_row();
@@ -8134,12 +8151,14 @@ gear=D
         assert_eq!(lines.len(), 3, "a.log's 3 lines, not on into b.log");
         assert_eq!(lines[0].get("file").and_then(Value::as_str), Some("a.log"));
         assert_eq!(page.get("files").unwrap().as_array().unwrap().len(), 2);
-        // Records in a tab of several files. first_line isn't there yet: a
-        // part of the view doesn't give its file's bytes (ai-evaluation.md).
+        // Records in a tab of several files: each says where it starts in its
+        // own file (LogSource::file_line, through the view's parts).
         call(&mut app, "set_records", r#"{"records":"start=/\\[/"}"#);
         settle_app(&mut app, &ctx);
         let page = call(&mut app, "filter", r#"{"query":"file == b.log"}"#);
-        assert_eq!(page.get("total").and_then(Value::as_u64), Some(2), "b.log as 2 records");
+        let lines = page.get("lines").unwrap().as_array().unwrap();
+        let firsts: Vec<Option<u64>> = lines.iter().map(|l| l.get("first_line").and_then(Value::as_u64)).collect();
+        assert_eq!(firsts, [Some(1), Some(4)], "b.log's records start at its lines 1 and 4: {page}");
         std::fs::remove_dir_all(&dir).ok();
     }
 

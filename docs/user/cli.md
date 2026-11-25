@@ -24,7 +24,7 @@ files.
 | `help [TOPIC]` | the commands, a command's options, `nfd` (the query language), `fields FILE…`, `agent` (how to analyse with nerka, for [AI agents](agents.md)) or `skill` (the same as a `SKILL.md`) |
 | `filter QUERY FILE…` | print the lines an [NFD query](queries.md) keeps |
 | `search PATTERN FILE…` | print the lines a regex matches, like `grep -n` |
-| `lines FILE FROM TO` | print a range of lines (1-based, inclusive) |
+| `lines FILE FROM TO` | print a range of lines (1-based, inclusive), each with its number (`-N`: without) |
 | `marks FILE` | list the bookmarks saved for a file; `--add LINE --note TEXT` adds one (an [agent's](agents.md) finding), `--remove LINE` removes one |
 | `expand` | turn [Library](library.md) picks into plain NFD |
 | `packs` | list the loaded packs and their queries |
