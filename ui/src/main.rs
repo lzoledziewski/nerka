@@ -31,6 +31,7 @@
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod agent;
 mod bundles;
 mod checks;
 mod compare;
@@ -53,6 +54,7 @@ mod shot;
 mod signals;
 mod skips;
 mod sync;
+mod terminal;
 mod tuning;
 mod view;
 
@@ -3443,6 +3445,8 @@ struct App {
     option_errors: Vec<String>,
     /// `--screenshot PATH`: waiting to save the window.
     shoot: Option<Shoot>,
+    /// What agents asked of this window and changed in it (`nerka mcp`).
+    agent: agent::AgentState,
     focus_search: bool,
     window_title: String,
     /// Query packs (search manager) and where they come from besides the
@@ -3588,11 +3592,12 @@ struct SettingsFields<'a> {
     local_time: &'a mut bool,
     mf4_local_time: &'a mut bool,
     pattern_tuning: &'a mut bool,
+    ai_command: &'a mut String,
 }
 
 /// The Settings window's fields ([`SettingsFields`]).
 fn settings_ui(ui: &mut egui::Ui, f: SettingsFields<'_>) -> SettingsChange {
-    let SettingsFields { name, theme, limit, local_time, mf4_local_time, pattern_tuning } = f;
+    let SettingsFields { name, theme, limit, local_time, mf4_local_time, pattern_tuning, ai_command } = f;
     let mut save = SettingsChange::default();
     egui::Grid::new("settings-grid").num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| {
         ui.label(RichText::new("Look").strong());
@@ -3639,6 +3644,18 @@ fn settings_ui(ui: &mut egui::Ui, f: SettingsFields<'_>) -> SettingsChange {
             .add_enabled(!alpha, egui::Checkbox::new(pattern_tuning, "Pattern tuning"))
             .on_hover_text("🛠 Tuning in the Patterns window: the pattern configuration tried on the trace at hand")
             .on_disabled_hover_text("Always shown in alpha builds");
+        save.theme |= r.changed();
+        ui.end_row();
+        ui.label(RichText::new("AI agents").strong());
+        ui.end_row();
+        ui.label("AI command");
+        let r = ui
+            .add(egui::TextEdit::singleline(ai_command).hint_text("claude").desired_width(200.0))
+            .on_hover_text(
+                "What 🤖 AI opens a terminal with, in the active file's folder (claude, codex, gemini, …). It gets \
+                 NERKA_WINDOW, so `nerka mcp` works on this window; Claude Code gets it at once, others need \
+                 `nerka mcp --install codex` (or gemini) once.",
+            );
         save.theme |= r.changed();
         ui.end_row();
         ui.label(RichText::new("This window").strong());
@@ -4397,6 +4414,7 @@ impl App {
                         local_time: &mut self.prefs.local_time,
                         mf4_local_time: &mut self.prefs.mf4_local_time,
                         pattern_tuning: &mut self.prefs.pattern_tuning,
+                        ai_command: &mut self.prefs.ai_command,
                     },
                 );
                 ui.separator();
@@ -4893,6 +4911,11 @@ impl App {
             match r {
                 instance::Request::Open(files) => self.open_files(ctx, files),
                 instance::Request::Move { files, preset } => self.take_tab(ctx, files, &preset),
+                // An agent works on the window as it is: no focus taken.
+                instance::Request::Agent(call) => {
+                    self.agent_call(ctx, call);
+                    continue;
+                }
             }
             ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
             ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
@@ -5648,6 +5671,7 @@ impl App {
         self.poll_instance(&ctx);
         self.poll_jobs(&ctx);
         self.shoot_step(&ctx);
+        self.agent_frame(&ctx);
         for t in &mut self.tabs {
             t.notes = self.prefs.bookmark_notes;
             t.columns.note_column(t.notes == NoteMode::Column);
@@ -5714,6 +5738,31 @@ impl App {
                      b / Shift+B jump to the next / previous one. Saved next to the log as <file>.nerka-marks. \
                      🤖: an agent's annotations (nerka marks --add), yours once accepted in the panel.",
                 );
+                // The user's AI in a terminal, on this window (nerka mcp).
+                let ai = ui.button(format!("{} AI", view::ANNOTATION_GLYPH)).on_hover_text(format!(
+                    "Open a terminal running your AI ({}; Settings → AI command) in the active file's folder, \
+                     working on this window through nerka mcp: it reads what you have open, bookmarks its \
+                     findings and can set the filter or plot, each change listed in 🤖 Agent",
+                    if self.prefs.ai_command.trim().is_empty() { "none set" } else { self.prefs.ai_command.trim() }
+                ));
+                if ai.clicked() {
+                    let dir = self
+                        .tabs
+                        .get(self.active)
+                        .and_then(|t| t.path.parent().map(Path::to_path_buf))
+                        .or_else(|| std::env::current_dir().ok())
+                        .unwrap_or_default();
+                    self.status = match terminal::open(&dir, &self.prefs.ai_command) {
+                        Ok(()) => format!("Opened a terminal with {} for this window", self.prefs.ai_command.trim()),
+                        Err(e) => e,
+                    };
+                }
+                // What an agent changed here (nerka mcp), once one has.
+                if !self.agent.log.is_empty() {
+                    let n = self.agent.log.iter().filter(|a| !a.undone).count();
+                    ui.toggle_value(&mut self.agent.open, format!("{} Agent ({n})", view::ANNOTATION_GLYPH))
+                        .on_hover_text("What an agent changed in this window (filter, search, bookmarks, plot), each with ↶ Undo");
+                }
                 let queries: usize = self.library.packs().iter().map(|p| p.queries.len()).sum();
                 let signals = self.tabs.get(self.active).map_or(0, |t| t.signals.len());
                 ui.toggle_value(&mut self.show_signals, format!("📈 Signals ({signals})")).on_hover_text(
@@ -7984,6 +8033,55 @@ gear=D
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// An agent's calls on the window (`nerka mcp`): reading tools answer
+    /// from a thread, changes show in the tab, are listed and undone.
+    #[test]
+    fn an_agent_reads_and_changes_the_window() {
+        use nerka_core::json::Value;
+        let dir = std::env::temp_dir().join(format!("nerka-gui-agent-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("app.log");
+        std::fs::write(&log, "[INFO] one\n[ERROR] two\n[INFO] three\n[ERROR] four\n[INFO] five\n").unwrap();
+        let ctx = egui::Context::default();
+        let mut app = App::default();
+        app.open_files(&ctx, vec![log.clone()]);
+        settle_app(&mut app, &ctx);
+        let call = |app: &mut App, tool: &str, args: &str| -> Result<Value, String> {
+            let (tx, rx) = std::sync::mpsc::channel();
+            let args = nerka_core::json::parse(args).unwrap();
+            app.agent_call(&ctx, instance::AgentCall { tool: tool.into(), args, reply: tx });
+            rx.recv_timeout(Duration::from_secs(10)).expect("an answer")
+        };
+        let w = call(&mut app, "window", "{}").unwrap();
+        let tab = &w.get("tabs").unwrap().as_array().unwrap()[0];
+        assert_eq!(tab.get("lines").and_then(Value::as_u64), Some(5));
+        let n = call(&mut app, "count", r#"{"query":"level >= ERROR"}"#).unwrap();
+        assert_eq!(n.get("count").and_then(Value::as_u64), Some(2));
+        let page = call(&mut app, "filter", r#"{"query":"level >= ERROR","max":1}"#).unwrap();
+        assert_eq!(page.get("more").and_then(Value::as_u64), Some(1));
+        let e = call(&mut app, "count", r#"{"query":"lvl >= ERROR"}"#).unwrap_err();
+        assert!(e.contains("unknown field 'lvl'"), "{e}");
+        assert!(call(&mut app, "nope", "{}").unwrap_err().contains("no tool 'nope'"));
+        // Changes: the filter, a bookmark; listed, undone.
+        call(&mut app, "set_filter", r#"{"query":"level >= ERROR"}"#).unwrap();
+        settle_app(&mut app, &ctx);
+        assert_eq!(app.tabs[0].result().unwrap().lines, [1, 3]);
+        let n = call(&mut app, "count", r#"{"in_view":true}"#).unwrap();
+        assert_eq!(n.get("count").and_then(Value::as_u64), Some(2));
+        let b = call(&mut app, "bookmark", r#"{"line":4,"note":"the second error"}"#).unwrap();
+        assert_eq!(b.get("author").and_then(Value::as_str), Some("ai"));
+        assert!(app.tabs[0].bookmarks.is_annotation(3));
+        assert!(call(&mut app, "bookmark", r#"{"line":9,"note":"x"}"#).unwrap_err().contains("lines 1 to 5"));
+        assert_eq!(app.agent.log.len(), 2);
+        app.agent_undo(&ctx, 1);
+        assert!(!app.tabs[0].bookmarks.contains(3), "the bookmark undone");
+        app.agent_undo(&ctx, 0);
+        settle_app(&mut app, &ctx);
+        assert_eq!(app.tabs[0].pattern, "", "the filter undone");
+        assert!(app.agent.log.iter().all(|a| a.undone));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     /// An agent writes the sidecar while the tab has the file open
     /// (`nerka marks --add`): the tab takes its bookmarks in when the focus
     /// comes back, and a save of the tab's doesn't write over them.
@@ -8343,6 +8441,7 @@ gear=D
                             local_time: &mut true,
                             mf4_local_time: &mut true,
                             pattern_tuning: &mut false,
+                            ai_command: &mut String::new(),
                         };
                         settings_ui(ui, fields);
                         let change = protocols::settings_section(ui, edit, &prefs, &[]);

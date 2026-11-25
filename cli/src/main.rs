@@ -36,6 +36,8 @@ use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
+mod mcp;
+
 #[derive(Parser)]
 #[command(
     name = "nerka",
@@ -155,6 +157,22 @@ enum Cmd {
         /// time, lines per level, how each file was read, notes.
         #[arg(long)]
         json: bool,
+    },
+    /// An MCP server (stdio) for an AI agent of your choice: its tools work
+    /// on the files open in a nerka window, and change what you see there
+    /// (docs/user/agents.md).
+    Mcp {
+        /// The window's process id (default: NERKA_WINDOW, else the window
+        /// focused last).
+        #[arg(long, value_name = "PID")]
+        window: Option<u32>,
+        /// Print the MCP configuration (JSON) to put in a client's settings.
+        #[arg(long, conflicts_with = "install")]
+        config: bool,
+        /// Register `nerka mcp` with an AI client by running its own `mcp
+        /// add`: claude, codex or gemini.
+        #[arg(long, value_name = "CLIENT")]
+        install: Option<String>,
     },
     /// Help: the commands, `help COMMAND`, `help nfd` (the query language),
     /// `help fields FILE…` (the fields queries can use on those files),
@@ -725,20 +743,7 @@ fn view_marks(paths: &[PathBuf], f: &dyn LogSource) -> std::io::Result<Bookmarks
     Bookmarks::load_for_parts(&files)
 }
 
-/// Each row of a view: its file (index into the view's paths) and its
-/// line there, merged by time or not.
-fn locator(f: &dyn LogSource) -> impl Fn(LineNo) -> (usize, LineNo) + '_ {
-    let (inner, line_of) = match f.reordered() {
-        Some(r) => (r.inner, Some(r.line_of)),
-        None => (f, None),
-    };
-    let starts: Vec<LineNo> = inner.part_files().iter().map(|&(first, _)| first).collect();
-    move |row| {
-        let l = line_of.map_or(row, |m| m[row as usize]);
-        let k = starts.partition_point(|&s| s <= l).saturating_sub(1);
-        (k, l - starts[k])
-    }
-}
+use agent::locator;
 
 /// Lines as `filter`, `search` print them: `-m` and `--skip` applied, as
 /// text (`LINE:` or `FILE:LINE:` prefixes, as grep prints them) or JSON
@@ -1356,50 +1361,17 @@ fn compare(
     };
     let shown = if top == 0 { diffs.len() } else { top.min(diffs.len()) };
     if json {
-        let side_json = |side: usize| {
-            let v = view(side);
+        let names = [views[0].names(), view(1).names()];
+        let av = agent::View { source: &*view(0).source, files: &names[0] };
+        let bv = agent::View { source: &*view(1).source, files: &names[1] };
+        let side = |k: usize| {
             Value::object([
-                ("file", Value::from(v.paths.first().map(|p| p.display().to_string()))),
-                ("filter", filters[side].clone().into()),
-                ("lines", ps.lines[side].into()),
+                ("file", Value::from(view(k).paths.first().map(|p| p.display().to_string()))),
+                ("filter", filters[k].clone().into()),
+                ("lines", ps.lines[k].into()),
             ])
         };
-        let mut list = Vec::new();
-        for d in &diffs[..shown] {
-            let p = &ps.patterns[d.pattern];
-            let side = match d.change() {
-                pattern::Change::New => 1,
-                pattern::Change::Gone => 0,
-                pattern::Change::Changed => usize::from(d.ratio() >= 1.0),
-            };
-            let change = match d.change() {
-                pattern::Change::New => "new",
-                pattern::Change::Gone => "gone",
-                pattern::Change::Changed => "changed",
-            };
-            let mut v = Value::new_object();
-            v.push("change", change).push("score", d.score).push("a", d.counts[0]).push("b", d.counts[1]);
-            if change == "changed" {
-                v.push("ratio", d.ratio());
-            }
-            let sides = match d.value {
-                None => &p.sides,
-                Some((s, k)) => &p.slots().nth(s).expect("a slot").values[k].sides,
-            };
-            let at = place_json(view(side), sides[side].first);
-            v.push("first", at.clone()).push("side", ["a", "b"][side]);
-            v.push("fields", Value::object(p.fields.iter().map(|(n, x)| (n.to_string(), Value::from(x.to_string())))));
-            v.push("template", p.template());
-            if let Some((s, k)) = d.value {
-                v.push("slot", s + 1).push("value", p.slots().nth(s).expect("a slot").values[k].value().to_string());
-            }
-            if queries {
-                v.push("query", ps.query(p));
-            }
-            list.push(v);
-        }
-        let mut v = Value::object([("a", side_json(0)), ("b", side_json(1))]);
-        v.push("min_score", min_score).push("differences", Value::Array(list)).push("more", diffs.len() - shown);
+        let v = agent::compare(&ps, &diffs, [&av, &bv], [side(0), side(1)], min_score, top, queries);
         writeln!(out, "{v}")?;
         if stats {
             out.flush()?;
@@ -1470,11 +1442,11 @@ fn compare(
     Ok(())
 }
 
-/// Where a line of a view is, as JSON: `{"file", "line"}` (from 1, in
-/// its own file).
-fn place_json(view: &Opened, row: LineNo) -> Value {
-    let (k, line) = locator(&*view.source)(row);
-    Value::object([("file", Value::from(view.paths[k].display().to_string())), ("line", (line + 1).into())])
+impl Opened {
+    /// Its files' names, for [`agent::View`].
+    fn names(&self) -> Vec<String> {
+        self.paths.iter().map(|p| p.display().to_string()).collect()
+    }
 }
 
 /// One file, or several as one view (review 2026-11-09, R6: the console
@@ -1692,6 +1664,35 @@ fn run() -> Result<()> {
     let mut found = true;
     match cli.cmd {
         Cmd::Help { topic } => help(&topic, &mut out)?,
+        Cmd::Mcp { window, config, install } => {
+            let exe = std::env::current_exe().context("finding nerka's own path")?;
+            let exe = exe.display().to_string();
+            if config {
+                let server = Value::object([("command", Value::from(exe.as_str())), ("args", vec!["mcp"].into())]);
+                let v = Value::object([("mcpServers", Value::object([("nerka", server)]))]);
+                writeln!(out, "{v}")?;
+            } else if let Some(client) = install {
+                let args: Vec<&str> = match client.to_ascii_lowercase().as_str() {
+                    "claude" => vec!["mcp", "add", "--scope", "user", "nerka", "--", &exe, "mcp"],
+                    "codex" => vec!["mcp", "add", "nerka", "--", &exe, "mcp"],
+                    "gemini" => vec!["mcp", "add", "--scope", "user", "nerka", &exe, "mcp"],
+                    other => anyhow::bail!("--install {other}: claude, codex or gemini (others: nerka mcp --config)"),
+                };
+                let client = client.to_ascii_lowercase();
+                eprintln!("nerka: running {client} {}", args.join(" "));
+                let status = std::process::Command::new(&client)
+                    .args(&args)
+                    .status()
+                    .with_context(|| format!("{client} isn't on PATH; run it yourself: {client} {}", args.join(" ")))?;
+                if !status.success() {
+                    anyhow::bail!("{client} mcp add failed ({status})");
+                }
+            } else {
+                out.flush()?;
+                drop(out);
+                return mcp::serve(window);
+            }
+        }
         Cmd::Open { files, json: true } => {
             let view = open_silent(&files)?;
             let names: Vec<String> = view.paths.iter().map(|p| p.display().to_string()).collect();
@@ -1802,56 +1803,10 @@ fn run() -> Result<()> {
             let at = locator(f);
             let shown = if top == 0 { ps.patterns.len() } else { top.min(ps.patterns.len()) };
             if json {
-                let names: Vec<String> = view.paths.iter().map(|p| p.display().to_string()).collect();
-                let none = agent::Fields::default();
-                let mut list = Vec::new();
-                for p in &ps.patterns[..shown] {
-                    let mut v = Value::new_object();
-                    v.push("count", p.count())
-                        .push("share", p.count() as f64 / ps.total().max(1) as f64)
-                        .push("first", place_json(&view, p.first()))
-                        .push(
-                            "fields",
-                            Value::object(p.fields.iter().map(|(n, x)| (n.to_string(), Value::from(x.to_string())))),
-                        )
-                        .push("template", p.template())
-                        .push("unsorted", p.unsorted);
-                    if values {
-                        let slots = p.slots().enumerate().map(|(k, s)| {
-                            let vals = s.values.iter().map(|x| {
-                                Value::object([
-                                    ("value", Value::from(x.value().to_string())),
-                                    ("count", x.count().into()),
-                                    ("first", place_json(&view, x.first())),
-                                    ("last", place_json(&view, x.last())),
-                                ])
-                            });
-                            Value::object([
-                                ("slot", Value::from(k + 1)),
-                                ("kind", (if s.is_state() { "state" } else { "values" }).into()),
-                                ("overflow", s.overflow.into()),
-                                ("values", Value::Array(vals.collect())),
-                            ])
-                        });
-                        v.push("slots", Value::Array(slots.collect()));
-                    }
-                    if queries {
-                        v.push("query", ps.query(p));
-                    }
-                    if let Some(n) = show {
-                        let n = if n == 0 { usize::MAX } else { n };
-                        let lines = p.lines[0].iter().take(n).map(|&l| {
-                            let (k, line) = at(l);
-                            agent::line(f, l, &names[k], line, &none)
-                        });
-                        v.push("lines", Value::Array(lines.collect()));
-                        v.push("lines_more", p.lines[0].len().saturating_sub(n));
-                    }
-                    list.push(v);
-                }
-                let mut v = Value::object([("total", Value::from(ps.total()))]);
-                v.push("patterns", Value::Array(list)).push("more", ps.patterns.len() - shown);
-                writeln!(out, "{v}")?;
+                let names = view.names();
+                let v = agent::View { source: f, files: &names };
+                let detail = agent::PatternDetail { values, queries, lines: show };
+                writeln!(out, "{}", agent::patterns(&ps, &v, top, detail))?;
             }
             let place = |l: LineNo| {
                 if view.paths.len() > 1 {

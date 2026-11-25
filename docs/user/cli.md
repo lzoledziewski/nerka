@@ -20,6 +20,7 @@ files.
 | Command | Does |
 |---|---|
 | `open FILE…` | index the file(s) and print lines, size, throughput, fields, protocols and what was skipped |
+| `mcp` | an [MCP](agents.md#with-you-on-your-window-mcp) server for an AI agent, working on a nerka window's tabs; `--install CLIENT`, `--config`, `--window PID` |
 | `help [TOPIC]` | the commands, a command's options, `nfd` (the query language), `fields FILE…`, `agent` (how to analyse with nerka, for [AI agents](agents.md)) or `skill` (the same as a `SKILL.md`) |
 | `filter QUERY FILE…` | print the lines an [NFD query](queries.md) keeps |
 | `search PATTERN FILE…` | print the lines a regex matches, like `grep -n` |

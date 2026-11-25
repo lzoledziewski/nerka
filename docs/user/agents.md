@@ -1,13 +1,19 @@
 ---
 title: "AI agents"
-description: "Let an AI agent of your choice analyse logs and traces with the nerka command line: JSON output in pages, a guide it reads in one go, a skill file, and its findings left as bookmarks you see in nerka-gui."
+description: "Let an AI agent of your choice analyse logs and traces with nerka: on its own with the command line (JSON output in pages, a guide, a skill file), or with you on the files open in nerka-gui through MCP (nerka mcp), its findings left as annotations you accept."
 ---
 
 # AI agents
 
-An AI agent that can run commands (Claude Code, Codex, Gemini CLI, or any
-other) can analyse a log or trace with the `nerka` command line, as you
-would. nerka ships no model and needs no account: the agent is yours.
+nerka ships no model and needs no account: the agent is yours (Claude Code,
+Codex, Gemini CLI, or any other). It works with nerka in two ways:
+
+- **On its own, with the command line:** it runs `nerka` as you would, on
+  any file, and leaves its findings as bookmarks for you to look at later.
+- **With you, on your window ([MCP](#with-you-on-your-window-mcp)):** it
+  works on the files you have open in nerka-gui, sees your filter and
+  selection, and shows you what it found there: a bookmark, a filter, a
+  plot. Every change it makes is listed, and you can undo it.
 
 ## What the agent reads first
 
@@ -62,6 +68,44 @@ it shows as a box, and the violet still tells annotations apart.
 
 `nerka marks FILE` lists them all, `--remove LINE` removes one, and
 `--by NAME` says who made one (`--by ''`: yours).
+
+## With you, on your window (MCP)
+
+`nerka mcp` is an [MCP](https://modelcontextprotocol.io) server: an AI
+client starts it, and its tools work on a nerka window, the one you
+started the agent from, else the one you used last. It opens no files of
+its own: open the files in nerka-gui first.
+
+**🤖 AI** in the window's top bar opens a terminal (Windows Terminal or a
+console window, your desktop's terminal, Terminal on macOS) in the active
+file's folder, running your AI command (Settings → **AI command**,
+`claude` by default), set up to work on this window. Claude Code gets
+`nerka mcp` at once; other clients need it registered once:
+
+```
+nerka mcp --install codex        # or claude, gemini: runs the client's own `mcp add`
+nerka mcp --config               # the JSON to put in any other client's settings
+```
+
+The agent's tools:
+
+| Tool | What it does |
+|---|---|
+| `window` | your tabs: files, lines, your filter and search, how many lines the filter shows, bookmarks, plotted signals, the selected line |
+| `summary`, `help` | what a tab's files are (format, fields, time span, levels, what was skipped); the query language and the tab's fields and signals |
+| `count`, `filter`, `lines` | lines by an NFD query, in pages, also only among the lines your filter shows (`in_view`) and around matches by time; a range or the lines around one |
+| `patterns`, `compare` | message patterns (the rarest first), and what differs between two sets of lines |
+| `bookmarks`, `signals`, `signal`, `lifecycles` | your bookmarks; the tab's signals and a signal's values; its lifecycles |
+| `show` | goes to a line in your window |
+| `set_filter`, `set_search` | puts a query in the Filter or Search box |
+| `bookmark` | bookmarks a line with a note: an annotation (🤖) you accept or not |
+| `plot` | plots signals of the tab |
+| `screenshot` | a picture of the window or the plot, for the agent to look at |
+
+What the agent changed is listed in **🤖 Agent** in the top bar (it shows
+once the agent has changed something), newest first, each with **↶
+Undo**; the status bar says each change as it happens. Its bookmarks are
+annotations, as above.
 
 ## Pictures
 

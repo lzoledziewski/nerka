@@ -52,6 +52,8 @@ pub struct SearchPrefs {
     /// The Patterns window's tuning pane in a release build (alpha builds
     /// always show it; owner, 2026-11-23).
     pub pattern_tuning: bool,
+    /// What 🤖 AI terminal runs (`claude`, `codex`, `gemini`, …).
+    pub ai_command: String,
     /// Light, dark, or as the system says (egui falls back to dark where
     /// it can't tell, as on many Linux desktops).
     pub theme: egui::ThemePreference,
@@ -87,6 +89,7 @@ impl Default for SearchPrefs {
             plot_window: false,
             plot_window_maximized: false,
             pattern_tuning: false,
+            ai_command: "claude".into(),
             theme: egui::ThemePreference::System,
             routes: Vec::new(),
             disabled_protocols: Vec::new(),
@@ -108,6 +111,10 @@ impl SearchPrefs {
                 }
                 "disabled_protocols" => {
                     p.disabled_protocols = value.split_whitespace().map(str::to_owned).collect();
+                    continue;
+                }
+                "ai_command" => {
+                    p.ai_command = value.trim().to_owned();
                     continue;
                 }
                 _ => {}
@@ -201,6 +208,7 @@ impl SearchPrefs {
         out.push_str(&format!("plot_window_maximized={}\n", self.plot_window_maximized));
         out.push_str(&format!("theme={}\n", theme_key(self.theme)));
         out.push_str(&format!("pattern_tuning={}\n", self.pattern_tuning));
+        out.push_str(&format!("ai_command={}\n", self.ai_command.replace(['\n', '\r'], " ")));
         for r in &self.routes {
             out.push_str(&format!("route={r}\n"));
         }
@@ -298,6 +306,7 @@ mod tests {
             plot_window: true,
             plot_window_maximized: true,
             pattern_tuning: true,
+            ai_command: "codex --full-auto".into(),
             theme: egui::ThemePreference::Light,
             routes: vec!["DLT:port=3490,vlan=5".into()],
             disabled_protocols: vec!["syslog".into()],

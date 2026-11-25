@@ -17,6 +17,13 @@
 //! once) and has [`REQUEST_TIME`] for its whole request, so a client that
 //! connects and sends nothing, or a byte at a time, can't hold up the next
 //! hand-off (review 2026-11-07 R17).
+//!
+//! **Agents** (`nerka mcp`, `docs/dev/ai.md` workflow B): after the token,
+//! the line `agent` keeps the connection open; the client sends a JSON call
+//! a line, `{"id": …, "tool": "count", "args": {…}}`, and the window
+//! answers each with a line `{"id": …, "result": …}` or `{"id": …,
+//! "error": "…"}`, in order. Only the hello has a deadline then: a call may
+//! take as long as its work ([`AGENT_TIME`] at most).
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream};
@@ -25,16 +32,20 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant, SystemTime};
 
-const MAGIC: &str = "nerka1";
+/// The hello of every connection (`nerka_core::link` speaks it too).
+const MAGIC: &str = nerka_core::link::MAGIC;
 /// Bytes a request may have at most.
 const MAX_REQUEST: u64 = 1 << 20;
 /// Time a request may take from connecting to `end`, however it trickles in.
 const REQUEST_TIME: Duration = Duration::from_secs(2);
 /// Connections served at once; more are closed at once.
 const MAX_SERVING: usize = 8;
+/// The longest an agent's call may take before the window is said not to
+/// answer.
+const AGENT_TIME: Duration = nerka_core::link::AGENT_TIME;
 
 fn dir() -> Option<PathBuf> {
-    nerka_core::config_dir().map(|d| d.join("instances"))
+    nerka_core::link::instances_dir()
 }
 
 /// A token that other users' processes can't guess (they can't read the
@@ -52,8 +63,8 @@ fn new_token() -> String {
     out
 }
 
-/// What another `nerka-gui` asked this window for.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// What another `nerka-gui` (or an agent) asked this window for.
+#[derive(Debug, Clone, PartialEq)]
 pub enum Request {
     Open(Vec<PathBuf>),
     /// A tab moved here: its files, and a preset file with its filter,
@@ -62,6 +73,23 @@ pub enum Request {
         files: Vec<PathBuf>,
         preset: PathBuf,
     },
+    /// An agent's call (`nerka mcp`).
+    Agent(AgentCall),
+}
+
+/// A tool an agent calls on this window, and where its answer goes: the
+/// result, or why there is none.
+#[derive(Debug, Clone)]
+pub struct AgentCall {
+    pub tool: String,
+    pub args: nerka_core::json::Value,
+    pub reply: mpsc::Sender<Result<nerka_core::json::Value, String>>,
+}
+
+impl PartialEq for AgentCall {
+    fn eq(&self, other: &Self) -> bool {
+        (&self.tool, &self.args) == (&other.tool, &other.args)
+    }
 }
 
 /// This window's listener and registration.
@@ -183,65 +211,137 @@ fn listen(listener: TcpListener, token: String, tx: mpsc::Sender<Request>, wake:
         }
         let (tx, token, wake, serving) = (tx.clone(), token.clone(), wake.clone(), serving.clone());
         std::thread::spawn(move || {
-            if let Some(req) = serve_one(stream, &token)
-                && tx.send(req).is_ok()
-            {
-                wake();
-            }
+            let deliver = |req: Request| {
+                if tx.send(req).is_ok() {
+                    wake();
+                }
+            };
+            serve(stream, &token, Instant::now() + REQUEST_TIME, &deliver);
             serving.fetch_sub(1, Ordering::SeqCst);
         });
     }
 }
 
-/// A stream that may be read until a deadline: each read waits at most the
-/// time left, then reads fail.
+/// A stream that may be read until a deadline (none: as long as it
+/// takes): each read waits at most the time left, then reads fail.
 struct Until {
     stream: TcpStream,
-    deadline: Instant,
+    deadline: Option<Instant>,
 }
 
 impl Read for Until {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        let left = self.deadline.saturating_duration_since(Instant::now());
-        if left.is_zero() {
+        let left = self.deadline.map(|d| d.saturating_duration_since(Instant::now()));
+        if left.is_some_and(|l| l.is_zero()) {
             return Err(std::io::ErrorKind::TimedOut.into());
         }
-        self.stream.set_read_timeout(Some(left))?;
+        self.stream.set_read_timeout(left)?;
         self.stream.read(buf)
     }
 }
 
+/// A line of at most [`MAX_REQUEST`] bytes, without its line end; `None`
+/// at the end of the stream, on an error, or for a longer line.
+fn read_line(r: &mut BufReader<Until>) -> Option<String> {
+    let mut buf = Vec::new();
+    let n = r.by_ref().take(MAX_REQUEST).read_until(b'\n', &mut buf).ok()?;
+    if n == 0 || (buf.last() != Some(&b'\n') && n as u64 >= MAX_REQUEST) {
+        return None;
+    }
+    while matches!(buf.last(), Some(b'\n' | b'\r')) {
+        buf.pop();
+    }
+    String::from_utf8(buf).ok()
+}
+
+#[cfg(test)]
 fn serve_one(stream: TcpStream, token: &str) -> Option<Request> {
     serve_until(stream, token, Instant::now() + REQUEST_TIME)
 }
 
+/// The one request a hand-off connection makes (tests).
+#[cfg(test)]
 fn serve_until(stream: TcpStream, token: &str, deadline: Instant) -> Option<Request> {
-    let mut out = stream.try_clone().ok()?;
-    let mut lines = BufReader::new(Until { stream, deadline }.take(MAX_REQUEST)).lines();
-    let hello = lines.next()?.ok()?;
-    let (magic, got) = hello.split_once(' ')?;
+    let got = std::cell::RefCell::new(None);
+    serve(stream, token, deadline, &|r| *got.borrow_mut() = Some(r));
+    got.into_inner()
+}
+
+/// Serve one connection: a hand-off (`open` / `preset` lines, `end`) gives
+/// one request; an agent's (`agent`) a request per call, each answered on
+/// the connection once the window has answered it.
+fn serve(stream: TcpStream, token: &str, deadline: Instant, deliver: &dyn Fn(Request)) {
+    let Ok(mut out) = stream.try_clone() else { return };
+    let mut r = BufReader::new(Until { stream, deadline: Some(deadline) });
+    let Some(hello) = read_line(&mut r) else { return };
+    let Some((magic, got)) = hello.split_once(' ') else { return };
     // Compare without stopping at the first difference.
     let same = got.len() == token.len() && got.bytes().zip(token.bytes()).fold(0u8, |a, (x, y)| a | (x ^ y)) == 0;
     if magic != MAGIC || !same {
-        return None;
+        return;
     }
     let (mut files, mut preset) = (Vec::new(), None);
-    for line in lines {
-        let line = line.ok()?;
+    while let Some(line) = read_line(&mut r) {
         match line.split_once('\t') {
             Some(("open", path)) if !path.is_empty() => files.push(PathBuf::from(path)),
             Some(("preset", path)) if !path.is_empty() && preset.is_none() => preset = Some(PathBuf::from(path)),
+            _ if line == "agent" && files.is_empty() && preset.is_none() => {
+                r.get_mut().deadline = None;
+                if out.write_all(b"ok\n").is_ok() {
+                    serve_agent(&mut r, &mut out, deliver);
+                }
+                return;
+            }
             _ if line == "end" => {
                 let _ = out.write_all(b"ok\n");
-                return Some(match preset {
+                deliver(match preset {
                     Some(preset) => Request::Move { files, preset },
                     None => Request::Open(files),
                 });
+                return;
             }
-            _ => return None,
+            _ => return,
         }
     }
-    None
+}
+
+/// An agent's calls, one a line, each answered before the next is read.
+fn serve_agent(r: &mut BufReader<Until>, out: &mut TcpStream, deliver: &dyn Fn(Request)) {
+    use nerka_core::json::{self, Value};
+    while let Some(line) = read_line(r) {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let (id, answer) = match json::parse(&line) {
+            Err(e) => (Value::Null, Err(format!("not JSON: {e}"))),
+            Ok(call) => {
+                let id = call.get("id").cloned().unwrap_or(Value::Null);
+                match call.get("tool").and_then(Value::as_str) {
+                    None => (id, Err("no \"tool\" in the call".to_owned())),
+                    Some(tool) => {
+                        let args = call.get("args").cloned().unwrap_or_else(Value::new_object);
+                        let (tx, rx) = mpsc::channel();
+                        deliver(Request::Agent(AgentCall { tool: tool.to_owned(), args, reply: tx }));
+                        let answer = rx.recv_timeout(AGENT_TIME).unwrap_or_else(|e| {
+                            Err(match e {
+                                mpsc::RecvTimeoutError::Timeout => "the window didn't answer in time".to_owned(),
+                                mpsc::RecvTimeoutError::Disconnected => "the window dropped the call".to_owned(),
+                            })
+                        });
+                        (id, answer)
+                    }
+                }
+            }
+        };
+        let mut v = Value::object([("id", id)]);
+        match answer {
+            Ok(result) => v.push("result", result),
+            Err(e) => v.push("error", e),
+        };
+        if writeln!(out, "{v}").is_err() {
+            return;
+        }
+    }
 }
 
 /// Give `files` to the window focused last. Returns false if no window
@@ -383,6 +483,46 @@ mod tests {
         let labels: Vec<String> = others_in(&dir, 13).into_iter().map(|w| w.label).collect();
         assert_eq!(labels, ["OTA crash · a.dlt", "b.log", "nerka"]);
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// An agent's connection stays open: a JSON call a line, each answered
+    /// in order with its id; a bad line gets an error, not the end.
+    #[test]
+    fn an_agent_connection_answers_each_call() {
+        use nerka_core::json::{Value, parse};
+        let (tx, rx) = mpsc::channel();
+        let listener = TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || listen(listener, "secret".into(), tx, || {}));
+        // The window: answers each call with its tool's name.
+        std::thread::spawn(move || {
+            for r in rx {
+                if let Request::Agent(call) = r {
+                    let answer =
+                        if call.tool == "fail" { Err("no".into()) } else { Ok(Value::from(call.tool.as_str())) };
+                    let _ = call.reply.send(answer);
+                }
+            }
+        });
+        let mut s = TcpStream::connect(addr).unwrap();
+        s.write_all(b"nerka1 secret\nagent\n").unwrap();
+        let mut r = BufReader::new(s.try_clone().unwrap());
+        let mut line = String::new();
+        r.read_line(&mut line).unwrap();
+        assert_eq!(line, "ok\n");
+        // Slower than a hand-off's deadline: the connection stays.
+        std::thread::sleep(REQUEST_TIME + Duration::from_millis(200));
+        for (call, want) in [
+            (r#"{"id":1,"tool":"count","args":{}}"#, r#"{"id":1,"result":"count"}"#),
+            ("not json", r#"{"id":null,"error":"not JSON: not a JSON value at byte 0"}"#),
+            (r#"{"id":"x","tool":"fail"}"#, r#"{"id":"x","error":"no"}"#),
+            (r#"{"id":3}"#, r#"{"id":3,"error":"no \"tool\" in the call"}"#),
+        ] {
+            writeln!(s, "{call}").unwrap();
+            line.clear();
+            r.read_line(&mut line).unwrap();
+            assert_eq!(parse(line.trim()).unwrap(), parse(want).unwrap(), "{call}");
+        }
     }
 
     /// While one client holds a connection open, another is served.

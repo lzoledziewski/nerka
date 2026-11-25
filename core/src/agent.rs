@@ -186,6 +186,308 @@ pub fn summary(source: &dyn LogSource, files: &[String], index_seconds: f64, pro
     Ok(v)
 }
 
+/// Where each row of a view is: its file (an index into the view's
+/// files) and its line there, merged by time or not.
+pub fn locator(source: &dyn LogSource) -> impl Fn(LineNo) -> (usize, LineNo) + '_ {
+    let (inner, line_of) = match source.reordered() {
+        Some(r) => (r.inner, Some(r.line_of)),
+        None => (source, None),
+    };
+    let starts: Vec<LineNo> = inner.part_files().iter().map(|&(first, _)| first).collect();
+    move |row| {
+        let l = line_of.map_or(row, |m| m[row as usize]);
+        let k = starts.partition_point(|&s| s <= l).saturating_sub(1);
+        (k, l - starts.get(k).copied().unwrap_or(0))
+    }
+}
+
+/// A view: its source and its files' names, as JSON places and lines
+/// name them.
+pub struct View<'a> {
+    pub source: &'a dyn LogSource,
+    pub files: &'a [String],
+}
+
+impl View<'_> {
+    /// Row `row`'s file name and line in it (0-based).
+    pub fn at(&self, row: LineNo) -> (&str, LineNo) {
+        let (k, line) = locator(self.source)(row);
+        (self.files.get(k).or(self.files.first()).map_or("", String::as_str), line)
+    }
+
+    /// `{"file", "line"}` (from 1) of row `row`.
+    pub fn place(&self, row: LineNo) -> Value {
+        let (file, line) = self.at(row);
+        Value::object([("file", Value::from(file)), ("line", (line + 1).into())])
+    }
+
+    /// Row `row` as a line object ([`line`]).
+    pub fn line(&self, row: LineNo, fields: &Fields) -> Value {
+        let (file, line_no) = self.at(row);
+        line(self.source, row, file, line_no, fields)
+    }
+
+    /// A page of `rows`: `{"total", "lines": [...], "more", "skip"}`,
+    /// `skip` rows left out first, at most `max` given (`more`: how many
+    /// after them; `skip`: where the next page starts). `matched` marks a
+    /// line with `"match"` (lines around matches).
+    pub fn page(
+        &self,
+        rows: &[LineNo],
+        skip: u64,
+        max: u64,
+        fields: &Fields,
+        matched: Option<&dyn Fn(LineNo) -> bool>,
+    ) -> Value {
+        let from = (skip as usize).min(rows.len());
+        let to = from.saturating_add(max as usize).min(rows.len());
+        let lines = rows[from..to].iter().map(|&r| {
+            let mut v = self.line(r, fields);
+            if let Some(m) = matched {
+                v.push("match", m(r));
+            }
+            v
+        });
+        let mut v = Value::object([("total", Value::from(rows.len()))]);
+        v.push("lines", Value::Array(lines.collect())).push("more", rows.len() - to).push("skip", to);
+        v
+    }
+}
+
+/// What [`patterns`] adds to each pattern.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PatternDetail {
+    /// Each slot's values: count, first and last line.
+    pub values: bool,
+    /// An NFD query finding its lines.
+    pub queries: bool,
+    /// Its first N lines (0: all).
+    pub lines: Option<usize>,
+}
+
+/// Patterns as `{"total", "patterns": [...], "more"}`, the first `top`
+/// (0: all) in their order.
+pub fn patterns(ps: &crate::pattern::Patterns, view: &View, top: usize, detail: PatternDetail) -> Value {
+    let shown = if top == 0 { ps.patterns.len() } else { top.min(ps.patterns.len()) };
+    let none = Fields::default();
+    let mut list = Vec::new();
+    for p in &ps.patterns[..shown] {
+        let mut v = Value::new_object();
+        v.push("count", p.count())
+            .push("share", p.count() as f64 / ps.total().max(1) as f64)
+            .push("first", view.place(p.first()))
+            .push("fields", Value::object(p.fields.iter().map(|(n, x)| (n.to_string(), Value::from(x.to_string())))))
+            .push("template", p.template())
+            .push("unsorted", p.unsorted);
+        if detail.values {
+            let slots = p.slots().enumerate().map(|(k, s)| {
+                let vals = s.values.iter().map(|x| {
+                    Value::object([
+                        ("value", Value::from(x.value().to_string())),
+                        ("count", x.count().into()),
+                        ("first", view.place(x.first())),
+                        ("last", view.place(x.last())),
+                    ])
+                });
+                Value::object([
+                    ("slot", Value::from(k + 1)),
+                    ("kind", (if s.is_state() { "state" } else { "values" }).into()),
+                    ("overflow", s.overflow.into()),
+                    ("values", Value::Array(vals.collect())),
+                ])
+            });
+            v.push("slots", Value::Array(slots.collect()));
+        }
+        if detail.queries {
+            v.push("query", ps.query(p));
+        }
+        if let Some(n) = detail.lines {
+            let n = if n == 0 { usize::MAX } else { n };
+            v.push("lines", Value::Array(p.lines[0].iter().take(n).map(|&l| view.line(l, &none)).collect()));
+            v.push("lines_more", p.lines[0].len().saturating_sub(n));
+        }
+        list.push(v);
+    }
+    let mut v = Value::object([("total", Value::from(ps.total()))]);
+    v.push("patterns", Value::Array(list)).push("more", ps.patterns.len() - shown);
+    v
+}
+
+/// The differences of a comparison as `{"a", "b", "min_score",
+/// "differences": [...], "more"}`: `sides` describe A and B (file, filter,
+/// lines), `views` place their lines.
+pub fn compare(
+    ps: &crate::pattern::Patterns,
+    diffs: &[crate::pattern::Difference],
+    views: [&View; 2],
+    sides: [Value; 2],
+    min_score: f64,
+    top: usize,
+    queries: bool,
+) -> Value {
+    use crate::pattern::Change;
+    let shown = if top == 0 { diffs.len() } else { top.min(diffs.len()) };
+    let mut list = Vec::new();
+    for d in &diffs[..shown] {
+        let p = &ps.patterns[d.pattern];
+        let side = match d.change() {
+            Change::New => 1,
+            Change::Gone => 0,
+            Change::Changed => usize::from(d.ratio() >= 1.0),
+        };
+        let change = match d.change() {
+            Change::New => "new",
+            Change::Gone => "gone",
+            Change::Changed => "changed",
+        };
+        let mut v = Value::new_object();
+        v.push("change", change).push("score", d.score).push("a", d.counts[0]).push("b", d.counts[1]);
+        if change == "changed" {
+            v.push("ratio", d.ratio());
+        }
+        let at = match d.value {
+            None => p.sides[side].first,
+            Some((s, k)) => p.slots().nth(s).expect("a slot").values[k].sides[side].first,
+        };
+        v.push("first", views[side].place(at)).push("side", ["a", "b"][side]);
+        v.push("fields", Value::object(p.fields.iter().map(|(n, x)| (n.to_string(), Value::from(x.to_string())))));
+        v.push("template", p.template());
+        if let Some((s, k)) = d.value {
+            v.push("slot", s + 1).push("value", p.slots().nth(s).expect("a slot").values[k].value().to_string());
+        }
+        if queries {
+            v.push("query", ps.query(p));
+        }
+        list.push(v);
+    }
+    let [a, b] = sides;
+    let mut v = Value::object([("a", a), ("b", b)]);
+    v.push("min_score", min_score).push("differences", Value::Array(list)).push("more", diffs.len() - shown);
+    v
+}
+
+/// A signal's values between rows `from` and `to` (inclusive): how many
+/// events; a number's first, last, minimum and maximum; an enum's states
+/// with their counts; and at most `points` events spread over the range
+/// (an enum: its changes first), each with its place and time.
+pub fn signal(
+    def: &crate::SignalDef,
+    series: &crate::signal::SignalSeries,
+    view: &View,
+    from: LineNo,
+    to: LineNo,
+    points: usize,
+) -> Value {
+    use crate::signal::ValueRef;
+    let events: Vec<(LineNo, ValueRef)> = series.iter().filter(|(r, _)| (from..=to).contains(r)).collect();
+    let mut v = Value::object([("name", Value::from(def.name())), ("kind", def.kind().as_str().into())]);
+    v.push("events", events.len());
+    let at = |(row, val): (LineNo, ValueRef)| {
+        let mut p = view.place(row);
+        p.push("time", view.source.time(row).map(time_text));
+        p.push(
+            "value",
+            match val {
+                ValueRef::Num(n) => Value::from(n),
+                ValueRef::Enum(t) => Value::from(String::from_utf8_lossy(t).into_owned()),
+            },
+        );
+        p
+    };
+    if let (Some(&first), Some(&last)) = (events.first(), events.last()) {
+        v.push("first", at(first)).push("last", at(last));
+    }
+    let nums: Vec<f64> =
+        events.iter().filter_map(|(_, x)| if let ValueRef::Num(n) = x { Some(*n) } else { None }).collect();
+    if !nums.is_empty() {
+        v.push("min", nums.iter().copied().fold(f64::INFINITY, f64::min));
+        v.push("max", nums.iter().copied().fold(f64::NEG_INFINITY, f64::max));
+    }
+    // An enum: its states and how often each came; its changes.
+    let mut shown: Vec<(LineNo, ValueRef)> = Vec::new();
+    if nums.is_empty() && !events.is_empty() {
+        let mut states: Vec<(String, u64)> = Vec::new();
+        let mut last: Option<&[u8]> = None;
+        for &(row, x) in &events {
+            if let ValueRef::Enum(t) = x {
+                let name = String::from_utf8_lossy(t).into_owned();
+                match states.iter_mut().find(|(n, _)| *n == name) {
+                    Some(s) => s.1 += 1,
+                    None => states.push((name, 1)),
+                }
+                if last != Some(t) {
+                    shown.push((row, x));
+                    last = Some(t);
+                }
+            }
+        }
+        v.push("states", Value::object(states.into_iter().map(|(n, c)| (n, Value::from(c)))));
+        v.push("changes", shown.len());
+    } else {
+        shown = events.clone();
+    }
+    // At most `points`, spread evenly, the first and the last kept.
+    let n = shown.len();
+    let picked: Vec<(LineNo, ValueRef)> = if n <= points.max(2) {
+        shown
+    } else {
+        let k = points.max(2);
+        (0..k).map(|i| shown[i * (n - 1) / (k - 1)]).collect()
+    };
+    v.push("thinned", picked.len() < n);
+    v.push("points", Value::Array(picked.into_iter().map(at).collect()));
+    v
+}
+
+/// A lifecycle definition's runs, as `nerka lifecycles --json` gives them
+/// (`lifecycles`, `issues`, `summary`), for one definition.
+pub fn lifecycles(name: &str, l: &crate::lifecycle::Lifecycles, view: &View) -> Value {
+    let lives = l.lives.iter().map(|x| {
+        let mut v = Value::new_object();
+        v.push("lifecycle", name)
+            .push("number", x.number)
+            .push("first", view.place(x.first))
+            .push("last", view.place(x.last))
+            .push("lines", x.lines)
+            .push("started_by", x.started_by.as_str())
+            .push("outcome", x.outcome.as_str())
+            .push("marker", x.marker.map(|m| view.place(m)))
+            .push("start", x.first_time.map(time_text))
+            .push("end", x.last_time.map(time_text))
+            .push("duration", x.duration())
+            .push("first_uptime", x.first_uptime)
+            .push("boot", x.boot);
+        v
+    });
+    let issues = l.findings.iter().map(|f| {
+        Value::object([
+            ("kind", Value::from(f.kind.as_str())),
+            ("at", view.place(f.row)),
+            ("count", f.count.into()),
+            ("lifecycle", format!("{name}#{}", l.lives.get(f.life).map_or(0, |x| x.number)).into()),
+            ("detail", f.detail.as_str().into()),
+        ])
+    });
+    let mut v = Value::object([("lifecycles", Value::Array(lives.collect()))]);
+    v.push("issues", Value::Array(issues.collect())).push("summary", format!("{name}: {}", l.summary()));
+    v
+}
+
+/// `bytes` in base64 (RFC 4648, padded): a screenshot's PNG in an answer.
+pub fn base64(bytes: &[u8]) -> String {
+    const A: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for c in bytes.chunks(3) {
+        let n =
+            (u32::from(c[0]) << 16) | (u32::from(*c.get(1).unwrap_or(&0)) << 8) | u32::from(*c.get(2).unwrap_or(&0));
+        out.push(A[(n >> 18) as usize & 63] as char);
+        out.push(A[(n >> 12) as usize & 63] as char);
+        out.push(if c.len() > 1 { A[(n >> 6) as usize & 63] as char } else { '=' });
+        out.push(if c.len() > 2 { A[n as usize & 63] as char } else { '=' });
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -210,6 +512,22 @@ mod tests {
             Fields::parse(&["apid".into()], &f).unwrap_err(),
             "no field 'apid': this file has none (plain text: raw and level)"
         );
+    }
+
+    #[test]
+    fn base64_as_rfc_4648() {
+        let cases = [
+            ("", ""),
+            ("f", "Zg=="),
+            ("fo", "Zm8="),
+            ("foo", "Zm9v"),
+            ("foob", "Zm9vYg=="),
+            ("fooba", "Zm9vYmE="),
+            ("foobar", "Zm9vYmFy"),
+        ];
+        for (a, b) in cases {
+            assert_eq!(base64(a.as_bytes()), b);
+        }
     }
 
     #[test]

@@ -1,11 +1,17 @@
-# AI preparation (design settled; A1, A2 built)
+# AI preparation (design settled; A1, A2, B1–B3 built)
 
 Status: **settled** with the owner (2026-11-24, "Settled" below). Built:
 step A1 (2026-11-24, branch `claude/ai-prep`: `core/src/json.rs`,
 `core/src/agent.rs`, the CLI; user guide `docs/user/cli.md#for-scripts-and-agents`)
 and step A2 (2026-11-24: `cli/src/agent_guide.md` as `help agent` / `help
 skill`, `marks --add` with an author, `Bookmarks::merge` in the window;
-user guide `docs/user/agents.md`). Next: step B1.
+user guide `docs/user/agents.md`), and steps B1–B3 (2026-11-25, built
+unattended, "Assumptions to review" below: `cli/src/mcp.rs`,
+`core/src/link.rs`, `ui/src/instance.rs` (the agent channel),
+`ui/src/agent.rs` (the tools, 🤖 Agent, undo), `ui/src/terminal.rs`
+(🤖 AI); user guide `docs/user/agents.md#with-you-on-your-window-mcp`).
+Next: the owner's review of the assumptions; the evaluation on real
+bug reports (`docs/dev/ai-evaluation.md`).
 
 ## What the owner asked for (2026-11-24)
 
@@ -189,6 +195,57 @@ provider in nerka).
 Each step is a pre-release on its own branch. A1 closes R10; B1 gets the
 window's handlers a module of their own (`ui/src/agent.rs`), not more lines
 in `ui/src/main.rs` (6,218 non-test lines).
+
+## Assumptions to review (B1–B3, built unattended 2026-11-25)
+
+The owner (2026-11-25): "you can take assumptions, will review in the
+morning". Each is a choice made while building; change any.
+
+1. **Tools** (17): `window`, `summary`, `help`, `count`, `filter`,
+   `lines`, `patterns`, `compare`, `bookmarks`, `signals`, `signal`,
+   `lifecycles` (reading); `show`, `set_filter`, `set_search`,
+   `bookmark`, `plot` (changing); `screenshot`. No `check` tool yet (the
+   CLI's `--check` covers it). `search` (regex) left out: NFD's `raw ~
+   /…/` in `filter` does it.
+2. **A tab** is named by `tab`: its number from 1, or part of its title;
+   default the active tab. Line numbers are from 1 in their own file, with
+   `file` (part of a name) in a tab of several files.
+3. **Bounded answers:** `filter` gives 50 lines by default, 1000 at most;
+   `lines` ±10 around a line, 1000 at most; `signal` 100 points;
+   `patterns` / `compare` 30. `in_view` reads only the lines the user's
+   filter shows.
+4. **Threads:** reading tools run on a thread of their own with a snapshot
+   of the tab; changing tools on the window's thread. An agent's call
+   never brings the window to the front.
+5. **`set_filter` / `set_search`** switch the box to NFD and put the query
+   in, as if typed; the result arrives a moment later (the answer says
+   so). Undo puts the box's mode and text back.
+6. **`bookmark`** makes an annotation (author `ai`, or `by`); changing an
+   existing bookmark keeps its author. Undo restores the bookmark as it
+   was (or none).
+7. **`plot`** adds lanes (`only`: replaces them) and shows the plot; undo
+   restores the lanes and whether it was shown. **`show`** isn't undoable
+   (navigation).
+8. **🤖 Agent** (top bar, shown once an agent changed something): the
+   changes, newest first, each with ↶ Undo; no redo; undone ones struck
+   through. The status bar says each change.
+9. **`screenshot`**: the window, or the plot's own window (`of: plot`), as
+   a PNG in an MCP image; a minimized window gives none (20 s).
+10. **No MCP progress or cancellation** yet: a call runs to its end (10
+    minutes at most).
+11. **Which window:** `--window PID`, else `NERKA_WINDOW`, else the window
+    focused last; the link is made again once if the window went away.
+12. **🤖 AI** (top bar) opens Windows Terminal (`wt.exe`) if there is one,
+    else a console window; `$TERMINAL` or the usual terminals on Linux;
+    Terminal on macOS. Settings → **AI command**, default `claude`. Claude
+    Code gets `--mcp-config` with `<config>/nerka/mcp.json` (the `nerka`
+    next to `nerka-gui`); others need `nerka mcp --install CLIENT`, which
+    runs the client's own `mcp add` (user scope).
+13. **`raw`** in answers is the line as the window shows it (its time
+    column in local time when the window shows local time); `time` is UTC.
+    Said in the server's instructions.
+14. **The 🔖 glyph** draws poorly on macOS (CI screenshot, owner
+    2026-11-25): left as it is for now.
 
 ## Settled (owner, 2026-11-24)
 

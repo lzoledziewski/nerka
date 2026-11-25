@@ -47,6 +47,7 @@ pub mod history;
 pub mod input;
 pub mod json;
 pub mod lifecycle;
+pub mod link;
 pub mod pack;
 pub mod pattern;
 pub mod plot;

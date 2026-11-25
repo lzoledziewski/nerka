@@ -59,6 +59,10 @@ they find their lines again in a changed file (one that can't is marked
 `?`). In queries, `bookmark` is a field: `level >= ERROR OR bookmark`,
 `bookmark ~ /fan/`.
 
+**🤖 AI** in the top bar opens a terminal with your AI agent (Settings →
+AI command) working on this window; **🤖 Agent** lists what it changed,
+with ↶ Undo ([AI agents](agents.md#with-you-on-your-window-mcp)).
+
 Bookmarks an [AI agent](agents.md) made (`nerka marks --add`) are
 **annotations**: 🤖 and violet in the views, the plot and the panel, until
 you accept them (✔ in the panel, or ✔ Accept all): then they are your

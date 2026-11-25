@@ -2,6 +2,10 @@
 
 The dated log of the project, newest first; append-only: add an entry at the top when `status.md` changes. Moved from `status.md` on 2026-11-10, word for word: its "Last update" line (each update with the ones before it) and its "Next steps" as they stood then, which tell what was built when and why. Where the moved text says "above", "below" or "this file", it means the old `status.md`: its sections are now `status.md` (state, pending decisions, limitations, licensing), `gui-decisions.md`, `features.md` and `history.md`.
 
+## 2026-11-25
+
+AI preparation, workflow B built unattended (owner: "proceed with MCP, carry out the plan, take assumptions"; `ai.md` → Assumptions to review; Decisions pending 9): `nerka mcp`, an MCP server over stdio (`cli/src/mcp.rs`), linked to a window through the loopback port and token (`core/src/link.rs`, the agent channel in `ui/src/instance.rs`); 17 tools on the window's tabs (`ui/src/agent.rs`: reading tools on a thread with a snapshot, answers built in core like `--json`); changes listed in 🤖 Agent with ↶ Undo; `screenshot` as an MCP image; 🤖 AI opening the user's terminal with the AI command (`ui/src/terminal.rs`; Claude Code with `--mcp-config`); `nerka mcp --install` / `--config`. Before it, CI on Windows: the `help nfd` test compared the grammar with CRLF line ends (fixed); the CI screenshot on macOS showed 🤖 well and 🔖 poorly (owner: leave it for now).
+
 ## 2026-11-24
 
 An agent's annotations in the window (owner: a distinct glyph, the original idea of annotations, and accepting one into a regular bookmark; the 🤖 icon kept; the plot with a checkbox of its own; CI's screenshot to show it on macOS too): 🤖 and violet in the note rows, the stripe, the hover, the plot's cursors and Δt, the 🔖 panel and its button; ✔ Accept / ✔ Accept all (`Bookmarks::accept`); the plot's 🤖 checkbox not kept with a kept plot (no plot format change); `B3 (ai)` gone from the views. CI's GUI screenshot now has a bookmark and an annotation (`nerka marks --add`). Found on the way: 🤖 isn't in egui's fonts, it comes from the system's emoji font (egui 0.37's fontique fallback).
