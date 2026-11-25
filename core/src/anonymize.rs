@@ -13,7 +13,9 @@
 //!
 //! The words are keyed by a secret (random per run unless a seed is
 //! given): without it the mapping can't be undone or repeated. Words to
-//! keep (`--keep`) stay as they are.
+//! keep (`--keep`) stay as they are, and so do level names (`INFO`,
+//! `ERROR`, upper case): the levels read from the text, and the patterns
+//! (`lone-word` takes them for header), stay the same.
 
 use crate::input::LogSource;
 use crate::input::dlt::writer::{Arg, Msg, Value};
@@ -96,7 +98,7 @@ impl Anonymizer {
     /// A word of letters: its made-up word, with `word`'s case.
     fn word(&mut self, word: &str) -> String {
         let lower = word.to_lowercase();
-        if self.keep.contains(&lower) {
+        if self.keep.contains(&lower) || crate::event::level_name(word.as_bytes()).is_some() {
             return word.to_owned();
         }
         let mapped = match self.words.get(&lower) {

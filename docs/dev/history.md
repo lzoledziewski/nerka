@@ -4,6 +4,8 @@ The dated log of the project, newest first; append-only: add an entry at the top
 
 ## 2026-11-25
 
+Patterns (owner): Compare lists what is the same on both sides too, and patterns or values only (CLI `--show` / `--rows`, MCP, the window); the setting `lone-word` (on by default) keeps a message's only word out of slots, which fixed a daemon's log's function traces (`patterns.md`; LogHub unchanged).
+
 The owner kept lines before a record split's first match as rows (`ai-evaluation.md`); the stack-dump hint says how to group only the goroutines.
 
 The review's list built (`ai.md` → Reviewed by the owner): the AI command from a list; `LogSource::file_line` (`first_line` in every view); numbered `nerka lines`; `@line` (a built-in signal, `LogSource::line_in_file`) and per-file numbers in a several-file tab's gutter; a read-only `queries` tool and the library's queries with notes in `help agent`; answer limits in Settings; the tools timed on 1 GiB text and DLT (all under 1.2 s but a time window on text, 13 s); a prototype keeping lines before a record split's first match as rows (to keep or drop); patterns tried on Go and Python traces (records fix the over-merge; a stack signature needed for Go); the DLT bug report a daemon's log's (the gateway's own log) evaluated, both workflows mostly right; `stack-dumps.md` designed. Decisions pending 9.

@@ -83,6 +83,16 @@ const STATE_VALUES: Help = Help {
            Lower: fewer states, more <*>. Higher: slots of more values listed as states.",
     effect: "↑ more {a|b|c} states · ↓ more <*>",
 };
+const LONE_WORD: Help = Help {
+    what: "A message's only word is never a slot. On: a level near the start (`INFO`, `587~DEBUG`) is \
+           header, not a sign of one message, and two messages whose words in common are only header \
+           and footer stay two patterns: `INFO dlt_message_init()` and `INFO dlt_message_free()`, or \
+           `LOG: radar: OK` and `LOG: imu: OFFLINE`; a state needs a word of the message in common \
+           (`door {open|closed}`).\n\n\
+           Off: such messages join into one pattern, the word a slot ({dlt_message_init()|…}), fewer \
+           patterns.",
+    effect: "on: one-word messages apart · off: fewer patterns",
+};
 
 /// The rule form's actions.
 const ACTIONS: [(&str, &str); 9] = [
@@ -550,6 +560,19 @@ impl TuningUi {
                     set.push(Setting::StateValues(d.state_values));
                 }
                 effect(ui, &STATE_VALUES);
+            });
+            ui.end_row();
+            ui.label("");
+            name(ui, "lone word", &LONE_WORD);
+            ui.horizontal(|ui| {
+                let mut m = s.lone_word;
+                if ui.checkbox(&mut m, "on").changed() {
+                    set.push(Setting::LoneWord(m));
+                }
+                if dot(ui, s.lone_word != d.lone_word, "on".into()) {
+                    set.push(Setting::LoneWord(d.lone_word));
+                }
+                effect(ui, &LONE_WORD);
             });
             ui.end_row();
         });

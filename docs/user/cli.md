@@ -243,6 +243,7 @@ side 4                    # stage 2: tokens on the longer side of a slot
 state-values 16           # a slot with more values (2–16) is <*>, not a state
 header sample 32 min 8 share 0.5 places 3   # header/footer detection
 merge on                  # stage 2 at all
+lone-word on              # a message's only word is never a slot
 
 # Rules: SCOPE: ACTION
 apid == NAV: keep Elapsed
@@ -259,6 +260,14 @@ The header settings: lines of a context held back per chunk (`sample`),
 the fewest to detect a header or footer on (`min`), the share of them a
 word must be on, more than (`share`), and how many tokens from the start
 and the end it may be at (`places`).
+
+`lone-word`: a message's only word is never a slot. A level near the
+start of a text line (`INFO`, `587~DEBUG`) counts as header, and two
+messages whose words in common are only header and footer stay two
+patterns: `[ 2088.35]~DLT~ 587~INFO ~dlt_message_init()` and `…
+~dlt_message_free()`, or `LOG: radar: OK` and `LOG: imu: OFFLINE`. A
+state still needs a word of the message in common (`door {open|closed}`).
+`lone-word off` joins them, the word in a slot: fewer patterns.
 
 A rule's **scope** is the fields lines are grouped by: for DLT `ecu`,
 `apid`, `ctid`, `type`, `mode` (the short text fields), for a text file
@@ -337,7 +346,8 @@ report) without what it says. A word becomes letters of the same length
 and case, the same everywhere and never another word's, so messages keep
 their structure and the same [patterns](#patterns-experimental) with the
 same counts; a run holding a digit keeps its digits as digits (made up per
-run); spaces and punctuation stay. A DLT file stays DLT: times, levels and
+run); spaces and punctuation stay, and so do level names in upper case
+(`INFO`, `ERROR`: the levels read from the text). A DLT file stays DLT: times, levels and
 the ECU, application and context IDs are kept (`--ids`: made up too), the
 payload is written as one string. Other files become text.
 

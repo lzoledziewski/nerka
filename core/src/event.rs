@@ -50,6 +50,21 @@ impl Level {
     }
 }
 
+/// The level an upper-case word names (`INFO`, `WARNING`, `ERR`), as
+/// [`detect_level`] reads them from text.
+pub fn level_name(word: &[u8]) -> Option<Level> {
+    match word {
+        b"TRACE" => Some(Level::Trace),
+        b"DEBUG" => Some(Level::Debug),
+        b"INFO" => Some(Level::Info),
+        b"NOTICE" => Some(Level::Notice),
+        b"WARN" | b"WARNING" => Some(Level::Warn),
+        b"ERROR" | b"ERR" => Some(Level::Error),
+        b"FATAL" | b"CRIT" | b"CRITICAL" => Some(Level::Fatal),
+        _ => None,
+    }
+}
+
 /// Detect the severity of a line from an upper-case level token in its
 /// prefix (`[ERROR]`, ` WARN `, `level=INFO`, …).
 ///
@@ -71,16 +86,7 @@ pub fn detect_level(line: &[u8]) -> Option<Level> {
             j += 1;
         }
         if j == head.len() || !word(head[j]) {
-            let level = match &head[i..j] {
-                b"TRACE" => Some(Level::Trace),
-                b"DEBUG" => Some(Level::Debug),
-                b"INFO" => Some(Level::Info),
-                b"NOTICE" => Some(Level::Notice),
-                b"WARN" | b"WARNING" => Some(Level::Warn),
-                b"ERROR" | b"ERR" => Some(Level::Error),
-                b"FATAL" | b"CRIT" | b"CRITICAL" => Some(Level::Fatal),
-                _ => None,
-            };
+            let level = level_name(&head[i..j]);
             if level.is_some() {
                 return level;
             }

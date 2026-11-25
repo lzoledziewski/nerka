@@ -660,6 +660,8 @@ fn group(sets: &[Set], options: &PatternOptions, progress: &Progress) -> Result<
             })
         })
         .collect::<Result<_>>()?;
+    // Levels in the text grouped (`lone-word`): raw text, not a field.
+    let levels = readings.iter().all(|r| r.field.is_none());
     let mut lines = [0u64; 2];
     for (side, set) in sets.iter().enumerate() {
         lines[side] = set.lines.map_or(set.source.line_count(), |l| l.len() as u64);
@@ -687,6 +689,7 @@ fn group(sets: &[Set], options: &PatternOptions, progress: &Progress) -> Result<
             let reading = &readings[side];
             let mut locals = Locals::new(config, &context);
             let mut d = Drain::new(context.len(), MAX_PER_CHUNK);
+            d.levels = levels;
             let mut of_line = Vec::new();
             if options.lines {
                 of_line.resize(to - from, u32::MAX);
@@ -745,12 +748,13 @@ fn group(sets: &[Set], options: &PatternOptions, progress: &Progress) -> Result<
         })
         .collect::<Result<_>>()?;
     let (mut parts, rests): (Vec<Chunk>, Vec<Rest>) = parts.into_iter().map(|(d, o, n, r)| ((d, o, n), r)).unzip();
-    let pooled = pool(&mut parts, rests, &tasks, config, &context, context.len());
+    let pooled = pool(&mut parts, rests, &tasks, config, &context, context.len(), levels);
     // A template's id: its index in its chunk plus the templates of the
     // chunks before.
     let mut offsets = Vec::with_capacity(parts.len());
     let mut of_lines = Vec::with_capacity(parts.len());
     let mut all = Drain::new(context.len(), MAX_TEMPLATES);
+    all.levels = levels;
     let mut next = 0u32;
     let mut ignored = [0u64; 2];
     for ((d, _, n), (side, _, _)) in parts.iter().zip(&tasks) {
@@ -835,8 +839,34 @@ fn group(sets: &[Set], options: &PatternOptions, progress: &Progress) -> Result<
         }
         by_vals.insert(f.vals.clone(), local);
     }
-    let (weights, ctxs) = weigh(&mut families, &shared);
-    let locals: Vec<Local> = ctxs.iter().map(|v| by_vals.remove(v).unwrap_or_default()).collect();
+    let (mut weights, ctxs) = weigh(&mut families, &shared);
+    let mut locals: Vec<Local> = ctxs.iter().map(|v| by_vals.remove(v).unwrap_or_default()).collect();
+    // `lone-word`: each context's header and footer words (stage 1's, and
+    // its `header` rules'); level words are header too, weighing nothing.
+    if locals.iter().any(|l| l.s.lone_word) {
+        let mut done = vec![false; locals.len()];
+        for f in &families {
+            let local = &mut locals[f.ctx];
+            if !local.s.lone_word || std::mem::replace(&mut done[f.ctx], true) {
+                continue;
+            }
+            local.levels = levels;
+            let tokens = all.boiler.get(&f.key).into_iter().flatten().chain(&local.header);
+            let words: Vec<Box<str>> =
+                tokens.flat_map(|t| atomize(t)).filter(|(_, a)| is_word(a)).map(|(_, a)| a.into()).collect();
+            local.header_words.extend(words);
+        }
+        for f in families.iter_mut().filter(|f| locals[f.ctx].s.lone_word && locals[f.ctx].levels) {
+            let w = &mut weights[f.ctx];
+            for l in f.words().filter(|l| is_level(l)) {
+                w.insert(l.into(), 0.0);
+            }
+        }
+        for f in families.iter_mut() {
+            let w = &weights[f.ctx];
+            f.size = f.words().map(|x| w.get(x).copied().unwrap_or(1.0)).sum();
+        }
+    }
     // Stage 2.
     let refused = Refused::default();
     if locals.iter().any(|l| l.s.merge) {
@@ -1029,6 +1059,7 @@ fn pool(
     config: &PatternConfig,
     context: &[String],
     fields: usize,
+    levels: bool,
 ) -> Option<Pooled> {
     let held: usize = rests.iter().flatten().map(|(_, s)| s.held.len()).sum();
     if held == 0 {
@@ -1068,6 +1099,7 @@ fn pool(
         }
     }
     let mut d = Drain::new(fields, MAX_TEMPLATES);
+    d.levels = levels;
     let mut lines = Vec::with_capacity(held);
     for ctx in order {
         let (s, from) = by_ctx.remove(&ctx).expect("seen");
@@ -1294,6 +1326,46 @@ fn mask_with<'t>(tok: &'t str, local: &Local) -> Cow<'t, str> {
     Cow::Owned(out)
 }
 
+/// A level's name, as levels are read from text (`INFO`, `WARNING`, `ERR`:
+/// [`crate::event::level_name`]): with `lone-word`, header, not the message.
+fn is_level(word: &str) -> bool {
+    crate::event::level_name(word.as_bytes()).is_some()
+}
+
+/// With `lone-word`: a token among the first `places` holding a level word
+/// (`INFO`, `587~DEBUG`): header, as [`Sample::boilerplate`]'s.
+fn level_token(t: &str, at: usize, local: &Local) -> bool {
+    at < local.s.header_places && has_level(t)
+}
+
+/// Whether a word of `t` (a run of word characters) is a level ([`is_level`]);
+/// on bytes, as it runs for a line's first tokens.
+fn has_level(t: &str) -> bool {
+    let b = t.as_bytes();
+    let word = |c: u8| c.is_ascii_alphanumeric() || c == b'_' || c >= 0x80;
+    let mut i = 0;
+    while i < b.len() {
+        if !word(b[i]) {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        while i < b.len() && word(b[i]) {
+            i += 1;
+        }
+        if (3..=8).contains(&(i - start)) && is_level(&t[start..i]) {
+            return true;
+        }
+    }
+    false
+}
+
+/// With `lone-word`, a header or footer word of `local`'s context (a level
+/// too, where its text holds them): no sign of the message.
+fn header_word(w: &str, local: &Local) -> bool {
+    local.header_words.contains(w) || local.levels && is_level(w)
+}
+
 fn is_word_char(c: char) -> bool {
     c.is_alphanumeric() || c == '_'
 }
@@ -1402,6 +1474,9 @@ struct Cluster {
     ids: Vec<u32>,
     /// Its context ([`context_id`]).
     ctx: u64,
+    /// Per token, with `lone-word` in raw text: a level's ([`level_token`]),
+    /// header; else empty. Known when it is made, so no line pays for it.
+    levels: Vec<bool>,
 }
 
 /// `n` into `c`: its lines, values and fields; the tokens they differ in
@@ -1443,6 +1518,9 @@ struct Drain {
     /// list is quicker than a set); a context not in it yet is still being
     /// sampled.
     boiler: HashMap<u64, Vec<Box<str>>>,
+    /// The text grouped holds its level (raw text, not a field such as
+    /// DLT's payload): `lone-word` takes level words for header.
+    levels: bool,
 }
 
 /// The templates of one group (`key`).
@@ -1508,9 +1586,10 @@ fn key<'a>(toks: impl ExactSizeIterator<Item = &'a str>, ctx: u64) -> u64 {
 /// {Bye|by} {[preauth]|user}` (LogHub 2k: grouping accuracy 0.715 →
 /// 0.738, `examples/loghub_bench.rs`).
 ///
-/// `shared`: the group's header and footer ([`Group::shared`]), and
-/// `boiler`: whether each token of `b` is the context's ([`Sample`]),
-/// passed over where both have them.
+/// `shared`: the group's header and footer ([`Group::shared`]), `boiler`:
+/// whether each token of `b` is the context's ([`Sample`]), and `levels`:
+/// whether each of `a` is a level ([`Cluster::levels`]), passed over where
+/// both have them.
 ///
 /// `local`: the context's settings and rules: `new-wildcards` (not 1) words
 /// may differ at once; a token holding a `keep` or `apart` word never
@@ -1518,6 +1597,7 @@ fn key<'a>(toks: impl ExactSizeIterator<Item = &'a str>, ctx: u64) -> u64 {
 /// template has `max-slots` wildcards at most. Where a rule refuses, 0.
 fn similarity<'a>(
     a: &[Tok],
+    levels: &[bool],
     b: impl Iterator<Item = Option<&'a str>>,
     shared: Option<&[Option<Box<str>>]>,
     boiler: &[bool],
@@ -1552,7 +1632,7 @@ fn similarity<'a>(
             continue;
         }
         if let (Tok::Lit(x), Some(y)) = (x, y)
-            && boiler.get(i) == Some(&true)
+            && (boiler.get(i) == Some(&true) || levels.get(i) == Some(&true))
             && **x == *y
         {
             continue;
@@ -1604,6 +1684,7 @@ impl Drain {
             cap,
             catchall: HashMap::new(),
             boiler: HashMap::new(),
+            levels: false,
         }
     }
 
@@ -1640,7 +1721,7 @@ impl Drain {
         key: u64,
         len: usize,
         sim: f32,
-        score: impl Fn(&[Tok], Option<&[Option<Box<str>>]>) -> f32,
+        score: impl Fn(&Cluster, Option<&[Option<Box<str>>]>) -> f32,
     ) -> Option<usize> {
         let mut best = None;
         let g = self.groups.get(&key)?;
@@ -1650,7 +1731,7 @@ impl Drain {
             if c.toks.len() != len {
                 continue;
             }
-            let s = score(&c.toks, shared);
+            let s = score(c, shared);
             if s >= sim && best.is_none_or(|(_, bs)| s > bs) {
                 best = Some((ci, s));
             }
@@ -1678,7 +1759,7 @@ impl Drain {
             _ => Vec::new(),
         };
         let found = self.best(k, toks.len(), local.s.similarity, |c, s| {
-            similarity(c, toks.iter().map(|t| Some(&**t)), s, &bp, local)
+            similarity(&c.toks, &c.levels, toks.iter().map(|t| Some(&**t)), s, &bp, local)
         });
         if let Some(g) = self.groups.get_mut(&k) {
             g.note(toks.iter().map(|t| Some(&**t)));
@@ -1718,6 +1799,11 @@ impl Drain {
                     catchall: false,
                     ids: Vec::new(),
                     ctx,
+                    levels: if self.levels && local.s.lone_word {
+                        toks.iter().enumerate().map(|(i, t)| level_token(t, i, local)).collect()
+                    } else {
+                        Vec::new()
+                    },
                 };
                 if self.full(k) {
                     self.catch_all(n);
@@ -1753,9 +1839,9 @@ impl Drain {
             }
             _ => Vec::new(),
         };
-        match self
-            .best(n.key, n.toks.len(), local.s.similarity, |c, s| similarity(c, n.toks.iter().map(lit), s, &bp, local))
-        {
+        match self.best(n.key, n.toks.len(), local.s.similarity, |c, s| {
+            similarity(&c.toks, &c.levels, n.toks.iter().map(lit), s, &bp, local)
+        }) {
             Some(ci) => merge_into(&mut self.clusters[ci], n),
             None if self.full(n.key) => self.catch_all(n),
             None => {
@@ -1801,6 +1887,8 @@ struct Family {
     ids: Vec<u32>,
     /// Its context (the fields' values): an index into [`weigh`]'s.
     ctx: usize,
+    /// Its context's id ([`context_id`]), as its stage-1 template's.
+    key: u64,
 }
 
 /// Words most lines of a context carry.
@@ -1896,6 +1984,7 @@ impl From<Cluster> for Family {
             grew: 0,
             ids: c.ids,
             ctx: 0,
+            key: c.ctx,
         }
     }
 }
@@ -2096,8 +2185,20 @@ fn assess(
         say(&|| format!("rule max-slots {m}: it would have {slots} slots"));
     }
     // One atom for another (or for nothing), all else the same: a state
-    // (`gear=D`, `gear=P`), however common the words around it.
-    let flip = gaps == 1 && widest <= 1;
+    // (`gear=D`, `gear=P`), however common the words around it; with
+    // `lone-word`, only if a word in common tells the message (not a header
+    // or footer word, nor a level): else the atom is the message's only
+    // word (`INFO dlt_message_init()`, `INFO dlt_message_free()`).
+    let anchored = || {
+        pairs.iter().any(|&(i, _)| match &a.parts[i].atom {
+            Atom::Lit(l) => is_word(l) && !header_word(l, local),
+            _ => false,
+        })
+    };
+    let flip = gaps == 1 && widest <= 1 && (!local.s.lone_word || anchored());
+    if gaps == 1 && widest <= 1 && !flip {
+        say(&|| "lone-word: no word in common but the header, so not a state".into());
+    }
     let ok = flip
         || common >= 0.5
             && match gaps {
@@ -2163,6 +2264,7 @@ pub fn explain(a: &Pattern, b: &Pattern, config: &PatternConfig) -> Vec<String> 
         grew: 0,
         ids: Vec::new(),
         ctx: 0,
+        key: 0,
     };
     if a.unsorted || b.unsorted {
         return vec!["apart: lines that fit no pattern (not sorted) aren't aligned".into()];
@@ -2302,6 +2404,7 @@ fn merge(a: Family, b: &Family, pairs: &[(usize, usize)]) -> Family {
         grew: a.grew,
         ids,
         ctx: a.ctx,
+        key: a.key,
     }
 }
 
@@ -2348,7 +2451,9 @@ fn sample_lines(f: &Family) -> Vec<(usize, LineNo)> {
 /// Of those taking `b`, the one of most words joins it (the closest), the
 /// most lines among equals; the most specific go first, so a chain (`b` in
 /// `a`, `a` in `c`) ends in the most general. Only patterns whose words
-/// `b` holds all are tried; one of no words (a catch-all) takes none.
+/// `b` holds all are tried; one of no words (a catch-all) takes none; with
+/// `lone-word`, nor does one of header words only (`[ <*>]~DLT~ <*>~INFO
+/// <*>`, which would take every one-word message).
 fn absorb(
     mut fams: Vec<Family>,
     locals: &[Local],
@@ -2371,6 +2476,10 @@ fn absorb(
         }
     }
     let usable = |f: &Family| !f.unsorted && locals[f.ctx].s.merge && f.parts.len() <= MAX_ATOMS;
+    let telling = |f: &Family| {
+        let local = &locals[f.ctx];
+        !local.s.lone_word || f.words().any(|w| !header_word(w, local))
+    };
     // Each pattern by its rarest word: those whose rarest word `b` holds
     // are the only ones that may take it.
     let mut by_rarest: HashMap<&str, Vec<usize>> = HashMap::new();
@@ -2408,7 +2517,12 @@ fn absorb(
         distinct.dedup();
         for w in distinct {
             for &a in by_rarest.get(w).into_iter().flatten() {
-                if a != b && !gone[a] && fams[a].compatible(&fams[b]) && subset(&sorted[a], &sorted[b]) {
+                if a != b
+                    && !gone[a]
+                    && fams[a].compatible(&fams[b])
+                    && subset(&sorted[a], &sorted[b])
+                    && telling(&fams[a])
+                {
                     candidates.push(a);
                 }
             }
@@ -2446,6 +2560,7 @@ fn absorb(
                     grew: 0,
                     ids: vec![],
                     ctx: 0,
+                    key: 0,
                 },
             );
             fams[a] = merge(into, &fams[b], &pairs);
@@ -2615,6 +2730,7 @@ fn merge_all(
                         grew: 0,
                         ids: vec![],
                         ctx: 0,
+                        key: 0,
                     },
                 );
                 out[c] = merge(f, &t, &pairs);
@@ -3309,8 +3425,17 @@ mod tests {
                 "LOG: Clock sync {started|done} Elapsed[us]: <*>; #<*>",
                 "LOG: Config reload requested Elapsed[us]: <*>; #<*>",
                 "LOG: Vendor <*> Elapsed[us]: <*>; #<*>",
-                "LOG: {radar|lidar|imu|gnss|hmi}: {OK|OFFLINE} Elapsed[us]: <*>; #<*>",
+                // `lone-word`: OK and OFFLINE are each the message's only
+                // word (the device a value), so two patterns.
+                "LOG: {imu|hmi}: OFFLINE Elapsed[us]: <*>; #<*>",
+                "LOG: {radar|lidar|gnss}: OK Elapsed[us]: <*>; #<*>",
             ]
+        );
+        let mut config = PatternConfig::default();
+        config.set("lone-word off").unwrap();
+        let ps = detect(&f, None, &PatternOptions { config, ..Default::default() }, &Progress::new()).unwrap();
+        assert!(
+            templates(&ps).contains(&"LOG: {radar|lidar|imu|gnss|hmi}: {OK|OFFLINE} Elapsed[us]: <*>; #<*>".to_owned())
         );
     }
 
@@ -3507,6 +3632,36 @@ mod tests {
         assert_eq!(what(&differences(&ps, &same)), [(Change::Same, None), (Change::Same, None)]);
         let values = Listed { rows: Rows::Values, ..all };
         assert_eq!(what(&differences(&ps, &values)), [(Change::Gone, Some((0, 1))), (Change::Same, Some((0, 0)))]);
+    }
+
+    #[test]
+    fn a_lone_word_is_its_own_pattern() {
+        // a daemon's own log: a level glued to the pid, then function
+        // names, each a message of one word.
+        let names = ["dlt_message_init()", "dlt_message_free()", "dlt_message_read()"];
+        let lines: Vec<String> = (0..90)
+            .map(|k| match k % 3 {
+                0 => format!("[ {k}.5]~DLT~  587~DEBUG    ~The connection not found or not TCP/Serial."),
+                1 => format!("[ {k}.5]~DLT~  587~INFO     ~{}", names[(k / 3) % 3]),
+                _ => format!("[ {k}.5]~DLT~  587~DEBUG    ~BufferLength={k}, HeaderSize=42"),
+            })
+            .collect();
+        let f = text(&lines.iter().map(String::as_str).collect::<Vec<_>>());
+        let ps = detect_all(&f);
+        for n in names {
+            let t = format!("[ <*>]~DLT~ <*>~INFO ~{n}");
+            assert!(templates(&ps).contains(&t), "{t} in {:?}", templates(&ps));
+        }
+        // lone-word off: one pattern, the name its slot.
+        let mut config = PatternConfig::default();
+        config.set("lone-word off").unwrap();
+        let options = PatternOptions { lines: true, config, ..Default::default() };
+        let ps = detect(&f, None, &options, &Progress::new()).unwrap();
+        let info: Vec<String> = templates(&ps).into_iter().filter(|t| t.contains("INFO")).collect();
+        assert_eq!(info.len(), 1, "{info:?}");
+        // A state stays a state: words of the message in common.
+        let f = text(&(0..40).map(|k| ["INFO door open", "INFO door closed"][k % 2]).collect::<Vec<_>>());
+        assert_eq!(templates(&detect_all(&f)), ["INFO door {open|closed}"]);
     }
 
     #[test]
@@ -3716,7 +3871,7 @@ mod tests {
             .collect();
         // Three lines a chunk: no header there.
         assert!(rests[0][0].1.boilerplate(&config.local(&[], &[])).is_empty());
-        let (d, lines) = pool(&mut parts, rests, &tasks, &config, &[], 0).expect("pooled");
+        let (d, lines) = pool(&mut parts, rests, &tasks, &config, &[], 0, true).expect("pooled");
         let mut boiler = d.boiler[&7].clone();
         boiler.sort();
         assert_eq!(boiler, ["Elapsed[us]:".into(), "LOG:".into()] as [Box<str>; 2]);

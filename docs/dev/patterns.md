@@ -22,6 +22,24 @@ the `patterns` file and bundle kind, `--pattern-config` / `--set` /
   computed automatically for now; they run only when asked (▶ Run).
 - **Compare chooses its content (owner, 2026-11-23):** the lines compared
   can be narrowed to what matters, and unwanted content ignored.
+- **A message's only word is never a slot, tunable (owner, 2026-11-25):**
+  from the AI evaluation: in a daemon's own log, function traces
+  (`[ <*>]~DLT~ <*>~INFO ~dlt_message_init()`, ~20 functions) were one
+  pattern of a third of the log. The setting `lone-word` (on by default;
+  CLI `--set`, rules `set lone-word off`, the tuning pane): a level word
+  among a raw text line's first `header places` tokens is header in
+  stage 1 (`Cluster::levels`, decided when a template is made); in stage
+  2 a flip (one atom for another) needs a word in common that isn't a
+  header or footer word (`Local::header_words`: stage 1's boilerplate and
+  `header` rules) or a level, and a pattern of header words only absorbs
+  nothing. Measured: LogHub-2.0 2k unchanged (GA 0.751, FGA 0.760, WGA
+  0.949); that log: 33 → 82 patterns, each function its own; of 21 other
+  evaluation logs, 6 changed: a Java dump's prefix-only pattern took 59 %
+  of lines, now 23 % (its messages apart), and four trace logs join
+  one message logged at NOTICE and INFO (`{NOTICE|INFO}`); the test
+  `LOG: radar: OK` / `LOG: imu: OFFLINE` is now two patterns, not one of
+  two slots. 1 GiB: patterns identical, time unchanged (text ~620 →
+  ~635 ms, noise; DLT payloads have no level check).
 - **Compare shows what it compared (owner, 2026-11-25):** besides new,
   gone and changed, what is in both and didn't change (**Same**: scoring
   under the minimum), to confirm the same behaviour on both sides; and
@@ -59,6 +77,7 @@ side 4                    # stage 2: tokens on the longer side of a slot
 state-values 16           # a slot with more values is <*>, not a state
 header sample 32 min 8 share 0.5 places 3   # header/footer detection
 merge on                  # stage 2 at all
+lone-word on              # a message's only word is never a slot
 
 # Rules: [scope:] action
 apid == NAV: keep Elapsed              # a word that never becomes a slot
