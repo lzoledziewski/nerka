@@ -365,9 +365,17 @@ fn split_by_starts(buf: &[u8], re: &Regex, progress: &Progress) -> Result<(Vec<u
         })
         .collect::<Result<_>>()?;
     let mut starts: Vec<u64> = parts.concat();
-    // Lines before the first start are a record too.
-    if !buf.is_empty() && starts.first() != Some(&0) {
-        starts.insert(0, 0);
+    // Lines before the first start stay one row each (owner, 2026-11-25,
+    // to evaluate: a log before a goroutine dump was one 525-line record,
+    // its lines out of reach of a filter or a bookmark).
+    // No line matching: the whole file is one record, as before (and said).
+    match starts.first().map(|&s| s as usize) {
+        Some(first) if first > 0 => {
+            let head: Vec<u64> = lines(&buf[..first], 0).map(|(s, _, _)| s as u64).collect();
+            starts.splice(0..0, head);
+        }
+        None if !buf.is_empty() => starts.push(0),
+        _ => {}
     }
     let ends = (0..starts.len())
         .map(|k| {

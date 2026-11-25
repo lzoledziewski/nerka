@@ -641,10 +641,11 @@ mod tests {
         assert!(h.iter().any(|x| x.starts_with("no line has a time")), "{h:?}");
         let split = crate::input::records::RecordSplit::parse(r"start=/^goroutine \d/").unwrap();
         let r = crate::input::records::RecordFile::from_bytes("dump.txt", dump.as_bytes().to_vec(), split);
-        assert_eq!(r.line_count(), 4);
+        // The two lines before the dump stay rows, then a record per goroutine.
+        assert_eq!(r.line_count(), 5);
         let files = ["dump.txt".to_owned()];
         let v = View { source: &r, files: &files, compact: true };
-        assert_eq!(v.place(2).to_string(), r#"{"line":3,"first_line":6}"#);
+        assert_eq!(v.place(3).to_string(), r#"{"line":4,"first_line":6}"#);
         assert!(hints(&r).iter().all(|x| !x.contains("goroutine dump")), "read as records already");
     }
 
