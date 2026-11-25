@@ -4,6 +4,8 @@ The dated log of the project, newest first; append-only: add an entry at the top
 
 ## 2026-11-25
 
+Evaluation rounds 5 and 6 (`ai-evaluation.md`): a DLT trace (a DLT trace, the attachment downloaded at the owner's request) and a server's log with crash dumps (a logfmt server log), 8 blind runs, all right; fixed from them: logfmt times, `--width` / MCP `width`, a crash hint, the regex-slash advice. Owner's GUI items: changed signal values coloured in the line window, Show in search results, resizing a window over a view no longer scrolls it; tuning in the Patterns window in every build. Gate before 0.3.0 (Windows): PASS (WARN: PERF-2 within machine noise on re-runs, ARCH-2/3/4, DOC-3, MSRV-1); Linux not checked (the VM was off).
+
 Patterns (owner): Compare lists what is the same on both sides too, and patterns or values only (CLI `--show` / `--rows`, MCP, the window); the setting `lone-word` (on by default) keeps a message's only word out of slots, which fixed a daemon's log's function traces (`patterns.md`; LogHub unchanged).
 
 The owner kept lines before a record split's first match as rows (`ai-evaluation.md`); the stack-dump hint says how to group only the goroutines.
