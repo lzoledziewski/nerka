@@ -112,7 +112,7 @@ start=/RE/ outside=rows         what to do with lines outside every record (belo
 - JSON gives `"match_line"`: the file line of the first matching line, so
   an agent bookmarks the line that matters, not the header.
 
-### Later, if a log needs it
+### Later, if a log needs it (owner, 2026-11-25: `cont=` later)
 
 - `cont=/RE/`: only lines matching join the record above (Filebeat's
   multiline). It mirrors `start=` (`cont=/^\s/` is `start=/^\S/`, the
@@ -158,4 +158,4 @@ start=/RE/ outside=rows         what to do with lines outside every record (belo
 3. **Numbering by file line:** in 0.3.0, or after it?
 4. **The matching line under a folded record:** the first match only, or
    every matching line (a boot with many)?
-5. **`cont=`:** leave for later (proposed)?
+5. ~~`cont=`~~ **Answered (owner, 2026-11-25): later.** Added when a real log needs a negation `start=` can't say.
