@@ -2,7 +2,8 @@
 //! Patterns window: two sets of lines grouped into patterns together, so a
 //! pattern is the same on both sides, and what differs between them: patterns
 //! and slot values new in B, gone from B, then more or less often, surest
-//! first (`nerka_core::pattern::differences`, as `nerka compare`).
+//! first, and, when asked, those the same on both sides; patterns, values or
+//! both (`nerka_core::pattern::differences`, as `nerka compare`).
 //!
 //! A side is all lines, the filter result, a typed filter, lifecycles of a
 //! tab (picked by number, or every one of an outcome: owner, 2026-11-23,
@@ -15,15 +16,13 @@ use crate::job::{Job, Poll};
 use crate::patterns::{Input, Output, TabRef, template_job};
 use eframe::egui::{self, RichText};
 use nerka_core::lifecycle::{Lifecycles, Outcome};
-use nerka_core::pattern::{self, Change, Difference, PatternConfig, PatternOptions, Patterns};
+use nerka_core::pattern::{self, Change, Difference, Listed, PatternConfig, PatternOptions, Patterns, Rows};
 use nerka_core::{Filter, LineNo, LogSource, SearchResult};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 /// Rows listed at first; "Show more" adds as many.
 const PAGE: usize = 300;
-/// The score a change needs at first (G², p = 0.001).
-const MIN_SCORE: f64 = 10.8;
 const OUTCOMES: [Outcome; 5] = [Outcome::Planned, Outcome::Crash, Outcome::Unclean, Outcome::Lost, Outcome::Open];
 
 /// Where a side's lines come from.
@@ -108,7 +107,10 @@ struct RowKey {
 /// A finished comparison.
 struct Compared {
     ps: Patterns,
+    /// The rows `listed` lists (listed again when it changes, without a
+    /// new run).
     diffs: Vec<Difference>,
+    listed: Listed,
     /// Per side with lifecycles: how many were picked, and per pattern in
     /// how many of them it has lines.
     presence: [Option<(usize, Vec<usize>)>; 2],
@@ -125,7 +127,8 @@ pub struct CompareUi {
     pub sides: [Side; 2],
     only: String,
     ignore: String,
-    min_score: f64,
+    /// What the results list: the score, which changes, which rows.
+    listed: Listed,
     job: Option<(Job<Compared>, [String; 2])>,
     run: Option<Compared>,
     error: Option<String>,
@@ -144,7 +147,7 @@ impl Default for CompareUi {
             sides: Default::default(),
             only: String::new(),
             ignore: String::new(),
-            min_score: MIN_SCORE,
+            listed: Listed::default(),
             job: None,
             run: None,
             error: None,
@@ -364,19 +367,21 @@ impl CompareUi {
         }
         let [a, b]: [Prepared; 2] = prepared.try_into().ok().expect("two sides");
         let what = [a.what.clone(), b.what.clone()];
+        let listed = self.listed;
         let job = Job::spawn(ctx, move |progress| {
             let started = std::time::Instant::now();
             let lines = [lines_of(&a, progress)?, lines_of(&b, progress)?];
             let sa = pattern::Set { source: &*a.file, lines: lines[0].as_deref() };
             let sb = pattern::Set { source: &*b.file, lines: lines[1].as_deref() };
             let ps = pattern::compare(sa, sb, &options, progress)?;
-            let diffs = pattern::differences(&ps, 0.0);
+            let diffs = pattern::differences(&ps, &listed);
             let presence = [&a, &b].map(|p| p.lives.as_ref());
             let presence = [0, 1].map(|s| {
                 presence[s].map(|(lives, n)| (*n, ps.patterns.iter().map(|p| lives_of(lives, &p.lines[s])).collect()))
             });
             Ok(Compared {
                 diffs,
+                listed,
                 presence,
                 tabs: [a.tab, b.tab],
                 files: [Arc::as_ptr(&a.file) as *const u8 as usize, Arc::as_ptr(&b.file) as *const u8 as usize],
@@ -453,10 +458,35 @@ impl CompareUi {
             {
                 self.start(ui.ctx(), input, config);
             }
-            ui.label("Changes scoring")
-                .on_hover_text("G²: 3.84 is p = 0.05, 10.8 is p = 0.001. New and gone ones always show.");
-            ui.add(egui::DragValue::new(&mut self.min_score).range(0.0..=10_000.0).speed(0.1).max_decimals(1));
+            ui.label("Changes scoring").on_hover_text(
+                "G²: 3.84 is p = 0.05, 10.8 is p = 0.001. A change in count scoring less is Same; new and gone \
+                 ones whatever their score.",
+            );
+            ui.add(egui::DragValue::new(&mut self.listed.min_score).range(0.0..=10_000.0).speed(0.1).max_decimals(1));
             ui.label("or more");
+            ui.separator();
+            ui.label("Show:");
+            let hover = [
+                "Patterns and values with lines in B only",
+                "Patterns and values with lines in A only",
+                "In both, more or less often, scoring the minimum or more",
+                "In both and not changed (scoring less): the same behaviour on both sides",
+            ];
+            for (k, c) in Change::ALL.into_iter().enumerate() {
+                let name = ["New", "Gone", "Changed", "Same"][k];
+                ui.checkbox(&mut self.listed.changes[c as usize], name).on_hover_text(hover[k]);
+            }
+            ui.separator();
+            ui.label("Rows:");
+            egui::ComboBox::from_id_salt("compare-rows")
+                .selected_text(rows_name(self.listed.rows))
+                .show_ui(ui, |ui| {
+                    for r in Rows::ALL {
+                        ui.selectable_value(&mut self.listed.rows, r, rows_name(r));
+                    }
+                })
+                .response
+                .on_hover_text("Patterns: without their slots' values; values: slot values only");
         });
         if let Some(r) = &self.run {
             let now_files = [0, 1].map(|s| {
@@ -493,15 +523,12 @@ impl CompareUi {
     }
 
     fn results(&mut self, ui: &mut egui::Ui, input: &Input, out: &mut Output) {
+        self.relist();
         let Some(run) = &self.run else { return };
         let ps = &run.ps;
-        let rows: Vec<(&Difference, RowKey)> = run
-            .diffs
-            .iter()
-            .filter(|d| d.change() != Change::Changed || d.score >= self.min_score)
-            .map(|d| (d, row_key(ps, d)))
-            .collect();
+        let rows: Vec<(&Difference, RowKey)> = run.diffs.iter().map(|d| (d, row_key(ps, d))).collect();
         let hidden = rows.iter().filter(|(_, k)| self.ignored.contains(k)).count();
+        let nothing = rows.len() == hidden && !self.show_ignored;
         ui.horizontal(|ui| {
             ui.label(format!(
                 "A: {} ({} lines) · B: {} ({} lines) · {} patterns, {:.1?}",
@@ -524,6 +551,9 @@ impl CompareUi {
         let mut unignore = None;
         let mut show_more = false;
         let mut note = None;
+        if nothing {
+            ui.weak("Nothing listed: no row of the changes and rows shown above.");
+        }
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
             let mut section = None;
             let mut listed = 0;
@@ -537,18 +567,19 @@ impl CompareUi {
                     break;
                 }
                 listed += 1;
-                if section != Some(d.change()) {
-                    section = Some(d.change());
-                    let title = match d.change() {
+                if section != Some(d.change) {
+                    section = Some(d.change);
+                    let title = match d.change {
                         Change::New => "New in B".to_owned(),
                         Change::Gone => "Gone from B".to_owned(),
-                        Change::Changed => format!("Changed (score {} or more)", self.min_score),
+                        Change::Changed => format!("Changed (score {} or more)", self.listed.min_score),
+                        Change::Same => format!("Same in both (score below {})", self.listed.min_score),
                     };
                     ui.add_space(4.0);
                     ui.label(RichText::new(title).strong());
                 }
                 let p = &ps.patterns[d.pattern];
-                let side = usize::from(d.counts[0] == 0);
+                let side = nerka_core::agent::compare_side(d);
                 let value = d.value.and_then(|(s, v)| Some((s, &p.slots().nth(s)?.values[v])));
                 let first = value.map_or(p.sides[side].first, |(_, v)| v.sides[side].first);
                 crate::patterns::lit_row(ui, |ui| {
@@ -614,10 +645,10 @@ impl CompareUi {
                         }
                         ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
                             ui.monospace(format!("{:>7} → {:<7}", d.counts[0], d.counts[1]));
-                            let change = match d.change() {
+                            let change = match d.change {
                                 Change::New => "new".to_owned(),
                                 Change::Gone => "gone".to_owned(),
-                                Change::Changed => format!("×{:.2}", d.ratio()),
+                                Change::Changed | Change::Same => format!("×{:.2}", d.ratio()),
                             };
                             ui.monospace(format!("{change:>6}"));
                             ui.monospace(format!("{:>8.1}", d.score)).on_hover_text(
@@ -672,6 +703,26 @@ impl CompareUi {
     }
 }
 
+fn rows_name(r: Rows) -> &'static str {
+    match r {
+        Rows::All => "Patterns and values",
+        Rows::Patterns => "Patterns",
+        Rows::Values => "Values",
+    }
+}
+
+impl CompareUi {
+    /// The rows of what the results list now, if that changed since.
+    fn relist(&mut self) {
+        let Some(run) = &mut self.run else { return };
+        if run.listed != self.listed {
+            run.diffs = pattern::differences(&run.ps, &self.listed);
+            run.listed = self.listed;
+            self.shown = PAGE;
+        }
+    }
+}
+
 /// A difference's row key.
 fn row_key(ps: &Patterns, d: &Difference) -> RowKey {
     let p = &ps.patterns[d.pattern];
@@ -688,15 +739,10 @@ impl CompareUi {
         let Some(run) = &self.run else { return Vec::new() };
         run.diffs
             .iter()
-            .filter(|d| d.change() != Change::Changed || d.score >= self.min_score)
             .filter(|d| !self.ignored.contains(&row_key(&run.ps, d)))
             .map(|d| {
                 let p = &run.ps.patterns[d.pattern];
-                let change = match d.change() {
-                    Change::New => "new",
-                    Change::Gone => "gone",
-                    Change::Changed => "changed",
-                };
+                let change = d.change.name();
                 match d.value {
                     None => format!("{change} {}", p.template()),
                     Some((s, v)) => {
@@ -709,6 +755,11 @@ impl CompareUi {
     }
 
     /// Ignore a pattern (no fields) by its template.
+    pub fn list_for_test(&mut self, listed: Listed) {
+        self.listed = listed;
+        self.relist();
+    }
+
     pub fn ignore_for_test(&mut self, template: &str) {
         self.ignored.push(RowKey { pattern: template.to_owned(), value: None });
     }

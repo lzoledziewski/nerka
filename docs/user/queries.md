@@ -23,6 +23,7 @@ apid == NAV AND level >= WARN AND payload ~ "timeout"
 | `"text"` | the whole line contains the text |
 | `@signal OP VALUE` | a [signal](signals.md)'s value compares so |
 | `bookmark` | the line has a bookmark |
+| `outside` | text read as [records](formats.md#multi-line-records): a row outside every record (`NOT outside`: the records only) |
 | `A AND B`, `A OR B`, `NOT A`, `( … )` | logic; also `&&`, `\|\|`, `!` |
 
 **Operators:** `==`, `!=`, `>=`, `<=`, `>`, `<`, and `~` / `!~` (matches /
@@ -94,7 +95,8 @@ bookmark ~ /fan/             # its name or note
 `@name` is a signal of the tab or command ([Signals](signals.md)); an
 unknown one is an error. `@time` is the line's time where the file knows it
 (DLT, captures): compare it with a quoted date-time, or a time of day
-(`"10:00:00"`).
+(`"10:00:00"`). `@line` is the line's number in its own file, in a tab of
+several files too: `@line < 526`, `file == b.log AND @line >= 190`.
 
 ## Around a condition, by time
 

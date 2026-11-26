@@ -49,9 +49,18 @@ pub struct SearchPrefs {
     pub plot_window: bool,
     /// The plot's own window opens maximized (as it was last left).
     pub plot_window_maximized: bool,
-    /// The Patterns window's tuning pane in a release build (alpha builds
-    /// always show it; owner, 2026-11-23).
-    pub pattern_tuning: bool,
+    /// What 🤖 AI terminal runs (`claude`, `codex`, `gemini`, …).
+    pub ai_command: String,
+    /// The FIBEX files loaded at every start (the Signals panel's **Load
+    /// at start**; owner, 2026-11-25), unless `--fibex` gives others.
+    pub fibex_autoload: bool,
+    /// Those files, as they were last loaded (`fibex_file=` lines).
+    pub fibex_files: Vec<String>,
+    /// An agent's answers (`crate::agent::Limits`): lines when it doesn't
+    /// say, lines at most, patterns when it doesn't say.
+    pub ai_lines: u64,
+    pub ai_most: u64,
+    pub ai_top: u64,
     /// Light, dark, or as the system says (egui falls back to dark where
     /// it can't tell, as on many Linux desktops).
     pub theme: egui::ThemePreference,
@@ -86,7 +95,12 @@ impl Default for SearchPrefs {
             checks_auto: true,
             plot_window: false,
             plot_window_maximized: false,
-            pattern_tuning: false,
+            ai_command: "claude".into(),
+            fibex_autoload: false,
+            fibex_files: Vec::new(),
+            ai_lines: 50,
+            ai_most: 1000,
+            ai_top: 30,
             theme: egui::ThemePreference::System,
             routes: Vec::new(),
             disabled_protocols: Vec::new(),
@@ -108,6 +122,28 @@ impl SearchPrefs {
                 }
                 "disabled_protocols" => {
                     p.disabled_protocols = value.split_whitespace().map(str::to_owned).collect();
+                    continue;
+                }
+                "ai_command" => {
+                    p.ai_command = value.trim().to_owned();
+                    continue;
+                }
+                "fibex_file" => {
+                    if !value.trim().is_empty() {
+                        p.fibex_files.push(value.trim().to_owned());
+                    }
+                    continue;
+                }
+                k @ ("ai_lines" | "ai_most" | "ai_top") => {
+                    if let Ok(n) = value.trim().parse::<u64>()
+                        && n > 0
+                    {
+                        match k {
+                            "ai_lines" => p.ai_lines = n,
+                            "ai_most" => p.ai_most = n,
+                            _ => p.ai_top = n,
+                        }
+                    }
                     continue;
                 }
                 _ => {}
@@ -165,7 +201,7 @@ impl SearchPrefs {
                 "checks_auto" => p.checks_auto = flag,
                 "plot_window" => p.plot_window = flag,
                 "plot_window_maximized" => p.plot_window_maximized = flag,
-                "pattern_tuning" => p.pattern_tuning = flag,
+                "fibex_autoload" => p.fibex_autoload = flag,
                 _ => {}
             }
         }
@@ -200,9 +236,14 @@ impl SearchPrefs {
         out.push_str(&format!("plot_window={}\n", self.plot_window));
         out.push_str(&format!("plot_window_maximized={}\n", self.plot_window_maximized));
         out.push_str(&format!("theme={}\n", theme_key(self.theme)));
-        out.push_str(&format!("pattern_tuning={}\n", self.pattern_tuning));
+        out.push_str(&format!("ai_command={}\n", self.ai_command.replace(['\n', '\r'], " ")));
+        out.push_str(&format!("ai_lines={}\nai_most={}\nai_top={}\n", self.ai_lines, self.ai_most, self.ai_top));
         for r in &self.routes {
             out.push_str(&format!("route={r}\n"));
+        }
+        out.push_str(&format!("fibex_autoload={}\n", self.fibex_autoload));
+        for f in &self.fibex_files {
+            out.push_str(&format!("fibex_file={}\n", f.replace(['\n', '\r'], " ")));
         }
         out.push_str(&format!("disabled_protocols={}\n", self.disabled_protocols.join(" ")));
         out
@@ -297,7 +338,12 @@ mod tests {
             checks_auto: false,
             plot_window: true,
             plot_window_maximized: true,
-            pattern_tuning: true,
+            ai_command: "codex --full-auto".into(),
+            fibex_autoload: true,
+            fibex_files: vec!["D:/fibex/ecu1.xml".into(), "/home/u/ecu 2.xml".into()],
+            ai_lines: 80,
+            ai_most: 2000,
+            ai_top: 40,
             theme: egui::ThemePreference::Light,
             routes: vec!["DLT:port=3490,vlan=5".into()],
             disabled_protocols: vec!["syslog".into()],

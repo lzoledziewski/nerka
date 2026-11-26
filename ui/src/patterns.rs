@@ -188,6 +188,10 @@ pub struct PatternsUi {
     shown: usize,
     /// The configuration file's stamp, and when it was looked at.
     config: (Option<Instant>, Option<(SystemTime, u64)>),
+    /// `--patterns`: ▶ Run once the tab's file is read.
+    pub autorun: bool,
+    /// `--screenshot`: this window's picture, asked for at its next frame.
+    pub shoot: Option<Arc<std::sync::Mutex<Option<egui::ColorImage>>>>,
 }
 
 impl Default for PatternsUi {
@@ -213,6 +217,8 @@ impl Default for PatternsUi {
             error: None,
             unfolded: HashMap::new(),
             shown: PAGE,
+            autorun: false,
+            shoot: None,
             config: (None, None),
         }
     }
@@ -270,7 +276,7 @@ pub struct Input<'a> {
     pub title: String,
     /// The pattern configuration to run with (the saved one).
     pub config: fn() -> Result<PatternConfig, String>,
-    /// The tuning pane is shown (alpha builds, or ⚙ Settings).
+    /// The tuning pane is shown (every build; tests turn it off).
     pub tuning: bool,
 }
 
@@ -298,6 +304,12 @@ impl PatternsUi {
 
     pub fn is_busy(&self) -> bool {
         self.job.is_some() || self.compare.is_busy()
+    }
+
+    /// How many patterns the last run found.
+    #[cfg(test)]
+    pub fn found(&self) -> Option<usize> {
+        self.run.as_ref().map(|r| r.patterns.patterns.len())
     }
 
     /// Its id: the tab's in [`TabRef::id`].
@@ -474,6 +486,9 @@ impl PatternsUi {
         }
         self.poll();
         self.compare.poll();
+        if std::mem::take(&mut self.autorun) {
+            self.start(ctx, input);
+        }
         // A setting changed in the tuning pane: the same lines again.
         if input.tuning && self.tuning.due() && self.job.is_none() {
             self.start(ctx, input);
@@ -486,7 +501,13 @@ impl PatternsUi {
         let mut closed = false;
         ctx.show_viewport_immediate(id, builder, |ui, _| {
             closed = ui.input(|i| i.viewport().close_requested());
-            egui::CentralPanel::default().show(ui, |ui| self.contents(ui, input, &mut out));
+            let panel = egui::CentralPanel::default().show(ui, |ui| self.contents(ui, input, &mut out)).response.rect;
+            // `--screenshot`: eframe takes no picture of a window drawn
+            // immediately, so this one is drawn inside the main window then
+            // (`App::patterns_windows`) and cut out of its picture.
+            if let Some(slot) = self.shoot.take() {
+                crate::shot::request_part(ui.ctx(), panel, slot);
+            }
         });
         if closed {
             self.open = false;
@@ -1193,6 +1214,18 @@ mod tests {
         // Ignored, it leaves the list.
         p.compare.ignore_for_test("panic in task");
         assert!(!p.compare.rows_for_test().contains(&"new panic in task".to_owned()));
+        // The same ones, patterns only: the doors, in both and not changed;
+        // listed again without a new run.
+        use nerka_core::pattern::{Listed, Rows};
+        let same = Listed { changes: [false, false, false, true], rows: Rows::Patterns, ..Default::default() };
+        p.compare.list_for_test(same);
+        let rows = p.compare.rows_for_test();
+        assert!(!rows.is_empty() && rows.iter().all(|r| r.starts_with("same ") && !r.contains("slot")), "{rows:?}");
+        assert!(rows.iter().any(|r| r.starts_with("same door")), "{rows:?}");
+        // Values only.
+        p.compare.list_for_test(Listed { rows: Rows::Values, ..Default::default() });
+        let rows = p.compare.rows_for_test();
+        assert!(!rows.is_empty() && rows.iter().all(|r| r.contains("slot")), "{rows:?}");
     }
 
     /// Tuning (α2): a setting changed in the pane runs the same lines

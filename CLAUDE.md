@@ -18,6 +18,12 @@ cargo deny check                             # dependency licences / advisories 
 cargo run -p nerka-cli -- filter 'level >= ERROR AND raw ~ /SSL/' app.log
 cargo run -p nerka-gui -- app.log --query 'level >= ERROR'
 cargo run -p nerka-cli -- --signal 'v=/v=(?<v>\d+)/' filter '@v > 100' app.log   # signals (@name)
+cargo run -p nerka-cli -- filter --json -m 50 --fields apid 'level >= ERROR' trace.dlt   # JSON Lines in pages (--skip N; -c first); exit 0 found, 1 none, 2 error
+cargo run -p nerka-cli -- open --json trace.dlt          # what a file is: fields, time span, levels (core/src/agent.rs)
+cargo run -p nerka-cli -- help nfd                       # the grammar (core/src/dsl/grammar.txt) and examples
+cargo run -p nerka-cli -- help agent                     # the agents' guide (cli/src/agent_guide.md; `help skill`: as a SKILL.md; every command in it is run by a test)
+cargo run -p nerka-cli -- marks --add 42 --note 'the first error' app.log   # an agent's bookmark (author `ai`, merged into an open window)
+cargo run -p nerka-cli -- mcp                            # MCP server (stdio) on the nerka window focused last (NERKA_WINDOW=pid: that one); cli/src/mcp.rs -> core/src/link.rs -> ui/src/instance.rs -> ui/src/agent.rs
 cargo run -p nerka-cli -- filter --before 30s --after 2s 'payload ~ /watchdog/' trace.dlt   # lines around a match by time (NFD: before(30s, …), after, around)
 cargo run -p nerka-cli -- --fibex ecu1.xml filter 'apid == NAV' trace.dlt        # DLT non-verbose via FIBEX
 cargo run -p nerka-cli -- --someip-port 30501 filter 'proto == SOMEIP AND type == ERROR' trace.pcap   # protocols by UDP port
@@ -104,8 +110,10 @@ GUI decisions: read it before changing the UI, and record new ones there.
 - Search changes: every engine test runs the fast path against the naive
   per-line path (`run_filter` in `engine/search.rs`). Keep that invariant and
   add a test for every bug.
-- DSL changes: update the grammar comment in `dsl/mod.rs` and add parser tests,
-  including error positions.
+- DSL changes: update the grammar in `dsl/grammar.txt` (it is `dsl/mod.rs`'s
+  doc and `nerka help nfd`) and add parser tests, including error positions.
+- JSON is hand-written (`core/src/json.rs`, no serde; `docs/dev/ai.md`); `--json`
+  objects are built in core (`core/src/agent.rs`) so the MCP bridge can answer with the same.
 - Performance-sensitive changes: report before/after numbers from the `--stats` benchmark above.
 - Keep dependencies few and justified in the PR description (spec §3.1).
 - A breaking change to a saved file's format (packs, presets, plots, checks,

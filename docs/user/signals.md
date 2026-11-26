@@ -45,7 +45,8 @@ defaults to the signal's name. Parts:
 - the file: `@time` for files that know their lines' times (DLT,
   captures, text files whose [profile](formats.md#profiles) reads a time:
   by default the date-time each line starts with), moved by the file's
-  [offset](formats.md#a-files-offset);
+  [offset](formats.md#a-files-offset); and `@line`, every line's number in
+  its own file (a record: its first line), also in a tab of several files;
 - a text file's [profile](formats.md#profiles): its `signal` clauses, for
   its files only, shown as `profile NAME` and changed in ⚙ Settings →
   Profiles… (a signal of yours with the same name wins);
@@ -79,7 +80,9 @@ zones (`Z`, `UTC`, `+02:00`) and plain numbers (seconds since 1970, or ms,
 the current line: `• event` when the line itself carries it, else `↑ N`
 (the line of the event that set it; click to go there). ✎ edits, − removes,
 the checkbox switches a saved signal on or off, **New signal or lifecycle**
-adds one. The line window (`Enter`) lists the line's own signals.
+adds one. The line window (`Enter`) lists the line's own signals, a
+value that changed what was held before coloured (`was 10`), and below,
+folded, the others' states held from earlier lines.
 
 A query's or FIBEX signal's kind, scope and ⚙ (lifecycle, default) change
 it **in this tab only**. A query signal changed so shows ●; 💾 (**Save
@@ -135,7 +138,8 @@ which no zoom shows apart, are *4 changes at the same time*.
 - **Value markers:** right-click a number lane's name → add a horizontal line
   at a value (a limit, a threshold); the same menu sets the y axis.
 - **Bookmarks** show as red lines with their names and notes and take part
-  in Δt; the plot's menu bookmarks the nearest event of the lane you
+  in Δt (an agent's [annotations](agents.md) in violet with 🤖; the 🔖 and
+  🤖 checkboxes show or hide each); the plot's menu bookmarks the nearest event of the lane you
   clicked, or, clicked near a change, **the change of @ota** (the line
   where the value changed), with a **name** (empty: `B1`, `B2`…, or the one
   it has) and a **note**.

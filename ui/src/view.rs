@@ -48,6 +48,17 @@ const TAB_COLS: usize = 4;
 const LINES_PER_NOTCH: u64 = 3;
 /// The stripe of a bookmarked line (and of its note).
 const BOOKMARK_COLOR: Color32 = Color32::from_rgb(230, 120, 40);
+/// An annotation's (an agent's bookmark, not accepted yet): its stripe,
+/// its glyph's colour in the panel and the plot.
+pub const ANNOTATION_COLOR: Color32 = Color32::from_rgb(150, 100, 230);
+/// An annotation's glyph, where a bookmark's is 🔖 (owner, 2026-11-24).
+pub const ANNOTATION_GLYPH: &str = "🤖";
+
+/// The glyph and colour of the bookmark on `line`: 🔖 and orange, or an
+/// annotation's 🤖 and violet.
+fn mark_style(b: &Bookmarks, line: LineNo) -> (&'static str, Color32) {
+    if b.is_annotation(line) { (ANNOTATION_GLYPH, ANNOTATION_COLOR) } else { ("🔖", BOOKMARK_COLOR) }
+}
 
 /// A position in the view: row and display column (see [`Cells`]).
 /// `col == usize::MAX` means "end of line".
@@ -259,6 +270,9 @@ pub struct Highlight<'a> {
     /// Where lifecycles start (file lines, ascending): a line above the row,
     /// labelled, red after one that ended badly (`docs/dev/lifecycles.md`).
     pub lifecycles: Option<&'a [Boundary]>,
+    /// The main view with a search: its menu offers **Show in search
+    /// results** (owner, 2026-11-25: the way back from a hit's click).
+    pub in_hits: bool,
 }
 
 /// A lifecycle's start, as the view marks it.
@@ -305,6 +319,8 @@ pub struct ViewOutput {
     pub detail: Option<u64>,
     /// The selection moved to this row in this frame (a click, the keys).
     pub moved_to: Option<u64>,
+    /// "Show in search results" chosen from the context menu, for this row.
+    pub in_hits: Option<u64>,
 }
 
 /// Draw `rows` rows; `line_of_row` maps a view row to a file line.
@@ -327,7 +343,15 @@ pub fn log_view(
     let snap = |v: f32| (v * ppp).round() / ppp;
     let row_h = snap(ui.fonts_mut(|f| f.row_height(&font)) + 2.0);
     let char_w = ui.fonts_mut(|f| f.glyph_width(&font, '0'));
-    let total_lines = source.line_count();
+    // Numbers are file lines (a record's first; owner, 2026-11-25): as wide
+    // as the file's last line.
+    let total_lines = match source.line_count().checked_sub(1) {
+        Some(last) => {
+            let more = source.line_bytes(last).map_or(0, |b| b.iter().filter(|&&c| c == b'\n').count() as u64);
+            (nerka_core::agent::locator(source)(last).1 + 1 + more).max(source.line_count())
+        }
+        None => 0,
+    };
     let gutter_w = (digits(total_lines) as f32 + 1.5) * char_w;
 
     let (outer, response) = ui.allocate_exact_size(ui.available_size(), Sense::click_and_drag());
@@ -559,6 +583,10 @@ pub fn log_view(
             i.pointer.interact_pos(),
         )
     });
+    // The press is the view's: no other widget took it (egui's hit test), as
+    // a window's resize edge reaching over the view does, which then
+    // scrolled the view as if selecting past its edge (owner, 2026-11-25).
+    let own_press = ui.ctx().dragged_id().is_none_or(|d| d == response.id);
     // ----- table header: drag a divider to resize its column -----
     let x0 = snap(text_x0 - state.x_off);
     let divider_x =
@@ -571,7 +599,7 @@ pub fn log_view(
             .filter(|p| header_rect.contains(*p) && response.contains_pointer())
             .and_then(|p| (0..n).find(|&k| (p.x - divider_x(&starts, &columns.widths, k)).abs() <= 4.0));
         over_divider = near.is_some();
-        if pressed && near.is_some() {
+        if pressed && near.is_some() && own_press {
             state.resizing = near;
         }
         if let Some(k) = state.resizing {
@@ -592,6 +620,7 @@ pub fn log_view(
         && let Some(p) = pointer
         && rows_rect.contains(p)
         && response.contains_pointer()
+        && own_press
     {
         let pos = hit(state, p);
         if command && !shift {
@@ -741,6 +770,7 @@ pub fn log_view(
     }
 
     let mut toggle_bookmark = None;
+    let mut in_hits = None;
     response.context_menu(|ui| {
         let has_sel = state.selection().is_some();
         let label = match state.picked.len() {
@@ -763,6 +793,15 @@ pub fn log_view(
         }
         if ui.add_enabled(state.selected.is_some(), egui::Button::new("Show whole line…  (Enter)")).clicked() {
             detail = state.selected;
+            ui.close();
+        }
+        if hl.in_hits
+            && ui
+                .add_enabled(state.selected.is_some(), egui::Button::new("Show in search results"))
+                .on_hover_text("Selects this line in the search results below, or the next hit after it")
+                .clicked()
+        {
+            in_hits = state.selected;
             ui.close();
         }
         ui.separator();
@@ -917,11 +956,15 @@ pub fn log_view(
     // Fold markers clicked: (file line, unfold).
     let mut folds: Vec<(LineNo, bool)> = Vec::new();
     let mut numbered = None;
+    // Each line numbered in its own file, as agents' answers and @line do;
+    // a record by its lines there (owner, 2026-11-25).
+    let at = nerka_core::agent::locator(source);
+    let file_line_of = |line: LineNo| at(line).1;
     for (y, row, slot) in slots(state.top, state.skipped(), rows, &is_open(state)) {
         let line = line_of_row(row);
         let k = match slot {
             Slot::Note(note) => {
-                note_slots.push((y, note));
+                note_slots.push((y, note, line));
                 continue;
             }
             Slot::Line(k) => k,
@@ -951,8 +994,9 @@ pub fn log_view(
                 painter.rect_filled(r, 1.0, s.colors[q % s.colors.len().max(1)]);
             }
         }
-        if hl.bookmarks.is_some_and(|b| b.contains(line)) {
-            painter.rect_filled(Rect::from_min_size(row_rect.min, vec2(char_w * 0.6, row_h)), 0.0, BOOKMARK_COLOR);
+        if let Some(b) = hl.bookmarks.filter(|b| b.contains(line)) {
+            let color = mark_style(b, line).1;
+            painter.rect_filled(Rect::from_min_size(row_rect.min, vec2(char_w * 0.6, row_h)), 0.0, color);
         }
         // A lifecycle starts here: a line above the row, its label at the
         // right (on the row's first slot).
@@ -971,13 +1015,14 @@ pub fn log_view(
             painter.rect_filled(Rect::from_min_size(at, galley.size()).expand(1.0), 2.0, vis.panel_fill);
             painter.galley(at, galley, c);
         }
-        // Its number on its first slot shown (a record scrolled into).
-        if numbered != Some(row) {
+        // Its number in the file; an unfolded record's lines each theirs.
+        {
             numbered = Some(row);
+            let number = file_line_of(line) + 1 + k as u64;
             painter.text(
                 pos2(text_rect.min.x + gutter_w - char_w * 0.75, snap(y + 1.0)),
                 Align2::RIGHT_TOP,
-                (line + 1).to_string(),
+                number.to_string(),
                 font.clone(),
                 dim,
             );
@@ -1058,20 +1103,47 @@ pub fn log_view(
                 }
             }
             // Folded: the rest of the record after the marker, its lines
-            // joined (a pretty JSON record's first line is only `{`).
+            // joined (a pretty JSON record's first line is only `{`); where
+            // a filter or search matched past its first line, from that
+            // line on, its number first, and how many other lines match
+            // (owner, 2026-11-25).
             if !open {
-                let (rest, rest_spans) = folded_preview(&whole, end, &record_spans);
-                let galley = painter.layout_job(spans_job(&format!("  {rest}"), 2, &rest_spans, &font, dim));
+                let mut lines_hit: Vec<usize> =
+                    record_spans.iter().map(|(r, _)| whole[..r.start.min(whole.len())].matches('\n').count()).collect();
+                lines_hit.sort_unstable();
+                lines_hit.dedup();
+                let past_first: Vec<usize> = lines_hit.iter().copied().filter(|&i| i > 0).collect();
+                let (from, prefix) = match past_first.first() {
+                    Some(&i) => {
+                        let from = whole.match_indices('\n').nth(i - 1).map_or(end, |(p, _)| p + 1);
+                        (from, format!("  {}: ", file_line_of(line) + 1 + i as u64))
+                    }
+                    None => (end, "  ".to_owned()),
+                };
+                let (rest, rest_spans) = folded_preview(&whole, from, &record_spans);
+                let galley =
+                    painter.layout_job(spans_job(&format!("{prefix}{rest}"), prefix.len(), &rest_spans, &font, dim));
                 let at = pos2(x + width, snap(y + 1.0));
                 width += galley.size().x;
                 painter.with_clip_rect(text_clip).galley(at, galley, dim);
+                if past_first.len() > 1 {
+                    let more = past_first.len() - 1;
+                    let note = format!("  (+{more} more matching line{})", if more == 1 { "" } else { "s" });
+                    let galley = painter.layout_job(note_job(note));
+                    let at = pos2(x + width, snap(y + 1.0));
+                    width += galley.size().x;
+                    painter.with_clip_rect(text_clip).galley(at, galley, dim);
+                }
             }
         }
         if hl.notes == NoteMode::EndOfLine
             && last
-            && let Some(note) = hl.bookmarks.and_then(|b| shown_note(b, line))
+            && let Some(b) = hl.bookmarks
+            && let Some(note) = shown_note(b, line)
         {
-            let galley = painter.layout_job(note_job(format!("◂ {note}")));
+            // An annotation says so; a bookmark's note goes as it was.
+            let glyph = if b.is_annotation(line) { format!("{ANNOTATION_GLYPH} ") } else { String::new() };
+            let galley = painter.layout_job(note_job(format!("◂ {glyph}{note}")));
             let at = width + char_w * 2.0;
             width = at + galley.size().x;
             painter.with_clip_rect(text_clip).galley(pos2(x + at, snap(y + 1.0)), galley, dim);
@@ -1124,13 +1196,14 @@ pub fn log_view(
         }
     }
 
-    for (y, note) in note_slots {
+    for (y, note, line) in note_slots {
         // The note above its line: no number, never scrolled sideways.
+        let (glyph, color) = hl.bookmarks.map_or(("🔖", BOOKMARK_COLOR), |b| mark_style(b, line));
         let r = Rect::from_min_size(pos2(text_rect.min.x, y), vec2(text_rect.width(), row_h));
         painter.rect_filled(r, 0.0, vis.extreme_bg_color);
         painter.rect_filled(r, 0.0, vis.faint_bg_color);
-        painter.rect_filled(Rect::from_min_size(r.min, vec2(char_w * 0.6, row_h)), 0.0, BOOKMARK_COLOR);
-        let galley = painter.layout_job(note_job(format!("🔖 {note}")));
+        painter.rect_filled(Rect::from_min_size(r.min, vec2(char_w * 0.6, row_h)), 0.0, color);
+        let galley = painter.layout_job(note_job(format!("{glyph} {note}")));
         painter.with_clip_rect(text_clip).galley(pos2(snap(text_x0), snap(y + 1.0)), galley, dim);
     }
 
@@ -1183,15 +1256,19 @@ pub fn log_view(
         && let line = line_of_row(hit(state, p).row)
         && let Some(name) = shown_name(b, line)
     {
-        let tip = match b.note(line).unwrap_or_default() {
-            "" => format!("🔖 {name}"),
-            note => format!("🔖 {name}\n{note}"),
+        let glyph = mark_style(b, line).0;
+        let mut tip = match b.note(line).unwrap_or_default() {
+            "" => format!("{glyph} {name}"),
+            note => format!("{glyph} {name}\n{note}"),
         };
+        if let Some(by) = b.author(line) {
+            tip += &format!("\n\nAn annotation by {by}: ✔ in the 🔖 Bookmarks panel makes it your bookmark");
+        }
         response.clone().on_hover_text_at_pointer(tip);
     }
 
     let moved_to = state.selected.filter(|_| state.selected != selected_before);
-    ViewOutput { clicked, has_focus, copied, toggle_bookmark, detail, moved_to }
+    ViewOutput { clicked, has_focus, copied, toggle_bookmark, detail, moved_to, in_hits }
 }
 
 /// How a line's characters map to display columns. In plain text a tab is
@@ -1565,6 +1642,7 @@ mod tests {
             lines: None,
             notes: NoteMode::Off,
             lifecycles: None,
+            in_hits: false,
         };
         let mut rect = Rect::NOTHING;
         let mut out = ctx.run_ui(input, |ui| {
@@ -1642,6 +1720,7 @@ mod tests {
             lines: None,
             notes: NoteMode::Off,
             lifecycles: None,
+            in_hits: false,
         };
         let mut t = 0.0;
         let mut step = |events: Vec<egui::Event>, state: &mut ViewState, columns: &mut Columns| {
@@ -1697,6 +1776,7 @@ mod tests {
             lines: None,
             notes: NoteMode::Off,
             lifecycles: None,
+            in_hits: false,
         };
         let mut t = 0.0;
         let mut step = |events: Vec<egui::Event>, state: &mut ViewState, file: &nerka_core::TextFile| {
@@ -1780,6 +1860,7 @@ mod tests {
                 lines: None,
                 notes: NoteMode::Off,
                 lifecycles: None,
+                in_hits: false,
             };
             let mut out = ctx.run_ui(input, |ui| {
                 egui::CentralPanel::default().frame(egui::Frame::NONE).show(ui, |ui| {
@@ -1889,6 +1970,7 @@ mod tests {
                 lines: None,
                 notes: NoteMode::Off,
                 lifecycles: None,
+                in_hits: false,
             };
             let mut out = ctx.run_ui(input, |ui| {
                 egui::CentralPanel::default().frame(egui::Frame::NONE).show(ui, |ui| {
@@ -1951,6 +2033,7 @@ mod tests {
                 lines: None,
                 notes: NoteMode::Off,
                 lifecycles: None,
+                in_hits: false,
             };
             let mut out = ctx.run_ui(input, |ui| {
                 egui::CentralPanel::default().frame(egui::Frame::NONE).show(ui, |ui| {
@@ -2057,6 +2140,7 @@ mod tests {
                 lines: None,
                 notes,
                 lifecycles: None,
+                in_hits: false,
             };
             let mut out = ctx.run_ui(input, |ui| {
                 egui::CentralPanel::default().frame(egui::Frame::NONE).show(ui, |ui| {
@@ -2132,6 +2216,7 @@ mod tests {
                     lines: None,
                     notes,
                     lifecycles: None,
+                    in_hits: false,
                 };
                 let mut out = ctx.run_ui(input, |ui| {
                     egui::CentralPanel::default().frame(egui::Frame::NONE).show(ui, |ui| {
@@ -2168,6 +2253,7 @@ mod tests {
             lines: None,
             notes: NoteMode::Off,
             lifecycles: None,
+            in_hits: false,
         };
         let mut t = 0.0;
         let mut step = |events: Vec<egui::Event>, state: &mut ViewState| {
@@ -2248,6 +2334,7 @@ mod tests {
             lines: None,
             notes: NoteMode::Off,
             lifecycles: None,
+            in_hits: false,
         };
         let mut t = 0.0;
         // Wherever the long line is, one of these rows is the cut-off last one.
@@ -2273,6 +2360,67 @@ mod tests {
         }
     }
 
+    /// Resizing a window over the view (the line window) from its edge,
+    /// down past the view: the view neither selects nor scrolls (owner,
+    /// 2026-11-25: it scrolled as if selecting past its edge).
+    #[test]
+    fn a_window_resized_over_the_view_doesnt_scroll_it() {
+        let text: String = (0..500).map(|i| format!("line {i}\n")).collect();
+        let file = nerka_core::TextFile::from_bytes("t", text.into_bytes());
+        let ctx = egui::Context::default();
+        let hl = Highlight {
+            highlighter: None,
+            bookmarks: None,
+            search: None,
+            lines: None,
+            notes: NoteMode::Off,
+            lifecycles: None,
+            in_hits: false,
+        };
+        let mut s = ViewState::default();
+        let mut win = None;
+        let mut t = 0.0;
+        let mut frame = |events: Vec<egui::Event>, s: &mut ViewState, win: &mut Option<Rect>| {
+            t += 1.0 / 60.0;
+            let screen = Rect::from_min_size(pos2(0.0, 0.0), vec2(600.0, 400.0));
+            let input = egui::RawInput { screen_rect: Some(screen), time: Some(t), events, ..Default::default() };
+            let mut out = ctx.run_ui(input, |ui| {
+                egui::CentralPanel::default().frame(egui::Frame::NONE).show(ui, |ui| {
+                    log_view(ui, "v", s, file.line_count(), &|r| r, &file, &mut Columns::default(), &hl);
+                });
+                let r = egui::Window::new("Line 1")
+                    .resizable(true)
+                    .default_pos(pos2(100.0, 50.0))
+                    .default_size([200.0, 100.0])
+                    .show(ui.ctx(), |ui| ui.label("detail"));
+                *win = r.map(|r| r.response.rect);
+            });
+            out.textures_delta.clear();
+        };
+        for _ in 0..3 {
+            frame(vec![], &mut s, &mut win);
+        }
+        let w = win.expect("the window");
+        // Its right edge, just outside the frame, over the view.
+        let edge = pos2(w.right() + 2.0, w.center().y);
+        let button = |pos, pressed| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        frame(vec![egui::Event::PointerMoved(edge)], &mut s, &mut win);
+        frame(vec![button(edge, true)], &mut s, &mut win);
+        let below = pos2(edge.x + 40.0, 395.0);
+        for k in 0..10 {
+            let p = pos2(below.x, below.y + k as f32);
+            frame(vec![egui::Event::PointerMoved(p)], &mut s, &mut win);
+        }
+        frame(vec![button(below, false)], &mut s, &mut win);
+        assert_eq!((s.top, s.sel), (0, None), "the view neither scrolled nor selected");
+        assert!(win.unwrap().width() > w.width(), "the window was resized: {w:?} → {:?}", win.unwrap());
+    }
+
     #[test]
     fn ctrl_click_picks_single_lines_and_copy_takes_them() {
         let text: String = (0..20).map(|i| format!("line {i}\n")).collect();
@@ -2287,6 +2435,7 @@ mod tests {
             lines: None,
             notes: NoteMode::Off,
             lifecycles: None,
+            in_hits: false,
         };
         let mut t = 0.0;
         let mut step = |events: Vec<egui::Event>, state: &mut ViewState| {

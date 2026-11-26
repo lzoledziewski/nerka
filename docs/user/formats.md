@@ -24,20 +24,38 @@ A stack trace belongs to its message. Read text as **records**:
 
 | Spec | A record |
 |---|---|
-| `start=/REGEX/` | starts at each line matching the regex (e.g. a date: `start=/\d{4}-\d\d-\d\d/`) |
+| `start=/REGEX/` | starts at each line matching the regex and runs to the next (e.g. a date: `start=/\d{4}-\d\d-\d\d/`, a boot: `start=/U-Boot/`) |
+| `start=/REGEX/ end=/REGEX/` | … and ends at the first line matching `end`, that line included (a goroutine of a Go dump: `start=/^goroutine \d/ end=/^$/`) |
+| `end=/REGEX/` | ends at each line matching the regex; the next line begins the next |
 | `blank` | is separated from the next by blank lines |
 | `sep=/REGEX/` | is separated by lines matching the regex (not part of either record) |
 | `json` | is a JSON value (below) |
 | `lines` | is one line |
 | `auto` | JSON if the file looks like JSON, else lines (the default) |
 
+**Lines outside every record**, before the first start and between an
+end and the next start: with `start=` alone they are one record (a
+session the log began in the middle of, like the others), with `end=` a
+row each (the log around a dump). `outside=one` or `outside=rows` says
+which: `start=/RE/ end=/RE/ outside=one`. In a query, the field
+`outside` is true on them: `NOT outside` shows the records only.
+
 GUI: the tab's menu → **Records…**, for the tab's text files (also beside
-DLT files and captures), remembered for each of them; **Automatic** forgets
-it. A file opened later with one of them keeps its own. CLI: `--records
-SPEC` (every text file). A record's level is read from its first line; a
-regex can span its lines. A `start=` or `sep=` that matches no line of a
-file leaves it one record, and the status bar (`nerka open`: a note) says
-so.
+DLT files and captures): *starts at*, *ends at* (optional), *lines
+outside records*; remembered for each file; **Automatic** forgets it. A
+file opened later with one of them keeps its own. CLI: `--records SPEC`
+(every text file); in a spec of several parts each regex is written
+between slashes (`[/]` or `\/` for a slash in it).
+
+A record's level and time are its first line's; a filter keeps a record
+when any of its lines matches (a regex can span them; `^` is each line's
+start). **Numbers stay the file's:** a record is numbered by its first
+line, so the numbers jump over a folded record (1352, then 1391), Ctrl+G
+goes to the record holding a line, and `nerka lines FILE FROM TO` reads
+the file's lines whatever `--records` says. A folded record that matched
+past its first line shows that line, its number first, and how many
+others match. A `start=` or `sep=` that matches no line of a file leaves
+it one record, and the status bar (`nerka open`: a note) says so.
 
 ### Profiles
 
@@ -49,7 +67,7 @@ CLAUSES`, the clauses separated by `;`:
 | `name *.log, app-*.txt` | the profile is for files whose name matches (`*`, `?`; any case) |
 | `first /REGEX/` | … whose first non-empty line matches |
 | `records lines`, `start=/REGEX/`, `sep=/REGEX/`, `blank`, `json`, `auto` | how lines group into rows ([Multi-line records](#multi-line-records); `auto` by default) |
-| `time auto` | a line's time is the date-time it starts with |
+| `time auto` | a line's time is the date-time it starts with (also logfmt's first key: `time=2025-10-17T10:00:01Z level=INFO …`, `ts=`, `t=`) |
 | `time /REGEX/` | a line's time is the regex's group `time` (or the whole match) |
 | `time none` | no time |
 | `zone utc`, `zone local`, `zone +02:00` | the zone of times written without one (default: as shown, [Times](#times)) |
@@ -89,8 +107,9 @@ each file's time is read.
 **When a time can't be read** (best effort):
 
 - `time auto` is used for a file only if at least half of its first 200
-  non-empty lines start with a time; a profile's own regex if any of them
-  has one. Otherwise the file has no time, as if the profile had `time
+  non-empty lines start with a time, or a tenth of them (10 at least) and
+  the first (a server's log with a tool's output between its own lines); a
+  profile's own regex if any of them has one. Otherwise the file has no time, as if the profile had `time
   none`, and **Files…** / `nerka open` say so.
 - A line without a time of its own (a stack trace's next lines, a wrapped
   message) has the time of the line before it, and lines before the first
@@ -124,7 +143,9 @@ ECU's uptime (`tmsp`), `ecu`, `apid`, `ctid`, `type` and the payload as
 text; [fields](queries.md#fields) filter on the headers without decoding
 the payload. **Non-verbose** messages are decoded with **FIBEX** files
 (`--fibex FILE`, or the Signals panel's FIBEX section): their text, APID,
-CTID and level, and their arguments can be [plotted](signals.md).
+CTID and level, and their arguments can be [plotted](signals.md). There,
+**Load at start** loads the FIBEX files in use whenever nerka starts
+(`--fibex` uses its own for that run).
 
 ## Captures: pcap, pcapng, MF4
 

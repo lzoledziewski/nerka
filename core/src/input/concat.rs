@@ -58,7 +58,13 @@ pub struct Concat {
 fn kind(s: &dyn LogSource) -> (Vec<&str>, Vec<(&str, FieldKind)>) {
     (
         s.columns().iter().map(|c| c.name.as_ref()).collect(),
-        s.schema().iter().map(|f| (f.name.as_ref(), f.kind)).collect(),
+        // Records' `outside` says how a file is split, not what it is: text
+        // read as records sits beside text read as lines.
+        s.schema()
+            .iter()
+            .filter(|f| f.name != super::records::OUTSIDE_FIELD)
+            .map(|f| (f.name.as_ref(), f.kind))
+            .collect(),
     )
 }
 
@@ -369,6 +375,18 @@ impl LogSource for Concat {
         self.part_detail(k, l)
     }
 
+    fn file_line(&self, line: LineNo) -> Option<LineNo> {
+        let (k, l) = self.locate(line)?;
+        self.parts[k].file_line(l)
+    }
+
+    fn line_in_file(&self, line: LineNo) -> LineNo {
+        match self.locate(line) {
+            Some((k, l)) => self.parts[k].line_in_file(l),
+            None => line,
+        }
+    }
+
     fn size_bytes(&self) -> u64 {
         self.parts.iter().map(|p| p.size_bytes()).sum()
     }
@@ -483,6 +501,14 @@ impl LogSource for View<'_> {
 
     fn line_detail(&self, line: LineNo) -> Option<Vec<String>> {
         self.whole.part_detail(self.k, line)
+    }
+
+    fn file_line(&self, line: LineNo) -> Option<LineNo> {
+        self.whole.parts[self.k].file_line(line)
+    }
+
+    fn line_in_file(&self, line: LineNo) -> LineNo {
+        self.whole.parts[self.k].line_in_file(line)
     }
 
     fn columns(&self) -> &[ColumnDef] {

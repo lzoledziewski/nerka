@@ -2,7 +2,39 @@
 
 The dated log of the project, newest first; append-only: add an entry at the top when `status.md` changes. Moved from `status.md` on 2026-11-10, word for word: its "Last update" line (each update with the ones before it) and its "Next steps" as they stood then, which tell what was built when and why. Where the moved text says "above", "below" or "this file", it means the old `status.md`: its sections are now `status.md` (state, pending decisions, limitations, licensing), `gui-decisions.md`, `features.md` and `history.md`.
 
+## 2026-11-25
+
+0.3.0 prepared (a release; not yet merged or tagged), after 0.3.0-alpha.2:
+
+- **AI preparation** (`ai.md`): workflow A, an agent with the CLI
+  (`--json` in pages, `help agent` / `help skill`, `marks` with an
+  author); workflow B, `nerka mcp` on the user's window (tools to read,
+  filter, bookmark as annotations and plot; every change listed and
+  undoable; the 🤖 AI terminal with Claude Code, Copilot, Codex and
+  Gemini presets, a client not installed said). Evaluated on real bug
+  reports with public logs (`ai-evaluation.md`); what the agents tripped
+  over fixed.
+- **Records** (`records.md`): `end=`, lines outside records
+  (`outside=one|rows`, the field `outside`), the file's numbering
+  everywhere, the line a folded record matched on.
+- **Patterns** (`patterns.md`): Compare lists what stayed the same, and
+  patterns or values only; the setting `lone-word`; tuning in every build.
+- **Text times:** logfmt's `time=`; a log with a tool's output between its
+  timed lines.
+- **The window:** changed signal values coloured in the line window, Show
+  in search results, a plotted signal that fails left out and said, FIBEX
+  Load at start, the Signals list keeping its room beside FIBEX, resizing
+  a window over a view no longer scrolls it.
+
 ## 2026-11-24
+
+An agent's annotations in the window (owner: a distinct glyph, the original idea of annotations, and accepting one into a regular bookmark; the 🤖 icon kept; the plot with a checkbox of its own; CI's screenshot to show it on macOS too): 🤖 and violet in the note rows, the stripe, the hover, the plot's cursors and Δt, the 🔖 panel and its button; ✔ Accept / ✔ Accept all (`Bookmarks::accept`); the plot's 🤖 checkbox not kept with a kept plot (no plot format change); `B3 (ai)` gone from the views. CI's GUI screenshot now has a bookmark and an annotation (`nerka marks --add`). Found on the way: 🤖 isn't in egui's fonts, it comes from the system's emoji font (egui 0.37's fontique fallback).
+
+AI preparation, step A2 built (`ai.md`, branch `claude/ai-prep`): `nerka help agent` (an agent's guide in one read, `cli/src/agent_guide.md`; a test runs every `nerka` command in it) and `help skill` (the same with a SKILL.md header); `nerka marks --add LINE --note --name --by` / `--remove`; bookmarks with an author (`ai` by default from the CLI) in a fifth sidecar column (old sidecars read as before; an older nerka keeps such a bookmark without its anchor); `Bookmarks::merge` (three-way) so a window takes in an agent's bookmarks when it gets the focus back and never writes over them; `B3 (ai)` / 🤖 in the window, taken in at once (assumed while building; owner, the same day: keep it); user guide `agents.md`.
+
+AI preparation, step A1 built (`ai.md`, branch `claude/ai-prep`; review R10 fixed): `--json` on `filter`, `search`, `lines`, `marks` (JSON Lines), `open`, `patterns`, `compare` (one object); JSON hand-written in core (`core/src/json.rs`: value, writer, parser with a depth limit) and the objects built there (`core/src/agent.rs`), for the MCP bridge later; `-m N`, `--skip N` (`-c` counts all); grep's exit status (0 found, 1 none, 2 an error; `--strict` and import's invalid items stay 1); `nerka help nfd` (the grammar now in `core/src/dsl/grammar.txt`) and `help fields FILE`; text from stdin (`-`); `tools/bench.sh` takes exit 1 as no match.
+
+AI preparation designed (`ai.md`, branch `claude/ai-prep` from `claude/patterns-review`, not built). The owner's goals: an MCP server, ease of use over the CLI with structured output, and an AI of the user's choice on the same session that bookmarks and annotates findings and uses the plot. Two workflows (owner): the CLI for an analysis the AI does, MCP for assisted analysis. Settled: JSON hand-written; grep's exit status (0 / 1 / 2) by default; bounded output one version of each (context by time only, as `before` / `after` / `around` and `filter --before / --after` already do it; R10's `-A / -B / -C` dropped; `-m N`; `--skip N`, since `--offset` moves a file's times); an external terminal started from the window, the AI's changes direct but listed and undoable, bookmarks with an author. No MCP without a window (the CLI covers it); the bridge `nerka mcp` in the CLI over stdio, reaching the window through `instance.rs`'s loopback port (not MCP over HTTP from the window). The design is settled; next: step A1. R10 (the CLI for scripts and agents, postponed 2026-11-10) is step A1.
 
 0.3.0-alpha.2 (a pre-release, owner: "let's prepare next alpha, before that full verification round"; on `claude/patterns-review`, not pushed, merged or tagged): the patterns after the owner's first use of alpha.1 (no grouping by file, covered patterns joined, ▾ Filter / 🔍 Search kept to the lines grouped, Only / Ignore, lit rows, Search from Compare, the tuning settings explained, Enter runs), lifecycles' `uptime QUERY` and lifecycles as every line during them, `before` / `after` / `around` in NFD and `filter --before / --after`, and the sshfs fix (`claude/sshfs-per-frame-open`: a read DLT file or capture not opened again every frame). Verified: the review gate `--full --bench` passed (fmt, clippy, tests, `cargo doc`, `cargo deny`, fuzz 3000 rounds; every query within 15 % of `bench-2026-11-14.tsv`, after `bench.sh compare` learned to read a baseline with CRLF line ends; WARN: `core/src/pattern.rs` 2827 and `ui/src/main.rs` 6218 non-test lines); fmt, clippy and tests in the Linux VM (core 428, GUI 171, CLI 18, integration 7), where Rust 1.100's clippy found two index loops 1.99's let pass (fixed).
 

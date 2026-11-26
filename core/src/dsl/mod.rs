@@ -8,27 +8,7 @@
 //! for why not PEG):
 //!
 //! ```text
-//! expr    := or
-//! or      := and ( ("OR" | "||") and )*
-//! and     := unary ( ("AND" | "&&") unary )*
-//! unary   := ("NOT" | "!") unary | primary
-//! primary := "(" expr ")"
-//!          | REGEX                      -- shorthand for  raw ~ REGEX
-//!          | STRING                     -- shorthand for  raw contains STRING
-//!          | FIELD OP VALUE
-//!          | SIGNAL OP VALUE
-//!          | "bookmark" [ OP VALUE ]    -- the line's bookmark
-//!          | WINDOW "(" DUR "," [ DUR "," ] expr ")"
-//! WINDOW  := before | after | around    -- around takes two DURs
-//! DUR     := NUMBER [ ms | s | m | h ]  -- default seconds
-//! FIELD   := raw | level | WORD         -- WORD: a field the source supplies
-//! SIGNAL  := "@" NAME [ "." VIEW ]      -- a signal the tab defines
-//! VIEW    := state | event | changed    -- default state; event and
-//!                                          changed may stand alone
-//! OP      := == | != | >= | <= | > | < | ~ | !~
-//! VALUE   := REGEX | STRING | WORD      -- numbers are WORDs: 42, 0x2a
-//! REGEX   := /pattern/flags             -- flags: i (ignore case)
-//! STRING  := "text"                     -- \" and \\ escapes
+#![doc = include_str!("grammar.txt")]
 //! ```
 //!
 //! Source fields (DLT `ecu`, `apid`, …) are parsed generically and resolved
@@ -95,6 +75,10 @@
 
 mod auto;
 mod parser;
+
+/// The grammar above as text (`nerka help nfd`): one file, so the two can't
+/// drift apart. Change the grammar in `grammar.txt`.
+pub const GRAMMAR: &str = include_str!("grammar.txt");
 
 use crate::event::{Event, FieldDef, FieldId, FieldKind, FieldValue, Level};
 use crate::signal::{SignalDef, SignalKind, SignalScope, SignalSeries, SignalView, Signals, ValueRef};
@@ -321,6 +305,7 @@ impl Expr {
                 None => *op == CmpOp::Ne,
             },
             Expr::Cond(Cond::Field(f)) => match (f.id.and_then(|id| ev.field(id)), &f.test) {
+                (Some(_), FieldTest::Any) => true,
                 (Some(FieldValue::Str(v)), FieldTest::Str(op, want)) => op.test(&*v, want.as_slice()),
                 (Some(FieldValue::Str(v)), FieldTest::StrNoCase(op, want)) => {
                     op.test(v.to_ascii_lowercase().as_slice(), want.as_slice())
@@ -487,8 +472,11 @@ impl FieldCond {
             }
             let mut known: Vec<&str> = vec!["raw", "level"];
             known.extend(schema.iter().map(|d| d.name.as_ref()));
+            // A line's number is the signal @line (evaluation: an agent
+            // wrote `line > 100`).
+            let hint = if self.name.eq_ignore_ascii_case("line") { "; a line's number is @line" } else { "" };
             return Err(DslError {
-                msg: format!("unknown field '{}' (this source has: {})", self.name, known.join(", ")),
+                msg: format!("unknown field '{}' (this source has: {}{hint})", self.name, known.join(", ")),
                 pos: self.pos,
             });
         };
@@ -496,6 +484,8 @@ impl FieldCond {
         let fail = |msg: String, pos| Err(DslError { msg, pos });
         let test = std::mem::replace(&mut self.test, FieldTest::Num(CmpOp::Eq, 0));
         self.test = match (test, schema[id].kind) {
+            // A field alone (`outside`): the row has it.
+            (t @ FieldTest::Any, _) => t,
             (t @ (FieldTest::Match(_) | FieldTest::Str(..)), FieldKind::Str)
             | (t @ (FieldTest::Match(_) | FieldTest::StrNoCase(..)), FieldKind::Name)
             | (t @ (FieldTest::Num(..) | FieldTest::Match(_)), FieldKind::U64)
@@ -505,11 +495,7 @@ impl FieldCond {
                 None => return fail(format!("'{name}' is a number but '{v}' isn't"), pos),
             },
             (
-                FieldTest::Str(..)
-                | FieldTest::StrNoCase(..)
-                | FieldTest::Num(..)
-                | FieldTest::Any
-                | FieldTest::Time(..),
+                FieldTest::Str(..) | FieldTest::StrNoCase(..) | FieldTest::Num(..) | FieldTest::Time(..),
                 FieldKind::F64,
             ) => {
                 return fail(format!("'{name}' is a number: use ==, !=, >=, <=, >, <, ~ or !~"), self.op_pos);
@@ -524,7 +510,6 @@ impl FieldCond {
                 FieldTest::Literal(..)
                 | FieldTest::Num(..)
                 | FieldTest::Float(..)
-                | FieldTest::Any
                 | FieldTest::Time(..)
                 | FieldTest::StrNoCase(..),
                 FieldKind::Str,
@@ -533,7 +518,6 @@ impl FieldCond {
                 FieldTest::Literal(..)
                 | FieldTest::Num(..)
                 | FieldTest::Float(..)
-                | FieldTest::Any
                 | FieldTest::Time(..)
                 | FieldTest::Str(..),
                 FieldKind::Name,
@@ -545,11 +529,7 @@ impl FieldCond {
                 None => return fail(format!("'{name}' is a number but '{v}' isn't"), pos),
             },
             (
-                FieldTest::Str(..)
-                | FieldTest::StrNoCase(..)
-                | FieldTest::Float(..)
-                | FieldTest::Any
-                | FieldTest::Time(..),
+                FieldTest::Str(..) | FieldTest::StrNoCase(..) | FieldTest::Float(..) | FieldTest::Time(..),
                 FieldKind::U64,
             ) => {
                 return fail(format!("'{name}' is a number: use ==, !=, >=, <=, >, <, ~ or !~"), self.op_pos);
@@ -1099,6 +1079,20 @@ mod tests {
         assert!(e.msg.contains("unknown field 'service'"), "{e}");
         assert_eq!(e.pos, 0);
         assert!(Query::compile("apid ~ 5").unwrap_err().msg.contains("regex"));
+        // A slash meant inside a regex (or `\/` lost to JSON) ended it.
+        let e = Query::compile("raw ~ /api/(get|put)/").unwrap_err();
+        assert!(e.msg.contains("write [/]"), "{e}");
+        assert_eq!(e.pos, 11);
+        assert!(Query::compile(r"raw ~ /api\/(get|put)/").is_ok());
+        assert!(!Query::compile("level >= ERROR )").unwrap_err().msg.contains("slash"));
+        // `outside` alone: a records field; on a file without it, unknown
+        // where it is written.
+        assert!(Query::compile("NOT outside AND level >= ERROR").is_ok());
+        let e = Query::compile_for("level >= WARN AND NOT outside", &[]).unwrap_err();
+        assert!(e.msg.contains("unknown field 'outside'"), "{e}");
+        assert_eq!(e.pos, 22);
+        let schema = [FieldDef::new("outside", FieldKind::U64, false)];
+        assert!(Query::compile_for("outside == 1", &schema).is_ok(), "with an operator: a number");
     }
 
     #[test]

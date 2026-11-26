@@ -5,7 +5,8 @@ title: nerka
 description: >-
   Fast log viewer and analyzer for big files: AUTOSAR DLT, pcap, pcapng and
   MF4 captures, text and JSON logs. Filter, search, plot signals, follow
-  boots and run checks. Windows and Linux.
+  boots, run checks, group messages into patterns and work with an AI
+  agent of your choice. Windows, Linux and macOS.
 lang: en
 theme: jekyll-theme-cayman
 # Both are supported on GitHub Pages: the SEO tags (titles, descriptions,

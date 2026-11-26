@@ -104,6 +104,16 @@ plot.
 - **Your own protocols:** describe a datagram format in a
   [Kaitai Struct](https://kaitai.io) `.ksy` file and nerka reads it like a
   built-in one, no code and no rebuild.
+- **Patterns:** a log's messages grouped into templates with their
+  varying parts as slots, the rarest first; **Compare** lists what is
+  new, gone, more frequent or the same between two boots, runs or files
+  (experimental).
+
+  ![the Patterns window on a demo drive: 9,844 lines as 16 patterns, each with its share, its count, its context (ECU, application, context) and its template, slots as <*> and states with their values ({D|P|N}); the rare ones last: a panic, a service not responding, a shutdown](docs/user/img/patterns.png)
+- **Your AI agent:** Claude Code, Codex, Gemini CLI or another analyses
+  files with the command line (JSON in pages), or works with you on your
+  window through MCP (`nerka mcp`), leaving annotations you accept or
+  undo. [AI agents →](https://lzoledziewski.github.io/nerka/user/agents.html)
 - **Bookmarks with notes** that survive a changed file, a **command line**
   (`nerka filter …`) with the same engine for scripts, and **settings
   bundles** to hand your library, plots and checks to a colleague.
@@ -146,6 +156,7 @@ The same engine on the command line:
 nerka filter 'level >= ERROR AND raw ~ /SSL|CERT/' app.log
 nerka search -i 'timeout|refused' app.log
 nerka open trace.pcap        # what's in the file: lines, fields, protocols
+nerka filter --json -m 50 'level >= ERROR' trace.dlt   # for scripts and agents: JSON Lines, in pages
 ```
 
 The [user guide](https://lzoledziewski.github.io/nerka/) has the rest,

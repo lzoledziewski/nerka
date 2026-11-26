@@ -207,6 +207,10 @@ impl LogSource for Merged {
         Some(Reorder { inner: &*self.inner, line_of: &self.line_of, row_of: &self.row_of })
     }
 
+    fn line_in_file(&self, line: LineNo) -> LineNo {
+        self.line_of.get(line as usize).map_or(line, |&l| self.inner.line_in_file(l))
+    }
+
     fn data_id(&self) -> usize {
         self.data_id
     }

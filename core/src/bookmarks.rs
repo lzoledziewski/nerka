@@ -1,7 +1,7 @@
 //! Bookmarks with optional notes, persisted next to the log.
 //!
 //! Storage is a plain-text sidecar `<log>.nerka-marks`, one bookmark per
-//! line: `<1-based line number>\t<note>\t<name>\t@<offset>:<hash>`. A
+//! line: `<1-based line number>\t<note>\t<name>\t@<offset>:<hash>[\t<author>]`. A
 //! bookmark has a short name (`B1`, `B2`… given when it is made,
 //! renamable) that the GUI shows instead of its line number; a sidecar
 //! without names (two columns) gets them when read. Human-readable,
@@ -18,6 +18,18 @@
 //! hash around its old row); one that isn't found stays on its old row,
 //! **unsure** ([`Bookmarks::is_unsure`]), until it is edited. A sidecar
 //! without anchors (older ones) is taken as it is.
+//!
+//! **Authors** (owner, 2026-11-24, `docs/dev/ai.md`): a bookmark someone
+//! else made than the user (`nerka marks --add`, an agent: `ai`) is an
+//! **annotation** until the user accepts it ([`Bookmarks::accept`]: it is
+//! then theirs, a bookmark like any other). It says so in a fifth column, written only then (with an empty anchor column if
+//! it has none). Older sidecars have none: the user's. An older nerka
+//! reading the column keeps the bookmark (line, note, name) without its
+//! anchor, and saves it as the user's.
+//!
+//! **Merging** ([`Bookmarks::merge`]): a window keeps its bookmarks while
+//! another program may write the sidecar (an agent adding findings); it
+//! merges the file's changes in, three-way, instead of writing over them.
 
 use crate::input::Anchor;
 use crate::{LineNo, LogSource};
@@ -40,6 +52,39 @@ struct Mark {
     anchor: Option<Anchor>,
     /// Its anchor didn't find the line: it stays on its old row.
     unsure: bool,
+    /// Who made it, if not the user: `ai` (`nerka marks --add`).
+    author: String,
+}
+
+impl Mark {
+    /// The same bookmark as far as a merge goes (not where it was found).
+    fn same(&self, other: &Mark) -> bool {
+        (&self.name, &self.note, &self.author) == (&other.name, &other.note, &other.author)
+    }
+}
+
+/// What [`Bookmarks::merge`] took from the file.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Merged {
+    pub added: usize,
+    pub removed: usize,
+    pub changed: usize,
+}
+
+impl Merged {
+    pub fn is_empty(&self) -> bool {
+        *self == Merged::default()
+    }
+
+    /// `2 added, 1 changed` (empty: nothing).
+    pub fn summary(&self) -> String {
+        let parts: Vec<String> = [(self.added, "added"), (self.removed, "removed"), (self.changed, "changed")]
+            .into_iter()
+            .filter(|(n, _)| *n > 0)
+            .map(|(n, what)| format!("{n} {what}"))
+            .collect();
+        parts.join(", ")
+    }
 }
 
 impl Bookmarks {
@@ -165,12 +210,13 @@ impl Bookmarks {
         let mut marks: BTreeMap<LineNo, Mark> = s
             .lines()
             .filter_map(|l| {
-                let mut cols = l.splitn(4, '\t');
+                let mut cols = l.splitn(5, '\t');
                 let n: LineNo = cols.next()?.trim().parse().ok()?;
                 let note = cols.next().unwrap_or("").to_owned();
                 let name = cols.next().unwrap_or("").trim().to_owned();
                 let anchor = cols.next().and_then(parse_anchor);
-                Some((n.checked_sub(1)?, Mark { name, note, anchor, unsure: false }))
+                let author = cols.next().unwrap_or("").trim().to_owned();
+                Some((n.checked_sub(1)?, Mark { name, note, anchor, unsure: false, author }))
             })
             .collect();
         // Unnamed ones (an older sidecar) get names in line order.
@@ -187,11 +233,18 @@ impl Bookmarks {
         self.marks
             .iter()
             .map(|(l, m)| {
-                let anchor = match m.anchor {
+                let mut anchor = match m.anchor {
                     Some(Anchor { offset: Some(o), hash }) => format!("\t@{o}:{hash:08x}"),
                     Some(Anchor { offset: None, hash }) => format!("\t@-:{hash:08x}"),
                     None => String::new(),
                 };
+                // The author only when not the user's: older sidecars stay as they were.
+                if !m.author.is_empty() {
+                    if anchor.is_empty() {
+                        anchor.push('\t');
+                    }
+                    anchor += &format!("\t{}", clean(&m.author));
+                }
                 format!("{}\t{}\t{}{anchor}\n", l + 1, clean(&m.note), clean(&m.name))
             })
             .collect()
@@ -238,6 +291,91 @@ impl Bookmarks {
             let free = free_name(&self.marks);
             self.marks.get_mut(&line).expect("there").name = free;
         }
+    }
+
+    /// Who made the bookmark on `line`, if not the user (`ai`); `None`
+    /// without one or for the user's.
+    pub fn author(&self, line: LineNo) -> Option<&str> {
+        self.marks.get(&line).map(|m| m.author.as_str()).filter(|a| !a.is_empty())
+    }
+
+    /// Say who made the bookmark on `line` (empty: the user).
+    pub fn set_author(&mut self, line: LineNo, author: &str) {
+        if let Some(m) = self.marks.get_mut(&line) {
+            m.author = author.replace(['\n', '\t'], " ").trim().to_owned();
+        }
+    }
+
+    /// Whether the bookmark on `line` is an annotation: made by someone
+    /// else (an agent) and not accepted yet.
+    pub fn is_annotation(&self, line: LineNo) -> bool {
+        self.author(line).is_some()
+    }
+
+    /// How many bookmarks are annotations.
+    pub fn annotations(&self) -> usize {
+        self.marks.values().filter(|m| !m.author.is_empty()).count()
+    }
+
+    /// Accept the annotation on `line`: it becomes the user's bookmark
+    /// (name and note kept). Whether there was one to accept.
+    pub fn accept(&mut self, line: LineNo) -> bool {
+        match self.marks.get_mut(&line) {
+            Some(m) if !m.author.is_empty() => {
+                m.author.clear();
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Accept every annotation; how many there were.
+    pub fn accept_all(&mut self) -> usize {
+        let lines: Vec<LineNo> = self.marks.iter().filter(|(_, m)| !m.author.is_empty()).map(|(l, _)| *l).collect();
+        lines.iter().filter(|&&l| self.accept(l)).count()
+    }
+
+    /// Remove the bookmark on `line`; whether there was one.
+    pub fn remove(&mut self, line: LineNo) -> bool {
+        self.marks.remove(&line).is_some()
+    }
+
+    /// Take in what another program changed in the sidecar: `base` is the
+    /// bookmarks as this side last read or saved them, `theirs` as the file
+    /// has them now (both on this side's rows). Their additions, removals
+    /// and edits come in where this side left the bookmark as it was in
+    /// `base`; where both changed one, this side's stays. A name a new one
+    /// brings that this side gave another meanwhile gets a free one.
+    pub fn merge(&mut self, base: &Bookmarks, theirs: &Bookmarks) -> Merged {
+        let mut got = Merged::default();
+        let unchanged = |ours: Option<&Mark>, was: Option<&Mark>| match (ours, was) {
+            (None, None) => true,
+            (Some(a), Some(b)) => a.same(b),
+            _ => false,
+        };
+        for (&l, t) in &theirs.marks {
+            let was = base.marks.get(&l);
+            if was.is_some_and(|w| w.same(t)) || !unchanged(self.marks.get(&l), was) {
+                continue;
+            }
+            if was.is_none() {
+                got.added += 1;
+            } else {
+                got.changed += 1;
+            }
+            let mut m = t.clone();
+            if self.marks.iter().any(|(&o, x)| o != l && x.name == m.name) {
+                m.name = free_name(&self.marks);
+            }
+            self.marks.insert(l, m);
+        }
+        for (&l, w) in &base.marks {
+            if !theirs.marks.contains_key(&l) && self.marks.get(&l).is_some_and(|o| o.same(w)) {
+                self.marks.remove(&l);
+                got.removed += 1;
+            }
+        }
+        got
     }
 
     /// Whether the bookmark's anchor didn't find its line when it was
@@ -387,6 +525,61 @@ mod tests {
         // An older sidecar: names given in line order, notes kept.
         let old = Bookmarks::parse("9\tsecond\n3\t\n");
         assert_eq!(old.iter_named().collect::<Vec<_>>(), [(2, "B1", ""), (8, "B2", "second")]);
+    }
+
+    #[test]
+    fn authors_in_a_fifth_column_only_when_not_the_user() {
+        let mut b = Bookmarks::default();
+        b.set_note(2, "mine");
+        b.set_note(4, "found it");
+        b.set_author(4, "ai");
+        assert_eq!(b.serialize(), "3\tmine\tB1\n5\tfound it\tB2\t\tai\n");
+        let back = Bookmarks::parse(&b.serialize());
+        assert_eq!((back.author(2), back.author(4)), (None, Some("ai")));
+        assert_eq!(back, b);
+        // With an anchor, after it.
+        let f = lines(10);
+        let s = b.anchored(&f).serialize();
+        let row = s.lines().nth(1).unwrap();
+        assert!(row.contains("\t@") && row.ends_with("\tai"), "{s}");
+        let mut back = Bookmarks::parse(&s);
+        back.resolve(&f);
+        assert_eq!((back.author(4), back.note(4)), (Some("ai"), Some("found it")));
+        // Accepted: the user's, as any other.
+        assert_eq!((back.annotations(), back.is_annotation(4)), (1, true));
+        assert!(back.accept(4) && !back.accept(4) && !back.accept(2));
+        assert_eq!((back.annotations(), back.author(4), back.name(4)), (0, None, Some("B2")));
+        back.set_author(2, "ai");
+        back.set_author(4, "ai");
+        assert_eq!((back.accept_all(), back.annotations()), (2, 0));
+    }
+
+    #[test]
+    fn a_merge_takes_in_what_the_file_got_meanwhile() {
+        // Both sides read: B1 on 1, B2 on 5.
+        let mut base = Bookmarks::default();
+        base.set_note(1, "one");
+        base.set_note(5, "five");
+        // The window: a note on 1 edited, 9 added (B3).
+        let mut ours = base.clone();
+        ours.set_note(1, "one, edited here");
+        ours.set_note(9, "nine");
+        // The file: an agent added 7 (named B3 there too), removed 5, edited 1.
+        let mut theirs = base.clone();
+        theirs.set_note(7, "seven");
+        theirs.set_author(7, "ai");
+        theirs.remove(5);
+        theirs.set_note(1, "one, edited there");
+        let got = ours.merge(&base, &theirs);
+        assert_eq!(got, Merged { added: 1, removed: 1, changed: 0 });
+        assert_eq!(got.summary(), "1 added, 1 removed");
+        let all: Vec<(LineNo, &str, &str)> = ours.iter_named().collect();
+        // Ours kept on 1 (both changed it); 7 came in with a free name.
+        assert_eq!(all, [(1, "B1", "one, edited here"), (7, "B4", "seven"), (9, "B3", "nine")]);
+        assert_eq!(ours.author(7), Some("ai"));
+        // Nothing changed on either side: nothing to take.
+        let same = ours.clone();
+        assert!(ours.merge(&same, &same).is_empty());
     }
 
     /// Rows move (lines added before, a capture indexed with other ports):

@@ -189,6 +189,19 @@ pub(super) fn tokens(src: &str) -> Result<Vec<(Tok, std::ops::Range<usize>)>, Ds
 }
 
 pub fn parse(src: &str) -> Result<Expr, DslError> {
+    parse_query(src).map_err(|mut e| {
+        // Right after a regex: often a slash meant inside it (`/api/(get|put)/`),
+        // or `\/` lost to JSON, where `\/` is only `/`.
+        let before = src.get(..e.pos).unwrap_or(src).trim_end();
+        if e.msg.starts_with("unexpected") && before.ends_with('/') && before.matches('/').count() >= 2 {
+            e.msg +=
+                r"; a / ended the regex before it: for a slash inside a regex write [/] (or \/; in a JSON string \\/)";
+        }
+        e
+    })
+}
+
+fn parse_query(src: &str) -> Result<Expr, DslError> {
     let mut lex = Lexer { s: src, pos: 0 };
     let (tok, pos) = lex.next()?;
     let mut p = Parser { lex, tok, pos };
@@ -272,6 +285,18 @@ impl Parser<'_> {
                 };
                 if matches!(field, "before" | "after" | "around") && self.tok == Tok::LParen {
                     return self.window(field, pos);
+                }
+                // `outside` alone: a row outside every record (records with
+                // start= / end=; owner, 2026-11-25: `NOT outside` hides them).
+                if field == "outside" && !matches!(self.tok, Tok::Op(_)) {
+                    return Ok(Expr::Cond(Cond::Field(FieldCond {
+                        name: "outside".into(),
+                        pos,
+                        op_pos: pos,
+                        id: None,
+                        test: FieldTest::Any,
+                        costly: false,
+                    })));
                 }
                 if field == "bookmark" { self.bookmark_condition(pos) } else { self.condition(field, pos) }
             }

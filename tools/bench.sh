@@ -90,7 +90,8 @@ one() {
     filter) err=$("$BIN/nerka" filter -c --stats "$q" "$DIR/$file" 2>&1 >/dev/null) ;;
     filter-ksy) err=$("$BIN/nerka" --protocol "$ROOT/examples/protocols/dlt.ksy" --protocol-port DLTK=3491 \
       filter -c --stats "$q" "$DIR/$file" 2>&1 >/dev/null) ;;
-  esac || { echo "bench: $kind '$q' on $file failed: $err" >&2; exit 1; }
+  # Exit 1 is "no match" (grep's status), not a failure.
+  esac || [ $? -eq 1 ] || { echo "bench: $kind '$q' on $file failed: $err" >&2; exit 1; }
   # "N matches in M lines | index X | search 12.3ms (...)"
   local matches t
   matches=$(sed -E 's/^([0-9]+) matches.*/\1/' <<<"$err")

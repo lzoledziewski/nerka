@@ -23,10 +23,9 @@ pub enum RecordSplit {
     /// One row per line (plain text).
     #[default]
     Lines,
-    /// A line matching the regex starts a record; the lines after it, up
-    /// to the next such line, belong to it (lines before the first one are
-    /// a record too).
-    Start(Regex),
+    /// Records bounded by a start line, an end line or both ([`Bounds`];
+    /// `docs/dev/records.md`).
+    Start(Bounds),
     /// Records are separated by blank lines (awk's `RS=""`).
     Blank,
     /// Records are separated by lines matching the regex (not part of
@@ -38,6 +37,51 @@ pub enum RecordSplit {
     Json,
 }
 
+/// What becomes of lines outside every record (before the first start,
+/// between an end and the next start).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Outside {
+    /// Each run of them is one record (a session the capture began in: the
+    /// owner's UART boots).
+    One,
+    /// Each is a row (the log around a dump).
+    Rows,
+}
+
+/// Where records start and end. A line matching `start` begins a record;
+/// one matching `end` ends it (that line included). Without `end` a record
+/// runs to the next start; without `start` the line after an end begins
+/// the next. Lines outside every record: `outside` (default: one record
+/// for `start` alone, rows with `end`; owner, 2026-11-25).
+#[derive(Debug, Clone)]
+pub struct Bounds {
+    pub start: Option<Regex>,
+    pub end: Option<Regex>,
+    pub outside: Outside,
+}
+
+impl Bounds {
+    /// `outside` when the spec doesn't say.
+    pub fn default_outside(end: bool) -> Outside {
+        if end { Outside::Rows } else { Outside::One }
+    }
+
+    /// The start and end regexes as written (without the anchoring nerka
+    /// adds), and whether `outside` is the default.
+    pub fn texts(&self) -> (Option<String>, Option<String>, bool) {
+        let re = |r: &Regex| {
+            let s = r.as_str();
+            s.strip_prefix("(?m)^(?:").and_then(|s| s.strip_suffix(')')).unwrap_or(s).to_owned()
+        };
+        let default = self.outside == Bounds::default_outside(self.end.is_some());
+        (self.start.as_ref().map(re), self.end.as_ref().map(re), default)
+    }
+}
+
+/// The field of a row outside every record (`outside`; NFD `NOT outside`
+/// hides them).
+pub const OUTSIDE_FIELD: &str = "outside";
+
 impl PartialEq for RecordSplit {
     fn eq(&self, other: &Self) -> bool {
         self.spec() == other.spec()
@@ -47,29 +91,23 @@ impl PartialEq for RecordSplit {
 impl Eq for RecordSplit {}
 
 impl RecordSplit {
-    /// Read a spec: `lines`, `blank`, `json`, `start=REGEX`, `sep=REGEX`
-    /// (a regex may be written `/…/`).
+    /// Read a spec: `lines`, `blank`, `json`, `sep=REGEX`, or bounds:
+    /// `start=/RE/`, `end=/RE/`, `outside=one|rows`, separated by spaces
+    /// (`start=/A/ end=/B/ outside=rows`). In a spec of one part a regex
+    /// may be written without slashes (`start=\d{4}-`, as before).
     pub fn parse(spec: &str) -> Result<RecordSplit> {
         let spec = spec.trim();
-        let regex = |s: &str| {
-            let s = s.trim();
-            let s = s.strip_prefix('/').and_then(|s| s.strip_suffix('/')).unwrap_or(s);
-            if s.is_empty() {
-                return Err(Error::Format("records: the regex is empty".into()));
-            }
-            // Errors about the regex as typed, not the wrapped one.
-            Regex::new(s).map_err(|e| Error::Format(format!("records: {e}")))?;
-            Regex::new(&format!("(?m)^(?:{s})")).map_err(|e| Error::Format(format!("records: {e}")))
-        };
         Ok(match spec {
             "" | "lines" => RecordSplit::Lines,
             "blank" => RecordSplit::Blank,
             "json" => RecordSplit::Json,
             _ => match spec.split_once('=') {
-                Some(("start", re)) => RecordSplit::Start(regex(re)?),
                 Some(("sep", re)) => RecordSplit::Separator(regex(re)?),
+                Some(("start" | "end" | "outside", _)) => RecordSplit::Start(bounds(spec)?),
                 _ => {
-                    let msg = format!("records: '{spec}' isn't lines, blank, json, start=REGEX or sep=REGEX");
+                    let msg = format!(
+                        "records: '{spec}' isn't lines, blank, json, sep=REGEX or start=REGEX / end=REGEX / outside=one|rows"
+                    );
                     return Err(Error::Format(msg));
                 }
             },
@@ -102,10 +140,94 @@ impl RecordSplit {
             RecordSplit::Lines => "lines".into(),
             RecordSplit::Blank => "blank".into(),
             RecordSplit::Json => "json".into(),
-            RecordSplit::Start(r) => format!("start=/{}/", re(r)),
+            RecordSplit::Start(b) => {
+                let mut parts = Vec::new();
+                if let Some(r) = &b.start {
+                    parts.push(format!("start=/{}/", re(r)));
+                }
+                if let Some(r) = &b.end {
+                    parts.push(format!("end=/{}/", re(r)));
+                }
+                if b.outside != Bounds::default_outside(b.end.is_some()) {
+                    parts.push(format!("outside={}", if b.outside == Outside::One { "one" } else { "rows" }));
+                }
+                parts.join(" ")
+            }
             RecordSplit::Separator(r) => format!("sep=/{}/", re(r)),
         }
     }
+}
+
+/// A regex of a spec (`/…/` or bare), anchored at a line's start.
+fn regex(s: &str) -> Result<Regex> {
+    let s = s.trim();
+    let s = s.strip_prefix('/').and_then(|s| s.strip_suffix('/')).unwrap_or(s);
+    if s.is_empty() {
+        return Err(Error::Format("records: the regex is empty".into()));
+    }
+    // Errors about the regex as typed, not the wrapped one.
+    Regex::new(s).map_err(|e| Error::Format(format!("records: {e}")))?;
+    Regex::new(&format!("(?m)^(?:{s})")).map_err(|e| Error::Format(format!("records: {e}")))
+}
+
+/// `start=… end=… outside=…`: each part `key=/regex/` (a `/` inside
+/// written `\/` or in a class, `[/]`) or `key=word`; one part alone may
+/// hold a bare regex with spaces (as specs did before `end=`).
+fn bounds(spec: &str) -> Result<Bounds> {
+    let bad = |m: String| Err(Error::Format(format!("records: {m}")));
+    let mut parts: Vec<(&str, &str)> = Vec::new();
+    let mut rest = spec.trim();
+    while !rest.is_empty() {
+        let Some((key, after)) = rest.split_once('=') else { return bad(format!("'{rest}' isn't KEY=VALUE")) };
+        let key = key.trim();
+        let (value, next) = if let Some(body) = after.strip_prefix('/') {
+            // To the slash that closes it: not escaped, not in a class.
+            let (mut esc, mut class) = (false, false);
+            let close = body.char_indices().find(|&(_, c)| {
+                let hit = c == '/' && !esc && !class;
+                match c {
+                    '\\' if !esc => esc = true,
+                    '[' if !esc => (class, esc) = (true, false),
+                    ']' if !esc => (class, esc) = (false, false),
+                    _ => esc = false,
+                }
+                hit
+            });
+            let Some((i, _)) = close else { return bad(format!("{key}=/…: no closing /")) };
+            (&after[..i + 2], &body[i + 1..])
+        } else if parts.is_empty()
+            && !after.contains(" end=")
+            && !after.contains(" outside=")
+            && !after.contains(" start=")
+        {
+            (after, "")
+        } else {
+            after.split_once(char::is_whitespace).unwrap_or((after, ""))
+        };
+        parts.push((key, value));
+        rest = next.trim_start();
+    }
+    let (mut start, mut end, mut outside) = (None, None, None);
+    for (key, value) in parts {
+        match key {
+            "start" if start.is_none() => start = Some(regex(value)?),
+            "end" if end.is_none() => end = Some(regex(value)?),
+            "outside" if outside.is_none() => {
+                outside = Some(match value {
+                    "one" => Outside::One,
+                    "rows" => Outside::Rows,
+                    v => return bad(format!("outside={v}: one or rows")),
+                })
+            }
+            "start" | "end" | "outside" => return bad(format!("{key} given twice")),
+            k => return bad(format!("'{k}': start, end or outside")),
+        }
+    }
+    if start.is_none() && end.is_none() {
+        return bad("start=/REGEX/ or end=/REGEX/ is needed".into());
+    }
+    let outside = outside.unwrap_or(Bounds::default_outside(end.is_some()));
+    Ok(Bounds { start, end, outside })
 }
 
 /// A text file read as records ([`RecordSplit`] other than lines).
@@ -119,7 +241,14 @@ pub struct RecordFile {
     split: RecordSplit,
     /// JSON records: the fields their keys give.
     json: Option<JsonFields>,
+    /// Bounds: the rows outside every record (ascending), and the schema
+    /// with the `outside` field.
+    outside: Vec<LineNo>,
+    bounds_schema: Vec<FieldDef>,
     data_id: usize,
+    /// Each record's first line in the file (from 0), counted once when
+    /// first asked ([`LogSource::file_line`]).
+    file_lines: std::sync::OnceLock<Vec<LineNo>>,
 }
 
 /// The fields of JSON records: every key path with a value in any record
@@ -267,8 +396,12 @@ fn lines(buf: &[u8], from: usize) -> impl Iterator<Item = (usize, usize, usize)>
 /// Bytes between progress reports and cancel checks.
 const REPORT: usize = 4 << 20;
 
+/// The records of `buf`: (start, end) each, and the rows outside every
+/// record (bounds).
+type Split = (Vec<u64>, Vec<u64>, Vec<LineNo>);
+
 /// The records of `buf`: (start, end) each.
-fn split(buf: &[u8], how: &RecordSplit, progress: &Progress) -> Result<(Vec<u64>, Vec<u64>)> {
+fn split(buf: &[u8], how: &RecordSplit, progress: &Progress) -> Result<Split> {
     progress.set_total(buf.len() as u64);
     let (mut starts, mut ends) = (Vec::new(), Vec::new());
     let mut reported = 0usize;
@@ -293,7 +426,8 @@ fn split(buf: &[u8], how: &RecordSplit, progress: &Progress) -> Result<(Vec<u64>
     match how {
         RecordSplit::Json => {
             let found = json::records(buf, progress)?;
-            return Ok(found.into_iter().unzip());
+            let (s, e) = found.into_iter().unzip();
+            return Ok((s, e, Vec::new()));
         }
         RecordSplit::Lines => {
             for (s, e, next) in lines(buf, 0) {
@@ -316,23 +450,92 @@ fn split(buf: &[u8], how: &RecordSplit, progress: &Progress) -> Result<(Vec<u64>
                 tick(next)?;
             }
         }
-        RecordSplit::Start(re) => {
-            let (s, e) = split_by_starts(buf, re, progress)?;
-            return Ok((s, e));
+        RecordSplit::Start(Bounds { start: Some(re), end: None, outside }) => {
+            return split_by_starts(buf, re, *outside, progress);
         }
+        RecordSplit::Start(b) => return split_by_bounds(buf, b, progress),
     }
     close(&mut open, &mut starts, &mut ends);
     progress.add((buf.len() - reported) as u64);
     starts.shrink_to_fit();
     ends.shrink_to_fit();
-    Ok((starts, ends))
+    Ok((starts, ends, Vec::new()))
+}
+
+/// Whether `re` matches at the start of the line `buf[s..e]`.
+fn at_line_start(re: &Regex, buf: &[u8], s: usize, e: usize) -> bool {
+    re.find(&buf[s..e]).is_some_and(|m| m.start() == 0)
+}
+
+/// A byte range of the file: start, end.
+type Span = (usize, usize);
+
+/// Records between start and end lines, one pass ([`Bounds`]).
+fn split_by_bounds(buf: &[u8], b: &Bounds, progress: &Progress) -> Result<Split> {
+    let (mut starts, mut ends, mut outside) = (Vec::new(), Vec::new(), Vec::new());
+    // The record, and the run of lines outside (`One`), being collected.
+    let (mut open, mut out): (Option<Span>, Option<Span>) = (None, None);
+    let push = |r: (usize, usize), starts: &mut Vec<u64>, ends: &mut Vec<u64>| {
+        starts.push(r.0 as u64);
+        ends.push(r.1 as u64);
+    };
+    let mut reported = 0usize;
+    for (s, e, next) in lines(buf, 0) {
+        if next - reported >= REPORT {
+            if progress.is_cancelled() {
+                return Err(Error::Cancelled);
+            }
+            progress.add((next - reported) as u64);
+            reported = next;
+        }
+        let begins = match &b.start {
+            Some(re) => at_line_start(re, buf, s, e),
+            // No start: a line outside a record begins one.
+            None => open.is_none(),
+        };
+        if begins {
+            if let Some(r) = open.take() {
+                push(r, &mut starts, &mut ends);
+            }
+            if let Some(r) = out.take() {
+                outside.push(starts.len() as LineNo);
+                push(r, &mut starts, &mut ends);
+            }
+            open = Some((s, e));
+        } else if let Some(r) = &mut open {
+            r.1 = e;
+        } else {
+            match b.outside {
+                Outside::Rows => {
+                    outside.push(starts.len() as LineNo);
+                    push((s, e), &mut starts, &mut ends);
+                }
+                Outside::One => out = Some((out.map_or(s, |o| o.0), e)),
+            }
+            continue;
+        }
+        if b.end.as_ref().is_some_and(|re| at_line_start(re, buf, s, e))
+            && let Some(r) = open.take()
+        {
+            push(r, &mut starts, &mut ends);
+        }
+    }
+    if let Some(r) = open.take() {
+        push(r, &mut starts, &mut ends);
+    }
+    if let Some(r) = out.take() {
+        outside.push(starts.len() as LineNo);
+        push(r, &mut starts, &mut ends);
+    }
+    progress.add((buf.len() - reported) as u64);
+    Ok((starts, ends, outside))
 }
 
 /// Records that begin at lines matching `re`: the lines are checked in
 /// parallel, in chunks that start at line starts (as the line index is
 /// built). A record ends where the next one starts, without that line
 /// break.
-fn split_by_starts(buf: &[u8], re: &Regex, progress: &Progress) -> Result<(Vec<u64>, Vec<u64>)> {
+fn split_by_starts(buf: &[u8], re: &Regex, how: Outside, progress: &Progress) -> Result<Split> {
     use rayon::prelude::*;
     let mut bounds = vec![0usize];
     while let Some(&last) = bounds.last() {
@@ -362,9 +565,22 @@ fn split_by_starts(buf: &[u8], re: &Regex, progress: &Progress) -> Result<(Vec<u
         })
         .collect::<Result<_>>()?;
     let mut starts: Vec<u64> = parts.concat();
-    // Lines before the first start are a record too.
-    if !buf.is_empty() && starts.first() != Some(&0) {
-        starts.insert(0, 0);
+    // Lines before the first start are outside every record: one record
+    // (a session the capture began in), or a row each (the log before a
+    // dump: `outside=rows`). No line matching: the whole file is one
+    // record (and said).
+    let mut outside = Vec::new();
+    match starts.first().map(|&s| s as usize) {
+        Some(first) if first > 0 => {
+            let head: Vec<u64> = match how {
+                Outside::One => vec![0],
+                Outside::Rows => lines(&buf[..first], 0).map(|(s, _, _)| s as u64).collect(),
+            };
+            outside = (0..head.len() as LineNo).collect();
+            starts.splice(0..0, head);
+        }
+        None if !buf.is_empty() => starts.push(0),
+        _ => {}
     }
     let ends = (0..starts.len())
         .map(|k| {
@@ -378,7 +594,7 @@ fn split_by_starts(buf: &[u8], re: &Regex, progress: &Progress) -> Result<(Vec<u
             end as u64
         })
         .collect();
-    Ok((starts, ends))
+    Ok((starts, ends, outside))
 }
 
 impl RecordFile {
@@ -386,27 +602,52 @@ impl RecordFile {
     pub fn open(path: impl AsRef<Path>, how: RecordSplit, progress: &Progress) -> Result<Self> {
         let path = path.as_ref();
         let data = Bytes::map(path)?;
-        let (starts, ends) = split(data.bytes(), &how, progress)?;
+        let (starts, ends, outside) = split(data.bytes(), &how, progress)?;
         let name = path.display().to_string();
         let json = (how == RecordSplit::Json).then(|| JsonFields::of(data.bytes(), &starts, &ends));
         let path = Some(path.to_path_buf());
-        Ok(Self { name, path, data, starts, ends, split: how, json, data_id: new_data_id() })
+        Ok(Self::of(name, path, data, (starts, ends, outside), how, json))
     }
 
-    /// In-memory text, handy for tests.
-    pub fn from_bytes(name: impl Into<String>, bytes: Vec<u8>, how: RecordSplit) -> Self {
-        let (starts, ends) = split(&bytes, &how, &Progress::new()).expect("not cancelled");
-        let json = (how == RecordSplit::Json).then(|| JsonFields::of(&bytes, &starts, &ends));
+    fn of(
+        name: String,
+        path: Option<PathBuf>,
+        data: Bytes,
+        split: Split,
+        how: RecordSplit,
+        json: Option<JsonFields>,
+    ) -> Self {
+        let (starts, ends, outside) = split;
+        let bounds_schema = if matches!(how, RecordSplit::Start(_)) {
+            vec![FieldDef::new(OUTSIDE_FIELD, FieldKind::U64, false)]
+        } else {
+            Vec::new()
+        };
         Self {
-            name: name.into(),
-            path: None,
-            data: Bytes::Owned(bytes),
+            name,
+            path,
+            data,
             starts,
             ends,
             split: how,
             json,
+            outside,
+            bounds_schema,
             data_id: new_data_id(),
+            file_lines: Default::default(),
         }
+    }
+
+    /// Rows outside every record (bounds), ascending.
+    pub fn outside_rows(&self) -> &[LineNo] {
+        &self.outside
+    }
+
+    /// In-memory text, handy for tests.
+    pub fn from_bytes(name: impl Into<String>, bytes: Vec<u8>, how: RecordSplit) -> Self {
+        let found = split(&bytes, &how, &Progress::new()).expect("not cancelled");
+        let json = (how == RecordSplit::Json).then(|| JsonFields::of(&bytes, &found.0, &found.1));
+        Self::of(name.into(), None, Bytes::Owned(bytes), found, how, json)
     }
 
     pub fn path(&self) -> Option<&Path> {
@@ -429,11 +670,34 @@ impl LogSource for RecordFile {
         self.data_id
     }
 
+    fn file_line(&self, line: LineNo) -> Option<LineNo> {
+        let lines = self.file_lines.get_or_init(|| {
+            // One pass: the line breaks before each record's start.
+            let buf = self.data.bytes();
+            let (mut out, mut at, mut n) = (Vec::with_capacity(self.starts.len()), 0usize, 0u64);
+            for &s in &self.starts {
+                let s = (s as usize).min(buf.len());
+                n += memchr::memchr_iter(b'\n', &buf[at..s]).count() as u64;
+                at = s;
+                out.push(n);
+            }
+            out
+        });
+        lines.get(line as usize).copied()
+    }
+
     fn schema(&self) -> &[FieldDef] {
-        self.json.as_ref().map_or(&[], |j| &j.schema)
+        match &self.json {
+            Some(j) => &j.schema,
+            None => &self.bounds_schema,
+        }
     }
 
     fn field(&self, line: LineNo, id: FieldId) -> Option<FieldValue<'_>> {
+        if self.json.is_none() {
+            // Bounds: `outside` is 1 on a row outside every record.
+            return (id == 0 && self.outside.binary_search(&line).is_ok()).then_some(FieldValue::U64(1));
+        }
         let j = self.json.as_ref()?;
         let v = json::get(self.record(line)?, j.paths.get(id)?)?;
         let num = |v: &Json<'_>| match v {
@@ -492,6 +756,25 @@ impl LogSource for RecordFile {
                 "{} matched no line: the whole file is one record (Records…: one row per line, or automatic)",
                 self.split.spec()
             ));
+        } else if let RecordSplit::Start(b) = &self.split {
+            // What the split did with the lines outside records.
+            let first = self.outside.first() == Some(&0) && b.start.is_some();
+            match b.outside {
+                Outside::One if first => {
+                    let lines = self.file_line(1).unwrap_or(1);
+                    info.notes.push(format!(
+                        "the first record (lines 1–{lines}) starts before the first match: a partial session \
+                         (outside=rows: a row each)"
+                    ));
+                }
+                Outside::Rows if !self.outside.is_empty() => {
+                    info.notes.push(format!(
+                        "{} rows outside every record, a line each (the field outside; NOT outside hides them)",
+                        self.outside.len()
+                    ));
+                }
+                _ => {}
+            }
         }
         info
     }

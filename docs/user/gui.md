@@ -16,7 +16,9 @@ switched on and checks switched on.
   every line again (↑ in the box brings the filter back).
 - **Search** (at the bottom) looks only among the lines the filter kept.
   Its hits are listed in the pane below it (click one to go there) and
-  coloured in the view; `n` / `N` jump to the next / previous hit.
+  coloured in the view; `n` / `N` jump to the next / previous hit. The
+  way back: right-click a line of the main view → **Show in search
+  results** selects it there (or the next hit after it).
 
 Each box has a **mode**:
 
@@ -39,7 +41,15 @@ words.
 - **Enter** on a line (or the right-click menu's **Show whole line…**)
   opens the line window: for DLT and captures the header fields as a grid,
   then the message with its own line breaks and tabs; **Copy message** /
-  **Copy line**. Long lines also scroll sideways (Shift+wheel, ← / →).
+  **Copy line**; the line's signals, a value that changed what was held
+  before it coloured, with what it was (`was 10`). Long lines also scroll
+  sideways (Shift+wheel, ← / →).
+- **Records** (the tab's menu → **Records…**, [Multi-line
+  records](formats.md#multi-line-records)): a record of several lines is
+  one row, folded (`▸ +38 lines`, → or a click unfolds it). The gutter
+  numbers lines as the file does: a record by its first line, each of its
+  lines when unfolded. A folded record a filter or search kept for a later
+  line shows that line, its number first, and `(+2 more matching lines)`.
 - **Selecting:** drag, Shift+click, double-click (a word), Shift+arrows,
   `Ctrl+A`. `Ctrl+C` copies the selection, or the current line.
 - **Picked lines:** `Ctrl+click` (or `Ctrl+Space`) picks single lines
@@ -59,11 +69,21 @@ they find their lines again in a changed file (one that can't is marked
 `?`). In queries, `bookmark` is a field: `level >= ERROR OR bookmark`,
 `bookmark ~ /fan/`.
 
+**🤖 AI** in the top bar opens a terminal with your AI agent (Settings →
+AI command) working on this window; **🤖 Agent** lists what it changed,
+with ↶ Undo ([AI agents](agents.md#with-you-on-your-window-mcp)).
+
+Bookmarks an [AI agent](agents.md) made (`nerka marks --add`) are
+**annotations**: 🤖 and violet in the views, the plot and the panel, until
+you accept them (✔ in the panel, or ✔ Accept all): then they are your
+bookmarks. When the window gets the focus back it takes in bookmarks added
+to the file meanwhile, and saving yours never writes over them.
+
 ## Several files
 
 Files opened together (multi-select in **Open…**, dropping several,
 `nerka-gui a.dlt b.pcap`) become **one tab**, one after another in the
-order given. The tab's menu → **Files…** lists them: move, remove or add
+order given; each line is numbered in its own file (`@line` in queries). The tab's menu → **Files…** lists them: move, remove or add
 files, turn protocols on or off per capture, pick a text file's
 [profile](formats.md#profiles), move a file's times by an
 [offset](formats.md#a-files-offset); below the list, how each file's time
@@ -104,6 +124,8 @@ date** when the file was read again, other lines or another field are
 chosen, or the [pattern configuration](cli.md#the-pattern-configuration)
 or the signals changed.
 
+![the Patterns window on a demo drive: 9,844 lines as 16 patterns, each with its share, its count, its context (ECU, application, context) and its template, slots as <*> and states with their values ({D|P|N}); the rare ones last: a panic, a service not responding, a shutdown](img/patterns.png)
+
 - **Lines:** all lines, the filter result, one lifecycle (`@ecu1` and its
   number: every line during it, or with *its lines only* its own lines),
   or the lines of a filter you type (NFD). **Field:** the text
@@ -132,6 +154,12 @@ together and lists what differs: patterns and slot values **new in B**,
 the score is G², 10.8 or more by default), as
 [`nerka compare`](cli.md#compare-experimental) does.
 
+- **Show:** *New*, *Gone*, *Changed* and *Same*: the last (off at first)
+  lists what is in both and scores less, most lines first, to confirm the
+  same behaviour on both sides. **Rows:** patterns and values, the
+  patterns only (no slot values), or the values only. Both list the
+  results again without a new run, as the minimum score does.
+
 - **A and B:** all lines, the filter result, the lines of a filter,
   lifecycles of `@name` by number (`2`, or a group: `2, 5-7`) or every one
   of an outcome (every `crash` against every `planned`): every line during
@@ -153,8 +181,7 @@ the score is G², 10.8 or more by default), as
 - In the Signals panel, **⚖** on a lifecycle compares it with the one
   before.
 
-**🛠 Tuning** (in the same window; alpha builds, else ⚙ Settings →
-Developer → Pattern tuning) edits the [pattern
+**🛠 Tuning** (in the same window) edits the [pattern
 configuration](cli.md#the-pattern-configuration) on the lines at hand:
 
 - **Settings** of both stages, each with **●** while it isn't the default
@@ -224,10 +251,11 @@ nerka-gui [OPTIONS] [FILE]...
 | `--library` | show the library |
 | `--signal SPEC`, `--lifecycle SPEC`, `--check SPEC` | a signal, lifecycle or check for this session (as the CLI's; not saved unless edited) |
 | `--plot NAME`, `--plot-window` | plot a signal (in a window of its own) |
+| `--patterns` | open the first tab's Patterns window and run it |
 | `--marker NAME=VALUE[:LABEL]`, `--cursor TIME` | a line in a plotted lane, a time cursor |
 | `--fibex FILE` | a FIBEX file for DLT non-verbose messages |
 | `--new-window`, `--name NAME` | a window of its own, its name |
-| `--screenshot PATH` | once the files are loaded, the signals collected and the plot drawn, save the window as a PNG and close it (for checks without a person at the screen); a plot in its own window is saved too, as `PATH-plot.png` (`shot.png` → `shot-plot.png`) |
+| `--screenshot PATH` | once the files are loaded, the signals collected and the plot drawn, save the window as a PNG and close it (for checks without a person at the screen); a plot in its own window is saved too, as `PATH-plot.png` (`shot.png` → `shot-plot.png`), and the Patterns window as `PATH-patterns.png` |
 | `-h, --help`, `-V, --version` | |
 
 A `--signal`, `--lifecycle` or `--check` that doesn't parse is listed in an

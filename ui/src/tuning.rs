@@ -2,9 +2,9 @@
 //! α2), a mode of the Patterns window: the pattern configuration's settings
 //! and rules edited on the trace at hand, each change re-running the
 //! patterns (debounced, on the same lines), what the change did, and why
-//! two patterns were kept apart or joined. Visible in pre-release (alpha)
-//! builds, else behind ⚙ Settings → *Developer: pattern tuning* (owner,
-//! 2026-11-23). Nothing is written until Save; Export and Load move a
+//! two patterns were kept apart or joined. Shown in every build (owner,
+//! 2026-11-25: it stays in the Patterns window for 0.3.0). Nothing is
+//! written until Save; Export and Load move a
 //! configuration between testers.
 
 use eframe::egui::{self, RichText};
@@ -82,6 +82,16 @@ const STATE_VALUES: Help = Help {
            (users, addresses). 16 at most: the values a slot keeps while grouping.\n\n\
            Lower: fewer states, more <*>. Higher: slots of more values listed as states.",
     effect: "↑ more {a|b|c} states · ↓ more <*>",
+};
+const LONE_WORD: Help = Help {
+    what: "A message's only word is never a slot. On: a level near the start (`INFO`, `587~DEBUG`) is \
+           header, not a sign of one message, and two messages whose words in common are only header \
+           and footer stay two patterns: `INFO dlt_message_init()` and `INFO dlt_message_free()`, or \
+           `LOG: radar: OK` and `LOG: imu: OFFLINE`; a state needs a word of the message in common \
+           (`door {open|closed}`).\n\n\
+           Off: such messages join into one pattern, the word a slot ({dlt_message_init()|…}), fewer \
+           patterns.",
+    effect: "on: one-word messages apart · off: fewer patterns",
 };
 
 /// The rule form's actions.
@@ -550,6 +560,19 @@ impl TuningUi {
                     set.push(Setting::StateValues(d.state_values));
                 }
                 effect(ui, &STATE_VALUES);
+            });
+            ui.end_row();
+            ui.label("");
+            name(ui, "lone word", &LONE_WORD);
+            ui.horizontal(|ui| {
+                let mut m = s.lone_word;
+                if ui.checkbox(&mut m, "on").changed() {
+                    set.push(Setting::LoneWord(m));
+                }
+                if dot(ui, s.lone_word != d.lone_word, "on".into()) {
+                    set.push(Setting::LoneWord(d.lone_word));
+                }
+                effect(ui, &LONE_WORD);
             });
             ui.end_row();
         });

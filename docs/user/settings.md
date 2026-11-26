@@ -20,8 +20,6 @@ description: "nerka's settings and where it keeps them: time zones, capture prot
   applies to files opened from then on (a tab's **Reload** reads its files
   again).
 - **Compressed MF4:** the unpack cache's size limit, its use, **Clear**.
-- **Developer → Pattern tuning:** the [Patterns](gui.md#patterns) window's
-  🛠 Tuning pane (always shown in alpha builds).
 - **Reload configuration:** read packs, presets, plots, checks, signals,
   profiles and preferences again (after editing a file by hand, or after
   another window changed them).

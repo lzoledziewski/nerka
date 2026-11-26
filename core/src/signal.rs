@@ -632,6 +632,9 @@ enum Builtin {
     No,
     /// The built-in `@time`: the source's own time of each line.
     Time,
+    /// The built-in `@line`: each row's line in its own file (owner,
+    /// 2026-11-25: "it could become a signal, just like file").
+    Line,
     /// A lifecycle: its number for the line's key.
     Life(Arc<LifecycleDef>),
     /// A check's occurrences in one source ([`crate::check`]).
@@ -832,6 +835,34 @@ impl SignalDef {
         }
     }
 
+    /// The built-in `@line`: the line of its own file each row is (from 1;
+    /// a record: its first line), in a view of several files too:
+    /// `@line < 526`, `file == b.log AND @line >= 190`.
+    pub fn source_line() -> SignalDef {
+        SignalDef {
+            name: "line".into(),
+            kind: SignalKind::Num,
+            group: "line".into(),
+            query: Query::compile("/(?<line>)/").expect("valid"),
+            cache: Cache::default(),
+            builtin: Builtin::Line,
+            built: Built::default(),
+            scope: SignalScope::All,
+            per: None,
+            life: None,
+            default: None,
+            off: false,
+            queries: Vec::new(),
+            argument: None,
+            profiles: Vec::new(),
+        }
+    }
+
+    /// Whether this is the built-in `@line`.
+    pub fn is_source_line(&self) -> bool {
+        matches!(self.builtin, Builtin::Line)
+    }
+
     /// A lifecycle as a signal (`@boot`): the lifecycle's number for the
     /// line's key; an event where one starts.
     pub fn lifecycle(def: LifecycleDef) -> SignalDef {
@@ -884,7 +915,7 @@ impl SignalDef {
 
     /// Whether this is a built-in the source gives (`@time`, `@uptime`).
     pub fn is_from_source(&self) -> bool {
-        matches!(self.builtin, Builtin::Time)
+        matches!(self.builtin, Builtin::Time | Builtin::Line)
     }
 
     /// Whether its values don't come from its query (a built-in or a
@@ -897,6 +928,7 @@ impl SignalDef {
     pub fn source_value(&self, source: &dyn LogSource, line: LineNo) -> Option<f64> {
         match self.builtin {
             Builtin::Time => source.time(line),
+            Builtin::Line => Some(source.line_in_file(line) as f64 + 1.0),
             _ => None,
         }
     }
@@ -1012,6 +1044,7 @@ impl SignalDef {
         let off = if self.off { "off " } else { "" };
         match &self.builtin {
             Builtin::Time => return "time:time (the file's own time)".into(),
+            Builtin::Line => return "line:num (the line in its own file)".into(),
             Builtin::Life(l) => return format!("{off}lifecycle {}", l.spec()),
             Builtin::Check(_) => return format!("{}:{} (a check's result)", self.name, self.kind.as_str()),
             Builtin::No => {}
@@ -1053,6 +1086,10 @@ impl SignalDef {
     pub fn value(&self, ev: &mut Event<'_>) -> Option<SignalValue> {
         match self.builtin {
             Builtin::Time => return ev.source()?.time(ev.line()).map(SignalValue::Num),
+            Builtin::Line => {
+                let src = ev.source()?;
+                return Some(SignalValue::Num(src.line_in_file(ev.line()) as f64 + 1.0));
+            }
             // Known from the whole source only.
             Builtin::Life(_) | Builtin::Check(_) => return None,
             Builtin::No => {}
@@ -1135,7 +1172,7 @@ impl SignalDef {
                     parts.push((first, key, Arc::new(Events::build(found, self.kind))));
                 }
             }
-            Builtin::No | Builtin::Time => unreachable!("not built in"),
+            Builtin::No | Builtin::Time | Builtin::Line => unreachable!("not built in"),
         }
         *built = Some(BuiltParts { key, life: life.cloned(), parts: parts.clone() });
         parts
@@ -1152,7 +1189,7 @@ impl SignalDef {
         let default = self.default.clone();
         match &self.builtin {
             // Every line is an event: the source answers directly.
-            Builtin::Time => {
+            Builtin::Time | Builtin::Line => {
                 return Ok(SignalSeries { key: source_key(source), parts, life: None, default: None });
             }
             // Events where lifecycles start, or the check's occurrences.
@@ -1346,6 +1383,10 @@ impl Signals {
         let some = source.line_count() > 0;
         if some && source.has_time() && s.get("time").is_none() {
             s.0.insert(0, Arc::new(SignalDef::source_time()));
+        }
+        if some && s.get("line").is_none() {
+            let at = usize::from(s.get("time").is_some_and(|t| t.is_from_source()));
+            s.0.insert(at, Arc::new(SignalDef::source_line()));
         }
         s.link();
         s

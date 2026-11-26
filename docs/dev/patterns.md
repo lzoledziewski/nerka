@@ -22,6 +22,32 @@ the `patterns` file and bundle kind, `--pattern-config` / `--set` /
   computed automatically for now; they run only when asked (▶ Run).
 - **Compare chooses its content (owner, 2026-11-23):** the lines compared
   can be narrowed to what matters, and unwanted content ignored.
+- **A message's only word is never a slot, tunable (owner, 2026-11-25):**
+  from the AI evaluation: in a daemon's own log, function traces
+  (`[ <*>]~DLT~ <*>~INFO ~dlt_message_init()`, ~20 functions) were one
+  pattern of a third of the log. The setting `lone-word` (on by default;
+  CLI `--set`, rules `set lone-word off`, the tuning pane): a level word
+  among a raw text line's first `header places` tokens is header in
+  stage 1 (`Cluster::levels`, decided when a template is made); in stage
+  2 a flip (one atom for another) needs a word in common that isn't a
+  header or footer word (`Local::header_words`: stage 1's boilerplate and
+  `header` rules) or a level, and a pattern of header words only absorbs
+  nothing. Measured: LogHub-2.0 2k unchanged (GA 0.751, FGA 0.760, WGA
+  0.949); that log 33 → 82 patterns, each function its own; of 21 other
+  evaluation logs, 6 changed: a Java dump's prefix-only pattern took 59 %
+  of lines, now 23 % (its messages apart), and four trace logs join one
+  message logged at NOTICE and INFO (`{NOTICE|INFO}`); the test
+  `LOG: radar: OK` / `LOG: imu: OFFLINE` is now two patterns, not one of
+  two slots. 1 GiB: patterns identical, time unchanged (text ~620 →
+  ~635 ms, noise; DLT payloads have no level check).
+- **Compare shows what it compared (owner, 2026-11-25):** besides new,
+  gone and changed, what is in both and didn't change (**Same**: scoring
+  under the minimum), to confirm the same behaviour on both sides; and
+  patterns without their values, or values only. Built: `Listed` /
+  `Rows` in `core/src/pattern.rs` (`differences` takes them); CLI `--show
+  new,gone,changed,same|all`, `--rows all|patterns|values`; MCP `show`,
+  `rows`; the window's Show checkboxes (Same off at first) and Rows,
+  listing again without a new run.
 
 ## Principle
 
@@ -51,6 +77,7 @@ side 4                    # stage 2: tokens on the longer side of a slot
 state-values 16           # a slot with more values is <*>, not a state
 header sample 32 min 8 share 0.5 places 3   # header/footer detection
 merge on                  # stage 2 at all
+lone-word on              # a message's only word is never a slot
 
 # Rules: [scope:] action
 apid == NAV: keep Elapsed              # a word that never becomes a slot
@@ -190,9 +217,9 @@ run at once. Changing the minimum score filters the rows without a new run.
 
 ## The tuning pane (🛠)
 
-For the alpha rounds; visible in alpha builds, behind ⚙ Settings →
-*Developer: pattern tuning* after (owner, 2026-11-23: a switch, off by
-default; the configuration file works either way).
+Shown in the Patterns window in every build, releases too (owner,
+2026-11-25: it stays there for 0.3.0; the Settings switch that hid it in
+releases is gone).
 
 ```
 ┌ 🛠 Pattern tuning ─────────────── config: patterns (saved) [Save][Load][Export] ┐
@@ -223,9 +250,7 @@ default; the configuration file works either way).
   with a bug report and it is loaded as it was.
 
 As built (2026-11-24, α2; `ui/src/tuning.rs`): **🛠 Tuning** is the third
-mode of the Patterns window, shown when the version is a pre-release
-(`-alpha…`) or ⚙ Settings → Developer → Pattern tuning (`prefs`:
-`pattern_tuning`) is on. The pane loads the saved configuration once and
+mode of the Patterns window. The pane loads the saved configuration once and
 from then on the window's runs use the pane's (saved or not); a change
 runs again after 0.6 s on the same lines. **Change** follows each line
 from the run before to this one (joins and splits; past 4 M lines only new
@@ -289,7 +314,7 @@ them:
   pane; Compare a mode of the window; ⚖ on a lifecycle row in the Signals
   panel (a button, runs at once; "like it"); Tuning a mode of the window,
   its configuration (even unsaved) what the window runs with until Revert;
-  the tuning pane in pre-releases, a Settings switch otherwise; `nerka
+  the tuning pane in every build (2026-11-25); `nerka
   anonymize` CLI only, DLT IDs kept unless `--ids`, a random key unless
   `--seed`.
 - **For now:** ignoring a row in Compare hides it, Save as ignore rule

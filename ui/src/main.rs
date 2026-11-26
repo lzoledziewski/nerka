@@ -31,6 +31,7 @@
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod agent;
 mod bundles;
 mod checks;
 mod compare;
@@ -53,6 +54,7 @@ mod shot;
 mod signals;
 mod skips;
 mod sync;
+mod terminal;
 mod tuning;
 mod view;
 
@@ -99,6 +101,7 @@ Options:
       --check SPEC         A check for this session (as `nerka --check`)
       --plot NAME          Plot a signal
       --plot-window        The plot in a window of its own
+      --patterns           Open the Patterns window and run it
       --marker NAME=VALUE[:LABEL]  A horizontal line in a plotted lane
       --cursor TIME        A time cursor in the plot
       --fibex FILE         FIBEX file for DLT non-verbose messages
@@ -106,7 +109,8 @@ Options:
       --name NAME          The window's name
       --screenshot PATH    Once loaded and drawn, save the window as a PNG
                            and close (checks and CI); the plot's own window
-                           goes to PATH-plot.png
+                           goes to PATH-plot.png, the Patterns window to
+                           PATH-patterns.png
   -h, --help               This text
   -V, --version            The version
 ";
@@ -141,6 +145,8 @@ fn main() -> eframe::Result {
     let mut markers: Vec<(String, plot::Marker)> = Vec::new();
     // `--plot-window`: the plot starts in a window of its own.
     let mut plot_window = false;
+    // `--patterns`: the Patterns window opens and runs once the file is read.
+    let mut patterns_at_start = false;
     // `--screenshot PATH`: the window as a PNG once loaded, then close.
     let mut screenshot: Option<PathBuf> = None;
     let (mut window_name, mut preset_file) = (None, None);
@@ -236,6 +242,10 @@ fn main() -> eframe::Result {
                 plot_window = true;
                 continue;
             }
+            Some("--patterns") => {
+                patterns_at_start = true;
+                continue;
+            }
             Some("--signal") => {
                 let spec = value();
                 match nerka_core::SignalDef::parse_spec(&spec) {
@@ -316,8 +326,15 @@ fn main() -> eframe::Result {
         options,
         Box::new(move |cc| {
             let show_signals = !signals.is_empty();
-            let mut app =
-                App { pack_paths: packs, show_library, show_signals, window_name, plot_window, ..Default::default() };
+            let mut app = App {
+                pack_paths: packs,
+                show_library,
+                show_signals,
+                window_name,
+                plot_window,
+                patterns_at_start,
+                ..Default::default()
+            };
             let ctx = cc.egui_ctx.clone();
             app.server = instance::Server::start(move || ctx.request_repaint());
             // A config folder written by an earlier nerka: to this one's formats.
@@ -329,7 +346,13 @@ fn main() -> eframe::Result {
             app.load_saved_signals();
             app.load_checks();
             if !fibex.is_empty() {
+                // `--fibex` for this run: the files saved to load at start
+                // stay as they are.
+                let keep = std::mem::take(&mut app.prefs.fibex_autoload);
                 app.set_fibex(&cc.egui_ctx, fibex);
+                app.prefs.fibex_autoload = keep;
+            } else if app.prefs.fibex_autoload {
+                app.autoload_fibex(&cc.egui_ctx);
             }
             for c in startup_checks.iter() {
                 app.add_session_check(c.clone());
@@ -681,6 +704,11 @@ struct Tab {
     filter_preview: PreviewCache,
 
     bookmarks: Bookmarks,
+    /// The bookmarks as the sidecars had them when last read or saved, and
+    /// the sidecars' stamp then: another program (`nerka marks --add`, an
+    /// agent) may write them meanwhile, and its changes are merged in.
+    marks_base: Bookmarks,
+    marks_stamp: Option<sync::Stamp>,
     /// The bookmarks changed since the last frame: what uses them runs again.
     marks_changed: bool,
     /// Where bookmark notes show in the views (the app's setting).
@@ -823,6 +851,17 @@ struct LineSignal {
     value: Option<String>,
     /// The line of the event that set the value; this line for an event.
     from: Option<LineNo>,
+    /// An event: the value held before this line (`None`: its first, or a
+    /// signal without a state before, as the line's own fields).
+    before: Option<String>,
+}
+
+impl LineSignal {
+    /// An event whose value differs from the one held before it (its first
+    /// event too: nothing was held).
+    fn changed(&self, line: LineNo) -> bool {
+        self.from == Some(line) && self.before.as_ref() != self.value.as_ref()
+    }
 }
 
 /// The line window's Signals section: the signals the line carries (its
@@ -840,12 +879,26 @@ fn signals_section(ui: &mut egui::Ui, line: LineNo, signals: &[LineSignal]) -> O
             if events.is_empty() {
                 ui.weak("None: this line carries no signal's value.");
             }
-            egui::Grid::new("line-detail-signals-grid").num_columns(3).spacing([12.0, 2.0]).striped(true).show(
+            // A value that changed what was held is coloured, with what it
+            // was (owner, 2026-11-25); the same value again stays plain.
+            let changed_color = ui.visuals().warn_fg_color;
+            egui::Grid::new("line-detail-signals-grid").num_columns(4).spacing([12.0, 2.0]).striped(true).show(
                 ui,
                 |ui| {
                     for s in &events {
                         ui.label(RichText::new(format!("@{}", s.name)).monospace().strong());
-                        ui.monospace(s.value.as_deref().unwrap_or("—"));
+                        let value = s.value.as_deref().unwrap_or("—");
+                        if s.changed(line) {
+                            ui.label(RichText::new(value).monospace().strong().color(changed_color))
+                                .on_hover_text("Changed on this line");
+                            match &s.before {
+                                Some(b) => ui.weak(format!("was {b}")),
+                                None => ui.weak("first value"),
+                            };
+                        } else {
+                            ui.monospace(value);
+                            ui.weak("");
+                        }
                         ui.weak(format!("{} · {}", s.kind, s.origin));
                         ui.end_row();
                     }
@@ -1360,6 +1413,8 @@ impl Tab {
             chips_open: false,
             filter_preview: PreviewCache::default(),
             bookmarks: Bookmarks::default(),
+            marks_base: Bookmarks::default(),
+            marks_stamp: None,
             marks_changed: false,
             notes: NoteMode::default(),
             marks_open: Default::default(),
@@ -2064,6 +2119,8 @@ impl Tab {
                                 self.status = format!("Could not read bookmarks: {e}");
                                 Bookmarks::default()
                             });
+                            self.marks_base = self.bookmarks.clone();
+                            self.marks_stamp = Some(self.marks_stamp_now());
                             self.columns = Columns::from_defs(f.columns());
                             let f: Arc<dyn LogSource> = Arc::from(f);
                             self.file = Some(f.clone());
@@ -2133,7 +2190,10 @@ impl Tab {
                 Ok(Finished::Done(Stage::Filter)) => {
                     self.filter_failed = None;
                     let n = self.result().map_or(0, |r| r.lines.len());
-                    self.status = format!("Filter keeps {n} lines ({took:.2?})");
+                    // Records counted as records (owner, 2026-11-25).
+                    let what =
+                        if self.file.as_ref().is_some_and(|f| f.file_line(0).is_some()) { "records" } else { "lines" };
+                    self.status = format!("Filter keeps {n} {what} ({took:.2?})");
                     // What it can't find (a `proto` no message has, `net.*`
                     // of senders not kept): said (2026-11-08 R8, 2026-11-09 R2).
                     if let (Some(f), Some(file)) = (self.session.filter(), &self.file)
@@ -2496,11 +2556,22 @@ impl Tab {
             } else {
                 "saved"
             };
-            let base =
-                LineSignal { name: d.name().to_owned(), kind: d.kind().as_str(), origin, value: None, from: None };
+            let base = LineSignal {
+                name: d.name().to_owned(),
+                kind: d.kind().as_str(),
+                origin,
+                value: None,
+                from: None,
+                before: None,
+            };
             if d.is_from_source() {
-                let value = file.time(line).map(|t| nerka_core::time::format_time(t, 6));
-                out.push(LineSignal { from: value.as_ref().map(|_| line), value, ..base });
+                let value = d
+                    .source_value(&*file, line)
+                    .map(|v| if d.is_source_line() { format!("{v}") } else { nerka_core::time::format_time(v, 6) });
+                // Built in (`@time`, `@line`): a value on every line, no
+                // state to compare with.
+                let before = value.clone();
+                out.push(LineSignal { from: value.as_ref().map(|_| line), value, before, ..base });
                 continue;
             }
             let Some(series) = self.views.series(d, &*file, kept.as_ref(), self.signals_gen) else {
@@ -2508,7 +2579,16 @@ impl Tab {
                 continue;
             };
             match series.state(line) {
-                Some((row, v)) => out.push(LineSignal { value: Some(d.format(v)), from: Some(row), ..base }),
+                Some((row, v)) => {
+                    // An event here: what was held before it, to tell a
+                    // change from the same value again (owner, 2026-11-25).
+                    let before = if row == line {
+                        line.checked_sub(1).and_then(|l| series.state(l)).map(|(_, b)| d.format(b))
+                    } else {
+                        None
+                    };
+                    out.push(LineSignal { value: Some(d.format(v)), from: Some(row), before, ..base })
+                }
                 None => out.push(base),
             }
         }
@@ -2533,6 +2613,7 @@ impl Tab {
                     kind: a.ty.kind().as_str(),
                     origin: "FIBEX, not used",
                     from: value.as_ref().map(|_| line),
+                    before: value.clone(),
                     value,
                 });
             }
@@ -2570,7 +2651,51 @@ impl Tab {
         Bookmarks::load_for_parts(&files)
     }
 
+    /// The stamp of the view's sidecars (`<file>.nerka-marks`).
+    fn marks_stamp_now(&self) -> sync::Stamp {
+        let sidecars: Vec<PathBuf> = self.paths.iter().map(|p| Bookmarks::sidecar_path(p)).collect();
+        sync::Stamp::of(&sidecars)
+    }
+
+    /// Another program changed the sidecars since they were last read or
+    /// saved (an agent's `nerka marks --add`): its changes merged into the
+    /// tab's bookmarks, three-way (`Bookmarks::merge`: where both changed
+    /// one, the tab's stays). Returns what came in.
+    fn take_in_marks(&mut self) -> nerka_core::bookmarks::Merged {
+        let Some(file) = self.file.clone() else { return Default::default() };
+        let now = self.marks_stamp_now();
+        if self.marks_stamp.as_ref().is_some_and(|was| was.changed(&now).is_empty()) {
+            return Default::default();
+        }
+        self.marks_stamp = Some(now);
+        let Ok(theirs) = self.load_bookmarks(&*file) else { return Default::default() };
+        let got = self.bookmarks.merge(&self.marks_base, &theirs);
+        self.marks_base = theirs;
+        if !got.is_empty() {
+            self.marks_changed = true;
+        }
+        got
+    }
+
+    /// The focus came back: bookmarks another program added meanwhile are
+    /// taken in and said in the status bar.
+    fn follow_marks(&mut self) {
+        let got = self.take_in_marks();
+        if !got.is_empty() {
+            self.status = format!("Bookmarks changed in the file meanwhile, taken in: {}", got.summary());
+            // Ours had changes the file doesn't: keep both in the file.
+            if self.bookmarks != self.marks_base {
+                self.save_bookmarks();
+            }
+        }
+    }
+
     fn save_bookmarks(&mut self) {
+        // What another program wrote meanwhile isn't written over.
+        let got = self.take_in_marks();
+        if !got.is_empty() {
+            self.status += &format!(" · taken in from the file meanwhile: {}", got.summary());
+        }
         let Some(file) = self.file.clone() else { return };
         // Merged by time: each file's bookmarks on its own lines.
         let (marks, file) = match file.reordered() {
@@ -2592,6 +2717,8 @@ impl Tab {
         if let Err(e) = res {
             self.status = format!("Could not save bookmarks: {e}");
         }
+        self.marks_base = self.bookmarks.clone();
+        self.marks_stamp = Some(self.marks_stamp_now());
         self.marks_changed = true;
     }
 
@@ -2680,11 +2807,25 @@ impl Tab {
 
     fn bookmarks_list(&mut self, ui: &mut egui::Ui, file: &dyn LogSource) {
         ui.weak("m toggle · b / B next / prev");
+        // An agent's annotations: kept apart until accepted (owner, 2026-11-24).
+        let mut accept_all = false;
+        let waiting = self.bookmarks.annotations();
+        if waiting > 0 {
+            ui.horizontal(|ui| {
+                ui.colored_label(view::ANNOTATION_COLOR, format!("{} {waiting}", view::ANNOTATION_GLYPH));
+                ui.label(if waiting == 1 { "annotation by an agent" } else { "annotations by an agent" });
+                accept_all = ui
+                    .small_button("✔ Accept all")
+                    .on_hover_text("Make every annotation your bookmark (names and notes kept)")
+                    .clicked();
+            });
+        }
         ui.separator();
         if self.bookmarks.is_empty() {
             ui.weak("No bookmarks yet.");
             return;
         }
+        let mut accept = None;
         let mut jump = None;
         let mut edits: Vec<(LineNo, String)> = Vec::new();
         let mut remove = None;
@@ -2707,6 +2848,18 @@ impl Tab {
                     }
                     if self.bookmarks.is_unsure(line) {
                         ui.colored_label(ui.visuals().warn_fg_color, "?").on_hover_text(UNSURE_MARK);
+                    }
+                    if let Some(by) = self.bookmarks.author(line) {
+                        if ui
+                            .small_button("✔")
+                            .on_hover_text("Accept: make it your bookmark (name and note kept)")
+                            .clicked()
+                        {
+                            accept = Some(line);
+                        }
+                        ui.colored_label(view::ANNOTATION_COLOR, view::ANNOTATION_GLYPH).on_hover_text(format!(
+                            "An annotation by {by} (nerka marks --add): an agent's finding, not yours until accepted"
+                        ));
                     }
                     // The name (the plot shows it); edited in place.
                     let mut text = match &self.mark_rename {
@@ -2770,7 +2923,16 @@ impl Tab {
         {
             self.marks_open.insert(l);
         }
-        let changed = !edits.is_empty() || rename.is_some() || remove.is_some();
+        let changed = !edits.is_empty() || rename.is_some() || remove.is_some() || accept.is_some() || accept_all;
+        if accept_all {
+            let n = self.bookmarks.accept_all();
+            self.status = format!("{n} annotation{} accepted as your bookmarks", if n == 1 { "" } else { "s" });
+        }
+        if let Some(l) = accept
+            && self.bookmarks.accept(l)
+        {
+            self.status = format!("Annotation on line {} accepted as your bookmark", l + 1);
+        }
         for (l, t) in edits {
             self.bookmarks.set_note(l, t);
         }
@@ -2928,6 +3090,7 @@ impl Tab {
                     lines: lines.as_ref(),
                     notes: self.notes,
                     lifecycles: None,
+                    in_hits: false,
                 },
             );
             self.view_output(&out, true, |row| hits.lines[row as usize]);
@@ -3055,6 +3218,10 @@ impl Tab {
         };
         let rows = self.main_rows();
         let boundaries = self.lifecycle_boundaries(file);
+        // Records: the filter's matches highlighted, so a folded record
+        // shows the line it matched on (owner, 2026-11-25).
+        let filter_marks =
+            (file.file_line(0).is_some()).then(|| self.session.filter().map(|f| f.highlighter())).flatten();
         let out = log_view(
             ui,
             "main",
@@ -3064,16 +3231,39 @@ impl Tab {
             file,
             &mut self.columns,
             &Highlight {
-                // Every row matches the filter: only search hits are coloured.
-                highlighter: None,
+                // Every row matches the filter: only search hits are
+                // coloured, but inside a record what the filter matched.
+                highlighter: filter_marks.as_ref(),
                 bookmarks: Some(&self.bookmarks),
                 search: marks.as_ref(),
                 lines: lines.as_ref(),
                 notes: self.notes,
                 lifecycles: Some(boundaries.as_slice()),
+                in_hits: search_hits.is_some(),
             },
         );
         self.view_output(&out, false, line_of_row);
+        if let Some(row) = out.in_hits {
+            self.show_in_hits(line_of_row(row));
+        }
+    }
+
+    /// Select `line` in the search results, or the next hit after it (the
+    /// main view's **Show in search results**); the status says which.
+    fn show_in_hits(&mut self, line: LineNo) {
+        let Some((_, hits)) = self.search_hits() else { return };
+        let i = hits.position_at_or_after(line);
+        if i >= hits.len() {
+            self.status = format!("No search hit at line {} or after it", line + 1);
+            return;
+        }
+        self.hits_view.select(i as u64, hits.len() as u64);
+        let at = hits.lines[i];
+        self.status = if at == line {
+            format!("Line {} in the search results: hit {} of {}", line + 1, i + 1, hits.len())
+        } else {
+            format!("Line {} isn't a hit: the next one, line {} (hit {} of {})", line + 1, at + 1, i + 1, hits.len())
+        };
     }
 
     /// Where the tab's lifecycles start (found already), for the view; made
@@ -3353,6 +3543,8 @@ struct App {
     option_errors: Vec<String>,
     /// `--screenshot PATH`: waiting to save the window.
     shoot: Option<Shoot>,
+    /// What agents asked of this window and changed in it (`nerka mcp`).
+    agent: agent::AgentState,
     focus_search: bool,
     window_title: String,
     /// Query packs (search manager) and where they come from besides the
@@ -3405,6 +3597,9 @@ struct App {
     fibex_args: Option<(usize, Arc<Vec<nerka_core::Argument>>)>,
     /// The plot is in a window of its own, and what that window shares.
     plot_window: bool,
+    /// `--patterns`: the first tab's Patterns window, opened and run once
+    /// its file is read.
+    patterns_at_start: bool,
     plot_win: Arc<std::sync::Mutex<plot::Detached>>,
     /// What the plot's window was last asked to repaint for.
     plot_win_key: Option<plot::WindowKey>,
@@ -3497,12 +3692,14 @@ struct SettingsFields<'a> {
     limit: &'a mut String,
     local_time: &'a mut bool,
     mf4_local_time: &'a mut bool,
-    pattern_tuning: &'a mut bool,
+    ai_command: &'a mut String,
+    /// An agent's answers: lines by default, at most, patterns by default.
+    ai_limits: [&'a mut u64; 3],
 }
 
 /// The Settings window's fields ([`SettingsFields`]).
 fn settings_ui(ui: &mut egui::Ui, f: SettingsFields<'_>) -> SettingsChange {
-    let SettingsFields { name, theme, limit, local_time, mf4_local_time, pattern_tuning } = f;
+    let SettingsFields { name, theme, limit, local_time, mf4_local_time, ai_command, ai_limits } = f;
     let mut save = SettingsChange::default();
     egui::Grid::new("settings-grid").num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| {
         ui.label(RichText::new("Look").strong());
@@ -3541,15 +3738,48 @@ fn settings_ui(ui: &mut egui::Ui, f: SettingsFields<'_>) -> SettingsChange {
         );
         save.times |= r.changed();
         ui.end_row();
-        ui.label(RichText::new("Developer").strong());
+        ui.label(RichText::new("AI agents").strong());
         ui.end_row();
-        ui.label("Patterns");
-        let alpha = env!("CARGO_PKG_VERSION").contains('-');
-        let r = ui
-            .add_enabled(!alpha, egui::Checkbox::new(pattern_tuning, "Pattern tuning"))
-            .on_hover_text("🛠 Tuning in the Patterns window: the pattern configuration tried on the trace at hand")
-            .on_disabled_hover_text("Always shown in alpha builds");
-        save.theme |= r.changed();
+        ui.label("AI command");
+        ui.horizontal(|ui| {
+            // A client to pick (owner, 2026-11-25), or Custom: the command line
+            // below is what runs, either way.
+            let picked = terminal::PRESETS.iter().find(|(_, cmd)| ai_command.trim() == *cmd).map(|(name, _)| *name);
+            egui::ComboBox::from_id_salt("ai-command").selected_text(picked.unwrap_or("Custom")).show_ui(ui, |ui| {
+                for (name, cmd) in terminal::PRESETS {
+                    if ui.selectable_label(picked == Some(*name), format!("{name}  ({cmd})")).clicked() {
+                        *ai_command = (*cmd).to_owned();
+                        save.theme = true;
+                    }
+                }
+                if ui.selectable_label(picked.is_none(), "Custom…").clicked() && picked.is_some() {
+                    ai_command.clear();
+                    save.theme = true;
+                }
+            });
+            let r = ui
+                .add(egui::TextEdit::singleline(ai_command).hint_text("command line").desired_width(160.0))
+                .on_hover_text(
+                    "What 🤖 AI opens a terminal with, in the active file's folder. It gets NERKA_WINDOW, so \
+                     `nerka mcp` works on this window; Claude Code gets it at once, others need `nerka mcp \
+                     --install codex` (or gemini) once. Flags can follow the command.",
+                );
+            save.theme |= r.changed();
+        });
+        ui.end_row();
+        ui.label("Answers");
+        ui.horizontal(|ui| {
+            // Agents read in pages: what a page holds (owner, 2026-11-25).
+            let [lines, most, top] = ai_limits;
+            for (v, label, tip) in [
+                (lines, "lines", "Lines an answer gives when the agent doesn't ask for a number"),
+                (most, "at most", "Lines an answer gives at most, whatever the agent asks"),
+                (top, "patterns", "Patterns and differences an answer gives when the agent doesn't ask for a number"),
+            ] {
+                save.theme |= ui.add(egui::DragValue::new(v).range(1..=100_000)).on_hover_text(tip).changed();
+                ui.label(label);
+            }
+        });
         ui.end_row();
         ui.label(RichText::new("This window").strong());
         ui.end_row();
@@ -4181,6 +4411,12 @@ impl App {
             self.config_notice.get_or_insert_with(Default::default).0.extend(changed);
             self.refresh_notice();
         }
+        // Bookmarks an agent added meanwhile (`nerka marks --add`).
+        if focused {
+            for tab in &mut self.tabs {
+                tab.follow_marks();
+            }
+        }
     }
 
     /// What the notice says, from its files: checks and signals by name
@@ -4300,7 +4536,8 @@ impl App {
                         limit,
                         local_time: &mut self.prefs.local_time,
                         mf4_local_time: &mut self.prefs.mf4_local_time,
-                        pattern_tuning: &mut self.prefs.pattern_tuning,
+                        ai_command: &mut self.prefs.ai_command,
+                        ai_limits: [&mut self.prefs.ai_lines, &mut self.prefs.ai_most, &mut self.prefs.ai_top],
                     },
                 );
                 ui.separator();
@@ -4401,24 +4638,17 @@ impl App {
     }
 
     fn save_prefs_from(&mut self, prefs: SearchPrefs) {
-        // A tab knows its search settings only; the ports, the cache and
-        // the times stay.
+        // A tab knows its search settings only (`Tab::search_prefs`): those
+        // five, the rest as they are. Listing what to keep instead lost
+        // what the list missed (the AI command, its limits, checks on
+        // their own, FIBEX at start) to the defaults.
         let prefs = SearchPrefs {
-            dlt_ports: self.prefs.dlt_ports.clone(),
-            someip_ports: self.prefs.someip_ports.clone(),
-            syslog_ports: self.prefs.syslog_ports.clone(),
-            unpack_limit_gib: self.prefs.unpack_limit_gib,
-            local_time: self.prefs.local_time,
-            mf4_local_time: self.prefs.mf4_local_time,
-            bookmark_notes: self.prefs.bookmark_notes,
-            merge_by_time: self.prefs.merge_by_time,
-            theme: self.prefs.theme,
-            plot_window: self.prefs.plot_window,
-            plot_window_maximized: self.prefs.plot_window_maximized,
-            routes: self.prefs.routes.clone(),
-            disabled_protocols: self.prefs.disabled_protocols.clone(),
-            protocols: self.prefs.protocols.clone(),
-            ..prefs
+            mode: prefs.mode,
+            options: prefs.options,
+            search_mode: prefs.search_mode,
+            search_regex: prefs.search_regex,
+            search_ignore_case: prefs.search_ignore_case,
+            ..self.prefs.clone()
         };
         if prefs == self.prefs {
             return;
@@ -4432,6 +4662,27 @@ impl App {
         }
     }
 
+    /// `--patterns`: the first tab's window opened and run, once its file
+    /// is read (a file that doesn't open: nothing).
+    fn open_patterns_at_start(&mut self, ctx: &egui::Context) {
+        if !self.patterns_at_start {
+            return;
+        }
+        let Some(t) = self.tabs.first_mut() else {
+            self.patterns_at_start = false;
+            return;
+        };
+        if t.loading.is_some() || !t.stage_jobs.is_empty() || t.signals_job.is_some() {
+            ctx.request_repaint_after(Duration::from_millis(50));
+            return;
+        }
+        self.patterns_at_start = false;
+        if t.file.is_some() {
+            t.patterns.open = true;
+            t.patterns.autorun = true;
+        }
+    }
+
     /// Each tab's Patterns window that is open, and what it asks of its
     /// tab: go to a line (of its tab, or another's in a compare: that tab
     /// comes to the front), a query to filter or search by.
@@ -4440,10 +4691,14 @@ impl App {
             return;
         }
         let name = self.window_name.clone();
-        // Alpha builds show the tuning pane; releases behind Settings
-        // (owner, 2026-11-23).
-        let tuning = env!("CARGO_PKG_VERSION").contains('-') || self.prefs.pattern_tuning;
+        // The tuning pane in every build, releases too (owner, 2026-11-25:
+        // it stays in the Patterns window for 0.3.0).
+        let tuning = true;
         let refs: Vec<patterns::TabRef> = self.tabs.iter().filter_map(Tab::tab_ref).collect();
+        // `--screenshot`: inside the main window, where eframe takes
+        // pictures (of a window drawn immediately it takes none).
+        let embedded = ctx.embed_viewports();
+        ctx.set_embed_viewports(embedded || self.shoot.is_some());
         let mut asked = Vec::new();
         for (i, t) in self.tabs.iter_mut().enumerate() {
             if !t.patterns.open {
@@ -4467,6 +4722,7 @@ impl App {
                 asked.push((i, out));
             }
         }
+        ctx.set_embed_viewports(embedded);
         for (i, out) in asked {
             let (filtered, searched) = self.apply_patterns(ctx, i, out);
             if let Some(q) = filtered {
@@ -4764,10 +5020,46 @@ impl App {
             }
         }
         self.fibex_paths = paths;
+        if self.prefs.fibex_autoload {
+            self.remember_fibex();
+        }
         for t in &mut self.tabs {
             if t.file.as_ref().is_some_and(|f| !f.columns().is_empty()) {
                 t.reopen(ctx, &self.prefs, self.fibex.clone());
             }
+        }
+    }
+
+    /// The FIBEX files in use, saved to load at every start (or none, with
+    /// **Load at start** off).
+    fn remember_fibex(&mut self) {
+        self.prefs.fibex_files = if self.prefs.fibex_autoload {
+            self.fibex_paths.iter().map(|p| p.display().to_string()).collect()
+        } else {
+            Vec::new()
+        };
+        if let Some(path) = prefs_path()
+            && let Err(e) = sync::save_prefs(&mut self.prefs, &mut self.prefs_base, &path)
+        {
+            self.status = format!("Could not save preferences: {e}");
+        }
+    }
+
+    /// The FIBEX files saved to load at start: those still there; the
+    /// status says which are gone.
+    fn autoload_fibex(&mut self, ctx: &egui::Context) {
+        let (there, gone): (Vec<PathBuf>, Vec<PathBuf>) =
+            self.prefs.fibex_files.iter().map(PathBuf::from).partition(|p| p.is_file());
+        if !there.is_empty() {
+            // Not saved again here: a file gone stays listed until the
+            // list changes (a drive not mounted yet).
+            let keep = std::mem::take(&mut self.prefs.fibex_autoload);
+            self.set_fibex(ctx, there);
+            self.prefs.fibex_autoload = keep;
+        }
+        if !gone.is_empty() {
+            let names: Vec<String> = gone.iter().map(|p| p.display().to_string()).collect();
+            self.status = format!("FIBEX not found, not loaded: {}", names.join(", "));
         }
     }
 
@@ -4797,6 +5089,11 @@ impl App {
             match r {
                 instance::Request::Open(files) => self.open_files(ctx, files),
                 instance::Request::Move { files, preset } => self.take_tab(ctx, files, &preset),
+                // An agent works on the window as it is: no focus taken.
+                instance::Request::Agent(call) => {
+                    self.agent_call(ctx, call);
+                    continue;
+                }
             }
             ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
             ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
@@ -5302,7 +5599,15 @@ impl App {
         match jump {
             Some(Some(n)) => {
                 if let Some(t) = self.tabs.get_mut(self.active) {
-                    t.goto_line(n.saturating_sub(1));
+                    // A line of the file: in records, the record holding it.
+                    let row = match &t.file {
+                        Some(f) if f.file_line(0).is_some() => {
+                            nerka_core::agent::row_of_file_line(&**f, 0, n.saturating_sub(1))
+                                .unwrap_or_else(|_| f.line_count().saturating_sub(1))
+                        }
+                        _ => n.saturating_sub(1),
+                    };
+                    t.goto_line(row);
                 }
                 self.goto = None;
             }
@@ -5448,6 +5753,8 @@ struct Shoot {
     saved: bool,
     /// The plot's own window's picture, while it is awaited.
     plot: Option<Arc<std::sync::Mutex<Option<egui::ColorImage>>>>,
+    /// The Patterns window's picture, while it is awaited.
+    patterns: Option<Arc<std::sync::Mutex<Option<egui::ColorImage>>>>,
 }
 
 impl Shoot {
@@ -5465,14 +5772,16 @@ impl Shoot {
             image: Default::default(),
             saved: false,
             plot: None,
+            patterns: None,
         }
     }
 
-    /// Where the plot's own window goes: `shot.png` → `shot-plot.png`.
-    fn plot_path(path: &Path) -> PathBuf {
+    /// Where another window's picture goes: `shot.png` → `shot-plot.png`
+    /// (`what`: `plot`, `patterns`).
+    fn side_path(path: &Path, what: &str) -> PathBuf {
         let stem = path.file_stem().map_or_else(Default::default, |s| s.to_string_lossy());
         let ext = path.extension().map_or_else(|| "png".into(), |e| e.to_string_lossy());
-        path.with_file_name(format!("{stem}-plot.{ext}"))
+        path.with_file_name(format!("{stem}-{what}.{ext}"))
     }
 }
 
@@ -5487,7 +5796,8 @@ impl App {
     /// `--screenshot`: count quiet frames, ask for the picture, save it and
     /// close the window.
     fn shoot_step(&mut self, ctx: &egui::Context) {
-        let busy = self.tabs.iter().any(|t| t.is_busy());
+        let busy = self.tabs.iter().any(|t| t.is_busy()) || self.patterns_at_start;
+        let patterns_window = self.tabs.get(self.active).is_some_and(|t| t.patterns.open);
         let plot_window = self.plot_window && self.tabs.get(self.active).is_some_and(|t| plot::lock(&t.plot).shown);
         let Some(s) = &mut self.shoot else { return };
         ctx.request_repaint();
@@ -5504,17 +5814,26 @@ impl App {
         };
         s.saved |= save(&s.path, &s.image);
         if let Some(slot) = &s.plot
-            && save(&Shoot::plot_path(&s.path), slot)
+            && save(&Shoot::side_path(&s.path, "plot"), slot)
         {
             s.plot = None;
         }
+        if let Some(slot) = &s.patterns
+            && save(&Shoot::side_path(&s.path, "patterns"), slot)
+        {
+            s.patterns = None;
+        }
         if let Some(asked) = s.asked {
-            // The plot's window may be gone: the main window's picture alone.
-            if s.plot.is_some() && asked.elapsed() > Duration::from_secs(10) {
-                console::error("nerka-gui: --screenshot: the plot's window drew nothing; not saved\n");
-                s.plot = None;
+            // A window may be gone: the main window's picture alone.
+            if asked.elapsed() > Duration::from_secs(10) {
+                if s.plot.take().is_some() {
+                    console::error("nerka-gui: --screenshot: the plot's window drew nothing; not saved\n");
+                }
+                if s.patterns.take().is_some() {
+                    console::error("nerka-gui: --screenshot: the Patterns window drew nothing; not saved\n");
+                }
             }
-            if s.saved && s.plot.is_none() {
+            if s.saved && s.plot.is_none() && s.patterns.is_none() {
                 self.shoot = None;
                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             }
@@ -5535,6 +5854,12 @@ impl App {
                 s.plot = Some(slot);
                 ctx.request_repaint_of(egui::ViewportId::from_hash_of("nerka-plot"));
             }
+            // The Patterns window (`--patterns`), drawn within this frame.
+            if patterns_window && let Some(t) = self.tabs.get_mut(self.active) {
+                let slot = Arc::new(std::sync::Mutex::new(None));
+                t.patterns.shoot = Some(slot.clone());
+                s.patterns = Some(slot);
+            }
         }
     }
 
@@ -5552,6 +5877,7 @@ impl App {
         self.poll_instance(&ctx);
         self.poll_jobs(&ctx);
         self.shoot_step(&ctx);
+        self.agent_frame(&ctx);
         for t in &mut self.tabs {
             t.notes = self.prefs.bookmark_notes;
             t.columns.note_column(t.notes == NoteMode::Column);
@@ -5567,6 +5893,7 @@ impl App {
         self.settings_window(&ctx);
         self.profiles_window(&ctx);
         self.bundle_windows(&ctx);
+        self.open_patterns_at_start(&ctx);
         self.patterns_windows(&ctx);
         if let Some(t) = self.tabs.get_mut(self.active)
             && let Some(d) = &mut t.detail
@@ -5605,11 +5932,46 @@ impl App {
                     self.pick_files(&ctx);
                 }
                 ui.separator();
-                let marks = self.tabs.get(self.active).map_or(0, |t| t.bookmarks.len());
-                ui.toggle_value(&mut self.show_bookmarks, format!("🔖 Bookmarks ({marks})")).on_hover_text(
+                let (marks, waiting) =
+                    self.tabs.get(self.active).map_or((0, 0), |t| (t.bookmarks.len(), t.bookmarks.annotations()));
+                // An agent's annotations waiting to be accepted show apart.
+                let label = if waiting > 0 && marks == waiting {
+                    format!("🔖 Bookmarks ({} {waiting})", view::ANNOTATION_GLYPH)
+                } else if waiting > 0 {
+                    format!("🔖 Bookmarks ({} · {} {waiting})", marks - waiting, view::ANNOTATION_GLYPH)
+                } else {
+                    format!("🔖 Bookmarks ({marks})")
+                };
+                ui.toggle_value(&mut self.show_bookmarks, label).on_hover_text(
                     "Mark lines to come back to: m (or right-click) toggles a bookmark on the current line, \
-                     b / Shift+B jump to the next / previous one. Saved next to the log as <file>.nerka-marks.",
+                     b / Shift+B jump to the next / previous one. Saved next to the log as <file>.nerka-marks. \
+                     🤖: an agent's annotations (nerka marks --add), yours once accepted in the panel.",
                 );
+                // The user's AI in a terminal, on this window (nerka mcp).
+                let ai = ui.button(format!("{} AI", view::ANNOTATION_GLYPH)).on_hover_text(format!(
+                    "Open a terminal running your AI ({}; Settings → AI command) in the active file's folder, \
+                     working on this window through nerka mcp: it reads what you have open, bookmarks its \
+                     findings and can set the filter or plot, each change listed in 🤖 Agent",
+                    if self.prefs.ai_command.trim().is_empty() { "none set" } else { self.prefs.ai_command.trim() }
+                ));
+                if ai.clicked() {
+                    let dir = self
+                        .tabs
+                        .get(self.active)
+                        .and_then(|t| t.path.parent().map(Path::to_path_buf))
+                        .or_else(|| std::env::current_dir().ok())
+                        .unwrap_or_default();
+                    self.status = match terminal::open(&dir, &self.prefs.ai_command) {
+                        Ok(()) => format!("Opened a terminal with {} for this window", self.prefs.ai_command.trim()),
+                        Err(e) => e,
+                    };
+                }
+                // What an agent changed here (nerka mcp), once one has.
+                if !self.agent.log.is_empty() {
+                    let n = self.agent.log.iter().filter(|a| !a.undone).count();
+                    ui.toggle_value(&mut self.agent.open, format!("{} Agent ({n})", view::ANNOTATION_GLYPH))
+                        .on_hover_text("What an agent changed in this window (filter, search, bookmarks, plot), each with ↶ Undo");
+                }
                 let queries: usize = self.library.packs().iter().map(|p| p.queries.len()).sum();
                 let signals = self.tabs.get(self.active).map_or(0, |t| t.signals.len());
                 ui.toggle_value(&mut self.show_signals, format!("📈 Signals ({signals})")).on_hover_text(
@@ -5658,7 +6020,17 @@ impl App {
                         }
                         tip += "\n\nClick: where, one by one (and an export for a bug report)";
                     }
-                    let r = ui.add(egui::Label::new(text).sense(egui::Sense::click())).on_hover_text(tip);
+                    // Cut short (… and the hover has it all) so it never runs
+                    // under the buttons at the right (a
+                    // records spec did).
+                    const RIGHT: f32 = 250.0;
+                    let room = (ui.available_width() - RIGHT).max(80.0);
+                    let r = ui
+                        .allocate_ui(egui::vec2(room, ui.spacing().interact_size.y), |ui| {
+                            ui.add(egui::Label::new(text).truncate().sense(egui::Sense::click()))
+                        })
+                        .inner
+                        .on_hover_text(tip);
                     if warned && r.clicked() {
                         open_skips = true;
                     }
@@ -5865,6 +6237,7 @@ impl App {
                         views: &mut tab.views,
                         kept: tab.session.result(),
                         fibex: fibex.as_deref(),
+                        fibex_autoload: self.prefs.fibex_autoload,
                         arg_picks: &mut tab.arg_picks,
                         library: &self.library,
                         check_results: &tab.check_results,
@@ -6202,6 +6575,15 @@ impl App {
                     all.extend(paths);
                     self.set_fibex(&ctx, all);
                 }
+            }
+            Some(signals::FibexAction::Autoload(on)) => {
+                self.prefs.fibex_autoload = on;
+                self.remember_fibex();
+                self.status = if on {
+                    format!("FIBEX: {} files loaded at every start", self.prefs.fibex_files.len())
+                } else {
+                    "FIBEX: none loaded at start".into()
+                };
             }
             Some(signals::FibexAction::Forget) => {
                 self.set_fibex(&ctx, Vec::new());
@@ -6557,7 +6939,7 @@ query timeouts  labels: vision
         // (with the file's built-in @time, an event on every DLT line).
         assert_eq!(
             own.iter().map(|s| (s.name.as_str(), s.origin)).collect::<Vec<_>>(),
-            [("time", "built in"), ("free_slots", "FIBEX")]
+            [("time", "built in"), ("line", "built in"), ("free_slots", "FIBEX")]
         );
 
         // Its − in the Signals panel unpicks it (owner, 2026-10-28: it only
@@ -6600,6 +6982,7 @@ query timeouts  labels: vision
                         views: &mut tab.views,
                         kept: None,
                         fibex: Some(&*fibex),
+                        fibex_autoload: false,
                         arg_picks: &mut tab.arg_picks,
                         library: &Library::new(),
                         check_results: &[],
@@ -6636,6 +7019,7 @@ query timeouts  labels: vision
 boot
 v=60
 gear=D
+v=60
 ",
         )
         .unwrap();
@@ -6652,6 +7036,13 @@ gear=D
             s.iter().map(|s| (s.name.as_str(), s.value.as_deref(), s.from)).collect();
         assert_eq!(rows, [("v", Some("60"), Some(2)), ("gear", Some("P"), Some(0))], "events first");
         assert_eq!(tab.line_signals(1, &[])[0].from, Some(0), "a state");
+        // A change is told from the same value again: v 10 → 60 here, 60
+        // again on line 5; its first value is a change too.
+        assert_eq!((s[0].before.as_deref(), s[0].changed(2)), (Some("10"), true));
+        let again = tab.line_signals(4, &[]);
+        assert_eq!((again[0].before.as_deref(), again[0].changed(4)), (Some("60"), false));
+        assert!(tab.line_signals(0, &[]).iter().all(|s| s.changed(0) && s.before.is_none()));
+        assert!(!s[1].changed(2), "held, not an event here");
         // The window follows the line selected in a view.
         let file = tab.file.clone().unwrap();
         tab.detail = LineDetail::of(&*file, 0);
@@ -7027,6 +7418,38 @@ gear=D
         settle_app(&mut app, &ctx);
         assert_eq!(app.active, 1);
         assert_eq!(app.tabs[1].session.hits().unwrap().lines.len(), 10);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `--patterns`: the first tab's Patterns window opens once its file is
+    /// read, and runs; `--screenshot` names its picture after the main one.
+    #[test]
+    fn patterns_at_start_open_and_run() {
+        let dir = std::env::temp_dir().join(format!("nerka-gui-patterns-start-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("a.log");
+        std::fs::write(&path, LOG).unwrap();
+        let ctx = egui::Context::default();
+        let mut app = App { patterns_at_start: true, ..Default::default() };
+        app.open(&ctx, path);
+        let mut opened_while_loading = false;
+        for _ in 0..500 {
+            let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1200.0, 800.0));
+            let input = egui::RawInput { screen_rect: Some(screen), ..Default::default() };
+            let mut out = ctx.run_ui(input, |ui| app.frame(ui));
+            out.textures_delta.clear();
+            let t = &app.tabs[0];
+            opened_while_loading |= t.patterns.open && t.loading.is_some();
+            if t.patterns.found().is_some() && !t.is_busy() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let t = &app.tabs[0];
+        assert!(!opened_while_loading);
+        assert!(t.patterns.open && !app.patterns_at_start);
+        assert!(t.patterns.found().is_some_and(|n| n > 0), "{:?}", t.patterns.found());
+        assert_eq!(Shoot::side_path(Path::new("out/shot.png"), "patterns"), Path::new("out/shot-patterns.png"));
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -7880,6 +8303,158 @@ gear=D
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// An agent's calls on the window (`nerka mcp`): reading tools answer
+    /// from a thread, changes show in the tab, are listed and undone.
+    #[test]
+    fn an_agent_reads_and_changes_the_window() {
+        use nerka_core::json::Value;
+        let dir = std::env::temp_dir().join(format!("nerka-gui-agent-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("app.log");
+        std::fs::write(&log, "[INFO] one\n[ERROR] two\n[INFO] three\n[ERROR] four\n[INFO] five\n").unwrap();
+        let ctx = egui::Context::default();
+        let mut app = App::default();
+        app.open_files(&ctx, vec![log.clone()]);
+        settle_app(&mut app, &ctx);
+        let call = |app: &mut App, tool: &str, args: &str| -> Result<Value, String> {
+            let (tx, rx) = std::sync::mpsc::channel();
+            let args = nerka_core::json::parse(args).unwrap();
+            app.agent_call(&ctx, instance::AgentCall { tool: tool.into(), args, reply: tx });
+            rx.recv_timeout(Duration::from_secs(10)).expect("an answer")
+        };
+        let w = call(&mut app, "window", "{}").unwrap();
+        let tab = &w.get("tabs").unwrap().as_array().unwrap()[0];
+        assert_eq!(tab.get("lines").and_then(Value::as_u64), Some(5));
+        let n = call(&mut app, "count", r#"{"query":"level >= ERROR"}"#).unwrap();
+        assert_eq!(n.get("count").and_then(Value::as_u64), Some(2));
+        let page = call(&mut app, "filter", r#"{"query":"level >= ERROR","max":1}"#).unwrap();
+        assert_eq!(page.get("more").and_then(Value::as_u64), Some(1));
+        let e = call(&mut app, "count", r#"{"query":"lvl >= ERROR"}"#).unwrap_err();
+        assert!(e.contains("unknown field 'lvl'"), "{e}");
+        assert!(call(&mut app, "nope", "{}").unwrap_err().contains("no tool 'nope'"));
+        // The user's queries: nothing picked here; the box's filter said.
+        let q = call(&mut app, "queries", r#"{"library":false}"#).unwrap();
+        assert_eq!(q.get("picked").and_then(Value::as_array).map(<[Value]>::len), Some(0), "{q}");
+        assert!(q.get("filter").is_some() && q.get("library").is_some(), "{q}");
+        // Changes: the filter, a bookmark; listed, undone.
+        call(&mut app, "set_filter", r#"{"query":"level >= ERROR"}"#).unwrap();
+        settle_app(&mut app, &ctx);
+        assert_eq!(app.tabs[0].result().unwrap().lines, [1, 3]);
+        let n = call(&mut app, "count", r#"{"in_view":true}"#).unwrap();
+        assert_eq!(n.get("count").and_then(Value::as_u64), Some(2));
+        let b = call(&mut app, "bookmark", r#"{"line":4,"note":"the second error"}"#).unwrap();
+        assert_eq!(b.get("author").and_then(Value::as_str), Some("ai"));
+        assert!(app.tabs[0].bookmarks.is_annotation(3));
+        assert!(call(&mut app, "bookmark", r#"{"line":9,"note":"x"}"#).unwrap_err().contains("lines 1 to 5"));
+        assert_eq!(app.agent.log.len(), 2);
+        app.agent_undo(&ctx, 1);
+        assert!(!app.tabs[0].bookmarks.contains(3), "the bookmark undone");
+        app.agent_undo(&ctx, 0);
+        settle_app(&mut app, &ctx);
+        assert_eq!(app.tabs[0].pattern, "", "the filter undone");
+        assert!(app.agent.log.iter().all(|a| a.undone));
+        // An argument a tool doesn't take is an error that names the ones it does.
+        let e = call(&mut app, "filter", r#"{"query":"level >= ERROR","limit":5}"#).unwrap_err();
+        assert!(e.starts_with("filter has no argument 'limit': it takes tab, query, max"), "{e}");
+        // One file: named once per page, not on each line.
+        let page = call(&mut app, "filter", r#"{"query":"level >= ERROR"}"#).unwrap();
+        assert!(page.get("file").is_some() && page.get("lines").unwrap().as_array().unwrap()[0].get("file").is_none());
+        // Records: rows become records (a line `[` starts one), undone back to lines.
+        call(&mut app, "set_records", r#"{"records":"start=/\\[ERROR/"}"#).unwrap();
+        settle_app(&mut app, &ctx);
+        assert_eq!(app.tabs[0].file.as_ref().unwrap().line_count(), 3, "head, and a record per ERROR");
+        let k = app.agent.log.len() - 1;
+        app.agent_undo(&ctx, k);
+        settle_app(&mut app, &ctx);
+        assert_eq!(app.tabs[0].file.as_ref().unwrap().line_count(), 5);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A tab of two files (the evaluation): a range stays in its file,
+    /// lines name their file briefly (the paths once), and records say where
+    /// they start in their own file.
+    #[test]
+    fn an_agent_on_a_tab_of_two_files() {
+        use nerka_core::json::Value;
+        let dir = std::env::temp_dir().join(format!("nerka-gui-agent2-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (a, b) = (dir.join("a.log"), dir.join("b.log"));
+        std::fs::write(&a, "[INFO] a one\n  more\n[ERROR] a two\n").unwrap();
+        std::fs::write(&b, "[ERROR] b one\n  more\n  more\n[INFO] b two\n").unwrap();
+        let ctx = egui::Context::default();
+        let mut app = App::default();
+        app.open_files(&ctx, vec![a.clone(), b.clone()]);
+        settle_app(&mut app, &ctx);
+        let call = |app: &mut App, tool: &str, args: &str| -> Value {
+            let (tx, rx) = std::sync::mpsc::channel();
+            let args = nerka_core::json::parse(args).unwrap();
+            app.agent_call(&ctx, instance::AgentCall { tool: tool.into(), args, reply: tx });
+            rx.recv_timeout(Duration::from_secs(10)).expect("an answer").unwrap()
+        };
+        let page = call(&mut app, "lines", r#"{"file":"a.log","from":1,"to":99}"#);
+        let lines = page.get("lines").unwrap().as_array().unwrap();
+        assert_eq!(lines.len(), 3, "a.log's 3 lines, not on into b.log");
+        assert_eq!(lines[0].get("file").and_then(Value::as_str), Some("a.log"));
+        assert_eq!(page.get("files").unwrap().as_array().unwrap().len(), 2);
+        // Records in a tab of several files: each is numbered by its first
+        // line in its own file, and says how many it holds (owner,
+        // 2026-11-25: one numbering).
+        call(&mut app, "set_records", r#"{"records":"start=/\\[/"}"#);
+        settle_app(&mut app, &ctx);
+        let page = call(&mut app, "filter", r#"{"query":"file == b.log"}"#);
+        let lines = page.get("lines").unwrap().as_array().unwrap();
+        let at: Vec<(Option<u64>, Option<u64>)> = lines
+            .iter()
+            .map(|l| (l.get("line").and_then(Value::as_u64), l.get("lines").and_then(Value::as_u64)))
+            .collect();
+        assert_eq!(at, [(Some(1), Some(3)), (Some(4), None)], "b.log's records at its lines 1 (3) and 4: {page}");
+        // A line inside a record reads the record holding it.
+        let page = call(&mut app, "lines", r#"{"file":"b.log","from":2,"to":2}"#);
+        let lines = page.get("lines").unwrap().as_array().unwrap();
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].get("line").and_then(Value::as_u64), Some(1), "{page}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// An agent writes the sidecar while the tab has the file open
+    /// (`nerka marks --add`): the tab takes its bookmarks in when the focus
+    /// comes back, and a save of the tab's doesn't write over them.
+    #[test]
+    fn bookmarks_an_agent_adds_meanwhile_are_taken_in() {
+        let dir = std::env::temp_dir().join(format!("nerka-gui-agent-marks-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("app.log");
+        std::fs::write(&log, "[INFO] one\n[ERROR] two\n[INFO] three\n[ERROR] four\n[INFO] five\n").unwrap();
+        let ctx = egui::Context::default();
+        let mut app = App::default();
+        app.open_files(&ctx, vec![log.clone()]);
+        settle_app(&mut app, &ctx);
+        let t = &mut app.tabs[0];
+        t.toggle_bookmark_at(0);
+        // What `nerka marks --add 2 --note …` does.
+        let agent = |line: LineNo, note: &str| {
+            let f = nerka_core::open(&log, &nerka_core::Progress::new()).unwrap();
+            let mut m = Bookmarks::load_for(&log, &*f).unwrap();
+            m.set_note(line, note);
+            m.set_author(line, "ai");
+            m.save_for(&log, &*f).unwrap();
+        };
+        agent(1, "the first error");
+        t.follow_marks();
+        assert_eq!(t.bookmarks.note(1), Some("the first error"));
+        assert_eq!(t.bookmarks.author(1), Some("ai"));
+        assert!(t.status.contains("taken in: 1 added"), "{}", t.status);
+        // Another one, then the tab saves one of its own: all three kept.
+        agent(3, "the second");
+        t.toggle_bookmark_at(4);
+        let back = Bookmarks::read(&log).unwrap();
+        let lines: Vec<LineNo> = back.iter().map(|(l, _)| l).collect();
+        assert_eq!(lines, [0, 1, 3, 4]);
+        assert_eq!((back.author(0), back.author(3)), (None, Some("ai")));
+        assert!(t.bookmarks.contains(3));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     /// The Files window: the tab's files reordered, one removed and added
     /// again; the view stays on the same line of the same file. Files of
     /// another kind leave the tab as it was.
@@ -8199,7 +8774,8 @@ gear=D
                             limit: &mut "8".to_owned(),
                             local_time: &mut true,
                             mf4_local_time: &mut true,
-                            pattern_tuning: &mut false,
+                            ai_command: &mut String::new(),
+                            ai_limits: [&mut 50, &mut 1000, &mut 30],
                         };
                         settings_ui(ui, fields);
                         let change = protocols::settings_section(ui, edit, &prefs, &[]);
@@ -8643,6 +9219,37 @@ query nav
     /// The line window's Fields: every field of the line, with its value
     /// (DLT's ten and `proto`; a JSON record's keys, missing ones empty).
     #[test]
+    fn the_app_prefs_outlive_a_tabs_search_settings() {
+        let mut app = App::default();
+        app.prefs.ai_command = "codex".into();
+        app.prefs.ai_top = 7;
+        app.prefs.checks_auto = true;
+        app.fibex_paths = vec![PathBuf::from("D:/fibex/ecu1.xml")];
+        // Load at start on: the files in use are remembered.
+        app.prefs.fibex_autoload = true;
+        app.remember_fibex();
+        assert_eq!(app.prefs.fibex_files, ["D:/fibex/ecu1.xml"]);
+        // A tab saves its search settings: only those change.
+        app.save_prefs_from(SearchPrefs { mode: Mode::Query, search_regex: true, ..SearchPrefs::default() });
+        let p = &app.prefs;
+        assert_eq!((p.mode, p.search_regex), (Mode::Query, true));
+        assert_eq!((p.ai_command.as_str(), p.ai_top, p.checks_auto), ("codex", 7, true));
+        assert!(p.fibex_autoload && p.fibex_files.len() == 1);
+        // Off: nothing is loaded at start.
+        app.prefs.fibex_autoload = false;
+        app.remember_fibex();
+        assert!(app.prefs.fibex_files.is_empty());
+        // A saved file that's gone is said, not loaded.
+        let ctx = egui::Context::default();
+        app.prefs.fibex_autoload = true;
+        app.prefs.fibex_files = vec!["D:/nowhere/gone.xml".into()];
+        app.fibex_paths.clear();
+        app.autoload_fibex(&ctx);
+        assert!(app.fibex.is_none() && app.status.starts_with("FIBEX not found, not loaded: D:/nowhere/gone.xml"));
+        assert_eq!(app.prefs.fibex_files, ["D:/nowhere/gone.xml"], "kept until the list changes");
+    }
+
+    #[test]
     fn the_line_window_lists_every_field() {
         use nerka_core::input::dlt::writer::{Msg, Value};
         let mut buf = Vec::new();
@@ -8767,6 +9374,17 @@ query nav
         tab.jump_match(true);
         assert_eq!(tab.current_line(), 5);
         assert_eq!(tab.hits_view.selected, Some(1));
+        // Show in search results (the main view's menu): a hit's line, or
+        // the next hit after a line that isn't one; past the last, none.
+        tab.show_in_hits(1);
+        assert_eq!(tab.hits_view.selected, Some(0));
+        assert!(tab.status.contains("hit 1 of 2"), "{}", tab.status);
+        tab.show_in_hits(2);
+        assert_eq!(tab.hits_view.selected, Some(1));
+        assert!(tab.status.contains("isn't a hit: the next one, line 6"), "{}", tab.status);
+        tab.show_in_hits(6);
+        assert_eq!(tab.hits_view.selected, Some(1), "unchanged");
+        assert!(tab.status.starts_with("No search hit"), "{}", tab.status);
 
         // Editing the box drops the chips; the text is a plain query.
         tab.search.pattern.push_str(" OR /disk/");
@@ -8846,14 +9464,14 @@ query clock  signals: t:time
         tab.refresh_signals(&ctx, &lib, &saved, 0);
         // Nothing picked: only the time its lines start with (the built-in
         // profile: three of its four lines have one).
-        assert_eq!(tab.signals.iter().map(|d| d.name()).collect::<Vec<_>>(), ["time"]);
+        assert_eq!(tab.signals.iter().map(|d| d.name()).collect::<Vec<_>>(), ["time", "line"]);
 
         // A signal pick: its groups are signals; the filter stays empty.
         tab.picks.add(&lib, "p.speed", Use::Signal, None);
         tab.picks.add(&lib, "p.clock", Use::Signal, None);
         tab.refresh_signals(&ctx, &lib, &saved, 0);
         let kinds: Vec<(&str, &str)> = tab.signals.iter().map(|d| (d.name(), d.kind().as_str())).collect();
-        assert_eq!(kinds, [("time", "time"), ("v", "num"), ("gear", "enum"), ("t", "time")]);
+        assert_eq!(kinds, [("time", "time"), ("line", "num"), ("v", "num"), ("gear", "enum"), ("t", "time")]);
         assert_eq!(tab.picks.expand(&lib).unwrap().exp.nfd, "");
         tab.mode = Mode::Query;
         tab.pattern = "@gear == D AND level >= WARN".into();
@@ -8932,7 +9550,7 @@ query clock  signals: t:time
         tab.picks.params.insert("cam".into(), vec![("CAM1".into(), false), ("CAM2".into(), false)]);
         tab.refresh_signals(&ctx, &lib, &saved, 0);
         let names: Vec<&str> = tab.signals.iter().map(|d| d.name()).collect();
-        assert_eq!(names, ["drops_cam1", "total", "drops_cam2"]);
+        assert_eq!(names, ["line", "drops_cam1", "total", "drops_cam2"]);
         let total = tab.signals.get("total").unwrap();
         assert_eq!(total.queries(), ["drops (CAM1)", "drops (CAM2)"]);
         assert!(tab.option_conflicts.is_empty());

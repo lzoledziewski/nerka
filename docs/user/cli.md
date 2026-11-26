@@ -11,16 +11,21 @@ nerka [OPTIONS] <COMMAND>
 
 `nerka help <command>` (or `nerka <command> --help`) lists every option.
 Options for opening files (below) go before or after the command.
+`nerka help nfd` prints the [query language](queries.md)'s grammar with
+examples; `nerka help fields FILE…` the fields queries can use on those
+files.
 
 ## Commands
 
 | Command | Does |
 |---|---|
 | `open FILE…` | index the file(s) and print lines, size, throughput, fields, protocols and what was skipped |
+| `mcp` | an [MCP](agents.md#with-you-on-your-window-mcp) server for an AI agent, working on a nerka window's tabs; `--install CLIENT`, `--config`, `--window PID` |
+| `help [TOPIC]` | the commands, a command's options, `nfd` (the query language), `fields FILE…`, `agent` (how to analyse with nerka, for [AI agents](agents.md)) or `skill` (the same as a `SKILL.md`) |
 | `filter QUERY FILE…` | print the lines an [NFD query](queries.md) keeps |
 | `search PATTERN FILE…` | print the lines a regex matches, like `grep -n` |
-| `lines FILE FROM TO` | print a range of lines (1-based, inclusive) |
-| `marks FILE` | list the bookmarks saved for a file |
+| `lines FILE FROM TO` | print a range of lines (1-based, inclusive), each with its number (`-N`: without) |
+| `marks FILE` | list the bookmarks saved for a file; `--add LINE --note TEXT` adds one (an [agent's](agents.md) finding), `--remove LINE` removes one |
 | `expand` | turn [Library](library.md) picks into plain NFD |
 | `packs` | list the loaded packs and their queries |
 | `check FILE…` | run the [checks](checks.md) (`--check`): issues and facts |
@@ -38,13 +43,64 @@ nerka search -i 'timeout|refused' app.log
 nerka search --in 'level >= WARN' -c timeout app.log     # only among a filter's lines
 nerka open trace.pcap
 nerka lines app.log 100 120
+cat app.log | nerka filter 'level >= WARN' -     # text from stdin
 ```
+
+A file named `-` is text read from stdin (DLT and captures need a file).
 
 ## Output
 
 Lines print with their number (`1234:…`); `-N` leaves it out. With several
 files, each line prints as `FILE:LINE:` with the file's own line number.
 `-c` prints only the count. `--stats` prints timing to stderr.
+
+### For scripts and agents
+
+`--json` prints JSON instead, one compact object per line (JSON Lines) for
+commands that print lines, and one object for the others:
+
+| Command | `--json` prints |
+|---|---|
+| `filter`, `search`, `lines` | a line each: `{"file", "line", "time", "level", "raw"}`; `filter --before / --after` adds `"match"` (false: a line around a match), pack picks add `"queries"` |
+| `filter -c`, `search -c` | `{"count": N}` (pack picks: and `"queries": {"pack.q": N}`) |
+| `open` | the files, format, size, lines, index, columns, fields (`name`, `kind`, `costly`), protocols, first and last time, lines per level, how each file was read, notes |
+| `marks` | a bookmark each: `{"file", "line", "name", "note", "author", "unsure", "raw"}` (`author`: `ai`, or null for yours) |
+| `patterns` | `{"total", "patterns": […], "more"}`, each pattern with what `--values`, `--queries`, `--lines` add |
+| `compare` | `{"a", "b", "min_score", "show", "rows", "differences": […], "more"}`; a difference's `change` is `new`, `gone`, `changed` or `same` |
+| `check`, `lifecycles` | [their results](checks.md) |
+
+- `line` counts from 1, in the line's own file (a record: its first line;
+  `"lines"`: how many it holds; with a query, `"match_line"`: its first
+  line that matched, and `"matches"`: how many did); `time` is UTC in RFC 3339
+  (`2026-11-07T10:00:02.000000Z`) whatever `--local-time` says, a time of
+  day as `10:00:02.000000`; `time` and `level` are `null` on a line
+  without one.
+- `--fields apid,ctid` adds `"fields": {"apid": "NAV", "ctid": "MAIN"}`,
+  typed (text as strings, numbers as numbers); an unknown field is an
+  error listing the file's fields.
+- `--width N` cuts each line's `raw` at N characters, with `…`, and says
+  its length as `"raw_chars"` (a DLT payload of hex can run to thousands
+  of characters); without `--json` it cuts the printed lines.
+
+Big results come in pages:
+
+| Option | |
+|---|---|
+| `-m, --max-count N` | print at most N lines; how many more there are goes to stderr (`nerka: 120 more lines: --skip 20 for the next`), with `--json` as a last line `{"more": 120, "skip": 20}` |
+| `--skip N` | leave out the first N lines: with `-m`, the next page |
+
+`-c` counts every line whatever `-m` and `--skip` say, so a script (or an
+agent) can ask how big a result is before reading it. Lines around a
+condition come by time: `filter --before / --after`, or
+[`before` / `after` / `around`](queries.md#around-a-condition-by-time) in
+a query.
+
+```
+nerka filter -c 'level >= ERROR' trace.dlt
+nerka filter --json -m 50 --fields apid,ctid 'level >= ERROR' trace.dlt
+nerka filter --json -m 50 --skip 50 'level >= ERROR' trace.dlt
+nerka open --json trace.dlt
+```
 
 Warnings go to stderr: a query value no line can have (`proto == FOO` in a
 capture without it, a `file` no file is), what a reader skipped, a check
@@ -78,6 +134,21 @@ Instead of a pattern, `search` and `expand` take **pack picks**, and
 nerka --pack examples/packs/ expand -l ota -p cam=CAM1 --parts
 nerka --pack examples/packs/ search --in 'level >= WARN' -l ota -p cam=CAM1 app.log
 nerka filter --before 30s --after 2s 'payload ~ /watchdog reset/' trace.dlt
+```
+
+## `marks`
+
+| Option | |
+|---|---|
+| `--add LINE` | bookmark the line (from 1), or change the bookmark there; prints it |
+| `--note TEXT`, `--name NAME` | with `--add`: its note, its name (default: the first free of `B1`, `B2`…) |
+| `--by WHO` | with `--add`: who made it; a new one is `ai`'s by default, `--by ''` makes it yours |
+| `--remove LINE` | remove the bookmark on the line |
+| `--json` | JSON Lines |
+
+```
+nerka marks --add 1234 --note 'first watchdog reset' trace.dlt
+nerka marks trace.dlt
 ```
 
 ## `check` and `lifecycles`
@@ -177,6 +248,7 @@ side 4                    # stage 2: tokens on the longer side of a slot
 state-values 16           # a slot with more values (2–16) is <*>, not a state
 header sample 32 min 8 share 0.5 places 3   # header/footer detection
 merge on                  # stage 2 at all
+lone-word on              # a message's only word is never a slot
 
 # Rules: SCOPE: ACTION
 apid == NAV: keep Elapsed
@@ -193,6 +265,14 @@ The header settings: lines of a context held back per chunk (`sample`),
 the fewest to detect a header or footer on (`min`), the share of them a
 word must be on, more than (`share`), and how many tokens from the start
 and the end it may be at (`places`).
+
+`lone-word`: a message's only word is never a slot. A level near the
+start of a text line (`INFO`, `587~DEBUG`) counts as header, and two
+messages whose words in common are only header and footer stay two
+patterns: `[ 2088.35]~DLT~ 587~INFO ~dlt_message_init()` and `…
+~dlt_message_free()`, or `LOG: radar: OK` and `LOG: imu: OFFLINE`. A
+state still needs a word of the message in common (`door {open|closed}`).
+`lone-word off` joins them, the word in a slot: fewer patterns.
 
 A rule's **scope** is the fields lines are grouped by: for DLT `ecu`,
 `apid`, `ctid`, `type`, `mode` (the short text fields), for a text file
@@ -219,18 +299,24 @@ others add up (two `keep` rules keep both words).
 ## `compare` (experimental)
 
 `compare` groups two sets of lines into patterns together, so a pattern is
-the same on both sides, then lists what differs, in three parts:
+the same on both sides, then lists what differs, in three parts (a fourth
+on request):
 
 - **New in B**: patterns, and values of a pattern's slots, that only B has;
 - **Gone from B**: those only A has;
 - **Changed**: those in both, more or less often (a pattern against all of
-  its side's lines, a value against its pattern's), surest first.
+  its side's lines, a value against its pattern's), surest first;
+- **Same** (`--show same`, or `all`): those in both whose change scores
+  less than `--min-score`, most lines first: what both sets do alike, to
+  confirm the same behaviour on both sides.
 
 So a value stands out even inside a pattern it was merged into:
 `undervoltage` new in B, while `{voltage=|undervoltage} <*> mV` holds
 steady. The score is a log-likelihood ratio (G²): it weighs the evidence,
 so 1 line against none scores low and 500 against none high; `--min-score`
-applies to changes only, new and gone ones are always listed. Each line
+tells a change from the same, new and gone ones are listed whatever their
+score. `--rows patterns` leaves the values out (the patterns only),
+`--rows values` lists the values only. Each line
 prints the score, the lines in A and B, the change (`new`, `gone`, `×2.08`:
 how many times as often, by share), and the first line on the side it's on
 or grew on (`B:6412`).
@@ -241,6 +327,7 @@ The sets are two files, or one file's lines of two filters, e.g. two
 ```
 nerka compare good.dlt bad.dlt
 nerka compare --in 'apid == NAV' good.dlt bad.dlt
+nerka compare --show same --rows patterns good.dlt bad.dlt
 nerka --lifecycle 'ecu1: lines ecu == ECU1; reset uptime; planned payload ~ /shutdown/' compare --a '@ecu1 == 1' --b '@ecu1 == 2' trace.dlt
 ```
 
@@ -248,7 +335,9 @@ nerka --lifecycle 'ecu1: lines ecu == ECU1; reset uptime; planned payload ~ /shu
 |---|---|
 | `--a FILTER`, `--b FILTER` | set A's, set B's lines: only those an NFD filter keeps (one file: both needed) |
 | `--in FILTER` | both sets: only the lines an NFD filter keeps |
-| `--min-score S` | only changes at least this sure (default 10.8, p = 0.001; 3.84 is p = 0.05) |
+| `--min-score S` | a change at least this sure is *changed*, a less sure one *same* (default 10.8, p = 0.001; 3.84 is p = 0.05) |
+| `--show LIST` | what to list, comma-separated: `new`, `gone`, `changed`, `same`, or `all` (default `new,gone,changed`) |
+| `--rows ROWS` | `all` (default), `patterns` (no slot values) or `values` (slot values only) |
 | `-n, --top N` | print at most N differences (default 30; `0`: all) |
 | `--queries` | also each pattern's NFD query |
 | `--field NAME`, `--pattern-config FILE`, `--set`, `--rule`, `--similarity S`, `--no-merge` | as for `patterns` |
@@ -262,7 +351,8 @@ report) without what it says. A word becomes letters of the same length
 and case, the same everywhere and never another word's, so messages keep
 their structure and the same [patterns](#patterns-experimental) with the
 same counts; a run holding a digit keeps its digits as digits (made up per
-run); spaces and punctuation stay. A DLT file stays DLT: times, levels and
+run); spaces and punctuation stay, and so do level names in upper case
+(`INFO`, `ERROR`: the levels read from the text). A DLT file stays DLT: times, levels and
 the ECU, application and context IDs are kept (`--ids`: made up too), the
 payload is written as one string. Other files become text.
 
@@ -318,8 +408,13 @@ These apply to every command:
 
 ## Exit status
 
-- **0:** success, also when nothing matched.
-- **1:** an error (printed as `nerka: …` on stderr), including `check
-  --strict` finding an issue, `lifecycles --strict` a finding, and `import`
-  meeting an invalid item (the others are still imported).
-- **2:** a usage error (an unknown option, a missing argument).
+As grep's:
+
+- **0:** lines found (`filter`, `search`), or done.
+- **1:** nothing found: `filter` and `search` with no line (with `-c`,
+  after printing `0`); also `check --strict` finding an issue,
+  `lifecycles --strict` a finding, and `import` meeting an invalid item
+  (the others are still imported).
+- **2:** an error, printed as `nerka: …` on stderr: a query that doesn't
+  parse, a file that can't be read, a usage error (an unknown option, a
+  missing argument).

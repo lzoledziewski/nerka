@@ -13,6 +13,7 @@
 //! state-values 16           # a slot with more values is <*>, not a state
 //! header sample 32 min 8 share 0.5 places 3   # header/footer detection
 //! merge on                  # stage 2 at all
+//! lone-word on              # a message's only word is never a slot
 //!
 //! # Rules: SCOPE: ACTION
 //! apid == NAV: keep Elapsed
@@ -24,7 +25,7 @@
 //! line    := setting | rule                 -- `#` to the end: a comment (not in /regex/ or "…")
 //! setting := "similarity" F | "new-wildcards" N | "new-slots" N | "side" N
 //!          | "state-values" N | "header" ("sample" N | "min" N | "share" F | "places" N)+
-//!          | "merge" ("on" | "off")
+//!          | "merge" ("on" | "off") | "lone-word" ("on" | "off")
 //! rule    := scope ":" action
 //! scope   := "*" | FIELD "==" VALUE ("AND" FIELD "==" VALUE)*   -- VALUE: a word or "…", `*` any text
 //! action  := "keep" WORD+ | "value" REGEX | "literal" REGEX | "max-slots" N
@@ -65,6 +66,11 @@ pub struct Settings {
     pub header_places: usize,
     /// Stage 2 at all.
     pub merge: bool,
+    /// A message's only word is never a slot: level words near the start
+    /// (`INFO`, `587~DEBUG`) are header, and two messages differing in
+    /// their one other word (`dlt_message_init()`, `dlt_message_free()`)
+    /// stay two patterns, not a state.
+    pub lone_word: bool,
 }
 
 impl Default for Settings {
@@ -80,6 +86,7 @@ impl Default for Settings {
             header_share: 0.5,
             header_places: 3,
             merge: true,
+            lone_word: true,
         }
     }
 }
@@ -97,6 +104,7 @@ pub enum Setting {
     HeaderShare(f32),
     HeaderPlaces(usize),
     Merge(bool),
+    LoneWord(bool),
 }
 
 impl Setting {
@@ -113,11 +121,12 @@ impl Setting {
             Setting::HeaderShare(_) => 7,
             Setting::HeaderPlaces(_) => 8,
             Setting::Merge(_) => 9,
+            Setting::LoneWord(_) => 10,
         }
     }
 }
 
-const KEYS: usize = 10;
+const KEYS: usize = 11;
 
 impl Settings {
     pub fn apply(&mut self, s: Setting) {
@@ -132,6 +141,7 @@ impl Settings {
             Setting::HeaderShare(v) => self.header_share = v,
             Setting::HeaderPlaces(v) => self.header_places = v,
             Setting::Merge(v) => self.merge = v,
+            Setting::LoneWord(v) => self.lone_word = v,
         }
     }
 }
@@ -222,6 +232,11 @@ pub(super) struct Local {
     pub header: Vec<Box<str>>,
     pub ignore_all: bool,
     pub ignore: Vec<Regex>,
+    /// Filled by the engine for stage 2 (`lone-word`): the context's header
+    /// and footer words, as detected and as `header` rules say …
+    pub header_words: std::collections::HashSet<Box<str>>,
+    /// … and whether its text holds levels (raw text, not a field).
+    pub levels: bool,
 }
 
 impl Local {
@@ -367,6 +382,7 @@ impl PatternConfig {
         }
         line(!header.is_empty(), format!("header{header}"));
         line(s.merge != d.merge, format!("merge {}", if s.merge { "on" } else { "off" }));
+        line(s.lone_word != d.lone_word, format!("lone-word {}", if s.lone_word { "on" } else { "off" }));
         for r in &self.rules {
             out.push_str(&r.text);
             out.push('\n');
@@ -674,6 +690,11 @@ fn setting(toks: &[Token]) -> Result<Vec<Setting>, String> {
             Some("off") => one(Setting::Merge(false)),
             _ => Err("merge on or merge off".into()),
         },
+        "lone-word" => match rest.first().map(Token::text) {
+            Some("on") => one(Setting::LoneWord(true)),
+            Some("off") => one(Setting::LoneWord(false)),
+            _ => Err("lone-word on or lone-word off".into()),
+        },
         "header" => {
             if rest.is_empty() {
                 return Err("header and then sample N, min N, share F or places N".into());
@@ -705,7 +726,7 @@ fn setting(toks: &[Token]) -> Result<Vec<Setting>, String> {
             Ok(out)
         }
         k => Err(format!(
-            "unknown setting '{k}' (similarity, new-wildcards, new-slots, side, state-values, header, merge; a rule: SCOPE: ACTION)"
+            "unknown setting '{k}' (similarity, new-wildcards, new-slots, side, state-values, header, merge, lone-word; a rule: SCOPE: ACTION)"
         )),
     }
 }
@@ -717,13 +738,15 @@ mod tests {
     #[test]
     fn settings_and_comments() {
         let c = PatternConfig::parse(
-            "# defaults changed\nsimilarity 0.7   # stage 1\nnew-slots 2\nheader sample 16 min 4 share 0.6 places 2\nmerge off\n\n",
+            "# defaults changed\nsimilarity 0.7   # stage 1\nnew-slots 2\nheader sample 16 min 4 share 0.6 places 2\nmerge off\nlone-word off\n\n",
         )
         .unwrap();
         let s = &c.settings;
         assert_eq!((s.similarity, s.new_slots, s.header_sample, s.header_min), (0.7, 2, 16, 4));
-        assert_eq!((s.header_share, s.header_places, s.merge), (0.6, 2, false));
+        assert_eq!((s.header_share, s.header_places, s.merge, s.lone_word), (0.6, 2, false, false));
         assert!(c.rules.is_empty());
+        assert!(Settings::default().lone_word);
+        assert!(c.to_text().contains("lone-word off\n"), "{}", c.to_text());
     }
 
     #[test]
@@ -735,6 +758,7 @@ mod tests {
             ("side 0", "1 at least"),
             ("state-values 40", "2–16"),
             ("merge maybe", "merge on"),
+            ("lone-word yes", "lone-word on"),
             ("header sample", "a number"),
             ("header rows 3", "sample, min"),
             ("apid == NAV keep x", "AND or ':'"),

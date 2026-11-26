@@ -256,13 +256,22 @@ const LEADING_BYTES: usize = 64;
 /// (`2025-10-17 10:00:01.250 ERROR …`, `[2025-10-17T10:00:01Z] …`, `Oct 17
 /// 10:00:01 host …`). The longest run of its first five words that
 /// [`parse_time_as`] reads, trailing `,:;|-` aside. A plain number isn't
-/// taken (`12 files copied`): a profile's own rule can read numbers.
+/// taken (`12 files copied`): a profile's own rule can read numbers. A
+/// logfmt line's first key (`time=2025-10-17T10:00:01.25Z level=INFO …`,
+/// Go's slog; also `ts=`, `t=`, `timestamp=`, quoted or not) is its time.
 pub fn leading_time(line: &str, zone: Zone) -> Option<f64> {
     let mut end = line.len().min(LEADING_BYTES);
     while !line.is_char_boundary(end) {
         end -= 1;
     }
     let head = line[..end].trim_start();
+    if let Some(value) = ["time=", "ts=", "t=", "timestamp="].iter().find_map(|k| head.strip_prefix(k)) {
+        let value = match value.strip_prefix('"') {
+            Some(q) => &q[..q.find('"')?],
+            None => value.split_whitespace().next()?,
+        };
+        return (value.parse::<f64>().is_err()).then(|| parse_time_as(value, zone, Numbers::Auto)).flatten();
+    }
     // In brackets: what they hold.
     if let Some(rest) = head.strip_prefix(['[', '(']) {
         let close = rest.find([']', ')'])?;
@@ -776,6 +785,20 @@ mod tests {
             assert_eq!(leading_time(line, Zone::Utc), Some(at), "{line}");
         }
         assert_eq!(leading_time("10:00:01.25 INFO x", Zone::Utc), Some(36_001.25));
+        // logfmt (Go's slog): the time key first.
+        for line in [
+            "time=2025-10-17T10:00:01.25Z level=INFO msg=x",
+            "time=2025-10-17T03:00:01.250-07:00 level=INFO source=routes.go:1742 msg=\"server config\"",
+            "ts=\"2025-10-17 10:00:01.25\" level=warn",
+            "t=2025-10-17T10:00:01.25Z",
+        ] {
+            assert_eq!(leading_time(line, Zone::Utc), Some(at), "{line}");
+        }
+        for no in
+            ["time=12 level=x", "timeout=2025-10-17 x", "time=\"2025-10-17", "level=INFO time=2025-10-17T10:00:01Z"]
+        {
+            assert_eq!(leading_time(no, Zone::Utc), None, "{no}");
+        }
         // A zone for times written without one; a written zone wins.
         assert_eq!(leading_time("2025-10-17 12:00:01.25 x", Zone::Fixed(7200.0)), Some(at));
         assert_eq!(leading_time("2025-10-17T10:00:01.25Z x", Zone::Fixed(7200.0)), Some(at));
