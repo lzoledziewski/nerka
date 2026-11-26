@@ -202,7 +202,7 @@ pub struct Form {
     pub action: usize,
     pub arg: String,
     /// The tuned tab's kind (`profile == sail_log`, `proto == DLT`:
-    /// [`pattern::kind_scope`]): what the scope starts with, and keeps where
+    /// [`nerka_core::pattern::kind_scope`]): what the scope starts with, and keeps where
     /// a pattern gives no value, so a rule made on one kind of file isn't
     /// applied to others unless widened.
     pub kind: Vec<(String, String)>,

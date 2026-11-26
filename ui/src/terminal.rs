@@ -97,7 +97,10 @@ fn client(command: &str) -> Client {
         Some(quoted) => quoted.split('"').next().unwrap_or_default(),
         None => command.split_whitespace().next().unwrap_or_default(),
     };
-    let name = Path::new(first).file_stem().and_then(|s| s.to_str()).unwrap_or_default();
+    // Its file name, after a `/` or a `\` (either OS's paths), without
+    // the extension (`copilot.cmd`).
+    let file = first.rsplit(['/', '\\']).next().unwrap_or_default();
+    let name = file.split_once('.').map_or(file, |(stem, _)| stem);
     match name.to_ascii_lowercase().as_str() {
         "claude" => Client::Claude,
         "copilot" => Client::Copilot,

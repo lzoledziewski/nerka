@@ -215,7 +215,7 @@ impl SlotValue {
 
     /// Whether it is a value: not text around a stage-1 slot (one chunk's
     /// template had a slot where another's had words), whose lines' values
-    /// weren't read ([`reread`]: lines its pattern's regex missed).
+    /// weren't read (the re-read: lines its pattern's regex missed).
     pub fn is_known(&self) -> bool {
         !self.text.contains(ANY)
     }
@@ -671,7 +671,7 @@ const KIND_SAMPLE: u64 = 4096;
 /// looked at has that one: the scope a rule tuned on this source starts
 /// with, so it isn't applied to other kinds of files (`profile ==
 /// sail_log`, `proto == DLT`; a scope's field a source hasn't never
-/// matches). Lines looked at: up to [`KIND_SAMPLE`], spread evenly, and the
+/// matches). Lines looked at: up to 4 096, spread evenly, and the
 /// last.
 pub fn kind_scope(source: &dyn LogSource) -> Vec<(String, String)> {
     let n = source.line_count();
