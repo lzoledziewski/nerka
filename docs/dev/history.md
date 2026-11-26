@@ -2,9 +2,18 @@
 
 The dated log of the project, newest first; append-only: add an entry at the top when `status.md` changes. Moved from `status.md` on 2026-11-10, word for word: its "Last update" line (each update with the ones before it) and its "Next steps" as they stood then, which tell what was built when and why. Where the moved text says "above", "below" or "this file", it means the old `status.md`: its sections are now `status.md` (state, pending decisions, limitations, licensing), `gui-decisions.md`, `features.md` and `history.md`.
 
+## 2026-11-26
+
+0.3.0 released: PR #36 merged into `main`, tagged `v0.3.0`; what 2026-11-25
+lists, and the Patterns window's picture in the guide (`nerka-gui
+--patterns`). Verified before the merge: the review gate `--full`, the
+1 GiB benchmark within 15 % of `bench-2026-11-14.tsv` with the same
+counts, CI on Linux, Windows and macOS; the Linux VM run was abandoned
+(the VM unstable), after its fmt and clippy passed.
+
 ## 2026-11-25
 
-0.3.0 prepared (a release; not yet merged or tagged), after 0.3.0-alpha.2:
+0.3.0 prepared (a release), after 0.3.0-alpha.2:
 
 - **AI preparation** (`ai.md`): workflow A, an agent with the CLI
   (`--json` in pages, `help agent` / `help skill`, `marks` with an
