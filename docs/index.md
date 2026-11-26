@@ -56,6 +56,8 @@ the patterns and values new, gone or more frequent, or what stayed the
 same. Experimental, and tunable on the trace at hand.
 [Patterns →](user/gui.md#patterns)
 
+![the Patterns window on a demo drive: 9,844 lines as 16 patterns, each with its share, its count, its context (ECU, application, context) and its template, slots as <*> and states with their values ({D|P|N}); the rare ones last: a panic, a service not responding, a shutdown](user/img/patterns.png)
+
 ## Your AI agent, on your logs
 
 nerka ships no model: bring Claude Code, Codex, Gemini CLI or another.

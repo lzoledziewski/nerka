@@ -124,6 +124,8 @@ date** when the file was read again, other lines or another field are
 chosen, or the [pattern configuration](cli.md#the-pattern-configuration)
 or the signals changed.
 
+![the Patterns window on a demo drive: 9,844 lines as 16 patterns, each with its share, its count, its context (ECU, application, context) and its template, slots as <*> and states with their values ({D|P|N}); the rare ones last: a panic, a service not responding, a shutdown](img/patterns.png)
+
 - **Lines:** all lines, the filter result, one lifecycle (`@ecu1` and its
   number: every line during it, or with *its lines only* its own lines),
   or the lines of a filter you type (NFD). **Field:** the text
@@ -249,10 +251,11 @@ nerka-gui [OPTIONS] [FILE]...
 | `--library` | show the library |
 | `--signal SPEC`, `--lifecycle SPEC`, `--check SPEC` | a signal, lifecycle or check for this session (as the CLI's; not saved unless edited) |
 | `--plot NAME`, `--plot-window` | plot a signal (in a window of its own) |
+| `--patterns` | open the first tab's Patterns window and run it |
 | `--marker NAME=VALUE[:LABEL]`, `--cursor TIME` | a line in a plotted lane, a time cursor |
 | `--fibex FILE` | a FIBEX file for DLT non-verbose messages |
 | `--new-window`, `--name NAME` | a window of its own, its name |
-| `--screenshot PATH` | once the files are loaded, the signals collected and the plot drawn, save the window as a PNG and close it (for checks without a person at the screen); a plot in its own window is saved too, as `PATH-plot.png` (`shot.png` → `shot-plot.png`) |
+| `--screenshot PATH` | once the files are loaded, the signals collected and the plot drawn, save the window as a PNG and close it (for checks without a person at the screen); a plot in its own window is saved too, as `PATH-plot.png` (`shot.png` → `shot-plot.png`), and the Patterns window as `PATH-patterns.png` |
 | `-h, --help`, `-V, --version` | |
 
 A `--signal`, `--lifecycle` or `--check` that doesn't parse is listed in an

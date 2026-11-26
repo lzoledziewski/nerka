@@ -101,6 +101,7 @@ Options:
       --check SPEC         A check for this session (as `nerka --check`)
       --plot NAME          Plot a signal
       --plot-window        The plot in a window of its own
+      --patterns           Open the Patterns window and run it
       --marker NAME=VALUE[:LABEL]  A horizontal line in a plotted lane
       --cursor TIME        A time cursor in the plot
       --fibex FILE         FIBEX file for DLT non-verbose messages
@@ -108,7 +109,8 @@ Options:
       --name NAME          The window's name
       --screenshot PATH    Once loaded and drawn, save the window as a PNG
                            and close (checks and CI); the plot's own window
-                           goes to PATH-plot.png
+                           goes to PATH-plot.png, the Patterns window to
+                           PATH-patterns.png
   -h, --help               This text
   -V, --version            The version
 ";
@@ -143,6 +145,8 @@ fn main() -> eframe::Result {
     let mut markers: Vec<(String, plot::Marker)> = Vec::new();
     // `--plot-window`: the plot starts in a window of its own.
     let mut plot_window = false;
+    // `--patterns`: the Patterns window opens and runs once the file is read.
+    let mut patterns_at_start = false;
     // `--screenshot PATH`: the window as a PNG once loaded, then close.
     let mut screenshot: Option<PathBuf> = None;
     let (mut window_name, mut preset_file) = (None, None);
@@ -238,6 +242,10 @@ fn main() -> eframe::Result {
                 plot_window = true;
                 continue;
             }
+            Some("--patterns") => {
+                patterns_at_start = true;
+                continue;
+            }
             Some("--signal") => {
                 let spec = value();
                 match nerka_core::SignalDef::parse_spec(&spec) {
@@ -318,8 +326,15 @@ fn main() -> eframe::Result {
         options,
         Box::new(move |cc| {
             let show_signals = !signals.is_empty();
-            let mut app =
-                App { pack_paths: packs, show_library, show_signals, window_name, plot_window, ..Default::default() };
+            let mut app = App {
+                pack_paths: packs,
+                show_library,
+                show_signals,
+                window_name,
+                plot_window,
+                patterns_at_start,
+                ..Default::default()
+            };
             let ctx = cc.egui_ctx.clone();
             app.server = instance::Server::start(move || ctx.request_repaint());
             // A config folder written by an earlier nerka: to this one's formats.
@@ -3582,6 +3597,9 @@ struct App {
     fibex_args: Option<(usize, Arc<Vec<nerka_core::Argument>>)>,
     /// The plot is in a window of its own, and what that window shares.
     plot_window: bool,
+    /// `--patterns`: the first tab's Patterns window, opened and run once
+    /// its file is read.
+    patterns_at_start: bool,
     plot_win: Arc<std::sync::Mutex<plot::Detached>>,
     /// What the plot's window was last asked to repaint for.
     plot_win_key: Option<plot::WindowKey>,
@@ -4644,6 +4662,27 @@ impl App {
         }
     }
 
+    /// `--patterns`: the first tab's window opened and run, once its file
+    /// is read (a file that doesn't open: nothing).
+    fn open_patterns_at_start(&mut self, ctx: &egui::Context) {
+        if !self.patterns_at_start {
+            return;
+        }
+        let Some(t) = self.tabs.first_mut() else {
+            self.patterns_at_start = false;
+            return;
+        };
+        if t.loading.is_some() || !t.stage_jobs.is_empty() || t.signals_job.is_some() {
+            ctx.request_repaint_after(Duration::from_millis(50));
+            return;
+        }
+        self.patterns_at_start = false;
+        if t.file.is_some() {
+            t.patterns.open = true;
+            t.patterns.autorun = true;
+        }
+    }
+
     /// Each tab's Patterns window that is open, and what it asks of its
     /// tab: go to a line (of its tab, or another's in a compare: that tab
     /// comes to the front), a query to filter or search by.
@@ -4656,6 +4695,10 @@ impl App {
         // it stays in the Patterns window for 0.3.0).
         let tuning = true;
         let refs: Vec<patterns::TabRef> = self.tabs.iter().filter_map(Tab::tab_ref).collect();
+        // `--screenshot`: inside the main window, where eframe takes
+        // pictures (of a window drawn immediately it takes none).
+        let embedded = ctx.embed_viewports();
+        ctx.set_embed_viewports(embedded || self.shoot.is_some());
         let mut asked = Vec::new();
         for (i, t) in self.tabs.iter_mut().enumerate() {
             if !t.patterns.open {
@@ -4679,6 +4722,7 @@ impl App {
                 asked.push((i, out));
             }
         }
+        ctx.set_embed_viewports(embedded);
         for (i, out) in asked {
             let (filtered, searched) = self.apply_patterns(ctx, i, out);
             if let Some(q) = filtered {
@@ -5709,6 +5753,8 @@ struct Shoot {
     saved: bool,
     /// The plot's own window's picture, while it is awaited.
     plot: Option<Arc<std::sync::Mutex<Option<egui::ColorImage>>>>,
+    /// The Patterns window's picture, while it is awaited.
+    patterns: Option<Arc<std::sync::Mutex<Option<egui::ColorImage>>>>,
 }
 
 impl Shoot {
@@ -5726,14 +5772,16 @@ impl Shoot {
             image: Default::default(),
             saved: false,
             plot: None,
+            patterns: None,
         }
     }
 
-    /// Where the plot's own window goes: `shot.png` → `shot-plot.png`.
-    fn plot_path(path: &Path) -> PathBuf {
+    /// Where another window's picture goes: `shot.png` → `shot-plot.png`
+    /// (`what`: `plot`, `patterns`).
+    fn side_path(path: &Path, what: &str) -> PathBuf {
         let stem = path.file_stem().map_or_else(Default::default, |s| s.to_string_lossy());
         let ext = path.extension().map_or_else(|| "png".into(), |e| e.to_string_lossy());
-        path.with_file_name(format!("{stem}-plot.{ext}"))
+        path.with_file_name(format!("{stem}-{what}.{ext}"))
     }
 }
 
@@ -5748,7 +5796,8 @@ impl App {
     /// `--screenshot`: count quiet frames, ask for the picture, save it and
     /// close the window.
     fn shoot_step(&mut self, ctx: &egui::Context) {
-        let busy = self.tabs.iter().any(|t| t.is_busy());
+        let busy = self.tabs.iter().any(|t| t.is_busy()) || self.patterns_at_start;
+        let patterns_window = self.tabs.get(self.active).is_some_and(|t| t.patterns.open);
         let plot_window = self.plot_window && self.tabs.get(self.active).is_some_and(|t| plot::lock(&t.plot).shown);
         let Some(s) = &mut self.shoot else { return };
         ctx.request_repaint();
@@ -5765,17 +5814,26 @@ impl App {
         };
         s.saved |= save(&s.path, &s.image);
         if let Some(slot) = &s.plot
-            && save(&Shoot::plot_path(&s.path), slot)
+            && save(&Shoot::side_path(&s.path, "plot"), slot)
         {
             s.plot = None;
         }
+        if let Some(slot) = &s.patterns
+            && save(&Shoot::side_path(&s.path, "patterns"), slot)
+        {
+            s.patterns = None;
+        }
         if let Some(asked) = s.asked {
-            // The plot's window may be gone: the main window's picture alone.
-            if s.plot.is_some() && asked.elapsed() > Duration::from_secs(10) {
-                console::error("nerka-gui: --screenshot: the plot's window drew nothing; not saved\n");
-                s.plot = None;
+            // A window may be gone: the main window's picture alone.
+            if asked.elapsed() > Duration::from_secs(10) {
+                if s.plot.take().is_some() {
+                    console::error("nerka-gui: --screenshot: the plot's window drew nothing; not saved\n");
+                }
+                if s.patterns.take().is_some() {
+                    console::error("nerka-gui: --screenshot: the Patterns window drew nothing; not saved\n");
+                }
             }
-            if s.saved && s.plot.is_none() {
+            if s.saved && s.plot.is_none() && s.patterns.is_none() {
                 self.shoot = None;
                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             }
@@ -5795,6 +5853,12 @@ impl App {
                 self.plot_win.lock().unwrap_or_else(|e| e.into_inner()).shoot = Some(slot.clone());
                 s.plot = Some(slot);
                 ctx.request_repaint_of(egui::ViewportId::from_hash_of("nerka-plot"));
+            }
+            // The Patterns window (`--patterns`), drawn within this frame.
+            if patterns_window && let Some(t) = self.tabs.get_mut(self.active) {
+                let slot = Arc::new(std::sync::Mutex::new(None));
+                t.patterns.shoot = Some(slot.clone());
+                s.patterns = Some(slot);
             }
         }
     }
@@ -5829,6 +5893,7 @@ impl App {
         self.settings_window(&ctx);
         self.profiles_window(&ctx);
         self.bundle_windows(&ctx);
+        self.open_patterns_at_start(&ctx);
         self.patterns_windows(&ctx);
         if let Some(t) = self.tabs.get_mut(self.active)
             && let Some(d) = &mut t.detail
@@ -7353,6 +7418,38 @@ v=60
         settle_app(&mut app, &ctx);
         assert_eq!(app.active, 1);
         assert_eq!(app.tabs[1].session.hits().unwrap().lines.len(), 10);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `--patterns`: the first tab's Patterns window opens once its file is
+    /// read, and runs; `--screenshot` names its picture after the main one.
+    #[test]
+    fn patterns_at_start_open_and_run() {
+        let dir = std::env::temp_dir().join(format!("nerka-gui-patterns-start-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("a.log");
+        std::fs::write(&path, LOG).unwrap();
+        let ctx = egui::Context::default();
+        let mut app = App { patterns_at_start: true, ..Default::default() };
+        app.open(&ctx, path);
+        let mut opened_while_loading = false;
+        for _ in 0..500 {
+            let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1200.0, 800.0));
+            let input = egui::RawInput { screen_rect: Some(screen), ..Default::default() };
+            let mut out = ctx.run_ui(input, |ui| app.frame(ui));
+            out.textures_delta.clear();
+            let t = &app.tabs[0];
+            opened_while_loading |= t.patterns.open && t.loading.is_some();
+            if t.patterns.found().is_some() && !t.is_busy() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let t = &app.tabs[0];
+        assert!(!opened_while_loading);
+        assert!(t.patterns.open && !app.patterns_at_start);
+        assert!(t.patterns.found().is_some_and(|n| n > 0), "{:?}", t.patterns.found());
+        assert_eq!(Shoot::side_path(Path::new("out/shot.png"), "patterns"), Path::new("out/shot-patterns.png"));
         std::fs::remove_dir_all(&dir).ok();
     }
 

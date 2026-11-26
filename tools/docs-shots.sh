@@ -2,6 +2,7 @@
 # The user guide's screenshots of the demo trace, made again:
 #   docs/user/img/plot.png     the plot in its own window
 #   docs/user/img/library.png  the Library, picks with line colours, a search
+#   docs/user/img/patterns.png the Patterns window on the whole trace
 #   docs/user/img/nerka.png    the README's: picks, a query's editor open (its
 #                              NFD), a plot, a search (Windows only: a click
 #                              opens the editor, tools/screenshot.ps1)
@@ -47,7 +48,10 @@ filter selection
 search regex throttl(ing|ed)
 EOF
 run --library --preset-file "$work/library.nerka-preset" --screenshot "$out/library.png"
-echo "saved $out/plot.png and $out/library.png"
+
+run --patterns --screenshot "$work/patterns.png"
+cp "$work/patterns-patterns.png" "$out/patterns.png"
+echo "saved $out/plot.png, $out/library.png and $out/patterns.png"
 
 # The README's: the same picks with speed and temperature plotted, and the
 # timeouts query's editor open (a click on its ✎ in the Selection).

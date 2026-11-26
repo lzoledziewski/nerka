@@ -108,6 +108,8 @@ plot.
   varying parts as slots, the rarest first; **Compare** lists what is
   new, gone, more frequent or the same between two boots, runs or files
   (experimental).
+
+  ![the Patterns window on a demo drive: 9,844 lines as 16 patterns, each with its share, its count, its context (ECU, application, context) and its template, slots as <*> and states with their values ({D|P|N}); the rare ones last: a panic, a service not responding, a shutdown](docs/user/img/patterns.png)
 - **Your AI agent:** Claude Code, Codex, Gemini CLI or another analyses
   files with the command line (JSON in pages), or works with you on your
   window through MCP (`nerka mcp`), leaving annotations you accept or
