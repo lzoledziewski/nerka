@@ -789,6 +789,10 @@ struct Tab {
     offset_for: Vec<(PathBuf, i64)>,
     /// FIBEX arguments used as signals (picked in the Signals panel).
     arg_picks: Vec<nerka_core::Argument>,
+    /// Signals an agent defined here (`nerka mcp` add_signal; owner,
+    /// 2026-11-26): this tab's only, not saved, until the user keeps one
+    /// (Signals panel → Keep: then a saved signal like theirs).
+    agent_signals: Vec<nerka_core::SignalDef>,
     /// The Files window: the tab's files as they are being edited.
     files_edit: Option<FilesEdit>,
     /// How each text file of the tab is split into rows, by path
@@ -1367,6 +1371,8 @@ impl Tab {
             .collect();
         options.profile_for = profile_for.clone();
         options.offset_for = offset_for.clone();
+        // An agent's signals on these files, as it left them.
+        let agent_signals = agent::remembered_signals(&paths);
         Self {
             path: paths[0].clone(),
             paths,
@@ -1449,6 +1455,7 @@ impl Tab {
             profile_for,
             offset_for,
             arg_picks: Vec::new(),
+            agent_signals,
             files_edit: None,
             records_for,
             signal_hidden: Default::default(),
@@ -1770,6 +1777,14 @@ impl Tab {
         Ok(said)
     }
 
+    /// An agent's signals here changed: remembered for the tab's files
+    /// (back when they're opened again, split or moved).
+    fn remember_agent_signals(&mut self) {
+        if let Err(e) = agent::remember_signals(&self.paths, &self.agent_signals) {
+            self.status = format!("Could not remember the agent's signals: {e}");
+        }
+    }
+
     /// Build the tab's signals again if what they come from changed: the
     /// file's `@time`, the user's `saved` signals, the named groups of the
     /// selection's included and signal queries (with the kinds and scopes
@@ -1783,13 +1798,14 @@ impl Tab {
             .map(|id| lib.get(id).map(|(_, q)| q.text.as_str()))
             .collect();
         let fingerprint = format!(
-            "{:?}{:?}{lifecycle_queries:?}",
+            "{:?}{:?}{lifecycle_queries:?}{:?}",
             self.picks
                 .nodes
                 .iter()
                 .map(|n| (n.role, &n.text, &n.parent, &n.source, n.edited, n.detached, &n.signals))
                 .collect::<Vec<_>>(),
-            self.picks.params
+            self.picks.params,
+            self.agent_signals.iter().map(|d| d.spec()).collect::<Vec<_>>()
         );
         let key = (saved_gen, self.choices_gen, fingerprint);
         if self.signals_key.as_ref() == Some(&key) {
@@ -1879,6 +1895,14 @@ impl Tab {
                 } else {
                     hide(d.name(), format!("the group (?<{}>…) of query {}", d.group(), d.queries().join(", ")));
                 }
+            }
+        }
+        // An agent's, last: a name taken since it was added is the other's.
+        for d in &self.agent_signals {
+            if s.get(d.name()).is_none() {
+                s.set(d.clone());
+            } else {
+                hide(d.name(), format!("an agent's (🤖): {}", d.spec()));
             }
         }
         // Library queries in lifecycles, expanded; what isn't loaded says so.
@@ -3476,6 +3500,22 @@ fn term_lines(terms: &[Term]) -> Vec<ChipLine<'_>> {
         .collect()
 }
 
+/// The user keeps an agent's signal `name` (Signals panel → Keep): off the
+/// tab's agent signals into `saved` (the caller saves them), and the
+/// agent's change no longer its to undo. False: no such signal.
+fn keep_agent_signal(tab: &mut Tab, saved: &mut Signals, log: &mut [agent::Activity], name: &str) -> bool {
+    let Some(k) = tab.agent_signals.iter().position(|d| d.name() == name) else { return false };
+    saved.set(tab.agent_signals.remove(k));
+    tab.remember_agent_signals();
+    for a in log {
+        if matches!(&a.undo, Some(agent::Undo::Signal { name: n, paths }) if n == name && *paths == tab.paths) {
+            a.undo = None;
+            a.what += " (kept)";
+        }
+    }
+    true
+}
+
 /// Definitions given on the command line, by name, each with the saved
 /// one it replaced: they last the session, unless the user adds or edits
 /// one in the GUI (then it is theirs, and saved).
@@ -3518,8 +3558,12 @@ struct App {
     search_history: SearchHistory,
     /// Search mode and options for new tabs: the last ones the user picked.
     prefs: SearchPrefs,
-    /// Shown when no tab is open (e.g. why the last open failed).
+    /// The window's message (why an open failed, what a button did): shown
+    /// by the status bar when no tab is open, else moved to the active
+    /// tab's status line ([`App::show_status`]).
     status: String,
+    /// `status` as the bar last showed it with no tab open.
+    status_shown: String,
     /// The checks, signals and prefs files as this window last read or
     /// wrote them: a save merges its changes into what another window
     /// wrote since (`sync`, owner, 2026-11-09: U3).
@@ -3601,6 +3645,11 @@ struct App {
     /// its file is read.
     patterns_at_start: bool,
     plot_win: Arc<std::sync::Mutex<plot::Detached>>,
+    /// The main window drew since the last `App::logic` ([`App::plot_close_waits`]).
+    drew: bool,
+    /// The plot window was minimized while its close waits for the main
+    /// window to draw.
+    plot_win_hid: bool,
     /// What the plot's window was last asked to repaint for.
     plot_win_key: Option<plot::WindowKey>,
     /// The plot window's builder while it is open, with the pass it was
@@ -5786,13 +5835,72 @@ impl Shoot {
 }
 
 impl eframe::App for App {
+    /// Each pass, and alone while the main window doesn't draw.
+    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        if self.plot_close_waits(ctx) {
+            ctx.send_viewport_cmd_to(
+                egui::ViewportId::from_hash_of("nerka-plot"),
+                egui::ViewportCommand::Minimized(true),
+            );
+        }
+    }
+
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        self.drew = true;
         self.frame(ui);
+        self.show_status(ui.ctx());
         view::clean_copies(ui.ctx());
     }
 }
 
 impl App {
+    /// Whether to minimize the plot window, once: it asked to close (✖,
+    /// ✖ Close, ⧉ back into the window), and the main window, which takes
+    /// it away in its pass, didn't draw since the last `logic` (eframe runs
+    /// only `App::logic` then). On Wayland a window another covers gets no
+    /// frames, so a plot window over the main one stayed until the main
+    /// window was raised; minimized, it uncovers it.
+    fn plot_close_waits(&mut self, ctx: &egui::Context) -> bool {
+        let drew = std::mem::replace(&mut self.drew, false);
+        let asked = self.plot_window && {
+            let d = self.plot_win.lock().unwrap_or_else(|e| e.into_inner());
+            d.closed || d.out.close || d.out.toggle_window
+        };
+        if !asked {
+            self.plot_win_hid = false;
+            return false;
+        }
+        if self.plot_win_hid {
+            return false;
+        }
+        if drew {
+            // Another pass: one that doesn't draw is the main window waiting.
+            ctx.request_repaint();
+            return false;
+        }
+        self.plot_win_hid = true;
+        true
+    }
+
+    /// A new window message moved onto the active tab's status line, which
+    /// the status bar shows while a tab is open (else the 🤖 AI button's
+    /// "not installed", a FIBEX load, a saved check, … never showed). Moved,
+    /// so the same message set again shows again; one the bar showed with no
+    /// tab open stays there, not over the status of a tab opened since. One
+    /// set after the bar was drawn shows on the next frame, asked for here.
+    fn show_status(&mut self, ctx: &egui::Context) {
+        let Some(t) = self.tabs.get_mut(self.active) else {
+            self.status_shown.clone_from(&self.status);
+            return;
+        };
+        if !self.status.is_empty() && self.status != self.status_shown {
+            t.status = std::mem::take(&mut self.status);
+            ctx.request_repaint();
+        }
+        self.status.clear();
+        self.status_shown.clear();
+    }
+
     /// `--screenshot`: count quiet frames, ask for the picture, save it and
     /// close the window.
     fn shoot_step(&mut self, ctx: &egui::Context) {
@@ -6066,6 +6174,7 @@ impl App {
             egui::Panel::top("tabs").show(ui, |ui| self.tab_bar(ui));
         }
 
+        self.show_status(&ctx);
         egui::Panel::bottom("status").show(ui, |ui| {
             ui.horizontal(|ui| match self.tabs.get(self.active) {
                 Some(t) => {
@@ -6245,6 +6354,7 @@ impl App {
                         pack_options: &tab.pack_options,
                         conflicts: &tab.option_conflicts,
                         hidden: &tab.signal_hidden,
+                        agent: &tab.agent_signals,
                     };
                     signals::signals_panel(ui, &mut tab.signals_ui, input)
                 })
@@ -6287,6 +6397,19 @@ impl App {
             }
             if let Some(name) = &out.adopted {
                 self.session_signals.adopt(name);
+            }
+            // An agent's signal kept (owner, 2026-11-26): a saved one, the
+            // user's; or taken off the tab.
+            if let Some(name) = out.keep
+                && keep_agent_signal(tab, &mut self.saved_signals, &mut self.agent.log, &name)
+            {
+                self.status = format!("@{name} kept: saved with your signals");
+                save_signals = true;
+            }
+            if let Some(name) = out.drop_agent {
+                tab.agent_signals.retain(|d| d.name() != name);
+                tab.remember_agent_signals();
+                self.status = format!("@{name}, the agent's signal, taken off this tab");
             }
             if out.saved_changed {
                 save_signals = true;
@@ -6990,6 +7113,7 @@ query timeouts  labels: vision
                         pack_options: &tab.pack_options,
                         conflicts: &tab.option_conflicts,
                         hidden: &tab.signal_hidden,
+                        agent: &[],
                     };
                     changed = signals::signals_panel(ui, &mut tab.signals_ui, input).args_changed;
                 });
@@ -7418,6 +7542,69 @@ v=60
         settle_app(&mut app, &ctx);
         assert_eq!(app.active, 1);
         assert_eq!(app.tabs[1].session.hits().unwrap().lines.len(), 10);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The plot window asks to close while the main window doesn't draw
+    /// (Wayland, covered by it: eframe runs only `App::logic`): minimized
+    /// once, at the second pass without a draw; with the main window
+    /// drawing, never.
+    #[test]
+    fn a_plot_window_closing_while_the_main_one_waits_is_minimized() {
+        let ctx = egui::Context::default();
+        let mut app = App { plot_window: true, ..Default::default() };
+        assert!(!app.plot_close_waits(&ctx), "nothing asked");
+        app.plot_win.lock().unwrap().closed = true;
+        // The main window draws: its pass takes the window away.
+        app.drew = true;
+        assert!(!app.plot_close_waits(&ctx));
+        // It doesn't: the next logic-only pass minimizes, once.
+        assert!(app.plot_close_waits(&ctx));
+        assert!(!app.plot_close_waits(&ctx));
+        // Closed by the main window's pass: for the next window, again.
+        app.plot_win.lock().unwrap().closed = false;
+        assert!(!app.plot_close_waits(&ctx) && !app.plot_win_hid);
+        app.plot_win.lock().unwrap().out.toggle_window = true;
+        assert!(app.plot_close_waits(&ctx), "⧉ back into the window too");
+    }
+
+    /// A window message (the 🤖 AI button's "not installed") shows on the
+    /// status bar while a tab is open, again when set again, and one from
+    /// before the tab opened doesn't cover the tab's own.
+    #[test]
+    fn window_messages_show_while_a_tab_is_open() {
+        let dir = std::env::temp_dir().join(format!("nerka-gui-status-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("a.log");
+        std::fs::write(&path, LOG).unwrap();
+        let ctx = egui::Context::default();
+        let mut app = App::default();
+        let frame = |app: &mut App| {
+            let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1200.0, 800.0));
+            let input = egui::RawInput { screen_rect: Some(screen), ..Default::default() };
+            let mut out = ctx.run_ui(input, |ui| {
+                app.frame(ui);
+                app.show_status(ui.ctx());
+            });
+            out.textures_delta.clear();
+        };
+        app.status = "Cannot open x.log".into();
+        frame(&mut app);
+        app.open(&ctx, path);
+        for _ in 0..500 {
+            frame(&mut app);
+            if !app.tabs[0].is_busy() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(!app.tabs[0].status.contains("Cannot open"), "{}", app.tabs[0].status);
+        for _ in 0..2 {
+            app.status = "'claude' isn't installed".into();
+            frame(&mut app);
+            assert_eq!(app.tabs[0].status, "'claude' isn't installed");
+            app.tabs[0].status = "Filter keeps 3 lines".into();
+        }
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -8367,6 +8554,199 @@ v=60
         app.agent_undo(&ctx, k);
         settle_app(&mut app, &ctx);
         assert_eq!(app.tabs[0].file.as_ref().unwrap().line_count(), 5);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// An agent reads the user's checks (owner, 2026-11-26: "add access to
+    /// checks"): which are on, the results with evidence lines, whether
+    /// they're current; it runs nothing.
+    #[test]
+    fn an_agent_reads_the_checks() {
+        use nerka_core::check::CheckDef;
+        use nerka_core::json::Value;
+        let dir = std::env::temp_dir().join(format!("nerka-gui-agent-checks-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("app.log");
+        std::fs::write(&log, "[INFO] one\n[ERROR] two\n[INFO] three\n[ERROR] four\n").unwrap();
+        let ctx = egui::Context::default();
+        let mut app = App::default();
+        let call = |app: &mut App, tool: &str, args: &str| -> Result<Value, String> {
+            let (tx, rx) = std::sync::mpsc::channel();
+            let args = nerka_core::json::parse(args).unwrap();
+            app.agent_call(&ctx, instance::AgentCall { tool: tool.into(), args, reply: tx });
+            rx.recv_timeout(Duration::from_secs(10)).expect("an answer")
+        };
+        // None yet: said.
+        app.open(&ctx, log.clone());
+        settle_app(&mut app, &ctx);
+        let v = call(&mut app, "checks", "{}").unwrap();
+        assert!(v.get("note").and_then(Value::as_str).is_some_and(|n| n.contains("no checks")), "{v}");
+        app.saved_checks.set(CheckDef::parse_spec("errors: lines level >= ERROR; exists").unwrap());
+        app.saved_checks.set(CheckDef::parse_spec("off timeouts: lines /timeout/; exists").unwrap());
+        let run = |app: &mut App| {
+            for _ in 0..500 {
+                let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1200.0, 800.0));
+                let input = egui::RawInput { screen_rect: Some(screen), ..Default::default() };
+                let mut out = ctx.run_ui(input, |ui| app.frame(ui));
+                out.textures_delta.clear();
+                let t = &app.tabs[0];
+                if t.checks_job.is_none() && (t.checks_key.is_some() || t.checks_stale) {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            panic!("checks still running");
+        };
+        run(&mut app);
+        let v = call(&mut app, "checks", "{}").unwrap();
+        assert_eq!(v.get("state").and_then(Value::as_str), Some("current"), "{v}");
+        let checks = v.get("checks").unwrap().as_array().unwrap();
+        let on: Vec<(&str, bool)> = checks
+            .iter()
+            .map(|c| (c.get("name").and_then(Value::as_str).unwrap(), c.get("on") == Some(&Value::Bool(true))))
+            .collect();
+        assert_eq!(on, [("errors", true), ("timeouts", false)]);
+        let rows = v.get("results").unwrap().as_array().unwrap();
+        assert_eq!(rows.len(), 1, "the one on, overall: {v}");
+        assert_eq!(rows[0].get("check").and_then(Value::as_str), Some("errors"));
+        let ev = rows[0].get("evidence").unwrap().as_array().unwrap();
+        let first = ev[0].get("lines").unwrap().as_array().unwrap()[0].get("line").and_then(Value::as_u64);
+        assert_eq!(first, Some(2), "the first error's line, from 1: {v}");
+        assert!(call(&mut app, "checks", r#"{"name":"nope"}"#).unwrap_err().contains("no check 'nope'"));
+        // Auto off and something changed: out of date, and nothing ran.
+        app.tabs[0].checks_auto = false;
+        app.tabs[0].checks_on.as_mut().unwrap().insert("timeouts".into());
+        run(&mut app);
+        let v = call(&mut app, "checks", "{}").unwrap();
+        assert!(v.get("state").and_then(Value::as_str).unwrap().starts_with("out of date"), "{v}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// An agent defines a signal (owner's request, 2026-11-26): on the tab
+    /// only, plotted, read; a name taken or a
+    /// field the file lacks refused; undone, or kept by the user as theirs.
+    #[test]
+    fn an_agent_defines_a_signal() {
+        use nerka_core::json::Value;
+        let dir = std::env::temp_dir().join(format!("nerka-gui-agent-signal-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("app.log");
+        std::fs::write(&log, "voltage mV 3588\nboot\nvoltage mV 3601\nvoltage mV 2950\n").unwrap();
+        let ctx = egui::Context::default();
+        let mut app = App::default();
+        app.open_files(&ctx, vec![log.clone()]);
+        settle_app(&mut app, &ctx);
+        let call = |app: &mut App, tool: &str, args: &str| -> Result<Value, String> {
+            let (tx, rx) = std::sync::mpsc::channel();
+            let args = nerka_core::json::parse(args).unwrap();
+            app.agent_call(&ctx, instance::AgentCall { tool: tool.into(), args, reply: tx });
+            rx.recv_timeout(Duration::from_secs(10)).expect("an answer")
+        };
+        let spec = r#"{"signal":"voltage=/voltage mV (?<voltage>\\d+)/"}"#;
+        let v = call(&mut app, "add_signal", spec).unwrap();
+        assert_eq!(v.get("name").and_then(Value::as_str), Some("voltage"));
+        assert!(app.tabs[0].signals.get("voltage").is_some(), "on the tab at once");
+        assert!(app.saved_signals.get("voltage").is_none(), "not saved");
+        call(&mut app, "plot", r#"{"signals":"voltage"}"#).unwrap();
+        settle_app(&mut app, &ctx);
+        let s = call(&mut app, "signal", r#"{"name":"voltage"}"#).unwrap();
+        assert_eq!(s.get("events").and_then(Value::as_u64), Some(3), "{s}");
+        // Refused: a name taken, a field a text file hasn't, a bad spec.
+        assert!(call(&mut app, "add_signal", spec).unwrap_err().contains("has a signal 'voltage' already"));
+        let e = call(&mut app, "add_signal", r#"{"signal":"v2=apid == PWR AND /mV (?<v2>\\d+)/"}"#).unwrap_err();
+        assert!(e.contains("apid"), "{e}");
+        assert!(call(&mut app, "add_signal", r#"{"signal":"x"}"#).unwrap_err().starts_with("signal x:"));
+        // Undone: off the tab.
+        let k = app.agent.log.iter().position(|a| a.what.starts_with("defined signal @voltage")).unwrap();
+        app.agent_undo(&ctx, k);
+        assert!(app.tabs[0].agent_signals.is_empty() && app.tabs[0].signals.get("voltage").is_none());
+        // Again, and kept: the user's (saved), the agent's undo gone.
+        call(&mut app, "add_signal", spec).unwrap();
+        let App { tabs, saved_signals, agent, .. } = &mut app;
+        assert!(keep_agent_signal(&mut tabs[0], saved_signals, &mut agent.log, "voltage"));
+        assert!(app.saved_signals.get("voltage").is_some() && app.tabs[0].agent_signals.is_empty());
+        let last = app.agent.log.last().unwrap();
+        assert!(last.undo.is_none() && last.what.ends_with("(kept)"), "{}", last.what);
+        // A lifecycle is a signal too: defined by the agent, read back.
+        call(&mut app, "add_signal", r#"{"signal":"lifecycle run: start /boot/"}"#).unwrap();
+        let l = call(&mut app, "lifecycles", r#"{"name":"run"}"#).unwrap();
+        let lives = l.get("lifecycles").unwrap().as_array().unwrap()[0].get("lifecycles").unwrap();
+        assert_eq!(lives.as_array().unwrap().len(), 2, "{l}");
+        // A page at a time: `more` to give back as `skip`.
+        let mut page = |args: &str| {
+            let l = call(&mut app, "lifecycles", args).unwrap();
+            let one = l.get("lifecycles").unwrap().as_array().unwrap()[0].clone();
+            (one.get("lifecycles").unwrap().as_array().unwrap().len(), one.get("more").and_then(Value::as_u64))
+        };
+        assert_eq!(page(r#"{"name":"run","max":1}"#), (1, Some(1)));
+        assert_eq!(page(r#"{"name":"run","max":1,"skip":1}"#), (1, None));
+        // A saved lifecycle by a field a text file hasn't: its error in its
+        // place, the others still read.
+        app.saved_signals
+            .set(nerka_core::SignalDef::parse_spec("lifecycle ecu: lines ecu == E1; reset uptime").unwrap());
+        app.saved_gen += 1;
+        let App { tabs, library, saved_signals, saved_gen, .. } = &mut app;
+        tabs[0].refresh_signals(&ctx, library, saved_signals, *saved_gen);
+        let l = call(&mut app, "lifecycles", "{}").unwrap();
+        let all = l.get("lifecycles").unwrap().as_array().unwrap();
+        assert!(all.iter().any(|x| x.get("error").and_then(Value::as_str).is_some_and(|e| e.contains("ecu"))), "{l}");
+        assert!(all.iter().any(|x| x.get("lifecycles").is_some()), "{l}");
+        // Kept, it's the user's: not the agent's to remove.
+        let e = call(&mut app, "remove_signal", r#"{"name":"voltage"}"#).unwrap_err();
+        assert!(e.contains("the user's"), "{e}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// An agent's signals are remembered per file (owner, 2026-11-26): back
+    /// when the file is opened again; `remove_signal` takes only its own,
+    /// forgets them, and is undone.
+    #[test]
+    fn an_agents_signals_come_back_with_the_file() {
+        use nerka_core::json::Value;
+        let dir = std::env::temp_dir().join(format!("nerka-gui-agent-memo-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let memo = dir.join("agent-signals");
+        agent::TEST_MEMO.with(|m| *m.borrow_mut() = Some(memo.clone()));
+        let (log, other) = (dir.join("app.log"), dir.join("other.log"));
+        std::fs::write(&log, "voltage mV 3588\ntemp 40 C\nvoltage mV 2950\n").unwrap();
+        std::fs::write(&other, "voltage mV 1\n").unwrap();
+        let ctx = egui::Context::default();
+        let call = |app: &mut App, tool: &str, args: &str| -> Result<Value, String> {
+            let (tx, rx) = std::sync::mpsc::channel();
+            let args = nerka_core::json::parse(args).unwrap();
+            app.agent_call(&ctx, instance::AgentCall { tool: tool.into(), args, reply: tx });
+            rx.recv_timeout(Duration::from_secs(10)).expect("an answer")
+        };
+        let opened = |paths: Vec<PathBuf>| {
+            let mut app = App::default();
+            app.open_files(&ctx, paths);
+            settle_app(&mut app, &ctx);
+            // As a frame does.
+            let App { tabs, library, saved_signals, saved_gen, .. } = &mut app;
+            tabs[0].refresh_signals(&ctx, library, saved_signals, *saved_gen);
+            app
+        };
+        let mut app = opened(vec![log.clone()]);
+        call(&mut app, "add_signal", r#"{"signal":"voltage=/voltage mV (?<voltage>\\d+)/"}"#).unwrap();
+        call(&mut app, "add_signal", r#"{"signal":"temp=/temp (?<temp>\\d+)/"}"#).unwrap();
+        let tabbed = call(&mut app, "add_signal", r#"{"signal":"t2=/a\tb(?<t2>x)/"}"#).unwrap_err();
+        assert!(tabbed.contains("without tabs"), "{tabbed}");
+        // Opened again (another window, a split): both back, still the agent's.
+        let mut again = opened(vec![log.clone()]);
+        let names: Vec<&str> = again.tabs[0].agent_signals.iter().map(|d| d.name()).collect();
+        assert_eq!(names, ["voltage", "temp"]);
+        assert!(again.tabs[0].signals.get("temp").is_some());
+        assert!(opened(vec![other.clone()]).tabs[0].agent_signals.is_empty(), "that file's only");
+        // Removed: off the tab and forgotten; undone: back.
+        assert!(call(&mut again, "remove_signal", r#"{"name":"nope"}"#).unwrap_err().contains("no signal 'nope'"));
+        call(&mut again, "remove_signal", r#"{"name":"@temp"}"#).unwrap();
+        assert!(again.tabs[0].signals.get("temp").is_none());
+        assert_eq!(opened(vec![log.clone()]).tabs[0].agent_signals.len(), 1);
+        let k = again.agent.log.len() - 1;
+        again.agent_undo(&ctx, k);
+        assert!(again.tabs[0].signals.get("temp").is_some());
+        assert_eq!(opened(vec![log.clone()]).tabs[0].agent_signals.len(), 2);
+        agent::TEST_MEMO.with(|m| *m.borrow_mut() = None);
         std::fs::remove_dir_all(&dir).ok();
     }
 

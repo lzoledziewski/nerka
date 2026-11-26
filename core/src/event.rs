@@ -122,17 +122,27 @@ pub struct FieldDef {
     /// Getting the value decodes the line (e.g. a DLT payload), so
     /// conditions on it are evaluated after the cheap ones.
     pub costly: bool,
+    /// Its value names what kind of message the line is (DLT `mid`: a
+    /// non-verbose message's id), so patterns group by it as they do by
+    /// `apid` ([`crate::pattern`]), even if it is a number.
+    pub names_message: bool,
 }
 
 impl FieldDef {
     /// A field with a fixed name.
     pub const fn new(name: &'static str, kind: FieldKind, costly: bool) -> FieldDef {
-        FieldDef { name: Cow::Borrowed(name), kind, costly }
+        FieldDef { name: Cow::Borrowed(name), kind, costly, names_message: false }
+    }
+
+    /// It names the kind of message ([`FieldDef::names_message`]).
+    pub const fn naming(mut self) -> FieldDef {
+        self.names_message = true;
+        self
     }
 
     /// A field whose name comes from the data (a JSON key).
     pub fn owned(name: String, kind: FieldKind, costly: bool) -> FieldDef {
-        FieldDef { name: Cow::Owned(name), kind, costly }
+        FieldDef { name: Cow::Owned(name), kind, costly, names_message: false }
     }
 }
 

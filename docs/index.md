@@ -79,9 +79,10 @@ undo. [AI agents →](user/agents.md)
 8. [Checks](user/checks.md): known problems found per log or per boot.
 9. [The command line](user/cli.md): every command and option.
 10. [AI agents](user/agents.md): an agent of your choice, with the command line or on your window (MCP), its findings as annotations.
-11. [Protocol definitions](user/protocol-definitions.md): your own protocols in captures, in `.ksy` files.
-12. [Settings bundles](user/bundles.md): export and import your setup.
-13. [Settings and where things are kept](user/settings.md).
+11. [How patterns work](user/patterns.md): how lines become patterns and what Compare's score means.
+12. [Protocol definitions](user/protocol-definitions.md): your own protocols in captures, in `.ksy` files.
+13. [Settings bundles](user/bundles.md): export and import your setup.
+14. [Settings and where things are kept](user/settings.md).
 
 nerka is at 0.x: file formats, the query language and the window can still
 change. Licensed under MIT or Apache-2.0.

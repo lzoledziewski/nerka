@@ -140,16 +140,19 @@ Each answer has `structuredContent` plus a short text form.
 | `filter` | Lines a filter matches: `max`, `offset`, `fields`, context |
 | `lines` | A line range, or lines around one (the user's selected line by default) |
 | `patterns` / `compare` | As the CLI's, on a tab or two lifecycles |
-| `lifecycles` / `check` | As the CLI's, with the tab's lifecycles and checks |
+| `lifecycles` | As the CLI's, with the tab's lifecycles (an agent defines one with `add_signal`, `lifecycle NAME: …`); runs in pages (`max`, default 50; `skip`), issues and summary whole; one that can't be read on the tab says why in its place |
+| `checks` | (owner, 2026-11-26: "add access to checks") The user's checks and their results on the tab, read from the window, never run: which are on, a row per check and scope (`agent::check_rows`, also `check --json`'s) with evidence places, errors, and the state (current, running, out of date, not run) |
 | `signal` | A signal's values in a range: count, min, max, changes, a thinned series |
 | `show` | Go to a line in the window (scrolls and selects it) |
 | `set_filter` / `set_search` | Put NFD in the tab's boxes, as if typed |
 | `bookmark` | Add or edit a bookmark with a note, the AI as author |
+| `add_signal` | Define a signal on a tab, `--signal`'s spec (owner's request, 2026-11-26: an agent plots a signal it defines). Not among the user's saved signals: remembered per file (`<config>/nerka/agent-signals`, `spec<TAB>path`, a file of its own so `records` keeps its format), back on every open, split or move; shown 🤖 in the Signals panel, where the user keeps it (saved, theirs; the agent's undo then gone) or drops it; a name taken is refused, and later loses to any other source's |
+| `remove_signal` | Remove a signal the agent defined and the user hasn't kept (owner, 2026-11-26: "delete them by AI after clarification from the user"): the description tells it to ask first, `destructiveHint: true` lets a client ask (the other changes say `false`: undoable, additive); the user's own are refused; undoable |
 | `plot` | Open the plot with signals, a time range, markers and cursors |
 | `screenshot` | The window or the plot as a PNG, returned as an MCP image |
 
 `count`, `filter`, `lines` and the rest read without changing the window;
-`show`, `set_*`, `bookmark` and `plot` change it. `screenshot` lets the AI
+`show`, `set_*`, `bookmark`, `add_signal` and `plot` change it. `screenshot` lets the AI
 see the plot it made and check it shows the problem (`shot.rs` already
 captures the window and the plot).
 
@@ -199,7 +202,7 @@ in `ui/src/main.rs` (6,218 non-test lines).
 
 Workflow B was built unattended on assumptions; the owner reviewed them
 the next morning. **Kept as built:** the 18 tools (a `check` tool when
-agents ask; `filter` with `raw ~` instead of a regex `search`); a tab by
+agents ask: `checks`, built 2026-11-26 when the owner asked; `filter` with `raw ~` instead of a regex `search`); a tab by
 number or title, lines from 1 in their own file; reading on a thread,
 changes on the window's thread, never the focus; `set_filter` /
 `set_search` in NFD, undone with the box's mode and text; `bookmark` as an

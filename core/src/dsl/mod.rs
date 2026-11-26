@@ -61,7 +61,10 @@
 //! `before(30s, X)` holds on a line whose time is at most 30 s before a
 //! line `X` keeps (or is that line), `after(5s, X)` up to 5 s after one,
 //! `around(30s, 5s, X)` both: the lines around a condition, for one (an
-//! agent's "what happened before the crash"). `X` is any query; it runs
+//! agent's "what happened before the crash"). Either of `around`'s may be
+//! negative, for a window apart from the line: `around(10s, -5s, X)` from
+//! 10 s to 5 s before it, `around(-5s, 10s, X)` from 5 s to 10 s after (a
+//! window ending before it starts is an error). `X` is any query; it runs
 //! once over the source before the search ([`Query::prepare`]), its lines'
 //! times widened into windows. A line without a time is in none; a source
 //! without times is an error there.
@@ -1011,6 +1014,10 @@ mod tests {
         assert_eq!(w("before(30s, /crash/)"), (30.0, 0.0, "/crash/".into()));
         assert_eq!(w("after(500ms, level >= ERROR)"), (0.0, 0.5, "level >= ERROR".into()));
         assert_eq!(w("AROUND(2m, 5, apid == NAV OR /x/)"), (120.0, 5.0, "apid == NAV OR /x/".into()));
+        // A window apart from the line: from 10 s to 5 s before, 5 to 10 s after.
+        assert_eq!(w("around(10s, -5s, /x/)"), (10.0, -5.0, "/x/".into()));
+        assert_eq!(w("around(-5s, 10s, /x/)"), (-5.0, 10.0, "/x/".into()));
+        assert_eq!(w("around(5s, -5s, /x/)"), (5.0, -5.0, "/x/".into()));
         assert!(q("before(1s, /a/) AND NOT after(1s, /b/)").uses_windows());
         assert!(!q("level >= ERROR").uses_windows());
         // A field named like one, compared: a field.
@@ -1025,6 +1032,16 @@ mod tests {
         bad("around(5s, /x/)", 11, "around(…) needs a duration here (30s, 500ms, 2m)");
         bad("after(5s, /x/", 13, "expected ')' but found end of query");
         bad("after(5s, )", 10, "expected a condition but found ')'");
+        let neg = "before(…) takes no negative duration; a window apart from the line: around(10s, -5s, …), from \
+                   10 s to 5 s before it";
+        bad("before(-5s, /x/)", 7, neg);
+        bad("around(-soon, 5s, /x/)", 7, "around(…) needs a duration here (30s, 500ms, 2m)");
+        bad(
+            "around(2s, -5s, /x/)",
+            11,
+            "the window ends before it starts: around(B, A, …) runs from B before the line to A after it, so A \
+             can't be below -B",
+        );
     }
 
     #[test]

@@ -170,7 +170,7 @@ carry, and keeps the values. `connection established peer=10.0.3.7` and
 values that repeat is a **state**, shown with its values (most lines
 first), while a part with many (users, addresses, numbers) shows as `<*>`.
 
-How: values holding a digit (numbers, hex, times, addresses) are masked
+How (in full: [How patterns work](patterns.md)): values holding a digit (numbers, hex, times, addresses) are masked
 first; messages of the same length, first word and fields (DLT `apid`,
 `ctid`, …) that are alike enough join a template, the words where they
 differ becoming slots; a message differing from a template in two words or
@@ -203,7 +203,7 @@ first.
 |---|---|
 | `--in FILTER` | only the lines an NFD filter keeps |
 | `--rare` | the rarest patterns first: the odd message out |
-| `--values` | also each slot's values: lines, first and last line |
+| `--values` | also each slot's values: lines, first and last line (read from the lines themselves where two of a message's templates differed; `(not read)`: lines whose value couldn't be read, never compared) |
 | `--queries` | also each pattern's NFD query, to `filter` its lines |
 | `-l, --lines N` | also each pattern's first N lines with their numbers (`0`: all) |
 | `-n, --top N` | print at most N patterns (default 30; `0`: all) |
@@ -223,8 +223,11 @@ nerka patterns -n 5 --lines 3 app.log
 nerka patterns --rule 'apid == PWR: apart voltage= undervoltage' --set new-slots=2 trace.dlt
 ```
 
-Non-verbose DLT messages without a [FIBEX](formats.md) have no text to
-group, only their bytes. Lines that hardly repeat (a binary file read as
+Non-verbose DLT messages without a [FIBEX](formats.md) have no text,
+only their id and bytes (`[1001] 0a ff 3c …`): they are grouped by their
+message id (`mid`, shown with the pattern), the bytes one value, so each
+message is a pattern (`mid=1001 [<*>] <*>`). With a FIBEX they are text
+like any other. Lines that hardly repeat (a binary file read as
 text) don't each become a pattern: past a few thousand, the rest of a
 length go into one, marked *not sorted*. Messages longer than 64 words are
 grouped by their first 63, the rest shown as `…`.
@@ -259,6 +262,7 @@ ctid == TCP: no-merge
 *: header INFO: WARN: ERROR:
 *: ignore /heartbeat/
 ctid == TCP: set similarity 0.7
+*: prefix /\[[^\]]*\] \[(?<uart>\w+):\w+\] /
 ```
 
 The header settings: lines of a context held back per chunk (`sample`),
@@ -275,8 +279,10 @@ state still needs a word of the message in common (`door {open|closed}`).
 `lone-word off` joins them, the word in a slot: fewer patterns.
 
 A rule's **scope** is the fields lines are grouped by: for DLT `ecu`,
-`apid`, `ctid`, `type`, `mode` (the short text fields), for a text file
-its profile's text fields; `FIELD == VALUE`, `*` in a value for any text,
+`apid`, `ctid`, `type`, `mode`, `proto` (the short text fields), for a
+text file `profile` (the [profile](formats.md#profiles) it is read with:
+`profile == sail_log` keeps a rule to those files) and its profile's text
+fields; `FIELD == VALUE`, `*` in a value for any text,
 `"…"` for a value with spaces, joined by `AND`; `*` alone is every line. A
 field a file doesn't have is empty there.
 
@@ -291,10 +297,16 @@ field a file doesn't have is empty there.
 | `no-merge` | templates aren't aligned (stage 1 only) |
 | `ignore`, `ignore /REGEX/` | the lines (whose message the regex finds) are left out, of `compare` too |
 | `set SETTING` | a setting for these lines only: `set similarity 0.7` |
+| `prefix /REGEX/` | what the regex matches at the start of a message isn't the message: a time and a source before each line (`[00:01:02.345] [uart2:MODEM] battery 37%`). Its named groups (`(?<uart>…)`) are fields of the line: shown with the pattern, usable in a later rule's scope (`uart == uart0: ignore`), and lines of different values never share a pattern. Without names nothing is kept apart. A line the regex doesn't match stays whole, in patterns of its own |
 
 Rules are read top to bottom. Of those setting one thing (`max-slots`,
-`no-merge`, each setting of `set`) the first that applies counts; the
-others add up (two `keep` rules keep both words).
+`no-merge`, `prefix`, each setting of `set`) the first that applies counts;
+the others add up (two `keep` rules keep both words).
+
+A `prefix` rule's scope is the file's own fields (its groups come from it).
+A pattern's query puts the regex back before the message, each group's
+value written in: `raw ~ /^(?:\[[^\]]*\] \[(?:uart2):\w+\] )\s*battery…/`.
+A group named like a field of the file is left out (the field counts).
 
 ## `compare` (experimental)
 
@@ -390,7 +402,7 @@ These apply to every command:
 | `--merge` | several files: their lines sorted by time (files that know their times: DLT, captures, text with a time; ties in the order given); else one after another |
 | `--records SPEC` | read text as records: `start=/REGEX/`, `blank`, `sep=/REGEX/`, `json`, `lines` or `auto` ([Files and formats](formats.md)) |
 | `--profile NAME` | read every text file with this [profile](formats.md#profiles) (a saved one, or `default`) |
-| `--profile 'NAME: CLAUSES'` | define a profile for the run, chosen by its rules before the saved ones (repeatable) |
+| `--profile 'NAME: CLAUSES'` | define a profile for the run, chosen by its rules before the saved ones (repeatable); one with neither `name` nor `first` is forced on every text file, as `--profile NAME` would |
 | `--offset FILE=OFFSET` | move a file's times (`trace.dlt=+3h`, `app.log=-0.250s`; the file as given or its name; repeatable) |
 | `--dlt-port PORT`, `--someip-port PORT`, `--syslog-port PORT` | UDP ports of these protocols in captures (repeatable; defaults 3490, 30490, 514) |
 | `--protocol FILE` | a [protocol definition](protocol-definitions.md) (`.ksy`) |

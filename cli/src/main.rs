@@ -130,8 +130,8 @@ struct Cli {
     merge: bool,
     /// How text files are read (repeatable): `NAME` forces that profile
     /// on every text file (a saved one, or `default`); `NAME: CLAUSES`
-    /// defines one for this run, chosen by its rules before the saved ones,
-    /// e.g. `'app: name *.log; time /^(?<time>\S+ \S+)/; zone local'`.
+    /// defines one for this run, chosen by its rules before the saved ones
+    /// (with neither `name` nor `first`: forced on every text file), e.g. `'app: name *.log; time /^(?<time>\S+ \S+)/; zone local'`.
     /// Clauses: name GLOBS, first /REGEX/, records SPEC, time auto|none|/REGEX/,
     /// zone utc|local|+HH:MM, numbers s|ms|us|ns|auto, signal SPEC.
     #[arg(long, global = true, value_name = "NAME|SPEC")]
@@ -1224,33 +1224,7 @@ fn checks(
             if matches!(s.verdict, Verdict::Issue(_)) {
                 issues += 1;
             }
-            if json {
-                let verdict = match &s.verdict {
-                    Verdict::Ok => "\"ok\"".to_owned(),
-                    Verdict::Issue(n) => format!("{{\"issue\": {n}}}"),
-                    Verdict::Fact(v) => format!("{{\"fact\": {}}}", v.as_deref().map_or("null".into(), js)),
-                };
-                let ev: Vec<String> = s
-                    .evidence
-                    .iter()
-                    .take(evidence.max(1))
-                    .map(|e| {
-                        let lines: Vec<String> = e.rows.iter().map(|r| (r + 1).to_string()).collect();
-                        format!("{{\"lines\": [{}], \"note\": {}}}", lines.join(", "), js(&e.note))
-                    })
-                    .collect();
-                rows.push(format!(
-                    "  {{\"check\": {}, \"kind\": {}, \"scope\": {}, \"first_line\": {}, \"end_line\": {}, \
-                     \"verdict\": {verdict}, \"times_go_back\": {}, \"evidence\": [{}]}}",
-                    js(&r.name),
-                    js(r.kind.as_str()),
-                    js(&s.scope.label),
-                    s.scope.from + 1,
-                    s.scope.to,
-                    r.times_go_back,
-                    ev.join(", ")
-                ));
-            } else {
+            if !json {
                 writeln!(out, "{}\t{}\t{}\t{shown}", r.name, r.kind.as_str(), s.scope.label)?;
                 for e in s.evidence.iter().take(evidence) {
                     let lines: Vec<String> = e.rows.iter().map(|r| (r + 1).to_string()).collect();
@@ -1259,6 +1233,11 @@ fn checks(
                     writeln!(out, "\t\t\tline {}{note}: {text}", lines.join(" -> "))?;
                 }
             }
+        }
+        if json {
+            // Built in core, as the MCP `checks` tool answers.
+            let place = |row: LineNo| nerka_core::json::Value::from(row + 1);
+            rows.extend(nerka_core::agent::check_rows(&r, evidence.max(1), &place).iter().map(|v| format!("  {v}")));
         }
     }
     if back {
@@ -1563,16 +1542,29 @@ fn profiles(given: &[String], forced: &mut Option<String>) -> Result<nerka_core:
     for e in errors {
         eprintln!("nerka: profiles: {e}");
     }
+    // A definition with no `name` or `first` would never be chosen: given
+    // here, it is meant for these files, so it is forced, as its NAME would be.
+    let mut names: Vec<String> = Vec::new();
     for spec in given.iter().rev() {
         if spec.contains(':') {
             let p = Profile::parse_spec(spec).map_err(|e| {
                 anyhow::anyhow!("--profile: {}\n  {spec}\n  {}^", e.msg, " ".repeat(e.column(spec) - 1))
             })?;
+            if !p.matches_by_itself() {
+                names.insert(0, p.name().to_owned());
+            }
             ps.put_first(p);
         }
     }
-    for name in given.iter().filter(|s| !s.contains(':')) {
-        let name = name.trim();
+    names.extend(given.iter().filter(|s| !s.contains(':')).map(|s| s.trim().to_owned()));
+    let mut seen: Vec<String> = Vec::new();
+    names.retain(|n| {
+        let fresh = !seen.iter().any(|s| s.eq_ignore_ascii_case(n));
+        seen.push(n.clone());
+        fresh
+    });
+    for name in &names {
+        let name = name.as_str();
         if ps.get(name).is_none() && !name.eq_ignore_ascii_case(DEFAULT) {
             let known: Vec<&str> = ps.iter().map(|p| p.name()).collect();
             anyhow::bail!(

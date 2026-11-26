@@ -110,10 +110,18 @@ configuration (a rule made in the pane too), never only for the session.
 | `no-merge` | stage 2 doesn't merge templates there |
 | `ignore` | lines there are left out of patterns and compares (`apid == GPS: ignore`; `*: ignore /heartbeat/` for messages matching) |
 | `set KEY VALUE` | a setting for that scope only (`ctid == TCP: set similarity 0.7`) |
+| `prefix /REGEX/` | (owner, 2026-11-26) what it matches at a message's start isn't the message (a time and a UART before each text line); its named groups are fields of the line, as `apid`: a tuning rule for any source, not a profile's fields (profiles stay without fields, 2026-11-11) |
 
 Rules are read top to bottom. Of those setting one thing (`max-slots`,
-`no-merge`, each setting of `set`) the first that applies counts; the
-others add up (two `keep` rules keep both words).
+`no-merge`, `prefix`, each setting of `set`) the first that applies counts;
+the others add up (two `keep` rules keep both words).
+
+`prefix` as built (2026-11-26): the source's fields choose the rule; the
+matched text is cut before tokenising, its groups and the rule that cut
+(a hidden field) join the context, so cut and uncut lines never share a
+pattern, and later rules can be scoped by a group (`ignore` sees the cut
+message). A pattern's query puts the regex back, anchored, each group of
+one value pinned to it (groups aren't NFD fields).
 
 As built (2026-11-24): `keep` and `apart` words never become or join a
 wildcard in stage 1 (a token holding one), and stage 2 refuses a merge
@@ -330,6 +338,36 @@ them:
 - **Later:** `state-values` (2–16) to be tuned; ⋮ "At most N slots"
   proposing one less; "Why" explaining stage 2 only; pooling rare contexts
   up to 256 K lines.
+- **Chunks of 256 K lines** (owner, 2026-11-26): stage 1 runs per chunk,
+  and its templates depend on a chunk's lines, so a message could be cut
+  differently on each side of a chunk's end. Measured: `big.dlt`,
+  `big.log`, HDFS the same results and time; LogHub OpenStack's leftover
+  Compare row (727, a pattern split at line 65 553) gone; BGL (one context, 1 100 templates)
+  3.8 → 5.3 s; 1 M chunks too slow (BGL 21.5 s). Default 256 K.
+- **Planned: a `chunk` setting** (owner, 2026-11-26): `chunk 256K` in the
+  configuration, `--set chunk=64K` for a run, a field in 🛠 Tuning
+  ("larger: a file splits less; a log of many kinds of messages in one
+  context gets slower"). Global only: the file is cut into chunks before
+  any context is known, so a `set chunk` rule is refused with why. Sizes
+  64 K–4 M, with `K`/`M`. Older nerka versions reject the key (an unknown
+  key is an error), so a configuration or bundle holding it doesn't read
+  there; the default writes nothing. Test: the setting parsed and
+  refused in a rule; patterns at 64 K and 256 K the same on a file under
+  64 K lines.
+- **Non-verbose DLT by message id** (owner, 2026-11-26): without a FIBEX
+  a non-verbose message is `[id] bytes`; the id was masked and each byte
+  without a digit a word, so nearly every message was a template, and
+  stage 2 spent its time aligning byte strings (`nv.dlt` below).
+  Now a field may name the message's kind (`FieldDef::names_message`,
+  DLT `mid`), the engine groups by it as by `apid`, and a run of hex
+  bytes (3 or more, one with a letter) is one value
+  (`BYTES`, its regex the bytes). `nv.dlt` (4.3 M lines, 70 %
+  non-verbose): 3 531 patterns, 1.85 s → 288, 0.37 s; with its FIBEX
+  592 → 163 (one per message, `{OFF|ON}` a state). `big.dlt`'s
+  generator draws 1 000 random ids per ECU and random lengths of
+  ascending bytes (`00 01 02`, no letter: numbers): 701 → 65 547
+  patterns, 1.2 → 2.7 s. A leading zero as a sign of bytes was tried
+  and dropped: `01 02 03` in text logs are numbers.
 - **A lifecycle side** (2026-11-24): every line during it by default, *its
   lines only* a checkbox (its lines rule), in Compare and the Patterns
   window; ▾ during in the Signals panel.
@@ -352,7 +390,12 @@ them:
   the same message in two patterns as a state's value and a slot (BGL
   `data storage interrupt`, 1.9 %), templates of slots only (`<*> <*> <*>
   <*>`) taking any line of their length, and stage 1 splitting a message by
-  the number of words in a value.
+  the number of words in a value. A slot stage 2 made held each
+  template's cut of its messages, which two templates could cut apart
+  differently (LogHub OpenStack: a "value" changed at line 65 536, a chunk's
+  end, and ranked first in Compare): such slots are now read from their
+  lines (2026-11-26). Which pattern a line joins can still depend on the
+  order lines come in (Drain).
 - Compare's Only / Ignore wanted in Patterns too, on top of its Lines
   selector: built.
 - Compare rows: their buttons at the right are far from a short text (no

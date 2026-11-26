@@ -122,7 +122,8 @@ as slots, and states with their values (`gear={D|P|N}`), as
 until **▶ Run**, and a result stays until the next run; it says **Out of
 date** when the file was read again, other lines or another field are
 chosen, or the [pattern configuration](cli.md#the-pattern-configuration)
-or the signals changed.
+or the signals changed. How lines become patterns, and what a result can
+and can't tell: [How patterns work](patterns.md).
 
 ![the Patterns window on a demo drive: 9,844 lines as 16 patterns, each with its share, its count, its context (ECU, application, context) and its template, slots as <*> and states with their values ({D|P|N}); the rare ones last: a panic, a service not responding, a shutdown](img/patterns.png)
 
@@ -191,10 +192,15 @@ configuration](cli.md#the-pattern-configuration) on the lines at hand:
   joined and split (**Show** lists them).
 - **Rules**, one per line, read top to bottom (▲ ▼ to move, − to remove);
   a rule that doesn't read says why. **➕** makes one from the scope fields
-  (`apid`, `ctid`, …; empty: any), an action and its argument. In 🧩
-  Patterns, **⋮** on a row fills it from that pattern: leave it out, at
-  most so many slots here, keep a slot's values apart, keep a value out of
-  slots.
+  (`apid`, `ctid`, …; empty: any), an action and its argument. The scope
+  starts with the kind of file tuned: its [profile](formats.md#profiles)
+  for text (`profile == sail_log`), its protocol for DLT or a capture of
+  one (`proto == DLT`), so a rule made on one kind of file leaves the
+  others alone; empty that field to widen it (a file of another kind has
+  no such field, or another value: the rule never applies there). In 🧩
+  Patterns, **⋮** on a row fills it from that pattern (keeping the kind):
+  leave it out, at most so many slots here, keep a slot's values apart,
+  keep a value out of slots.
 - **Last run:** templates and patterns, and the templates kept apart by
   two new slots, a long side, or a rule.
 - **Why:** tick **?** on two rows in 🧩 Patterns: where they differ, the

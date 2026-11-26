@@ -242,6 +242,10 @@ pub struct Output {
     pub save_to_pack: Option<String>,
     /// Drop the options this tab chose for a signal: the pack's again.
     pub reset_options: Option<String>,
+    /// An agent's signal the user keeps: saved, theirs from now on.
+    pub keep: Option<String>,
+    /// An agent's signal taken off this tab.
+    pub drop_agent: Option<String>,
     /// Go to this line (the event that set a state was clicked).
     pub goto: Option<LineNo>,
     /// Filter by this NFD (a lifecycle's "filter to it").
@@ -330,6 +334,9 @@ pub struct Input<'a> {
     /// Per signal, what of the same name it hides (a profile's signal
     /// behind a saved one, a query's group behind a profile's…).
     pub hidden: &'a HashMap<String, Vec<String>>,
+    /// Signals an agent defined on this tab (add_signal): kept or dropped
+    /// here.
+    pub agent: &'a [SignalDef],
 }
 
 pub fn signals_panel(ui: &mut egui::Ui, st: &mut SignalsUi, input: Input<'_>) -> Output {
@@ -351,6 +358,7 @@ pub fn signals_panel(ui: &mut egui::Ui, st: &mut SignalsUi, input: Input<'_>) ->
         pack_options,
         conflicts,
         hidden,
+        agent,
     } = input;
     let lifecycles: Vec<&str> = signals.iter().filter(|d| d.as_lifecycle().is_some()).map(|d| d.name()).collect();
     let mut out = Output::default();
@@ -390,7 +398,7 @@ pub fn signals_panel(ui: &mut egui::Ui, st: &mut SignalsUi, input: Input<'_>) ->
             }
             // The value column gets the room the other columns leave
             // (owner, 2026-10-28: a fixed cut wasted a wide panel).
-            let (name_fit, fit) = value_room(ui, signals, chosen, conflicts);
+            let (name_fit, fit) = value_room(ui, signals, chosen, conflicts, agent);
             let mut remove = None;
             let mut switch: Option<(String, bool)> = None;
             let mut remove_arg: Option<String> = None;
@@ -560,6 +568,25 @@ pub fn signals_panel(ui: &mut egui::Ui, st: &mut SignalsUi, input: Input<'_>) ->
                         if ui.link(RichText::new(label).weak()).on_hover_text(tip).clicked() {
                             out.open_profiles = true;
                         }
+                    } else if is_agents(agent, d) {
+                        // An agent's (add_signal): this tab's until kept.
+                        ui.horizontal(|ui| {
+                            ui.label("🤖").on_hover_text(format!(
+                                "Defined by an agent, on this tab only, not saved:
+{}",
+                                d.spec()
+                            ));
+                            if ui
+                                .small_button("Keep")
+                                .on_hover_text("Save it with your signals: every tab has it, as one of yours")
+                                .clicked()
+                            {
+                                out.keep = Some(d.name().to_owned());
+                            }
+                            if ui.small_button("−").on_hover_text("Take it off this tab").clicked() {
+                                out.drop_agent = Some(d.name().to_owned());
+                            }
+                        });
                     } else if d.queries().is_empty() {
                         ui.horizontal(|ui| {
                             let mut on = true;
@@ -1183,6 +1210,12 @@ Click: the Checks pane",
 /// What follows a value in its cell (`  • event`, `  ↑ 12345`), in characters.
 const SUFFIX: usize = 10;
 
+/// `d` is a signal an agent defined on this tab (and not one of the same
+/// name that hides it).
+fn is_agents(agent: &[SignalDef], d: &SignalDef) -> bool {
+    agent.iter().any(|a| a.name() == d.name() && a.spec() == d.spec())
+}
+
 /// How many characters fit in the list's name and value columns: the
 /// panel's width less the other columns (the last as wide as its widest
 /// row's buttons). Names take up to 32 characters, values at least 8; in a
@@ -1194,6 +1227,7 @@ fn value_room(
     signals: &Signals,
     chosen: &HashMap<String, SignalOptions>,
     conflicts: &HashMap<String, Vec<(String, SignalOptions)>>,
+    agent: &[SignalDef],
 ) -> (usize, usize) {
     let mono = egui::TextStyle::Monospace.resolve(ui.style());
     let body = egui::TextStyle::Body.resolve(ui.style());
@@ -1211,6 +1245,8 @@ fn value_room(
                 label("built in")
             } else if !d.profiles().is_empty() {
                 label(&format!("profile {}", d.profiles().join(", ")))
+            } else if is_agents(agent, d) {
+                label("🤖") + button("Keep") + button("−")
             } else if d.queries().is_empty() {
                 button("☐") + button("✎") + button("−")
             } else if d.argument_index().is_some() {
@@ -1822,7 +1858,7 @@ query drops(cam)
             let mut fit = (0, 0);
             let none = HashMap::new();
             let mut out = ctx.run_ui(egui::RawInput { screen_rect: Some(screen), ..Default::default() }, |ui| {
-                egui::CentralPanel::default().show(ui, |ui| fit = value_room(ui, sig, &none, &HashMap::new()));
+                egui::CentralPanel::default().show(ui, |ui| fit = value_room(ui, sig, &none, &HashMap::new(), &[]));
             });
             out.textures_delta.clear();
             fit

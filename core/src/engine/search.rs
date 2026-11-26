@@ -432,6 +432,12 @@ pub(crate) mod tests {
         assert_eq!(q("around(20s, 1s, /crash/)"), [1, 2, 3, 5, 7]);
         assert_eq!(q("around(40s, 1s, /crash/)"), [0, 1, 2, 3, 5, 6, 7]);
         assert_eq!(q("before(1m, /panic/) AND /speed/"), [1, 2, 6]);
+        // Windows apart from the line (a negative side): 10 to 5 s before
+        // each crash, 1 to 10 s after; overlapping ones still merge.
+        assert_eq!(q("around(10s, -5s, /crash/)"), [2]);
+        assert_eq!(q("around(-1s, 10s, /crash/)"), [5, 6]);
+        assert_eq!(q("around(30s, -20s, /crash/)"), [0, 1, 6]);
+        assert_eq!(q("around(50s, -5s, /crash/)"), [0, 1, 2, 3, 5, 6]);
         // Nested, and with the rest of the language.
         assert_eq!(q("after(1s, before(5s, /crash: w/))"), [2, 3, 5]);
         assert_eq!(q("before(0s, /nothing/)"), Vec::<LineNo>::new());

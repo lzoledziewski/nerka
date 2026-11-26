@@ -90,7 +90,13 @@ enum Client {
 }
 
 fn client(command: &str) -> Client {
-    let first = command.split_whitespace().next().unwrap_or_default();
+    // The program: a quoted path (spaces and all, as [`with_program`]
+    // writes it) or the first word.
+    let command = command.trim_start();
+    let first = match command.strip_prefix('"') {
+        Some(quoted) => quoted.split('"').next().unwrap_or_default(),
+        None => command.split_whitespace().next().unwrap_or_default(),
+    };
     let name = Path::new(first).file_stem().and_then(|s| s.to_str()).unwrap_or_default();
     match name.to_ascii_lowercase().as_str() {
         "claude" => Client::Claude,
@@ -133,18 +139,28 @@ pub fn open(dir: &Path, command: &str) -> Result<(), String> {
         return Err("no AI command: set one in Settings → AI command (e.g. claude)".into());
     }
     let program = command.split_whitespace().next().unwrap_or_default();
-    if find_program(program).is_none() {
+    let Some(found) = find_program(program) else {
         return Err(format!(
             "'{program}' isn't installed (not on PATH): {}; or choose another in ⚙ Settings → AI command",
             install_hint(Path::new(program).file_stem().and_then(|s| s.to_str()).unwrap_or(program))
         ));
-    }
+    };
     let cfg = match client(command) {
         Client::Other => None,
         c => mcp_config_file(c),
     };
-    let inner = inner_command(command, std::process::id(), cfg.as_deref(), cfg!(windows));
+    let command = with_program(command, &found);
+    let inner = inner_command(&command, std::process::id(), cfg.as_deref(), cfg!(windows));
     launch(dir, &inner)
+}
+
+/// `command` with its program as found, quoted: the terminal's shell may
+/// not have the folder it was found in on its PATH (`~/.local/bin` on a
+/// Linux login that had none yet: "sh: 1: claude: not found").
+fn with_program(command: &str, found: &Path) -> String {
+    let command = command.trim();
+    let rest = command.find(char::is_whitespace).map_or("", |i| &command[i..]);
+    format!("\"{}\"{rest}", found.display())
 }
 
 #[cfg(windows)]
@@ -219,6 +235,19 @@ mod tests {
         assert_eq!(inner_command("gemini", 7, None, false), "export NERKA_WINDOW=7; gemini; exec \"${SHELL:-sh}\"");
         assert_eq!(client("/usr/local/bin/claude --model x"), Client::Claude);
         assert_eq!((client("Claude.exe"), client("claudette")), (Client::Claude, Client::Other));
+        // The program runs as found, quoted, and is still known by its name.
+        let found = Path::new("/home/u/.local/bin/claude");
+        let cmd = with_program(" claude --model x ", found);
+        assert_eq!(cmd, "\"/home/u/.local/bin/claude\" --model x");
+        assert_eq!(client(&cmd), Client::Claude);
+        assert_eq!(with_program("claude", found), "\"/home/u/.local/bin/claude\"");
+        let spaced = with_program("copilot", Path::new("C:\\Users\\A B\\AppData\\Roaming\\npm\\copilot.cmd"));
+        assert_eq!(client(&spaced), Client::Copilot);
+        assert_eq!(
+            inner_command(&cmd, 7, Some(Path::new("/c/mcp.json")), false),
+            "export NERKA_WINDOW=7; \"/home/u/.local/bin/claude\" --model x --mcp-config \"/c/mcp.json\"; exec \
+             \"${SHELL:-sh}\""
+        );
         // Copilot: its own flag, the file prefixed with @.
         assert_eq!(
             inner_command("copilot", 42, Some(Path::new("C:\\n\\mcp-copilot.json")), true),

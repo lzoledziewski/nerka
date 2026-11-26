@@ -95,7 +95,7 @@ const LONE_WORD: Help = Help {
 };
 
 /// The rule form's actions.
-const ACTIONS: [(&str, &str); 9] = [
+const ACTIONS: [(&str, &str); 10] = [
     ("keep", "WORD… never in a slot"),
     ("apart", "WORD WORD… never in one slot"),
     ("max-slots", "N: slots a pattern has at most"),
@@ -105,6 +105,7 @@ const ACTIONS: [(&str, &str); 9] = [
     ("ignore", "[/REGEX/]: lines left out"),
     ("no-merge", "stage 1 only"),
     ("set", "SETTING VALUE for these lines"),
+    ("prefix", "/REGEX/: not the message, at its start; (?<name>…): a field"),
 ];
 
 /// What a change of settings did to the patterns.
@@ -200,6 +201,11 @@ pub struct Form {
     pub scope: Vec<(String, String)>,
     pub action: usize,
     pub arg: String,
+    /// The tuned tab's kind (`profile == sail_log`, `proto == DLT`:
+    /// [`pattern::kind_scope`]): what the scope starts with, and keeps where
+    /// a pattern gives no value, so a rule made on one kind of file isn't
+    /// applied to others unless widened.
+    pub kind: Vec<(String, String)>,
 }
 
 impl Form {
@@ -222,10 +228,23 @@ impl Form {
         format!("{scope}: {} {}", ACTIONS[self.action].0, self.arg.trim()).trim_end().to_owned()
     }
 
-    /// Filled for `action` with `arg`, scoped by `fields` (of a pattern).
+    /// The scope's fields `fields`, for a tab of `kind`: on another tab's
+    /// fields or kind, the scope starts again from the kind.
+    pub fn scope_for(&mut self, fields: &[String], kind: &[(String, String)]) {
+        if self.scope.iter().map(|(n, _)| n).ne(fields.iter()) || self.kind != kind {
+            self.kind = kind.to_vec();
+            self.scope = fields
+                .iter()
+                .map(|f| (f.clone(), kind.iter().find(|(n, _)| n == f).map(|(_, v)| v.clone()).unwrap_or_default()))
+                .collect();
+        }
+    }
+
+    /// Filled for `action` with `arg`, scoped by `fields` (of a pattern),
+    /// else by the tab's kind.
     pub fn fill(&mut self, fields: &[(String, String)], action: &str, arg: String) {
         for (n, v) in &mut self.scope {
-            *v = fields.iter().find(|(m, _)| m == n).map(|(_, w)| w.clone()).unwrap_or_default();
+            *v = fields.iter().chain(&self.kind).find(|(m, _)| m == n).map(|(_, w)| w.clone()).unwrap_or_default();
         }
         self.action = ACTIONS.iter().position(|(a, _)| *a == action).unwrap_or(0);
         self.arg = arg;
@@ -317,12 +336,13 @@ impl TuningUi {
         self.rules_changed();
     }
 
-    /// The pane. `fields`: the context fields rules are scoped by;
-    /// `last`: the last run.
+    /// The pane. `fields`: the context fields rules are scoped by; `kind`:
+    /// the tab's kind ([`Form::kind`]); `last`: the last run.
     pub fn ui(
         &mut self,
         ui: &mut egui::Ui,
         fields: &[String],
+        kind: &[(String, String)],
         last: Option<&Patterns>,
         load: fn() -> Result<PatternConfig, String>,
     ) {
@@ -330,9 +350,7 @@ impl TuningUi {
             self.load(load());
             self.edited = None;
         }
-        if self.form.scope.iter().map(|(n, _)| n).ne(fields.iter()) {
-            self.form.scope = fields.iter().map(|f| (f.clone(), String::new())).collect();
-        }
+        self.form.scope_for(fields, kind);
         ui.horizontal(|ui| {
             let path = PatternConfig::saved_path().map(|p| p.display().to_string()).unwrap_or_default();
             let state = if self.changed { "changed, not saved" } else { "as saved" };
@@ -755,5 +773,27 @@ mod tests {
         f.fill(&[("ctid".into(), "a b".into())], "no-merge", String::new());
         assert_eq!(f.rule(), "ctid == \"a b\": no-merge");
         assert!(PatternConfig::default().add_rule(&f.rule()).is_ok());
+    }
+
+    /// A rule starts scoped to the tuned tab's kind (its profile, its
+    /// protocol), and keeps it where a pattern gives no value; another
+    /// tab's kind starts the scope again.
+    #[test]
+    fn a_rule_starts_scoped_to_the_files_kind() {
+        let mut f = Form::default();
+        let text = [("profile".to_owned(), "sail_log".to_owned())];
+        f.scope_for(&["profile".into()], &text);
+        assert_eq!(f.rule(), "profile == sail_log: keep");
+        f.scope[0].1.clear();
+        f.scope_for(&["profile".into()], &text);
+        assert_eq!(f.rule(), "*: keep", "widened by the user, kept");
+        f.fill(&[], "prefix", "/x /".into());
+        assert_eq!(f.rule(), "profile == sail_log: prefix /x /");
+        let fields: Vec<String> = ["ecu", "apid", "proto"].map(String::from).to_vec();
+        f.scope_for(&fields, &[("proto".into(), "DLT".into())]);
+        f.fill(&[("apid".into(), "NAV".into())], "keep", "Elapsed".into());
+        assert_eq!(f.rule(), "apid == NAV AND proto == DLT: keep Elapsed");
+        f.scope_for(&fields, &[]);
+        assert_eq!(f.scope.iter().filter(|(_, v)| !v.is_empty()).count(), 0, "a capture of several protocols: any");
     }
 }

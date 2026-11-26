@@ -94,6 +94,11 @@ merges their events; if they give it different options, its row shows ⚠
 (hover: who gives what), the first picked query's options are used, and
 💾 writes them into all of them so they agree.
 
+A signal an [agent](agents.md) defined shows 🤖: it stays with its file
+(back whenever the file is opened), not among your saved signals. **Keep**
+saves it with yours (every tab has it from then on, ✎ and the checkbox as
+for your others); **−** takes it off and forgets it.
+
 **Filters first:** once a file is read, its signals' events, lifecycles,
 checks and plot lanes are worked out in the background. An open, a filter
 or a search goes first: the background work waits while one runs and only
@@ -103,8 +108,8 @@ while it works, also on a slow disk or a network share.
 **One name, several sources:** a name has one signal. Yours (saved, or
 `--signal`) win over the file's own `@time`, a
 [profile's](formats.md#profiles) over a FIBEX argument's, and those over a
-query's group. The one that wins shows ⚠ after its name; the hover says
-what it hides.
+query's group, and all of them over an agent's. The one that wins shows ⚠
+after its name; the hover says what it hides.
 
 ## Plots
 

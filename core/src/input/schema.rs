@@ -68,7 +68,7 @@ impl SchemaMap {
                     }
                     Some(_) => {}
                     None => {
-                        schema.push(FieldDef { name: Cow::Owned(name), kind: d.kind, costly: d.costly });
+                        schema.push(FieldDef { name: Cow::Owned(name), ..d.clone() });
                         from.push(vec![source]);
                     }
                 }

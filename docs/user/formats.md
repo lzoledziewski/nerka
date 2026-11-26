@@ -85,7 +85,8 @@ remembered for the file; CLI `--profile NAME`), else the first whose `name`
 matches (and whose `first` matches too, if it has one), else the first
 whose `first` alone matches, else the **default**: a profile of yours named
 `default`, or the built-in one (`time auto`). A profile with neither `name`
-nor `first` is used only when forced. A split chosen in **Records…** wins
+nor `first` is used only when forced (given on the command line, it is:
+`--profile 'os: time /^\S+ (?<time>\S+ \S+)/'` reads every text file with it). A split chosen in **Records…** wins
 over the profile's `records`.
 
 GUI: ⚙ Settings → **Profiles…** (kept in `profiles` in the configuration

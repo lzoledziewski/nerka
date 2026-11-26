@@ -70,7 +70,9 @@ number in its file) to read a range without the noise in it.
 
 `open --json` says so in `hints`. Without times, `--before` / `--after`
 can't work: read around a line with `lines FILE FROM TO` (the line numbers
-come from `filter` or `search`).
+come from `filter` or `search`). When the time is there but not first (a
+file name or a label before it), the hint gives the profile that reads it:
+`--profile 'timed: time /REGEX with (?<time>…)/'` on every command.
 
 A **stack dump** (Go's goroutines, Java's exceptions) reads best as
 records, a goroutine or an exception each: then `filter` gives whole
