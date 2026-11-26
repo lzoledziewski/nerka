@@ -2,6 +2,14 @@
 
 The dated log of the project, newest first; append-only: add an entry at the top when `status.md` changes. Moved from `status.md` on 2026-11-10, word for word: its "Last update" line (each update with the ones before it) and its "Next steps" as they stood then, which tell what was built when and why. Where the moved text says "above", "below" or "this file", it means the old `status.md`: its sections are now `status.md` (state, pending decisions, limitations, licensing), `gui-decisions.md`, `features.md` and `history.md`.
 
+## 2026-11-27
+
+0.3.1 prepared (a release; PR, merge and tag `v0.3.1` once CI is green):
+what 2026-11-26 lists after 0.3.0. Verified: the review gate `--full`
+on Windows (its `cargo doc` failure, three doc links, fixed), fmt, clippy
+and the tests in the Linux VM (a test of a Windows path failing there,
+fixed).
+
 ## 2026-11-26
 
 After 0.3.0, on branch `claude/status-messages`:
