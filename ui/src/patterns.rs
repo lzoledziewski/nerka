@@ -155,12 +155,18 @@ pub(crate) fn lit_row<R>(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui) -> R
     row.inner
 }
 
+/// A tab's kind: fields and their one value ([`pattern::kind_scope`]).
+type Kind = Vec<(String, String)>;
+
 /// A tab's Patterns window and its last result.
 pub struct PatternsUi {
     pub open: bool,
     pub mode: Mode,
     pub compare: CompareUi,
     pub tuning: TuningUi,
+    /// The tab's kind for the tuning pane's rules ([`pattern::kind_scope`]),
+    /// by (tab, lines): read once, not each frame.
+    kind: Option<((u64, u64), Kind)>,
     /// Patterns (their index in the result) picked for "why apart", and
     /// the explanation of the two.
     why: Vec<usize>,
@@ -202,6 +208,7 @@ impl Default for PatternsUi {
             mode: Mode::Patterns,
             compare: CompareUi::default(),
             tuning: TuningUi::default(),
+            kind: None,
             why: Vec::new(),
             why_text: None,
             id: NEXT.fetch_add(1, Ordering::Relaxed),
@@ -531,16 +538,28 @@ impl PatternsUi {
             self.mode = Mode::Patterns;
         }
         if self.mode == Mode::Tuning {
+            // The context fields a rule's scope can name (as the engine's:
+            // not `file`, a configuration outlives a file's name).
             let fields: Vec<String> = input
                 .tab
                 .file
                 .schema()
                 .iter()
-                .filter(|d| !d.costly && matches!(d.kind, nerka_core::FieldKind::Str | nerka_core::FieldKind::Name))
+                .filter(|d| {
+                    !d.costly
+                        && (matches!(d.kind, nerka_core::FieldKind::Str | nerka_core::FieldKind::Name)
+                            || d.names_message)
+                })
+                .filter(|d| d.name != "file")
                 .map(|d| d.name.to_string())
                 .collect();
+            let key = (input.tab.id, input.tab.file.line_count());
+            if self.kind.as_ref().is_none_or(|(k, _)| *k != key) {
+                self.kind = Some((key, pattern::kind_scope(&*input.tab.file)));
+            }
+            let kind = self.kind.as_ref().map(|(_, k)| k.as_slice()).unwrap_or_default();
             let last = self.run.as_ref().map(|r| &r.patterns);
-            self.tuning.ui(ui, &fields, last, input.config);
+            self.tuning.ui(ui, &fields, kind, last, input.config);
             return;
         }
         ui.separator();

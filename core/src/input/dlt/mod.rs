@@ -70,7 +70,7 @@ const SCHEMA: &[FieldDef] = &[
     // session id
     FieldDef::new("seid", FieldKind::U64, false),
     // message id of non-verbose messages (none on verbose ones: 0 is a valid id)
-    FieldDef::new("mid", FieldKind::U64, false),
+    FieldDef::new("mid", FieldKind::U64, false).naming(),
     // verbose, non-verbose
     FieldDef::new("mode", FieldKind::Str, false),
     // the decoded payload, i.e. the `payload` column

@@ -74,6 +74,18 @@ pub enum Undo {
         paths: Vec<PathBuf>,
         before: Vec<(PathBuf, RecordSplit)>,
     },
+    /// A signal it defined (`add_signal`): taken off the tab, unless the
+    /// user kept it (then theirs).
+    Signal {
+        paths: Vec<PathBuf>,
+        name: String,
+    },
+    /// A signal of its own it removed (`remove_signal`): back on the tab,
+    /// unless a signal of its name came since.
+    SignalBack {
+        paths: Vec<PathBuf>,
+        def: Box<nerka_core::SignalDef>,
+    },
 }
 
 /// Answers are bounded (an agent's context is small); the owner
@@ -109,12 +121,15 @@ const ARGS: &[(&str, &[&str])] = &[
     ("compare", &["tab", "a", "b", "in", "top", "min_score", "show", "rows", "queries", "in_view", "field"]),
     ("signals", &["tab"]),
     ("signal", &["tab", "name", "file", "from", "to", "points"]),
-    ("lifecycles", &["tab", "name"]),
+    ("lifecycles", &["tab", "name", "max", "skip"]),
+    ("checks", &["tab", "name", "evidence", "max", "skip"]),
     ("show", &["tab", "file", "line"]),
     ("set_filter", &["tab", "query"]),
     ("set_search", &["tab", "query"]),
     ("set_records", &["tab", "records"]),
     ("bookmark", &["tab", "file", "line", "note", "name", "by"]),
+    ("add_signal", &["tab", "signal"]),
+    ("remove_signal", &["tab", "name"]),
     ("plot", &["tab", "signals", "only"]),
     ("screenshot", &["of"]),
 ];
@@ -430,14 +445,23 @@ fn read(tool: &str, args: &Value, s: &Snap) -> Result<Value, String> {
         "lifecycles" => {
             let want = str_arg(args, "name");
             let mut out = Vec::new();
+            // One that can't be read here (a saved lifecycle by a field this
+            // file hasn't) says so in its place: the others still answer.
+            // Runs a page at a time per lifecycle: one per entity (a VM, a
+            // request) can make hundreds.
+            let (skip, max) = (num_arg(args, "skip", 0) as usize, num_arg(args, "max", 50).min(s.limits.most) as usize);
             for def in s.signals.lifecycles().filter(|d| want.is_none_or(|w| d.name().eq_ignore_ascii_case(w))) {
-                let l = def.lifecycles(&*s.source, &progress).map_err(|e| e.to_string())?;
-                out.push(ca::lifecycles(def.name(), &l, &view));
+                out.push(match def.lifecycles(&*s.source, &progress) {
+                    Ok(l) => ca::lifecycles(def.name(), &l, &view, skip, max),
+                    Err(e) => Value::object([("name", Value::from(def.name())), ("error", e.to_string().into())]),
+                });
             }
             if out.is_empty() {
                 return Err(match want {
                     Some(w) => format!("no lifecycle '{w}' in this tab"),
-                    None => "this tab has no lifecycles (the user defines them: 🔄 in the Signals panel)".into(),
+                    None => {
+                        "this tab has no lifecycles (define one: add_signal with `lifecycle NAME: start RULE`)".into()
+                    }
                 });
             }
             Ok(Value::object([("lifecycles", Value::Array(out))]))
@@ -461,6 +485,55 @@ fn pattern_options(args: &Value, lines: bool) -> Result<PatternOptions, String> 
     Ok(PatternOptions { field: str_arg(args, "field").map(str::to_owned), lines, config })
 }
 
+/// Where an agent's signals are remembered per file (owner, 2026-11-26:
+/// back on every open, as its annotations are): `<config>/nerka/agent-signals`,
+/// `spec<TAB>path` a line, as `records` is but a file of its own, so an
+/// older nerka's `records` reads as it did. Tests use their own file.
+fn memo_path() -> Option<PathBuf> {
+    #[cfg(test)]
+    return TEST_MEMO.with(|m| m.borrow().clone());
+    #[cfg(not(test))]
+    nerka_core::config_dir().map(|d| d.join("agent-signals"))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A test's memo file (none: nothing remembered).
+    pub(crate) static TEST_MEMO: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
+}
+
+fn read_memo() -> Vec<(PathBuf, String)> {
+    let text = memo_path().and_then(|p| std::fs::read_to_string(p).ok()).unwrap_or_default();
+    text.lines().filter_map(|l| l.split_once('\t')).map(|(spec, path)| (PathBuf::from(path), spec.to_owned())).collect()
+}
+
+/// The signals agents defined on `paths` (on any of them; one of a name).
+pub(crate) fn remembered_signals(paths: &[PathBuf]) -> Vec<nerka_core::SignalDef> {
+    let mut out: Vec<nerka_core::SignalDef> = Vec::new();
+    for (_, spec) in read_memo().into_iter().filter(|(p, _)| paths.contains(p)) {
+        if let Ok(d) = nerka_core::SignalDef::parse_spec(&spec)
+            && !out.iter().any(|o| o.name() == d.name())
+        {
+            out.push(d);
+        }
+    }
+    out
+}
+
+/// Remember `signals` as the agents' on each of `paths`, in place of what
+/// was remembered for them.
+pub(crate) fn remember_signals(paths: &[PathBuf], signals: &[nerka_core::SignalDef]) -> std::io::Result<()> {
+    let Some(file) = memo_path() else { return Ok(()) };
+    let mut memo: Vec<(PathBuf, String)> = read_memo().into_iter().filter(|(p, _)| !paths.contains(p)).collect();
+    for p in paths {
+        memo.extend(signals.iter().map(|d| (p.clone(), d.spec())));
+    }
+    if let Some(dir) = file.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    nerka_core::write_atomic(file, memo.iter().map(|(p, s)| format!("{s}\t{}\n", p.display())).collect::<String>())
+}
+
 /// `HH:MM:SS` now, for the activity list.
 fn now() -> String {
     let t = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0.0, |d| d.as_secs_f64());
@@ -482,6 +555,9 @@ impl App {
                 let _ = reply.send(Ok(self.agent_window()));
             }
             "queries" => self.agent_queries(&args, reply),
+            "checks" => {
+                let _ = reply.send(self.agent_checks(&args));
+            }
             "summary" | "help" | "count" | "filter" | "lines" | "bookmarks" | "patterns" | "compare" | "signals"
             | "signal" | "lifecycles" => match self.agent_snap(&args) {
                 Err(e) => {
@@ -495,7 +571,8 @@ impl App {
                     });
                 }
             },
-            "show" | "set_filter" | "set_search" | "set_records" | "bookmark" | "plot" => {
+            "show" | "set_filter" | "set_search" | "set_records" | "bookmark" | "add_signal" | "remove_signal"
+            | "plot" => {
                 let r = self.agent_change(ctx, &tool, &args);
                 let _ = reply.send(r);
             }
@@ -504,6 +581,95 @@ impl App {
                 let _ = reply.send(Err(format!("no tool '{other}'")));
             }
         }
+    }
+
+    /// `checks`: the user's checks as the tab's ✔ Checks shows them, read
+    /// (owner, 2026-11-26: "add access to checks"): which are on, the
+    /// results of the last run, a row per scope (overall, each lifecycle)
+    /// with evidence, and whether they're current. Ready in the window, so
+    /// answered here; it runs nothing.
+    fn agent_checks(&self, args: &Value) -> Result<Value, String> {
+        let i = self.agent_tab(args)?;
+        let snap = self.agent_snap(args)?;
+        let t = &self.tabs[i];
+        let view = snap.view();
+        let want = str_arg(args, "name");
+        // As the tab has them, else as saved (a tab takes the saved flags at first).
+        let on = |c: &nerka_core::check::CheckDef| {
+            t.checks_on.as_ref().map_or(c.is_on(), |on| on.contains(&c.name().to_lowercase()))
+        };
+        let checks: Vec<Value> = self
+            .saved_checks
+            .iter()
+            .map(|c| {
+                Value::object([
+                    ("name", Value::from(c.name())),
+                    ("kind", c.kind().as_str().into()),
+                    ("on", on(c).into()),
+                    ("spec", c.spec().into()),
+                ])
+            })
+            .collect();
+        if let Some(w) = want
+            && !self.saved_checks.iter().any(|c| c.name().eq_ignore_ascii_case(w))
+        {
+            return Err(format!("no check '{w}' (checks lists them)"));
+        }
+        let state = if t.checks_job.is_some() {
+            "running: these are the last run's results; ask again shortly"
+        } else if t.checks_key.is_none() {
+            "not run: Auto is off in the user's ✔ Checks, which run on ▶ Run"
+        } else if t.checks_stale {
+            "out of date: something changed since; Auto is off in the user's ✔ Checks, which run on ▶ Run"
+        } else {
+            "current"
+        };
+        let evidence = num_arg(args, "evidence", 3) as usize;
+        let place = |row: LineNo| view.place(row);
+        let (mut rows, mut errors, mut notes) = (Vec::new(), Vec::new(), Vec::new());
+        for (name, r) in &t.check_results {
+            if want.is_some_and(|w| !name.eq_ignore_ascii_case(w)) {
+                continue;
+            }
+            match r {
+                Ok(r) => {
+                    rows.extend(ca::check_rows(r, evidence, &place));
+                    if let Some(n) = &r.signal_note {
+                        notes.push(Value::from(format!("{name}: {n}")));
+                    }
+                    if r.times_go_back {
+                        notes.push(Value::from(format!(
+                            "{name}: time goes backward in this view, so its result may be wrong"
+                        )));
+                    }
+                }
+                Err(e) => {
+                    errors.push(Value::object([("check", Value::from(name.as_str())), ("error", e.as_str().into())]))
+                }
+            }
+        }
+        let (skip, max) =
+            (num_arg(args, "skip", 0) as usize, num_arg(args, "max", snap.limits.lines).min(snap.limits.most));
+        let total = rows.len();
+        let page: Vec<Value> = rows.into_iter().skip(skip).take(max as usize).collect();
+        let mut v = Value::object([
+            ("state", Value::from(state)),
+            ("checks", Value::Array(checks)),
+            ("results", Value::Array(page)),
+        ]);
+        if skip + (max as usize) < total {
+            v.push("more", (skip + max as usize) as u64);
+        }
+        if !errors.is_empty() {
+            v.push("errors", Value::Array(errors));
+        }
+        if !notes.is_empty() {
+            v.push("notes", Value::Array(notes));
+        }
+        if self.saved_checks.iter().next().is_none() {
+            v.push("note", "the user has no checks (✔ Checks in the window defines them)");
+        }
+        Ok(v)
     }
 
     /// The tab a call names (`tab`: its number from 1, or part of its
@@ -769,6 +935,75 @@ impl App {
                     Value::object([("ok", Value::from(true)), ("note", note.into())]),
                 )
             }
+            "add_signal" => {
+                let spec = str_arg(args, "signal").ok_or(
+                    "give \"signal\": NAME[:KIND]=/REGEX with (?<NAME>…)/, NFD before the regex for some lines \
+                     (voltage=apid == PWR AND /mV (?<voltage>\\d+)/)",
+                )?;
+                if spec.contains(['\t', '\n', '\r']) {
+                    return Err("a signal is one line, without tabs (\\t in a regex for a tab)".into());
+                }
+                let d = nerka_core::SignalDef::parse_spec(spec).map_err(|e| format!("signal {spec}: {e}"))?;
+                if !d.is_on() {
+                    return Err("an agent's signal is on: leave out \"off\"".into());
+                }
+                if snap.signals.get(d.name()).is_some() {
+                    return Err(format!(
+                        "the tab has a signal '{}' already (signals lists them): pick another name",
+                        d.name()
+                    ));
+                }
+                // Fields the files don't have: said now, not as an error later.
+                d.bind(snap.source.schema()).map_err(|e| {
+                    let q = d.query().source();
+                    format!("signal {spec}: {}\n  {q}\n  {}", e.at(q), e.caret(q))
+                })?;
+                let warnings = nerka_core::query_warnings(d.query(), &*snap.source);
+                let name = d.name().to_owned();
+                t.agent_signals.push(d);
+                t.remember_agent_signals();
+                t.refresh_signals(ctx, &self.library, &self.saved_signals, self.saved_gen);
+                self.active = i;
+                let answer = with_warnings(
+                    Value::object([
+                        ("name", Value::from(name.clone())),
+                        (
+                            "note",
+                            "on this tab now, shown as yours (🤖) until the user keeps it: plot it (plot), read its \
+                             values (signal), filter by it (@name)"
+                                .into(),
+                        ),
+                    ]),
+                    warnings,
+                );
+                (format!("defined signal @{name}: {spec}"), Some(Undo::Signal { paths: paths.clone(), name }), answer)
+            }
+            "remove_signal" => {
+                let name = str_arg(args, "name").ok_or("give \"name\": a signal you defined (add_signal)")?;
+                let name = name.trim().trim_start_matches('@').to_owned();
+                let Some(k) = t.agent_signals.iter().position(|d| d.name() == name) else {
+                    return Err(if snap.signals.get(&name).is_some() {
+                        format!(
+                            "@{name} is the user's (kept, saved, or from the files or queries): only they remove it"
+                        )
+                    } else {
+                        format!("no signal '{name}' in this tab (signals lists them)")
+                    });
+                };
+                let def = t.agent_signals.remove(k);
+                t.remember_agent_signals();
+                t.refresh_signals(ctx, &self.library, &self.saved_signals, self.saved_gen);
+                self.active = i;
+                let undo = Undo::SignalBack { paths: paths.clone(), def: Box::new(def) };
+                (
+                    format!("removed its signal @{name}"),
+                    Some(undo),
+                    Value::object([
+                        ("ok", Value::from(true)),
+                        ("note", "off the tab and forgotten for its files".into()),
+                    ]),
+                )
+            }
             "plot" => {
                 let names: Vec<String> = match args.get("signals") {
                     Some(Value::Array(a)) => {
@@ -825,7 +1060,10 @@ impl App {
                 return;
             }
             "plot" if self.plot_window => {
-                self.plot_win.lock().unwrap_or_else(|e| e.into_inner()).shoot = Some(slot.clone())
+                // The plot's own window draws only when asked: an idle one
+                // would never take the picture.
+                self.plot_win.lock().unwrap_or_else(|e| e.into_inner()).shoot = Some(slot.clone());
+                ctx.request_repaint_of(egui::ViewportId::from_hash_of("nerka-plot"));
             }
             "plot" | "window" => crate::shot::request_into(ctx, slot.clone()),
             other => {
@@ -860,6 +1098,7 @@ impl App {
                 None => {
                     waiting.push((slot, reply, asked));
                     ctx.request_repaint();
+                    ctx.request_repaint_of(egui::ViewportId::from_hash_of("nerka-plot"));
                 }
             }
         }
@@ -910,7 +1149,9 @@ impl App {
             | Undo::Search { paths, .. }
             | Undo::Bookmark { paths, .. }
             | Undo::Plot { paths, .. }
-            | Undo::Records { paths, .. } => paths.clone(),
+            | Undo::Records { paths, .. }
+            | Undo::Signal { paths, .. }
+            | Undo::SignalBack { paths, .. } => paths.clone(),
         };
         let Some(t) = self.tabs.iter_mut().find(|t| t.paths == paths) else { return };
         match u {
@@ -942,6 +1183,18 @@ impl App {
             Undo::Records { before, .. } => {
                 t.records_for = before;
                 t.reopen(ctx, &self.prefs, self.fibex.clone());
+            }
+            Undo::Signal { name, .. } => {
+                t.agent_signals.retain(|d| d.name() != name);
+                t.remember_agent_signals();
+                t.refresh_signals(ctx, &self.library, &self.saved_signals, self.saved_gen);
+            }
+            Undo::SignalBack { def, .. } => {
+                if t.signals.get(def.name()).is_none() {
+                    t.agent_signals.push(*def);
+                    t.remember_agent_signals();
+                    t.refresh_signals(ctx, &self.library, &self.saved_signals, self.saved_gen);
+                }
             }
         }
         t.status = "🤖 Agent's change undone".into();

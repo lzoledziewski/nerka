@@ -718,7 +718,7 @@ fn several_files_are_one_view() {
     // 2026-11-10: warn only); merged by time, the times don't go back.
     let o = nerka(&["--check", "r: lines apid == NAV; rate 5 per 1s", "check", "--json", a, b]);
     assert!(err(&o).contains("time goes backward in this view: rate, gap and then / missing expect"), "{}", err(&o));
-    assert!(out(&o).contains("\"times_go_back\": true"), "{}", out(&o));
+    assert!(out(&o).contains("\"times_go_back\":true"), "{}", out(&o));
     let o = nerka(&["--merge", "--check", "r: lines apid == NAV; rate 5 per 1s", "check", a, b]);
     assert!(!err(&o).contains("time goes backward"), "{}", err(&o));
     // Files that don't go together are refused, saying why: text without a
@@ -778,6 +778,12 @@ fn text_with_times_merges_with_dlt() {
     let o = nerka(&["--profile", "plain: time none", "--profile", "plain", "filter", "x", s(&log), s(&dlt)]);
     assert_eq!(o.status.code(), Some(2));
     assert!(err(&o).contains("app.log has no time"), "{}", err(&o));
+    // Defined without `name` or `first` it is forced at once, as it was
+    // above in two steps (given both ways, still one).
+    let o = nerka(&["--profile", "plain: time none", "filter", "x", s(&log), s(&dlt)]);
+    assert!(err(&o).contains("app.log has no time"), "{}", err(&o));
+    let o = nerka(&["--profile", "plain: time none", "--profile", "PLAIN", "filter", "-c", "raw ~ /app/", s(&log)]);
+    assert_eq!(o.status.code(), Some(0), "{}", err(&o));
     // A profile chosen by its rules, with a signal of its own.
     let o = nerka(&[
         "--profile",

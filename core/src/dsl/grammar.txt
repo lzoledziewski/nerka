@@ -11,7 +11,11 @@ primary := "(" expr ")"
          | "outside"                  -- a row outside every record (records
                                          with start= / end=: NOT outside)
          | WINDOW "(" DUR "," [ DUR "," ] expr ")"
-WINDOW  := before | after | around    -- around takes two DURs
+WINDOW  := before | after | around    -- around takes two DURs: before
+                                         and after the line, either one
+                                         negative for a window apart from
+                                         it (around(10s, -5s, X): 10 s to
+                                         5 s before)
 DUR     := NUMBER [ ms | s | m | h ]  -- default seconds
 FIELD   := raw | level | WORD         -- WORD: a field the source supplies
 SIGNAL  := "@" NAME [ "." VIEW ]      -- a signal the tab defines

@@ -102,18 +102,28 @@ The agent's tools:
 | `count`, `filter`, `lines` | lines by an NFD query, in pages, also only among the lines your filter shows (`in_view`) and around matches by time; a range or the lines around one; each line's text cut at 500 characters (`width`) |
 | `patterns`, `compare` | message patterns (the rarest first), and what differs between two sets of lines (`show: same`: also what stayed the same) |
 | `queries` | your queries: those picked in the tab's Library (each with its NFD and how many lines it matches) and the library's saved queries with their notes; read-only |
-| `bookmarks`, `signals`, `signal`, `lifecycles` | your bookmarks; the tab's signals and a signal's values; its lifecycles |
+| `bookmarks`, `signals`, `signal`, `lifecycles` | your bookmarks; the tab's signals and a signal's values; its lifecycles (runs 50 at a time, `max` / `skip`; their issues always whole) |
+| `checks` | your [checks](checks.md) and their results on the tab, as ✔ Checks shows them: which are on, each result overall and per lifecycle with its evidence lines, and whether they're current; it runs nothing |
 | `show` | goes to a line in your window |
 | `set_filter`, `set_search` | puts a query in the Filter or Search box |
 | `set_records` | reads the tab as records (a stack of a dump, an entry over several lines each), as **Records…** does; `summary` hints when that helps |
 | `bookmark` | bookmarks a line with a note: an annotation (🤖) you accept or not |
+| `add_signal` | defines a signal on the tab (`voltage:num=/voltage mV (?<voltage>\d+)/`), to plot or filter by, or a lifecycle (`lifecycle run: start /boot/`): the agent's, until you keep it |
+| `remove_signal` | removes a signal the agent defined and you haven't kept; it is told to ask you first. Yours it can't remove |
 | `plot` | plots signals of the tab |
 | `screenshot` | a picture of the window or the plot, for the agent to look at |
 
 What the agent changed is listed in **🤖 Agent** in the top bar (it shows
 once the agent has changed something), newest first, each with **↶
 Undo**; the status bar says each change as it happens. Its bookmarks are
-annotations, as above.
+annotations, as above. A signal it defines is shown with 🤖 in the
+[Signals panel](signals.md#the-signals-panel) and stays with the file:
+it comes back whenever the file is opened (in another window, after Split
+or Move to window too), still the agent's, not among your saved signals.
+**Keep** saves it with yours (every tab has it, yours from then on), **−**
+takes it off and forgets it. Ask "plot the voltage" and the agent can
+define the signal, plot it and look at the plot by itself; ask it to
+remove one and it can, after asking you.
 
 ## Pictures
 

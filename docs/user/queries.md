@@ -105,6 +105,8 @@ before(30s, payload ~ /crash/)              # up to 30 s before a crash line (an
 after(2s, level >= ERROR)                   # up to 2 s after an error
 around(30s, 5s, {sys.fault}) AND ecu == ECU1
 before(1m, /watchdog/) AND NOT /watchdog/   # what led to it, without it
+around(10s, -5s, bookmark == B3)            # from 10 s to 5 s before bookmark B3
+around(-5s, 10s, bookmark == B3)            # from 5 s to 10 s after it
 ```
 
 A line is kept when its time lies within the window before (`before`),
@@ -112,7 +114,15 @@ after (`after`) or around (`around`, before then after) a line the inner
 query keeps; windows that overlap join. The inner query is any query,
 another window too, and runs once over the file before the search. A line
 without a time is in no window; on a file without times it's an error.
-Durations: `500ms`, `30s` (or `30`), `2m`, `1h`. On the command line,
+Durations: `500ms`, `30s` (or `30`), `2m`, `1h`.
+
+Either of `around`'s durations may be negative, for a window apart from the
+line: `around(10s, -5s, X)` runs from 10 s before to 5 s before it, without
+the line itself. Slices like that compare well: in the Patterns window's
+**⚖ Compare**, take for A the lines of `around(10s, -5s, bookmark == B3)`
+and for B those of `before(5s, bookmark == B3)`: what changed in the last
+5 s before the bookmark. A window that would end
+before it starts (`around(2s, -5s, X)`) is an error. On the command line,
 [`filter --before / --after`](cli.md#filter-and-search) print the same with
 the matches marked.
 

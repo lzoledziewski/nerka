@@ -30,14 +30,16 @@
 //! scope   := "*" | FIELD "==" VALUE ("AND" FIELD "==" VALUE)*   -- VALUE: a word or "…", `*` any text
 //! action  := "keep" WORD+ | "value" REGEX | "literal" REGEX | "max-slots" N
 //!          | "apart" WORD WORD+ | "header" WORD+ | "no-merge" | "ignore" [REGEX]
-//!          | "set" setting
+//!          | "set" setting | "prefix" REGEX   -- prefix: not the message, at its start
 //! REGEX   := "/" … "/"                      -- `\/` for a slash
 //! ```
 //!
 //! A rule applies to the lines whose fields match its scope; fields a
 //! source doesn't have are empty. Of rules setting one thing (`max-slots`,
-//! `no-merge`, each setting of `set`) the first matching one applies; the
-//! others (`keep`, `value`, `literal`, `apart`, `header`, `ignore`) add up.
+//! `no-merge`, `prefix`, each setting of `set`) the first matching one
+//! applies; the others (`keep`, `value`, `literal`, `apart`, `header`,
+//! `ignore`) add up. A `prefix` rule's named groups are fields of the lines
+//! it cuts (`super::Cut`): later rules can be scoped by them.
 
 use regex::Regex;
 
@@ -198,6 +200,10 @@ pub enum Action {
     Ignore(Option<Regex>),
     /// Settings for these lines.
     Set(Vec<Setting>),
+    /// What it matches at the start of a message isn't the message (a
+    /// time and a source, `[00:01.2] [uart0:APP] …`); its named groups are
+    /// fields of the line (`uart`), as `apid` is. Anchored at the start.
+    Prefix(Regex),
 }
 
 #[derive(Debug, Clone)]
@@ -232,6 +238,8 @@ pub(super) struct Local {
     pub header: Vec<Box<str>>,
     pub ignore_all: bool,
     pub ignore: Vec<Regex>,
+    /// Its `prefix` rule: an index into [`PatternConfig::prefixes`].
+    pub prefix: Option<usize>,
     /// Filled by the engine for stage 2 (`lone-word`): the context's header
     /// and footer words, as detected and as `header` rules say …
     pub header_words: std::collections::HashSet<Box<str>>,
@@ -395,6 +403,17 @@ impl PatternConfig {
         crate::config_dir().map(|d| d.join("patterns"))
     }
 
+    /// The `prefix` rules' regexes, in order ([`Local::prefix`] indexes them).
+    pub(super) fn prefixes(&self) -> Vec<&Regex> {
+        self.rules
+            .iter()
+            .filter_map(|r| match &r.action {
+                Action::Prefix(re) => Some(re),
+                _ => None,
+            })
+            .collect()
+    }
+
     /// The settings and rules for lines whose fields `names` have `vals`.
     pub(super) fn local(&self, names: &[String], vals: &[Option<&[u8]>]) -> Local {
         let mut l = Local { s: self.settings.clone(), ..Local::default() };
@@ -406,7 +425,15 @@ impl PatternConfig {
                 .and_then(|i| vals.get(i).copied().flatten())
                 .map(|b| String::from_utf8_lossy(b).into_owned())
         };
-        for r in self.rules.iter().filter(|r| r.scope.matches(&value)) {
+        let mut prefixes = 0;
+        for r in &self.rules {
+            let prefix = matches!(r.action, Action::Prefix(_)).then(|| {
+                prefixes += 1;
+                prefixes - 1
+            });
+            if !r.scope.matches(&value) {
+                continue;
+            }
             let mut apply = |s: Setting| {
                 if !std::mem::replace(&mut set[s.key()], true) {
                     l.s.apply(s);
@@ -427,6 +454,9 @@ impl PatternConfig {
                 Action::Ignore(None) => l.ignore_all = true,
                 Action::Ignore(Some(re)) => l.ignore.push(re.clone()),
                 Action::Set(ss) => ss.iter().for_each(|&s| apply(s)),
+                Action::Prefix(_) => {
+                    l.prefix = l.prefix.or(prefix);
+                }
             }
         }
         let mut guard: Vec<Box<str>> = l.keep.clone();
@@ -606,6 +636,17 @@ fn regex(t: Option<&Token>, what: &str) -> Result<Regex, String> {
     }
 }
 
+/// A `prefix` rule's regex, anchored at the start; one that matches empty
+/// text would cut nothing from some lines: an error.
+fn prefix(t: Option<&Token>) -> Result<Regex, String> {
+    let re = regex(t, "prefix")?;
+    let anchored = Regex::new(&format!("^(?:{})", re.as_str())).map_err(|e| format!("prefix /{re}/: {e}"))?;
+    if anchored.is_match("") {
+        return Err(format!("prefix /{re}/ matches empty text: it would cut nothing"));
+    }
+    Ok(anchored)
+}
+
 fn number<T: std::str::FromStr>(t: Option<&Token>, what: &str) -> Result<T, String> {
     match t {
         Some(t) => t.text().parse().map_err(|_| format!("{what}: '{}' isn't a number", t.text())),
@@ -647,9 +688,10 @@ fn action(toks: &[Token]) -> Result<Action, String> {
             t => one(Action::Ignore(Some(regex(t, "ignore")?))),
         },
         "set" => Ok(Action::Set(setting(rest)?)),
-        a => {
-            Err(format!("unknown action '{a}' (keep, value, literal, max-slots, apart, header, no-merge, ignore, set)"))
-        }
+        "prefix" => one(Action::Prefix(prefix(rest.first())?)),
+        a => Err(format!(
+            "unknown action '{a}' (keep, value, literal, max-slots, apart, header, no-merge, ignore, set, prefix)"
+        )),
     }
 }
 
@@ -771,6 +813,9 @@ mod tests {
             ("*: max-slots many", "isn't a number"),
             ("*: no-merge now", "after no-merge"),
             ("*: value /x", "without its closing"),
+            ("*: prefix x", "isn't a /regex/"),
+            ("*: prefix /(\\[x\\] )?/", "matches empty text"),
+            ("*: prefix /a/ /b/", "after prefix"),
         ];
         for (line, want) in bad {
             let mut c = PatternConfig::default();
@@ -781,6 +826,24 @@ mod tests {
             };
             assert!(e.contains(want), "{line}: {e}");
         }
+    }
+
+    /// `prefix`: anchored at the start, the first matching rule's, an index
+    /// into the prefixes in order; written back as it was.
+    #[test]
+    fn prefix_rules() {
+        let c = PatternConfig::parse(
+            "apid == NAV: prefix /\\[\\w+\\] /\n*: prefix /\\[[^\\]]*\\] \\[(?<uart>\\w+):(?<src>\\w+)\\] /\n",
+        )
+        .unwrap();
+        let ps = c.prefixes();
+        assert_eq!(ps.len(), 2);
+        assert!(ps[1].is_match("[00:01.2] [uart0:APP] boot") && !ps[1].is_match("x [00:01.2] [uart0:APP] boot"));
+        let names = vec!["apid".to_string()];
+        assert_eq!(c.local(&names, &[Some(b"NAV")]).prefix, Some(0));
+        assert_eq!(c.local(&names, &[Some(b"GPS")]).prefix, Some(1));
+        assert_eq!(PatternConfig::default().local(&names, &[None]).prefix, None);
+        assert!(c.to_text().contains("*: prefix /\\[[^\\]]*\\] \\[(?<uart>"), "{}", c.to_text());
     }
 
     #[test]

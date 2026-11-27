@@ -2032,7 +2032,7 @@ dependencies = [
 
 [[package]]
 name = "nerka-cli"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "anyhow",
  "clap",
@@ -2041,7 +2041,7 @@ dependencies = [
 
 [[package]]
 name = "nerka-core"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "libc",
  "memchr",
@@ -2055,7 +2055,7 @@ dependencies = [
 
 [[package]]
 name = "nerka-gui"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "eframe",
  "miniz_oxide 0.9.1",

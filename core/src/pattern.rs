@@ -73,11 +73,24 @@ const MASK: char = '\u{E000}';
 const MASK_STR: &str = "\u{E000}";
 const ANY: char = '\u{E001}';
 const EITHER: char = '\u{E002}';
+/// A run of hex bytes, one value ([`masked_words`]): shown as `<*>`, its
+/// regex the bytes.
+const BYTES: char = '\u{E004}';
+const BYTES_STR: &str = "\u{E004}";
 /// The rest of a message past [`MAX_TOKENS`].
 const REST: char = '\u{E003}';
 const REST_STR: &str = "\u{E003}";
-/// Lines grouped per task.
-const CHUNK: usize = 64 * 1024;
+/// A value not known ([`SlotValue::value`]).
+pub const NOT_READ: &str = "(not read)";
+/// Lines grouped per task. Stage 1's templates depend on the lines a
+/// chunk holds, so a message can be cut differently on each side of a
+/// chunk's end: fewer, larger chunks give fewer such splits (LogHub
+/// OpenStack, 137 K lines: one chunk, no pattern split at line 65 553; the
+/// 1 GiB `big.log` and `big.dlt` the same patterns in the same time), but a
+/// log of many kinds of messages in one context runs slower (LogHub BGL,
+/// 4.7 M lines: 3.8 s at 64 K, 5.3 s here). To be a setting
+/// (`docs/dev/patterns.md`).
+const CHUNK: usize = 256 * 1024;
 /// Values a slot keeps.
 pub const MAX_VALUES: usize = 16;
 /// Tokens of a message looked at; the rest is one token, [`REST`].
@@ -171,6 +184,13 @@ pub struct Slot {
     pub overflow: bool,
     /// A value may be empty or span white space.
     wide: bool,
+    /// Made or joined by a stage-2 merge: its values are each template's
+    /// cut of its messages, and two templates of one message may cut it
+    /// differently (one had a slot where the other had words: `"GET`
+    /// beside `GET`, a user id beside a request id), so the same text could
+    /// be a different value on each's lines. [`reread`] reads them from the
+    /// lines instead.
+    stretch: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -193,12 +213,23 @@ impl SlotValue {
         if self.sides[0].count > 0 { self.sides[0].last } else { self.sides[1].last }
     }
 
-    /// The value: masked parts as `<*>`, empty as `∅`.
+    /// Whether it is a value: not text around a stage-1 slot (one chunk's
+    /// template had a slot where another's had words), whose lines' values
+    /// weren't read (the re-read: lines its pattern's regex missed).
+    pub fn is_known(&self) -> bool {
+        !self.text.contains(ANY)
+    }
+
+    /// The value: masked parts as `<*>`, empty as `∅`, one not known as
+    /// `(not read)`.
     pub fn value(&self) -> String {
         if self.text.is_empty() {
             return "∅".into();
         }
-        self.text.replace([MASK, ANY], "<*>").replace(EITHER, " ").replace(REST, "…")
+        if !self.is_known() {
+            return NOT_READ.into();
+        }
+        self.text.replace([MASK, ANY, BYTES], "<*>").replace(EITHER, " ").replace(REST, "…")
     }
 }
 
@@ -219,6 +250,17 @@ impl Slot {
         }
         self.overflow |= other.overflow;
         self.wide |= other.wide;
+        self.stretch |= other.stretch;
+    }
+
+    /// Whether a value of it isn't known ([`SlotValue::is_known`]).
+    pub fn unread(&self) -> bool {
+        self.values.iter().any(|v| !v.is_known())
+    }
+
+    /// Whether its values are to be read from the lines ([`reread`]).
+    fn to_read(&self) -> bool {
+        self.stretch || self.unread()
     }
 
     /// A state: all its values known, at least two, one of them on more than
@@ -226,6 +268,7 @@ impl Slot {
     pub fn is_state(&self) -> bool {
         let lines: u64 = self.values.iter().map(SlotValue::count).sum();
         !self.overflow
+            && !self.unread()
             && self.values.len() >= 2
             && lines > self.values.len() as u64
             && self.values.iter().all(|v| v.text.is_empty() || v.text.chars().any(char::is_alphabetic))
@@ -302,6 +345,21 @@ pub struct Pattern {
     /// Its masked values may be any text (`value` rules): their regex is
     /// any token's.
     loose: bool,
+    /// The `prefix` rule its lines' messages were cut by, if one.
+    prefix: Option<Prefix>,
+}
+
+/// A pattern's `prefix`: what its queries put before the message.
+#[derive(Debug, Clone, PartialEq)]
+struct Prefix {
+    /// The rule (an index into [`PatternConfig::prefixes`]).
+    rule: usize,
+    /// Its regex, anchored, a group of one value on all the pattern's lines
+    /// pinned to it ([`pin`]).
+    regex: String,
+    /// Its groups' names: fields of the pattern, but not of the source,
+    /// so not in its NFD (the regex holds them).
+    names: Vec<String>,
 }
 
 impl Pattern {
@@ -344,7 +402,7 @@ impl Pattern {
             }
         }
         let mut out = Vec::new();
-        let punct = |p: &Part| matches!(&p.atom, Atom::Lit(l) if !is_word(l) && &**l != MASK_STR);
+        let punct = |p: &Part| matches!(&p.atom, Atom::Lit(l) if !is_word(l) && !is_mask(l));
         for (i, p) in self.parts.iter().enumerate() {
             // Either: a space, but next to punctuation (`[{INFO|WARN}]`).
             let space = i > 0
@@ -357,7 +415,7 @@ impl Pattern {
                 text(&mut out, " ");
             }
             match &p.atom {
-                Atom::Lit(l) => text(&mut out, &l.replace(MASK, "<*>").replace(REST, "…")),
+                Atom::Lit(l) => text(&mut out, &l.replace([MASK, BYTES], "<*>").replace(REST, "…")),
                 Atom::Slot(slot) if slot.is_state() => {
                     out.push(Piece::State(slot.values.iter().map(SlotValue::value).collect()))
                 }
@@ -474,6 +532,7 @@ fn text_regex(text: &str, re: &mut String, loose: bool) {
             // `:`, `-` between them.
             MASK if loose => re.push_str(r"\S+?"),
             MASK => re.push_str(r"[\w.:\-]+"),
+            BYTES => re.push_str(r"[0-9A-Fa-f]{2}(?:\s+[0-9A-Fa-f]{2})*"),
             ANY => re.push_str(".*?"),
             REST => re.push_str(".*"),
             EITHER => re.push_str(r"\s*"),
@@ -570,7 +629,12 @@ impl Patterns {
 
     fn query_with(&self, p: &Pattern, re: &str) -> String {
         let mut q = String::new();
-        for (name, value) in &p.fields {
+        let re = match &p.prefix {
+            Some(pre) => Cow::Owned(format!("{}{}", pre.regex, re.strip_prefix('^').unwrap_or(re))),
+            None => Cow::Borrowed(re),
+        };
+        let own = |name: &String| p.prefix.as_ref().is_some_and(|pre| pre.names.contains(name));
+        for (name, value) in p.fields.iter().filter(|(n, _)| !own(n)) {
             q.push_str(name);
             q.push_str(" == \"");
             for c in value.chars() {
@@ -594,6 +658,41 @@ impl Patterns {
 pub struct Set<'a> {
     pub source: &'a dyn LogSource,
     pub lines: Option<&'a [LineNo]>,
+}
+
+/// The fields that say what kind of lines a source holds: how its text is
+/// read (`profile`), the protocol of its messages (`proto`: DLT, SOMEIP, …).
+pub const KIND_FIELDS: [&str; 2] = ["profile", "proto"];
+
+/// Lines [`kind_scope`] looks at, at most, spread over the source.
+const KIND_SAMPLE: u64 = 4096;
+
+/// Each of [`KIND_FIELDS`] the source has, with its value where every line
+/// looked at has that one: the scope a rule tuned on this source starts
+/// with, so it isn't applied to other kinds of files (`profile ==
+/// sail_log`, `proto == DLT`; a scope's field a source hasn't never
+/// matches). Lines looked at: up to 4 096, spread evenly, and the
+/// last.
+pub fn kind_scope(source: &dyn LogSource) -> Vec<(String, String)> {
+    let n = source.line_count();
+    if n == 0 {
+        return Vec::new();
+    }
+    let step = n.div_ceil(KIND_SAMPLE).max(1);
+    let lines: Vec<LineNo> = (0..n).step_by(step as usize).chain(std::iter::once(n - 1)).collect();
+    let schema = source.schema();
+    KIND_FIELDS
+        .iter()
+        .filter_map(|&name| {
+            let id = schema.iter().position(|d| d.name == name)? as FieldId;
+            let value = |line: LineNo| match source.field(line, id) {
+                Some(FieldValue::Str(b)) => Some(String::from_utf8_lossy(&b).into_owned()),
+                _ => None,
+            };
+            let first = value(lines[0]).filter(|v| !v.is_empty())?;
+            lines[1..].iter().all(|&l| value(l).as_deref() == Some(first.as_str())).then(|| (name.to_owned(), first))
+        })
+        .collect()
 }
 
 /// Group the lines of `source` (or only `lines`, ascending) into patterns.
@@ -641,15 +740,19 @@ fn group(sets: &[Set], options: &PatternOptions, progress: &Progress) -> Result<
     // and a configuration's rules outlive the file's name.
     let schema = sets[0].source.schema();
     let field = field_of(sets[0].source)?;
-    let context: Vec<String> = (0..schema.len())
+    let mut context: Vec<String> = (0..schema.len())
         .filter(|&i| {
             Some(i) != field
                 && !schema[i].costly
-                && matches!(schema[i].kind, FieldKind::Str | FieldKind::Name)
+                && (matches!(schema[i].kind, FieldKind::Str | FieldKind::Name) || schema[i].names_message)
                 && schema[i].name != crate::input::concat::FILE_FIELD
         })
         .map(|i| schema[i].name.to_string())
         .collect();
+    // `prefix` rules: which cut a line, and their groups, are context too.
+    let prefixes = config.prefixes();
+    let cut = (!prefixes.is_empty()).then(|| Cut::new(prefixes, &mut context, schema));
+    let context = context;
     let readings: Vec<Reading> = sets
         .iter()
         .map(|set| {
@@ -690,10 +793,9 @@ fn group(sets: &[Set], options: &PatternOptions, progress: &Progress) -> Result<
             let mut locals = Locals::new(config, &context);
             let mut d = Drain::new(context.len(), MAX_PER_CHUNK);
             d.levels = levels;
-            let mut of_line = Vec::new();
-            if options.lines {
-                of_line.resize(to - from, u32::MAX);
-            }
+            // Each line's template: a pattern's lines, and its slots read
+            // from them (`reread`).
+            let mut of_line = vec![u32::MAX; to - from];
             let mut vals = Vec::with_capacity(context.len());
             let mut ignored = 0u64;
             // Each context's first lines wait until its header and footer are
@@ -701,20 +803,21 @@ fn group(sets: &[Set], options: &PatternOptions, progress: &Progress) -> Result<
             let mut samples: HashMap<u64, Sample> = HashMap::new();
             for i in from..to {
                 let line = lines.map_or(i as LineNo, |l| l[i]);
-                let text = text_of(source, reading, line);
+                let mut text = text_of(source, reading, line);
                 read_context(source, reading, line, &mut vals);
+                if let Some(cut) = &cut {
+                    // The source's fields choose the `prefix` rule.
+                    let ctx = context_id(&vals);
+                    let rule = locals.get(ctx, || vals.iter().map(|v| v.as_deref()).collect()).prefix;
+                    text = cut.apply(rule, text, &mut vals);
+                }
                 let ctx = context_id(&vals);
                 let local = locals.get(ctx, || vals.iter().map(|v| v.as_deref()).collect());
                 if local.ignores(&text) {
                     ignored += 1;
                     continue;
                 }
-                let words = text.split_ascii_whitespace().take(MAX_TOKENS + 1);
-                let mut toks: Vec<Cow<str>> = if local.plain_mask() {
-                    words.map(mask).collect()
-                } else {
-                    words.map(|t| mask_with(t, local)).collect()
-                };
+                let mut toks = masked_words(text.split_ascii_whitespace().take(MAX_TOKENS + 1), local);
                 if toks.len() > MAX_TOKENS {
                     toks.truncate(MAX_TOKENS - 1);
                     toks.push(Cow::Borrowed(REST_STR));
@@ -735,9 +838,7 @@ fn group(sets: &[Set], options: &PatternOptions, progress: &Progress) -> Result<
                     continue;
                 }
                 let t = d.add_line(&toks, side, line, &vals, ctx, local);
-                if options.lines {
-                    of_line[i - from] = t as u32;
-                }
+                of_line[i - from] = t as u32;
             }
             // Contexts with fewer lines here, in the order they began: pooled
             // with the other chunks' (`pool`).
@@ -777,12 +878,15 @@ fn group(sets: &[Set], options: &PatternOptions, progress: &Progress) -> Result<
         }
     }
     let mut locals = Locals::new(config, &context);
+    // Per template id: no slot in it, so its lines are one masked text.
+    let mut fixed: Vec<bool> = Vec::new();
     for (d, of_line, _) in parts {
         offsets.push(next);
         of_lines.push(of_line);
         let n = d.clusters.len() as u32;
         for (k, mut c) in d.clusters.into_iter().enumerate() {
             c.ids = vec![next + k as u32];
+            fixed.push(c.fixed());
             let local = locals.get(c.ctx, || c.vals.iter().map(Val::bytes).collect());
             all.add_cluster(c, local);
         }
@@ -797,6 +901,7 @@ fn group(sets: &[Set], options: &PatternOptions, progress: &Progress) -> Result<
         let n = d.clusters.len() as u32;
         for (k, mut c) in d.clusters.into_iter().enumerate() {
             c.ids = vec![next + k as u32];
+            fixed.push(c.fixed());
             let local = locals.get(c.ctx, || c.vals.iter().map(Val::bytes).collect());
             all.add_cluster(c, local);
         }
@@ -885,7 +990,42 @@ fn group(sets: &[Set], options: &PatternOptions, progress: &Progress) -> Result<
             }
         }
         // A pattern whose lines another's query takes is that one.
-        families = absorb(families, &locals, sets, &readings, progress)?;
+        families = absorb(families, &locals, sets, &readings, cut.as_ref(), progress)?;
+        // Slots whose values the templates don't tell: read from the lines.
+        let which: Vec<usize> = (0..families.len()).filter(|&k| families[k].slots().any(Slot::to_read)).collect();
+        if !which.is_empty() {
+            let mut fam_of = vec![u32::MAX; next as usize];
+            for (n, &k) in which.iter().enumerate() {
+                for &id in &families[k].ids {
+                    fam_of[id as usize] = n as u32;
+                }
+            }
+            let mut lines: Vec<[Vec<LineNo>; 2]> = vec![Default::default(); which.len()];
+            // A template without slots: its lines counted, one read.
+            let mut once: HashMap<u32, (usize, Sides)> = HashMap::new();
+            let mut put = |side: usize, from: usize, i: usize, id: u32| {
+                if let Some(&n) = fam_of.get(id as usize).filter(|&&n| n != u32::MAX) {
+                    let line = sets[side].lines.map_or((from + i) as LineNo, |l| l[from + i]);
+                    if fixed[id as usize] {
+                        let (_, sides) = once.entry(id).or_insert((n as usize, Sides::default()));
+                        add_sides(sides, &one(side, line));
+                    } else {
+                        lines[n as usize][side].push(line);
+                    }
+                }
+            };
+            for (((side, from, _), offset), of_line) in tasks.iter().zip(&offsets).zip(&of_lines) {
+                for (i, &t) in of_line.iter().enumerate().filter(|(_, t)| **t != u32::MAX) {
+                    put(*side, *from, i, offset + t);
+                }
+            }
+            for &(task, i, id) in &pooled_lines {
+                let (side, from, _) = tasks[task];
+                put(side, from, i, id);
+            }
+            let once: Vec<(usize, Sides)> = once.into_values().collect();
+            reread(&mut families, &which, lines, &once, &locals, sets, &readings, cut.as_ref(), progress)?;
+        }
     }
     // A field goes into the queries where patterns differ in it.
     let telling: Vec<bool> = (0..context.len())
@@ -907,16 +1047,21 @@ fn group(sets: &[Set], options: &PatternOptions, progress: &Progress) -> Result<
             let local = &locals[f.ctx];
             let mut parts = f.parts;
             cap_values(&mut parts, local.s.state_values);
+            let marker = cut.as_ref().map(|c| c.marker);
             Pattern {
                 fields: context
                     .iter()
                     .zip(&f.vals)
                     .zip(&telling)
-                    .filter_map(|((name, v), &t)| match v {
-                        Val::One(Some(b)) if t => Some((name.clone(), String::from_utf8_lossy(b).into_owned())),
+                    .enumerate()
+                    .filter_map(|(k, ((name, v), &t))| match v {
+                        Val::One(Some(b)) if t && Some(k) != marker => {
+                            Some((name.clone(), String::from_utf8_lossy(b).into_owned()))
+                        }
                         _ => None,
                     })
                     .collect(),
+                prefix: cut.as_ref().and_then(|c| c.prefix(&f.vals, &context)),
                 parts: factor(parts),
                 sides: f.sides,
                 unsorted: f.unsorted,
@@ -1032,7 +1177,7 @@ fn flush_with(
 }
 
 /// A chunk's stage 1: its templates, each line's template (`u32::MAX`:
-/// left out; none without [`PatternOptions::lines`]), the lines ignored.
+/// left out), the lines ignored.
 type Chunk = (Drain, Vec<u32>, u64);
 /// A chunk's contexts it saw too few lines of ([`pool`]).
 type Rest = Vec<(u64, Sample)>;
@@ -1147,8 +1292,189 @@ fn read_context<'s>(source: &'s dyn LogSource, reading: &Reading, line: LineNo, 
     vals.clear();
     vals.extend(reading.context.iter().map(|id| match id.and_then(|id| source.field(line, id)) {
         Some(FieldValue::Str(b)) => Some(b),
+        // A number naming the message (DLT `mid`), as its digits.
+        Some(FieldValue::U64(n)) => Some(Cow::Owned(n.to_string().into_bytes())),
         _ => None,
     }));
+}
+
+/// The context's hidden field naming the `prefix` rule that cut a line
+/// (`0`, `1`, …; `-`: none): lines cut and not never share a pattern, and
+/// [`absorb`] cuts its sample lines as stage 1 did. Not a name a scope can
+/// write, and never one of a pattern's fields.
+const PREFIX_RULE: &str = "\u{1}prefix";
+
+/// `prefix` rules at work ([`config::Action::Prefix`]): their regexes, and
+/// where the rule that cut a line and each regex's named groups go among
+/// the context's values (after the source's fields).
+struct Cut<'c> {
+    res: Vec<&'c regex::Regex>,
+    marker: usize,
+    /// Per regex: each named group's index in its captures, its place in
+    /// the context.
+    groups: Vec<Vec<(usize, usize)>>,
+}
+
+impl<'c> Cut<'c> {
+    /// The marker and the groups' names added to `context`; a group named
+    /// like a field of the source is left out (the field wins).
+    fn new(res: Vec<&'c regex::Regex>, context: &mut Vec<String>, schema: &[crate::event::FieldDef]) -> Self {
+        let marker = context.len();
+        context.push(PREFIX_RULE.into());
+        let groups = res
+            .iter()
+            .map(|re| {
+                re.capture_names()
+                    .enumerate()
+                    .filter_map(|(g, name)| {
+                        let name = name?;
+                        if schema.iter().any(|d| d.name.eq_ignore_ascii_case(name)) {
+                            return None;
+                        }
+                        let at = context.iter().position(|n| n == name).unwrap_or_else(|| {
+                            context.push(name.to_owned());
+                            context.len() - 1
+                        });
+                        Some((g, at))
+                    })
+                    .collect()
+            })
+            .collect();
+        Cut { res, marker, groups }
+    }
+
+    /// `text` without what `rule` matches at its start, its groups and the
+    /// rule into `vals` (`-` where it matches nothing, or no rule applies).
+    fn apply<'s>(&self, rule: Option<usize>, text: Cow<'s, str>, vals: &mut [Option<Cow<'s, [u8]>>]) -> Cow<'s, str> {
+        let found = rule.and_then(|k| Some((k, self.res[k].captures(&text)?)));
+        let Some((k, caps)) = found else {
+            vals[self.marker] = Some(Cow::Borrowed(b"-"));
+            return text;
+        };
+        for &(g, at) in &self.groups[k] {
+            vals[at] = caps.get(g).map(|m| Cow::Owned(m.as_str().as_bytes().to_vec()));
+        }
+        let end = caps.get(0).map_or(0, |m| m.end());
+        drop(caps);
+        vals[self.marker] = Some(Cow::Owned(k.to_string().into_bytes()));
+        match text {
+            Cow::Borrowed(t) => Cow::Borrowed(&t[end..]),
+            Cow::Owned(t) => Cow::Owned(t[end..].to_owned()),
+        }
+    }
+
+    /// The rule that cut a family's lines, from its context's values.
+    fn rule(&self, vals: &[Val]) -> Option<usize> {
+        match vals.get(self.marker) {
+            Some(Val::One(Some(b))) => std::str::from_utf8(b).ok()?.parse().ok(),
+            _ => None,
+        }
+    }
+
+    /// A line's message as stage 1 had it, for a family of context `vals`.
+    fn message<'t>(&self, vals: &[Val], text: Cow<'t, str>) -> Cow<'t, str> {
+        let Some(end) = self.rule(vals).and_then(|k| self.res[k].find(&text)).map(|m| m.end()) else {
+            return text;
+        };
+        match text {
+            Cow::Borrowed(t) => Cow::Borrowed(&t[end..]),
+            Cow::Owned(t) => Cow::Owned(t[end..].to_owned()),
+        }
+    }
+
+    /// A family's [`Prefix`]: its rule's regex, each group of one value on
+    /// all its lines pinned to that value.
+    fn prefix(&self, vals: &[Val], context: &[String]) -> Option<Prefix> {
+        let rule = self.rule(vals)?;
+        let value = |name: &str| {
+            let at = self.groups[rule].iter().find(|&&(_, at)| context[at] == name)?.1;
+            match &vals[at] {
+                Val::One(Some(b)) => Some(String::from_utf8_lossy(b).into_owned()),
+                _ => None,
+            }
+        };
+        Some(Prefix {
+            rule,
+            regex: pin(self.res[rule].as_str(), &value),
+            names: self.groups[rule].iter().map(|&(_, at)| context[at].clone()).collect(),
+        })
+    }
+}
+
+/// `re` with each named group made a plain one, or, where `value` gives
+/// its name a value, that value (escaped): `^\[(?<uart>\w+)\]` → `^\[(?:uart0)\]`.
+fn pin(re: &str, value: &dyn Fn(&str) -> Option<String>) -> String {
+    let mut out = String::with_capacity(re.len());
+    let mut chars = re.char_indices().peekable();
+    // Open groups; the depth of a pinned one, whose text is skipped.
+    let (mut depth, mut skip) = (0usize, None);
+    // `[…]` nesting (a `]` right after `[` or `[^` is a literal).
+    let mut class = 0usize;
+    while let Some((i, c)) = chars.next() {
+        let keep = skip.is_none();
+        let mut put = |c: char| {
+            if keep {
+                out.push(c);
+            }
+        };
+        match c {
+            '\\' => {
+                put(c);
+                if let Some((_, n)) = chars.next() {
+                    put(n);
+                }
+            }
+            '[' => {
+                class += 1;
+                put(c);
+                if let Some(&(_, '^')) = chars.peek() {
+                    put(chars.next().expect("peeked").1);
+                }
+                if let Some(&(_, ']')) = chars.peek() {
+                    put(chars.next().expect("peeked").1);
+                }
+            }
+            ']' if class > 0 => {
+                class -= 1;
+                put(c);
+            }
+            _ if class > 0 => put(c),
+            '(' => {
+                depth += 1;
+                let rest = &re[i..];
+                let named = ["(?<", "(?P<"]
+                    .iter()
+                    .find(|o| rest.starts_with(**o) && !rest[o.len()..].starts_with(['=', '!']))
+                    .and_then(|o| Some((o.len(), rest[o.len()..].find('>')?)));
+                match named {
+                    Some((open, len)) if keep => {
+                        let name = &rest[open..open + len];
+                        // The rest of `(?<name>` (ASCII).
+                        for _ in 0..open + len {
+                            chars.next();
+                        }
+                        out.push_str("(?:");
+                        if let Some(v) = value(name) {
+                            out.push_str(&regex::escape(&v));
+                            out.push(')');
+                            skip = Some(depth);
+                        }
+                    }
+                    _ => put(c),
+                }
+            }
+            ')' => {
+                if skip == Some(depth) {
+                    skip = None;
+                } else {
+                    put(c);
+                }
+                depth = depth.saturating_sub(1);
+            }
+            _ => put(c),
+        }
+    }
+    out
 }
 
 /// A context's id: its fields' values hashed.
@@ -1256,6 +1582,38 @@ impl Sample {
 /// `tok` with each run of word characters holding a digit (and the `.`,
 /// `:`, `-` joining such runs) replaced by [`MASK`]: `peer=10.0.3.7` →
 /// `peer=<*>`, `2026-10-17` → `<*>`, `abc-12` → `abc-<*>`, `node3` → `<*>`.
+/// Bytes written as hex in a row (`ab cd 01 ff`; one with a letter at
+/// least), at least, that are one value though some hold no digit: a
+/// payload no one described (DLT non-verbose without a FIBEX), a dump. One,
+/// whatever its length, so messages of one kind with more or fewer bytes
+/// are one pattern; `12 34 56` and `01 02 03` are numbers, each a value.
+const HEX_RUN: usize = 3;
+
+/// A message's words masked ([`mask`], `local`'s `value` and `literal`
+/// rules), a run of [`HEX_RUN`] or more hex bytes as one value
+/// ([`BYTES`]).
+fn masked_words<'t>(words: impl Iterator<Item = &'t str>, local: &Local) -> Vec<Cow<'t, str>> {
+    let words: Vec<&str> = words.collect();
+    let byte = |w: &&str| w.len() == 2 && w.bytes().all(|b| b.is_ascii_hexdigit());
+    let mut out: Vec<Cow<str>> = Vec::with_capacity(words.len());
+    let mut i = 0;
+    while i < words.len() {
+        let run = words[i..].iter().take_while(|w| byte(w)).count();
+        // A byte with a letter (`0a`) tells hex bytes from numbers (`12 34
+        // 56`, `01 02 03`).
+        let hex = |w: &&str| w.bytes().any(|b| b.is_ascii_alphabetic());
+        if run >= HEX_RUN && words[i..i + run].iter().any(hex) {
+            out.push(Cow::Borrowed(BYTES_STR));
+            i += run;
+        } else {
+            let w = words[i];
+            out.push(if local.plain_mask() { mask(w) } else { mask_with(w, local) });
+            i += 1;
+        }
+    }
+    out
+}
+
 fn mask(tok: &str) -> Cow<'_, str> {
     if !tok.bytes().any(|b| b.is_ascii_digit()) {
         return Cow::Borrowed(tok);
@@ -1479,6 +1837,14 @@ struct Cluster {
     levels: Vec<bool>,
 }
 
+impl Cluster {
+    /// No slot in it (nor a message cut at [`MAX_TOKENS`]): its lines'
+    /// masked words are its tokens, the same on each.
+    fn fixed(&self) -> bool {
+        !self.catchall && self.toks.iter().all(|t| matches!(t, Tok::Lit(l) if !l.contains(REST)))
+    }
+}
+
 /// `n` into `c`: its lines, values and fields; the tokens they differ in
 /// become slots.
 fn merge_into(c: &mut Cluster, mut n: Cluster) {
@@ -1568,7 +1934,7 @@ fn key<'a>(toks: impl ExactSizeIterator<Item = &'a str>, ctx: u64) -> u64 {
     let mut h = std::hash::DefaultHasher::new();
     ctx.hash(&mut h);
     toks.len().hash(&mut h);
-    toks.into_iter().find(|&t| t != MASK_STR).hash(&mut h);
+    toks.into_iter().find(|&t| !is_mask(t)).hash(&mut h);
     h.finish()
 }
 
@@ -1659,11 +2025,16 @@ fn similarity<'a>(
 
 /// A token of masked values and ASCII punctuation only (`<*>`, `<*>;`,
 /// `#<*>`). On bytes: it runs for each token of each comparison.
+/// A masked value's token: a mask, or a run of bytes.
+fn is_mask(t: &str) -> bool {
+    t == MASK_STR || t == BYTES_STR
+}
+
 fn is_value(t: &str) -> bool {
-    let (b, m) = (t.as_bytes(), MASK_STR.as_bytes());
+    let (b, m, n) = (t.as_bytes(), MASK_STR.as_bytes(), BYTES_STR.as_bytes());
     let (mut i, mut masked) = (0, false);
     while i < b.len() {
-        if b[i..].starts_with(m) {
+        if b[i..].starts_with(m) || b[i..].starts_with(n) {
             masked = true;
             i += m.len();
         } else if b[i].is_ascii_punctuation() {
@@ -1990,6 +2361,13 @@ impl From<Cluster> for Family {
 }
 
 impl Family {
+    fn slots(&self) -> impl Iterator<Item = &Slot> {
+        self.parts.iter().filter_map(|p| match &p.atom {
+            Atom::Slot(s) => Some(s),
+            Atom::Lit(_) => None,
+        })
+    }
+
     fn words(&self) -> impl Iterator<Item = &str> {
         self.parts.iter().filter_map(|p| match &p.atom {
             Atom::Lit(l) if is_word(l) => Some(&**l),
@@ -2111,9 +2489,7 @@ fn assess(
     let (few, many) = (a.size.min(b.size), a.size.max(b.size));
     let tokens = |seg: &[Part]| {
         seg.iter()
-            .filter(|p| {
-                matches!(&p.atom, Atom::Slot(_)) || matches!(&p.atom, Atom::Lit(l) if is_word(l) || &**l == MASK_STR)
-            })
+            .filter(|p| matches!(&p.atom, Atom::Slot(_)) || matches!(&p.atom, Atom::Lit(l) if is_word(l) || is_mask(l)))
             .count()
     };
     let slot = |seg: &[Part]| matches!(seg, [Part { atom: Atom::Slot(_), .. }]);
@@ -2236,7 +2612,7 @@ fn assess(
 
 /// A place's atoms as text: `<*>` for values and slots, `∅` for nothing.
 fn shown(seg: &[Part]) -> String {
-    let t = render(seg).replace([MASK, ANY], "<*>").replace(EITHER, " ").replace(REST, "…");
+    let t = render(seg).replace([MASK, ANY, BYTES], "<*>").replace(EITHER, " ").replace(REST, "…");
     if t.is_empty() { "∅".into() } else { t }
 }
 
@@ -2253,6 +2629,9 @@ pub fn explain(a: &Pattern, b: &Pattern, config: &PatternConfig) -> Vec<String> 
         {
             return vec![format!("apart: their {n} differs ({v} / {w}); patterns never join across fields")];
         }
+    }
+    if a.prefix.as_ref().map(|p| p.rule) != b.prefix.as_ref().map(|p| p.rule) {
+        return vec!["apart: their lines' prefixes differ (prefix rules); cut and uncut lines never join".into()];
     }
     let family = |p: &Pattern| Family {
         parts: p.parts.clone(),
@@ -2386,6 +2765,13 @@ fn merge(a: Family, b: &Family, pairs: &[(usize, usize)]) -> Family {
         }
         (i, j) = (pi + 1, pj + 1);
     }
+    // Each slot here holds both templates' cut of their messages, which
+    // needn't be the same cut (`stretch`).
+    for p in &mut parts {
+        if let Atom::Slot(s) = &mut p.atom {
+            s.stretch = true;
+        }
+    }
     let mut vals = a.vals;
     for (v, w) in vals.iter_mut().zip(&b.vals) {
         v.join(w);
@@ -2459,6 +2845,7 @@ fn absorb(
     locals: &[Local],
     sets: &[Set],
     readings: &[Reading],
+    cut: Option<&Cut>,
     progress: &Progress,
 ) -> Result<Vec<Family>> {
     let words = |f: &Family| {
@@ -2538,7 +2925,13 @@ fn absorb(
             let texts = texts.get_or_insert_with(|| {
                 sample_lines(&fams[b])
                     .into_iter()
-                    .map(|(side, line)| text_of(sets[side].source, &readings[side], line).into_owned())
+                    .map(|(side, line)| {
+                        let text = text_of(sets[side].source, &readings[side], line);
+                        match cut {
+                            Some(cut) => cut.message(&fams[b].vals, text).into_owned(),
+                            None => text.into_owned(),
+                        }
+                    })
                     .collect()
             });
             if !texts.iter().all(|t| re.is_match(t)) {
@@ -2572,6 +2965,157 @@ fn absorb(
     let mut out: Vec<Family> = fams.into_iter().zip(gone).filter(|(_, g)| !g).map(|(f, _)| f).collect();
     out.sort_by(|a, b| by_count(&a.sides, &b.sides));
     Ok(out)
+}
+
+/// Stage 2 merges by templates, so where one side of a slot held a stage-1
+/// slot beside other parts (`<*> <*> <*>` against
+/// `nova.osapi_compute.wsgi.server`: one chunk of lines made a template
+/// with a slot where another's kept the words), that side's values aren't
+/// in any template: the slot would hold a "value" that is only where values
+/// were. Those slots of the families `which` are read from their lines
+/// (`lines`, per family and set) instead, by the family's regex with each
+/// such slot a group; a line it misses keeps the value not known.
+#[allow(clippy::too_many_arguments)]
+fn reread(
+    fams: &mut [Family],
+    which: &[usize],
+    lines: Vec<[Vec<LineNo>; 2]>,
+    once: &[(usize, Sides)],
+    locals: &[Local],
+    sets: &[Set],
+    readings: &[Reading],
+    cut: Option<&Cut>,
+    progress: &Progress,
+) -> Result<()> {
+    // Each family's regex on a message masked as stage 1 masks it (a
+    // masked value one marker, so it can't take the words beside it), its
+    // slots to read each a group.
+    fn masked_regex(text: &str, re: &mut String) {
+        let mut buf = [0u8; 4];
+        for c in text.chars() {
+            match c {
+                ANY => re.push_str(".*?"),
+                REST => re.push_str(".*"),
+                EITHER => re.push_str(r"\s*"),
+                c if c.is_whitespace() => re.push_str(r"\s+"),
+                c => re.push_str(&regex::escape(c.encode_utf8(&mut buf))),
+            }
+        }
+    }
+    let regexes: Vec<Option<(regex::Regex, Vec<usize>)>> = which
+        .iter()
+        .map(|&k| {
+            let f = &fams[k];
+            let mut re = String::from(r"^\s*");
+            let mut groups = Vec::new();
+            for (i, p) in f.parts.iter().enumerate() {
+                if i > 0 {
+                    re.push_str(sep_regex(p.sep));
+                }
+                match &p.atom {
+                    Atom::Lit(l) => masked_regex(l, &mut re),
+                    Atom::Slot(s) if s.to_read() => {
+                        re.push_str(&format!("(?<u{}>.*?)", groups.len()));
+                        groups.push(i);
+                    }
+                    Atom::Slot(s) if s.is_state() => {
+                        re.push_str("(?:");
+                        for (j, v) in s.values.iter().enumerate() {
+                            if j > 0 {
+                                re.push('|');
+                            }
+                            masked_regex(&v.text, &mut re);
+                        }
+                        re.push(')');
+                    }
+                    Atom::Slot(s) if s.wide => re.push_str(".*?"),
+                    Atom::Slot(_) => re.push_str(r"\S+"),
+                }
+            }
+            re.push_str(r"\s*$");
+            regex::Regex::new(&re).ok().map(|re| (re, groups))
+        })
+        .collect();
+    // The lines in pieces of a chunk, so one big pattern is read in
+    // parallel too; a template without slots, by one of its lines, each
+    // value counted on all of them (`once`: its family and lines).
+    let mut tasks: Vec<(usize, usize, &[LineNo], Option<&Sides>)> = Vec::new();
+    for (n, lines) in lines.iter().enumerate() {
+        if regexes[n].is_some() {
+            for (side, lines) in lines.iter().enumerate() {
+                tasks.extend(lines.chunks(CHUNK).map(|c| (n, side, c, None)));
+            }
+        }
+    }
+    let firsts: Vec<(usize, usize, LineNo, &Sides)> = once
+        .iter()
+        .filter(|(n, _)| regexes[*n].is_some())
+        .map(|(n, sides)| {
+            let side = usize::from(sides[0].count == 0);
+            (*n, side, sides[side].first, sides)
+        })
+        .collect();
+    for (n, side, line, sides) in &firsts {
+        tasks.push((*n, *side, std::slice::from_ref(line), Some(*sides)));
+    }
+    let unknown = ANY.to_string();
+    let read: Vec<(usize, Vec<Slot>)> = tasks
+        .into_par_iter()
+        .map(|(n, side, lines, all)| {
+            if progress.is_cancelled() {
+                return Err(Error::Cancelled);
+            }
+            let f = &fams[which[n]];
+            let local = &locals[f.ctx];
+            let (re, groups) = regexes[n].as_ref().expect("a regex");
+            let masked = |t: &str| -> String { masked_words(t.split_ascii_whitespace(), local).join(" ") };
+            let mut slots: Vec<Slot> = groups.iter().map(|_| Slot { wide: true, ..Default::default() }).collect();
+            // A message masked gives its values masked: read each one once
+            // (by the hash of its masked words).
+            let key = |t: &str| -> u64 {
+                let mut h = std::collections::hash_map::DefaultHasher::new();
+                masked_words(t.split_ascii_whitespace(), local).hash(&mut h);
+                h.finish()
+            };
+            let mut seen: HashMap<u64, Vec<String>> = HashMap::new();
+            for &line in lines {
+                let text = text_of(sets[side].source, &readings[side], line);
+                let text = match cut {
+                    Some(cut) => cut.message(&f.vals, text),
+                    None => text,
+                };
+                let values = seen.entry(key(&text)).or_insert_with(|| {
+                    let text = masked(&text);
+                    match re.captures(&text) {
+                        Some(c) => (0..groups.len())
+                            .map(|g| c.name(&format!("u{g}")).map_or("", |m| m.as_str()).to_owned())
+                            .collect(),
+                        None => vec![unknown.clone(); groups.len()],
+                    }
+                });
+                let sides = all.copied().unwrap_or_else(|| one(side, line));
+                for (slot, v) in slots.iter_mut().zip(values.iter()) {
+                    slot.add(v, &sides);
+                }
+            }
+            Ok((n, slots))
+        })
+        .collect::<Result<_>>()?;
+    let mut joined: Vec<Option<Vec<Slot>>> = vec![None; which.len()];
+    for (n, slots) in read {
+        match &mut joined[n] {
+            Some(all) => all.iter_mut().zip(slots).for_each(|(a, s)| a.join(s)),
+            none => *none = Some(slots),
+        }
+    }
+    for (n, slots) in joined.into_iter().enumerate() {
+        let (Some(slots), Some((_, groups))) = (slots, &regexes[n]) else { continue };
+        for (&i, mut slot) in groups.iter().zip(slots) {
+            slot.values.sort_by(|a, b| by_count(&a.sides, &b.sides));
+            fams[which[n]].parts[i].atom = Atom::Slot(slot);
+        }
+    }
+    Ok(())
 }
 
 /// Whether `local`'s rules let `b` join `a` aligned as `pairs`: no `keep`
@@ -3022,7 +3566,8 @@ pub fn differences(ps: &Patterns, listed: &Listed) -> Vec<Difference> {
             continue;
         }
         for (s, slot) in p.slots().enumerate() {
-            if slot.overflow || slot.values.len() < 2 {
+            // A value not known may be any of the others: no counts to compare.
+            if slot.overflow || slot.values.len() < 2 || slot.unread() {
                 continue;
             }
             for (v, value) in slot.values.iter().enumerate() {
@@ -3962,5 +4507,247 @@ mod tests {
         s.held.push((0, 0, vec!["LOG:".into(), "x".into()], vec![]));
         flush(&mut d, 7, &s, &local, 0, 0, &mut []);
         assert_eq!(d.boiler[&7], vec![Box::from("LOG:")]);
+    }
+
+    /// UART-style lines: a time and a source before each message
+    /// (`[00:00:01.234] [uart2:MODEM] battery 37%`), `n` of them.
+    fn uart(n: usize) -> TextFile {
+        let msgs = ["wifi connected rssi=-{}", "battery {}%", "task idle", "sensor read failed", "boot complete"];
+        let srcs = ["MCU", "APP", "MODEM"];
+        let mut x: u64 = 7;
+        let mut next = |m: u64| {
+            x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (x >> 33) % m
+        };
+        let lines: Vec<String> = (0..n)
+            .map(|i| {
+                let msg = msgs[next(5) as usize].replace("{}", &(next(90) + 1).to_string());
+                let (uart, src) = (next(4), srcs[next(3) as usize]);
+                format!("[00:{:02}:{:02}.{:03}] [uart{uart}:{src}] {msg}", i / 600 % 60, i / 10 % 60, next(1000))
+            })
+            .collect();
+        TextFile::from_bytes("uart.log", lines.join("\n").into_bytes())
+    }
+
+    /// Each pattern's query finds exactly its lines.
+    fn queries_exact(source: &dyn LogSource, ps: &Patterns) {
+        for p in &ps.patterns {
+            let q = Query::compile_in(&ps.query(p), source.schema(), &Default::default()).unwrap();
+            let res = search(source, &Filter::Query(q), &Progress::new()).unwrap();
+            assert_eq!(res.lines.len() as u64, p.count(), "{}", ps.query(p));
+        }
+    }
+
+    /// A slot stage 2 made from two templates of different shapes
+    /// (`[INFO ]` is two tokens, `[DEBUG]` one) is read from the lines: its
+    /// values are each line's, counted per set exactly, and the queries
+    /// still find every line. (LogHub OpenStack's request lines, before:
+    /// one chunk's template cut them otherwise than the next's, and a value
+    /// "changed" at line 65 536.)
+    #[test]
+    fn values_stage_2_made_are_read_from_the_lines() {
+        let names = ["alice", "bob", "carol"];
+        let line = |k: usize| {
+            let level = ["[INFO ]", "[DEBUG]", "[WARN ]"][k % 3];
+            format!("2026-01-01 00:00:{:02} {level} svc session opened user={}", k % 60, names[(k / 3) % 3])
+        };
+        let text = |range: std::ops::Range<usize>| {
+            TextFile::from_bytes(
+                "t",
+                range
+                    .map(line)
+                    .collect::<Vec<_>>()
+                    .join(
+                        "
+",
+                    )
+                    .into_bytes(),
+            )
+        };
+        let (a, b) = (text(0..300), text(300..390));
+        let ps = compare(
+            Set { source: &a, lines: None },
+            Set { source: &b, lines: None },
+            &Default::default(),
+            &Progress::new(),
+        )
+        .unwrap();
+        assert_eq!(ps.patterns.len(), 1, "{:?}", templates(&ps));
+        let p = &ps.patterns[0];
+        let values: Vec<(String, [u64; 2])> =
+            p.slots().flat_map(|s| &s.values).map(|v| (v.value(), [v.sides[0].count, v.sides[1].count])).collect();
+        for want in ["INFO", "DEBUG", "WARN"] {
+            assert!(values.contains(&(want.to_owned(), [100, 30])), "{want}: {values:?}");
+        }
+        for (n, want) in names.iter().enumerate() {
+            let count = |r: std::ops::Range<usize>| r.filter(|k| (k / 3) % 3 == n).count() as u64;
+            assert!(values.contains(&((*want).to_owned(), [count(0..300), count(300..390)])), "{want}: {values:?}");
+        }
+        assert!(p.slots().all(|s| !s.unread()));
+        check_queries(&a, &detect_all(&a));
+    }
+
+    /// DLT non-verbose messages no FIBEX describes (`[1001] 0a ff 3c …`)
+    /// group by their message id (`mid`, a field naming the message), and
+    /// their bytes are one value whatever their count: one pattern per
+    /// message, its query finding its lines. Before, the id was masked and
+    /// each byte a word: thousands of templates, most *not sorted*.
+    #[test]
+    fn non_verbose_messages_group_by_their_id() {
+        use crate::input::dlt::writer::{Msg, Payload};
+        let mut bytes = Vec::new();
+        for k in 0..300u32 {
+            let id = 1001 + k % 3;
+            let data: Vec<u8> = (0..(4 + k % 5)).map(|i| (0xa0 + (k * 7 + i) % 0x5f) as u8).collect();
+            let mut m = Msg::log(crate::Level::Info, "ECU1", "X", "Y", vec![]);
+            m.ext = None;
+            m.secs += k;
+            m.payload = Payload::NonVerbose { id, data };
+            m.encode(&mut bytes);
+        }
+        let d = crate::DltFile::from_bytes("nv.dlt", bytes);
+        let ps = detect_all(&d);
+        assert_eq!(ps.patterns.len(), 3, "{:?}", templates(&ps));
+        for p in &ps.patterns {
+            assert_eq!(p.count(), 100);
+            assert!(p.fields.iter().any(|(n, v)| n == "mid" && v.starts_with("100")), "{:?}", p.fields);
+            assert_eq!(p.template(), "[<*>] <*>");
+        }
+        // Numbers in a row are numbers, each a value: no letter, no bytes.
+        let t = text(&["took 12 34 56 ms", "took 12 34 57 ms"]);
+        assert_eq!(templates(&detect_all(&t)), ["took <*> <*> <*> ms"]);
+    }
+
+    /// A file's kind: its profile (text), its protocol (DLT); a view of two
+    /// kinds has none.
+    #[test]
+    fn a_files_kind_is_its_profile_or_protocol() {
+        use crate::input::dlt::writer::{Arg, Msg, Value};
+        use crate::input::profile::{Profile, Why};
+        let read = |lines: &[&str]| {
+            crate::input::timed::Timed::text(
+                Box::new(text(lines)),
+                &Profile::builtin(),
+                Why::Default,
+                0.0,
+                &Progress::new(),
+            )
+            .unwrap()
+        };
+        let t = read(&["2026-01-01 00:00:01 a", "2026-01-01 00:00:02 b"]);
+        assert_eq!(kind_scope(&t), [("profile".to_owned(), "default".to_owned())]);
+        assert!(kind_scope(&text(&["a"])).is_empty(), "no profile field: no kind");
+        let mut bytes = Vec::new();
+        for (i, apid) in ["NAV", "PWR"].iter().enumerate() {
+            let mut m = Msg::log(crate::Level::Info, "ECU1", apid, "CTX", vec![Arg::from(Value::Str("x".into()))]);
+            m.secs += i as u32;
+            m.encode(&mut bytes);
+        }
+        let d = crate::DltFile::from_bytes("t.dlt", bytes);
+        assert_eq!(kind_scope(&d), [("proto".to_owned(), "DLT".to_owned())]);
+        let both = crate::input::concat::Concat::new(vec![Box::new(t), Box::new(d)]).unwrap();
+        assert!(kind_scope(&both).is_empty(), "{:?}", kind_scope(&both));
+    }
+
+    /// A value not known (text around a stage-1 slot, its lines not read)
+    /// is no value: shown as such, never a state's, never compared.
+    #[test]
+    fn a_value_not_known_is_not_compared() {
+        let value = |text: &str, a: u64, b: u64| SlotValue {
+            text: text.into(),
+            sides: [Tally { count: a, first: 0, last: 0 }, Tally { count: b, first: 1, last: 1 }],
+        };
+        let slot =
+            Slot { values: vec![value("osapi", 10, 5), value(&format!("{ANY} {ANY}"), 7, 0)], ..Default::default() };
+        assert!(slot.unread() && !slot.is_state());
+        assert_eq!(slot.values[1].value(), NOT_READ);
+        let p = Pattern {
+            parts: vec![
+                Part { sep: Sep::Space, atom: Atom::Lit("svc".into()) },
+                Part { sep: Sep::Space, atom: Atom::Slot(slot) },
+            ],
+            sides: [Tally { count: 17, first: 0, last: 0 }, Tally { count: 5, first: 1, last: 1 }],
+            unsorted: false,
+            fields: vec![],
+            lines: Default::default(),
+            ids: vec![],
+            loose: false,
+            prefix: None,
+        };
+        let ps = Patterns { field: None, patterns: vec![p], lines: [17, 5], stats: Default::default() };
+        let all = Listed { min_score: 0.0, changes: [true; 4], rows: Rows::All };
+        assert!(differences(&ps, &all).iter().all(|d| d.value.is_none()), "no value rows");
+    }
+
+    /// `prefix`: the time and source before each message aren't the
+    /// message, so short messages stay apart and a source isn't a state;
+    /// named groups are fields that keep lines apart, and the queries find
+    /// the lines with their prefix (owner, 2026-11-26).
+    #[test]
+    fn a_prefix_is_not_the_message() {
+        let f = uart(3000);
+        // Without the rule the prefix is most of a short line.
+        let t = templates(&detect_all(&f));
+        assert!(t.iter().any(|t| t.contains("{MCU|") || t.contains("{APP|") || t.contains("{MODEM|")), "{t:?}");
+        // Cut, no groups: the five messages, nothing else.
+        let ps = detect_with(&f, r"*: prefix /\[[^\]]*\] \[[^\]]*\] /");
+        let mut t = templates(&ps);
+        t.sort();
+        assert_eq!(
+            t,
+            ["battery <*>%", "boot complete", "sensor read failed", "task idle", "wifi connected rssi=-<*>"],
+            "{t:?}"
+        );
+        assert!(ps.patterns.iter().all(|p| p.fields.is_empty()));
+        assert!(ps.query(&ps.patterns[0]).starts_with(r"raw ~ /^(?:\[[^\]]*\] \[[^\]]*\] )\s*"));
+        queries_exact(&f, &ps);
+        // A named group is a field: the messages per source, each query
+        // pinned to its source in the regex (no field `src` in NFD).
+        let ps = detect_with(&f, r"*: prefix /\[[^\]]*\] \[uart\d:(?<src>\w+)\] /");
+        assert_eq!(ps.patterns.len(), 15, "{:?}", templates(&ps));
+        let boot = ps.patterns.iter().find(|p| p.template() == "boot complete").unwrap();
+        let src = &boot.fields[0];
+        assert_eq!(src.0, "src");
+        let q = ps.query(boot);
+        assert!(q.starts_with(&format!(r"raw ~ /^(?:\[[^\]]*\] \[uart\d:(?:{})\] )", src.1)), "{q}");
+        queries_exact(&f, &ps);
+        // An ignore rule may be scoped by a group, and sees the message.
+        let ps = detect_with(&f, "*: prefix /\\[[^\\]]*\\] \\[uart\\d:(?<src>\\w+)\\] /\nsrc == MCU: ignore /^task/\n");
+        assert_eq!(ps.patterns.len(), 14, "{:?}", templates(&ps));
+    }
+
+    /// A prefix rule scoped to some lines: the others are the message as
+    /// they are, and a cut line never shares a pattern with an uncut one.
+    #[test]
+    fn a_prefix_cuts_only_where_it_matches() {
+        let f = text(&[
+            "[a] boot complete",
+            "[b] boot complete",
+            "boot complete",
+            "boot complete",
+            "[c] task idle",
+            "task idle",
+            "x [d] task idle",
+        ]);
+        let ps = detect_with(&f, r"*: prefix /\[\w\] /");
+        let counts: Vec<(String, u64)> = ps.patterns.iter().map(|p| (p.template(), p.count())).collect();
+        assert!(counts.contains(&("boot complete".into(), 2)), "{counts:?}");
+        assert_eq!(counts.iter().filter(|(t, _)| t == "boot complete").count(), 2, "{counts:?}");
+        // Cut (0, 1, 4) and uncut lines never in one pattern.
+        let cut = [0, 1, 4];
+        for p in &ps.patterns {
+            let l = &p.lines[0];
+            assert!(l.iter().all(|x| cut.contains(x)) || l.iter().all(|x| !cut.contains(x)), "{}: {l:?}", p.template());
+        }
+    }
+
+    #[test]
+    fn pin_writes_a_groups_value_in() {
+        let v = |n: &str| (n == "uart").then(|| "uart0".to_owned());
+        assert_eq!(pin(r"^(?:\[(?<uart>\w+)\] )", &v), r"^(?:\[(?:uart0)\] )");
+        assert_eq!(pin(r"^(?:(?P<uart>\w+(x|y)) (?<src>\w+))", &v), r"^(?:(?:uart0) (?:\w+))");
+        // Escapes, classes with brackets and parentheses, values escaped.
+        assert_eq!(pin(r"^(?:\((?<k>[]()]+)\))", &|_| Some("a.b".into())), r"^(?:\((?:a\.b)\))");
+        assert_eq!(pin(r"^(?:[\]](?<uart>[^)]))", &v), r"^(?:[\]](?:uart0))");
     }
 }

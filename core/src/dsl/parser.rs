@@ -310,10 +310,26 @@ impl Parser<'_> {
     fn window(&mut self, kind: &str, pos: usize) -> Result<Expr, DslError> {
         self.bump()?;
         let mut durs = Vec::new();
+        let mut second = 0;
         for _ in 0..if kind == "around" { 2 } else { 1 } {
             let at = self.pos;
+            second = at;
+            // `around`'s may be negative (owner, 2026-11-26): a window apart
+            // from the line, `around(10s, -5s, X)` from 10 s to 5 s before.
             let d = match self.bump()? {
-                Tok::Word(w) => crate::lifecycle::parse_duration(&w),
+                Tok::Word(w) => match w.strip_prefix('-') {
+                    Some(rest) if kind == "around" => crate::lifecycle::parse_duration(rest).map(|d| -d),
+                    Some(_) => {
+                        return err(
+                            format!(
+                                "{kind}(…) takes no negative duration; a window apart from the line: around(10s, \
+                                 -5s, …), from 10 s to 5 s before it"
+                            ),
+                            at,
+                        );
+                    }
+                    None => crate::lifecycle::parse_duration(&w),
+                },
                 _ => None,
             };
             let Some(d) = d else {
@@ -337,6 +353,14 @@ impl Parser<'_> {
             "after" => (0.0, durs[0]),
             _ => (durs[0], durs[1]),
         };
+        if back + ahead < 0.0 {
+            return err(
+                "the window ends before it starts: around(B, A, …) runs from B before the line to A after it, \
+                 so A can't be below -B"
+                    .to_string(),
+                second,
+            );
+        }
         Ok(Expr::Cond(Cond::Window(WindowCond {
             back,
             ahead,

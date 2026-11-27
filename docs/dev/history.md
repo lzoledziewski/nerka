@@ -2,9 +2,56 @@
 
 The dated log of the project, newest first; append-only: add an entry at the top when `status.md` changes. Moved from `status.md` on 2026-11-10, word for word: its "Last update" line (each update with the ones before it) and its "Next steps" as they stood then, which tell what was built when and why. Where the moved text says "above", "below" or "this file", it means the old `status.md`: its sections are now `status.md` (state, pending decisions, limitations, licensing), `gui-decisions.md`, `features.md` and `history.md`.
 
+## 2026-11-27
+
+0.3.1 prepared (a release; PR, merge and tag `v0.3.1` once CI is green):
+what 2026-11-26 lists after 0.3.0. Verified: the review gate `--full`
+on Windows (its `cargo doc` failure, three doc links, fixed), fmt, clippy
+and the tests in the Linux VM (a test of a Windows path failing there,
+fixed).
+
+## 2026-11-26
+
+After 0.3.0, on branch `claude/status-messages`:
+`around(10s, -5s, X)`, a negative side for a window apart from the line
+(owner's proposal: comparing −10…−5 s with −5…0 s before a bookmark);
+the pattern rule `prefix /REGEX/` (owner: a tuning rule for any source,
+not profile fields), its named groups fields of the line, the queries
+pinned to them; an agent defining signals (owner's request): MCP
+`add_signal`, remembered per file
+until the user keeps it (Signals panel: 🤖, Keep, −), and `remove_signal`
+for its own, after asking the user; MCP `checks`, the user's checks and
+their results read from the window (`check --json` built in core too).
+Fixes: the window's messages (🤖 AI's "not installed"
+among them) shown while a tab is open; 🤖 AI running the program as
+found (Linux: `~/.local/bin` not on the terminal's PATH). Checked in the
+Linux VM: a real terminal through `terminal::open` starting `claude` on
+the window.
+
+Then, evaluated on LogHub (Hadoop, OpenStack, BGL, HDFS_v1: their
+published labels; CLI and MCP; findings in this session, no-ledger):
+patterns' slot values read from the lines where stage 2 made the slot
+(a value "changed" at line 65 536, a chunk's end); chunks of 256 K lines
+(owner); non-verbose DLT grouped by message id, a run of hex bytes one
+value (owner); a tuning rule starts scoped to the file's kind, its
+profile or protocol (owner, `gui-decisions.md`); the guide's "How
+patterns work" (owner); a `--profile 'NAME: …'` without `name` or
+`first` forced, and a hint giving the profile when a line's time comes
+after a word; MCP `lifecycles` in pages, and one that can't be read on
+the tab no longer failing the others; the plot's own window closing on
+Wayland, and its picture for an agent. Measured in `patterns.md`; a
+`chunk` setting planned there.
+
+0.3.0 released: PR #36 merged into `main`, tagged `v0.3.0`; what 2026-11-25
+lists, and the Patterns window's picture in the guide (`nerka-gui
+--patterns`). Verified before the merge: the review gate `--full`, the
+1 GiB benchmark within 15 % of `bench-2026-11-14.tsv` with the same
+counts, CI on Linux, Windows and macOS; the Linux VM run was abandoned
+(the VM unstable), after its fmt and clippy passed.
+
 ## 2026-11-25
 
-0.3.0 prepared (a release; not yet merged or tagged), after 0.3.0-alpha.2:
+0.3.0 prepared (a release), after 0.3.0-alpha.2:
 
 - **AI preparation** (`ai.md`): workflow A, an agent with the CLI
   (`--json` in pages, `help agent` / `help skill`, `marks` with an

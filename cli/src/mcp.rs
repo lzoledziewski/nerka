@@ -189,8 +189,30 @@ fn tools() -> Value {
         ),
         (
             "lifecycles",
-            "The tab's lifecycles (an ECU's boots, a service's runs): each run's lines, start, end, how it ended, and findings.",
-            schema(vec![("tab", tab()), ("name", p("string", "One lifecycle"))], &[]),
+            "The tab's lifecycles (an ECU's boots, a service's runs): each run's lines, start, end, how it ended, and findings (issues and summary always whole). Runs a page at a time: more (and runs, how many) when some are left, give it back as skip.",
+            schema(
+                vec![
+                    ("tab", tab()),
+                    ("name", p("string", "One lifecycle")),
+                    ("max", p("integer", "Runs at most, per lifecycle (default 50)")),
+                    ("skip", p("integer", "Runs to skip (more says the next)")),
+                ],
+                &[],
+            ),
+        ),
+        (
+            "checks",
+            "The user's checks (✔ Checks: known issues and measured facts, overall and per lifecycle) and their results on the tab, read, not run: which are on, a row per check and scope with its verdict (ok, an issue's count, a fact's value) and evidence lines, errors, and state (current, running, out of date or not run: the user runs them). Start from its issues: open their lines, bookmark the cause.",
+            schema(
+                vec![
+                    ("tab", tab()),
+                    ("name", p("string", "One check")),
+                    ("evidence", p("integer", "Pieces of evidence per row (default 3)")),
+                    ("max", p("integer", "Rows at most")),
+                    ("skip", p("integer", "Rows to skip (more says the next)")),
+                ],
+                &[],
+            ),
         ),
         (
             "show",
@@ -239,6 +261,19 @@ fn tools() -> Value {
             ),
         ),
         (
+            "add_signal",
+            "Define a signal on the tab: a value its lines carry, taken by a regex's named group, to plot or filter by (@name). As --signal: NAME[:KIND]=/REGEX/ with a group (?<NAME>…) (voltage:num=/voltage mV (?<voltage>\\d+)/), NFD before the regex for some lines only (voltage=apid == PWR AND /mV (?<voltage>\\d+)/); KIND num (default) or enum. A lifecycle too: lifecycle NAME: start RULE (or reset uptime, gap DUR; lines RULE for its lines). It stays with this tab and its files (back when they are opened again), shown as yours (🤖): the user keeps it or drops it. Undoable. Then plot it.",
+            schema(
+                vec![("tab", tab()), ("signal", p("string", "NAME[:KIND]=[NFD AND] /REGEX with (?<NAME>…)/"))],
+                &["signal"],
+            ),
+        ),
+        (
+            "remove_signal",
+            "Remove a signal you defined (add_signal) that the user hasn't kept: off the tab, and forgotten for its files. Ask the user first: remove only a signal they asked to remove or agreed to. The user's own signals can't be removed. Undoable.",
+            schema(vec![("tab", tab()), ("name", p("string", "The signal you defined"))], &["name"]),
+        ),
+        (
             "plot",
             "Plot signals of the tab (signals lists them) in the window's plot.",
             schema(
@@ -257,12 +292,21 @@ fn tools() -> Value {
         ),
     ];
     let tools = list.into_iter().map(|(name, description, input)| {
-        let read_only = !matches!(name, "show" | "set_filter" | "set_search" | "set_records" | "bookmark" | "plot");
+        let read_only = !matches!(
+            name,
+            "show" | "set_filter" | "set_search" | "set_records" | "bookmark" | "add_signal" | "remove_signal" | "plot"
+        );
+        let mut hints = Value::object([("readOnlyHint", Value::from(read_only)), ("openWorldHint", false.into())]);
+        // MCP takes a change for destructive unless told: the others add or
+        // replace, undoable; removing asks the user first (owner, 2026-11-26).
+        if !read_only {
+            hints.push("destructiveHint", name == "remove_signal");
+        }
         Value::object([
             ("name", Value::from(name)),
             ("description", description.into()),
             ("inputSchema", input),
-            ("annotations", Value::object([("readOnlyHint", Value::from(read_only)), ("openWorldHint", false.into())])),
+            ("annotations", hints),
         ])
     });
     Value::Array(tools.collect())

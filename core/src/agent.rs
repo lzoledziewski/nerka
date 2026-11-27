@@ -488,6 +488,8 @@ pub fn hints(source: &dyn LogSource) -> Vec<String> {
                  {split} (CLI: --records '{split}'; window: set_records), each entry is one record with its time",
                 tried.len()
             ));
+        } else if let Some(hint) = later_time_hint(&tried) {
+            out.push(hint);
         } else {
             out.push(
                 "no line has a time: before / after (context by time) can't work; read around a line with lines".into(),
@@ -495,6 +497,35 @@ pub fn hints(source: &dyn LogSource) -> Vec<String> {
         }
     }
     out
+}
+
+/// Lines whose time comes after a few words (a file name, a label: LogHub's
+/// OpenStack `nova-api.log.1 2017-05-16 15:16:01.511 …`): the profile that
+/// reads it, when most of `tried` have one after the same number of words.
+fn later_time_hint(tried: &[String]) -> Option<String> {
+    use crate::time::{Zone, leading_time};
+    fn after(t: &str, k: usize) -> Option<Vec<&str>> {
+        let words: Vec<&str> = t.split_whitespace().skip(k).collect();
+        (!words.is_empty()).then_some(words)
+    }
+    for k in 1..=4 {
+        let timed =
+            tried.iter().filter(|t| after(t, k).is_some_and(|w| leading_time(&w.join(" "), Zone::Utc).is_some()));
+        if timed.clone().count() * 2 <= tried.len() {
+            continue;
+        }
+        let words = after(timed.clone().next()?, k)?;
+        // One word holds the whole time (`2017-05-16T15:16:01`), else two (a
+        // date and a time of day).
+        let one = leading_time(words[0], Zone::Utc);
+        let group = if one.is_some() && one == leading_time(&words.join(" "), Zone::Utc) { r"\S+" } else { r"\S+ \S+" };
+        let re = format!(r"^(?:\S+\s+){{{k}}}(?<time>{group})");
+        return Some(format!(
+            "lines start with a time after {k} word(s): read it with a profile, CLI --profile 'timed: time /{re}/' \
+             (window: the user sets it, Files… or ⚙ Settings → Profiles…); then before / after work"
+        ));
+    }
+    None
 }
 
 /// What [`patterns`] adds to each pattern.
@@ -689,9 +720,11 @@ pub fn signal(
 }
 
 /// A lifecycle definition's runs, as `nerka lifecycles --json` gives them
-/// (`lifecycles`, `issues`, `summary`), for one definition.
-pub fn lifecycles(name: &str, l: &crate::lifecycle::Lifecycles, view: &View) -> Value {
-    let lives = l.lives.iter().map(|x| {
+/// (`lifecycles`, `issues`, `summary`), for one definition: its runs from
+/// the `skip`th, `max` at most, and `more` (the `skip` for the next page)
+/// if some are left; its issues and summary always whole.
+pub fn lifecycles(name: &str, l: &crate::lifecycle::Lifecycles, view: &View, skip: usize, max: usize) -> Value {
+    let lives = l.lives.iter().skip(skip).take(max).map(|x| {
         let mut v = Value::new_object();
         v.push("lifecycle", name)
             .push("number", x.number)
@@ -719,7 +752,42 @@ pub fn lifecycles(name: &str, l: &crate::lifecycle::Lifecycles, view: &View) -> 
     });
     let mut v = Value::object([("lifecycles", Value::Array(lives.collect()))]);
     v.push("issues", Value::Array(issues.collect())).push("summary", format!("{name}: {}", l.summary()));
+    if skip.saturating_add(max) < l.lives.len() {
+        v.push("runs", l.lives.len() as u64).push("more", (skip + max) as u64);
+    }
     v
+}
+
+/// A check's result, a row per scope (`overall`, then each lifecycle's):
+/// `check --json` and the MCP `checks` tool. `place` says where a row is
+/// (the CLI: its number from 1; MCP: [`View::place`]); up to `evidence`
+/// pieces of evidence per scope.
+pub fn check_rows(r: &crate::check::CheckResult, evidence: usize, place: &dyn Fn(LineNo) -> Value) -> Vec<Value> {
+    use crate::check::Verdict;
+    let rows = r.scopes.iter().map(|s| {
+        let verdict = match &s.verdict {
+            Verdict::Ok => Value::from("ok"),
+            Verdict::Issue(n) => Value::object([("issue", Value::from(*n))]),
+            Verdict::Fact(v) => Value::object([("fact", v.clone().map_or(Value::Null, Value::from))]),
+        };
+        let evidence = s.evidence.iter().take(evidence).map(|e| {
+            Value::object([
+                ("lines", Value::Array(e.rows.iter().map(|&row| place(row)).collect())),
+                ("note", e.note.as_str().into()),
+            ])
+        });
+        Value::object([
+            ("check", Value::from(r.name.as_str())),
+            ("kind", r.kind.as_str().into()),
+            ("scope", s.scope.label.as_str().into()),
+            ("first_line", place(s.scope.from)),
+            ("end_line", place(s.scope.to.saturating_sub(1).max(s.scope.from))),
+            ("verdict", verdict),
+            ("times_go_back", r.times_go_back.into()),
+            ("evidence", Value::Array(evidence.collect())),
+        ])
+    });
+    rows.collect()
 }
 
 /// `bytes` in base64 (RFC 4648, padded): a screenshot's PNG in an answer.
@@ -785,6 +853,24 @@ mod tests {
         // Numbered by the file: the record at row 3 starts at line 6.
         assert_eq!(v.place(3).to_string(), r#"{"line":6}"#);
         assert!(hints(&r).iter().all(|x| !x.contains("goroutine dump")), "read as records already");
+    }
+
+    /// A time after a file name (LogHub's OpenStack): the hint gives the
+    /// profile, and the profile it gives reads the times.
+    #[test]
+    fn a_time_after_a_word_is_hinted_with_its_profile() {
+        let log = "nova-api.log.1 2017-05-16 15:16:01.511 25749 INFO GET /flavors\n\
+                   nova-compute.log 2017-05-16 15:16:02.007 2931 INFO Creating image\n\
+                   nova-api.log.1 2017-05-16 15:16:03.100 25749 INFO GET /servers\n";
+        let f = TextFile::from_bytes("os.log", log.as_bytes().to_vec());
+        let h = hints(&f);
+        let hint = h.iter().find(|x| x.starts_with("lines start with a time after 1 word")).expect("hinted");
+        let spec = hint.split('\'').nth(1).unwrap();
+        assert_eq!(spec, r"timed: time /^(?:\S+\s+){1}(?<time>\S+ \S+)/", "{hint}");
+        let p = crate::input::profile::Profile::parse_spec(spec).unwrap();
+        let t = p.time().read(log.lines().next().unwrap(), crate::time::Zone::Utc, Default::default()).unwrap();
+        assert_eq!(time_text(t), "2017-05-16T15:16:01.511000Z");
+        assert!(!h.iter().any(|x| x.starts_with("no line has a time")), "{h:?}");
     }
 
     #[test]
